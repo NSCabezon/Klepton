@@ -279,10 +279,29 @@ if REMOTE_JSON:
     remote = {}
     try: rj = json.load(open(REMOTE_JSON))
     except Exception: rj = {}
+    # The size may sit beside the path or one level down (a "metadata" /
+    # "attributes" object), and may be serialized as a float or a string —
+    # the first parser accepted only an int beside the path and listed 0 files.
+    SIZE_KEYS = ("size", "fileSize", "sizeInBytes", "byteCount", "logicalSize", "totalSize")
+    def as_int(v):
+        if isinstance(v, bool): return None
+        if isinstance(v, (int, float)): return int(v)
+        if isinstance(v, str) and v.strip().isdigit(): return int(v)
+        return None
+    def size_of(o):
+        for k in SIZE_KEYS:
+            n = as_int(o.get(k))
+            if n is not None: return n
+        for v in o.values():
+            if isinstance(v, dict):
+                for k in SIZE_KEYS:
+                    n = as_int(v.get(k))
+                    if n is not None: return n
+        return None
     def walk(o):
         if isinstance(o, dict):
             path = next((o[k] for k in ("relativePath", "path", "name") if isinstance(o.get(k), str)), None)
-            size = next((o[k] for k in ("size", "fileSize", "sizeInBytes", "byteCount") if isinstance(o.get(k), int)), None)
+            size = size_of(o) if path is not None else None
             if path is not None and size is not None:
                 p = path.lstrip("/")
                 i = p.find(DEST + "/")
