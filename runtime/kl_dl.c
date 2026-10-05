@@ -960,6 +960,8 @@ static void *klb_dlsym_null(const char *name) {
 }
 
 void *klb_dlsym(void *handle, const char *name) {
+    if (g_dlsym_override && kl_env_on("KL_TRACE_DLSYM", 0))
+        fprintf(stderr, "  [dl] dlsym(%p, %s)\n", handle, name ? name : "(null)");
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
@@ -1003,6 +1005,15 @@ void *klb_dlsym(void *handle, const char *name) {
         return NULL;
     }
     void *v = kl_sym((kl_image *)handle, name);
+    // glibc's dlsym on a library handle searches that library's whole
+    // dependency tree, not just the object: Panorama asks libpangoft2's handle
+    // for FcConfigCreate (libfontconfig) and FT_Load_Glyph (libfreetype). Under
+    // a door with glibc rules, fall back to every loaded image and then libc —
+    // a superset of the tree, in load (dependencies-first) order.
+    if (!v && g_needed_resolver) {
+        v = kl_guest_sym_global(name);
+        if (!v) v = kl_shim_lookup(name);
+    }
     if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
               return klb_dlsym_null(name); }
     { void *w = kl_dl_interpose(name, v); if (w) return w; }

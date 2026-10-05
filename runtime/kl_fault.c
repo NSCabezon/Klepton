@@ -148,6 +148,14 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         uintptr_t fpc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
         int win1 = (fa == (uintptr_t)KLX_TSD_SLOT * 8);
         int win2 = (fa == 0 && fpc == 0);
+        // KL_X18_RECOVER=0: report every such fault instead. Window 2 is
+        // ambiguous in a guest built by GCC, which uses x18 as a scratch
+        // register: a genuine call through a NULL pointer also lands at pc 0,
+        // and "resuming" it at whatever the guest last left in x18 turns a
+        // named crash into a silent spin.
+        static int recover = -1;
+        if (recover < 0) recover = kl_env_on("KL_X18_RECOVER", 1);
+        if (!recover) win1 = win2 = 0;
         if (win1 || win2) {
             void *target = pthread_getspecific(KLX_TSD_SLOT);
             size_t toff = 0;

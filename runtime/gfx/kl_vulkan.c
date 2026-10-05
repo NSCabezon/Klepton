@@ -84,6 +84,7 @@ unsigned long long kl_vulkan_frame_serial(void) { return 0; }
 // no MoltenVK, so a Vulkan OpenXR guest is refused at xrCreateInstance — where
 // the guest's own log names the extension — instead of somewhere further in.
 int   kl_vulkan_xr_supported(void) { return 0; }
+void  kl_vulkan_advertise_linux_wsi(int on) { (void)on; }
 const char *kl_vulkan_xr_instance_extensions(void) { return ""; }
 const char *kl_vulkan_xr_device_extensions(void) { return ""; }
 void *kl_vulkan_xr_physical_device(void *vi) { (void)vi; return NULL; }
@@ -432,6 +433,22 @@ static int ext_supported(const VkExtensionProperties *have, uint32_t nhave,
 // ---------------------------------------------------------------------------
 // Instance
 // ---------------------------------------------------------------------------
+// A Linux guest's render system (Source 2's) will not create an instance
+// unless the loader lists a Linux window-system surface extension — it then
+// gets its actual surface from SDL_Vulkan_CreateSurface, which the glibc door
+// answers with vkCreateMetalSurfaceEXT. So, on request, the three Linux WSI
+// names are ADVERTISED and, when enabled, swapped for VK_EXT_metal_surface at
+// vkCreateInstance — the same "ours, not MoltenVK's" move as Android WSI.
+static int g_linux_wsi;
+void kl_vulkan_advertise_linux_wsi(int on) { g_linux_wsi = on; }
+static const char *const k_linux_wsi[] = {
+    "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface",
+};
+static int is_linux_wsi(const char *e) {
+    for (unsigned i = 0; i < 3; i++) if (!strcmp(e, k_linux_wsi[i])) return 1;
+    return 0;
+}
+
 static VkResult klvk_EnumerateInstanceExtensionProperties(
         const char *layer, uint32_t *count, VkExtensionProperties *props) {
     vk_init();
@@ -443,7 +460,7 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
 
     uint32_t n = 0;
     real(layer, &n, NULL);
-    VkExtensionProperties *tmp = calloc(n + 2, sizeof *tmp);
+    VkExtensionProperties *tmp = calloc(n + 5, sizeof *tmp);
     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
     real(layer, &n, tmp);
 
@@ -456,8 +473,15 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
         tmp[n].specVersion = 6;
         n++;
     }
+    for (unsigned i = 0; g_linux_wsi && !layer && i < 3; i++) {
+        snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", k_linux_wsi[i]);
+        tmp[n].specVersion = 6;
+        n++;
+    }
 
     VkResult r = VK_SUCCESS;
+    VKT("vkEnumerateInstanceExtensionProperties(%s, %u, %p): %u available\n",
+        layer ? layer : "NULL", count ? *count : 0, (void *)props, n);
     if (!props) *count = n;
     else {
         uint32_t give = *count < n ? *count : n;
@@ -490,6 +514,12 @@ static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
         const char *e = ci->ppEnabledExtensionNames[i];
         if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
             VKT("instance ext %s -> ours (MoltenVK has no Android WSI)\n", e);
+            continue;
+        }
+        if (g_linux_wsi && is_linux_wsi(e)) {
+            VKI("instance ext %s -> VK_EXT_metal_surface (the window is a CAMetalLayer)\n", e);
+            if (have && ext_supported(have, nhave, "VK_EXT_metal_surface"))
+                ext_add(&keep, "VK_EXT_metal_surface");
             continue;
         }
         if (have && !ext_supported(have, nhave, e)) {
@@ -571,6 +601,135 @@ static void dev_resolve(klvk_device *d) {
 #undef R
 }
 
+// ---------------------------------------------------------------------------
+// Device features: ask for what the device has
+// ---------------------------------------------------------------------------
+//
+// A desktop Linux render system (Source 2's) enables feature bits it never
+// queried — its target driver has them all — and MoltenVK refuses the whole
+// device for one missing bit (VK_ERROR_FEATURE_NOT_PRESENT, "the 11th flag in
+// VkPhysicalDeviceExtendedDynamicState3FeaturesEXT"). An app that asks for a
+// feature it then does not use loses nothing when the bit is cleared; one that
+// does use it fails at that use, by name, instead of never getting a device.
+// So every feature struct in the create chain is copied, ANDed with what
+// vkGetPhysicalDeviceFeatures2 reports for the same struct, and each cleared
+// bit is logged. A struct this table does not know leaves the chain as it was.
+static size_t feature_struct_size(VkStructureType t) {
+    switch ((int)t) {
+#define FS(st, ty) case st: return sizeof(ty);
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, VkPhysicalDeviceFeatures2)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, VkPhysicalDeviceVulkan13Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, VkPhysicalDeviceMultiviewFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, VkPhysicalDeviceDynamicRenderingFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, VkPhysicalDeviceHostImageCopyFeaturesEXT)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicStateFeaturesEXT)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicState2FeaturesEXT)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicState3FeaturesEXT)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, VkPhysicalDeviceDescriptorIndexingFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, VkPhysicalDeviceTimelineSemaphoreFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, VkPhysicalDeviceShaderFloat16Int8Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, VkPhysicalDevice16BitStorageFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, VkPhysicalDevice8BitStorageFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, VkPhysicalDeviceBufferDeviceAddressFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, VkPhysicalDeviceSynchronization2Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, VkPhysicalDeviceImagelessFramebufferFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, VkPhysicalDeviceScalarBlockLayoutFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES, VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, VkPhysicalDeviceSamplerYcbcrConversionFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, VkPhysicalDeviceUniformBufferStandardLayoutFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, VkPhysicalDeviceShaderDrawParametersFeatures)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, VkPhysicalDeviceMaintenance4Features)
+    FS(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT, VkPhysicalDeviceFragmentDensityMapFeaturesEXT)
+#undef FS
+    default: return 0;
+    }
+}
+
+// Rebuild `ci`'s feature requests against what `phys` supports. Returns the
+// pNext chain to create with (a sanitized copy, or the original), and the
+// pEnabledFeatures to use; *owned collects what must be freed after.
+static const void *sanitize_features(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                                     VkPhysicalDeviceFeatures *core, int *have_core,
+                                     void **owned, int cap, int *nowned) {
+    *have_core = 0;
+    *nowned = 0;
+    PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)
+        real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!ci || !gf2) return ci ? ci->pNext : NULL;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (!feature_struct_size(b->sType)) {
+            // Not one we know (or not a feature struct at all): we cannot
+            // copy what we cannot size, so the chain goes through as it was.
+            VKT("device create chain: sType %d unknown — features not sanitized\n",
+                (int)b->sType);
+            return ci->pNext;
+        }
+    // Requested copies (what we will create with) and query copies (what the
+    // device reports), each chained in the original order.
+    VkBaseOutStructure *req_head = NULL, *req_tail = NULL, *q_head = NULL, *q_tail = NULL;
+    for (const VkBaseInStructure *b = ci->pNext; b && *nowned + 2 <= cap; b = b->pNext) {
+        size_t sz = feature_struct_size(b->sType);
+        VkBaseOutStructure *r = malloc(sz), *q = calloc(1, sz);
+        memcpy(r, b, sz);
+        r->pNext = NULL;
+        q->sType = b->sType;
+        owned[(*nowned)++] = r;
+        owned[(*nowned)++] = q;
+        if (req_tail) req_tail->pNext = r; else req_head = r;
+        req_tail = r;
+        if (b->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            if (q_tail) q_tail->pNext = q; else q_head = q;
+            q_tail = q;
+        }
+    }
+    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                     .pNext = q_head };
+    gf2(phys, &f2);
+    unsigned cleared = 0;
+    // Same order in both chains (FEATURES_2 aside, which ANDs with f2.features).
+    VkBaseOutStructure *q = q_head;
+    for (VkBaseOutStructure *r = req_head; r; r = r->pNext) {
+        size_t sz = feature_struct_size(r->sType);
+        const VkBool32 *sup;
+        VkBool32 *want;
+        size_t n;
+        if (r->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            want = (VkBool32 *)&((VkPhysicalDeviceFeatures2 *)r)->features;
+            sup  = (const VkBool32 *)&f2.features;
+            n = sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32);
+        } else {
+            want = (VkBool32 *)((uint8_t *)r + sizeof(VkBaseOutStructure));
+            sup  = (const VkBool32 *)((uint8_t *)q + sizeof(VkBaseOutStructure));
+            n = (sz - sizeof(VkBaseOutStructure)) / sizeof(VkBool32);
+            q = q->pNext;
+        }
+        for (size_t i = 0; i < n; i++)
+            if (want[i] && !sup[i]) {
+                want[i] = VK_FALSE;
+                cleared++;
+                VKI("device feature: sType %d flag #%zu requested but not supported — cleared\n",
+                    (int)r->sType, i + 1);
+            }
+    }
+    if (ci->pEnabledFeatures) {
+        *core = *ci->pEnabledFeatures;
+        *have_core = 1;
+        VkBool32 *want = (VkBool32 *)core;
+        const VkBool32 *sup = (const VkBool32 *)&f2.features;
+        for (size_t i = 0; i < sizeof *core / sizeof(VkBool32); i++)
+            if (want[i] && !sup[i]) {
+                want[i] = VK_FALSE;
+                cleared++;
+                VKI("device feature: core flag #%zu requested but not supported — cleared\n", i + 1);
+            }
+    }
+    if (cleared) VKI("device features: %u unsupported request(s) cleared\n", cleared);
+    return req_head;
+}
+
 static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -621,9 +780,21 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     mine.enabledLayerCount = 0;
     mine.ppEnabledLayerNames = NULL;
 
+    void *owned[64];
+    int nowned = 0, have_core = 0;
+    VkPhysicalDeviceFeatures core;
+    mine.pNext = sanitize_features(phys, ci, &core, &have_core, owned, 64, &nowned);
+    if (have_core) mine.pEnabledFeatures = &core;
+
     VkResult r = real(phys, &mine, alloc, out);
     free(have);
-    if (r != VK_SUCCESS) { VKI("vkCreateDevice FAILED %d\n", r); return r; }
+    for (int i = 0; i < nowned; i++) free(owned[i]);
+    if (r != VK_SUCCESS) {
+        VKI("vkCreateDevice FAILED %d\n", r);
+        for (const VkBaseInStructure *b = mine.pNext; b; b = b->pNext)
+            VKI("  device create chain: sType %d\n", (int)b->sType);
+        return r;
+    }
 
     klvk_device *d = calloc(1, sizeof *d);
     if (!d) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -670,24 +841,50 @@ static klvk_surface *surf_of(VkSurfaceKHR h) {
     return (s && s->magic == KLVK_SURF_MAGIC) ? s : NULL;
 }
 
+// A REAL surface — one MoltenVK made, vkCreateMetalSurfaceEXT on a
+// CAMetalLayer the host window gave us (the glibc door's SDL seam,
+// kl_glibc_sdl.c) — is MoltenVK's business end to end: every surface and
+// swapchain entry point below hands a handle that is not one of ours straight
+// through, and the window presents natively. The synthetic surface stays the
+// answer wherever there is no window (Android WSI, headless, the VR backend).
+#define KLVK_REAL(name) ((PFN_##name)mvk_sym(#name))
+
 static void klvk_DestroySurfaceKHR(VkInstance inst, VkSurfaceKHR surf,
                                    const VkAllocationCallbacks *alloc) {
-    (void)inst; (void)alloc;
     klvk_surface *s = surf_of(surf);
-    if (s) { s->magic = 0; free(s); }
+    if (s) { s->magic = 0; free(s); return; }
+    PFN_vkDestroySurfaceKHR real = KLVK_REAL(vkDestroySurfaceKHR);
+    if (real && surf) real(inst, surf, alloc);
 }
 
 static VkResult klvk_GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice p, uint32_t fam,
         VkSurfaceKHR surf, VkBool32 *out) {
-    (void)p; (void)fam; (void)surf;
+    if (surf && !surf_of(surf)) {
+        PFN_vkGetPhysicalDeviceSurfaceSupportKHR real =
+            KLVK_REAL(vkGetPhysicalDeviceSurfaceSupportKHR);
+        if (real) return real(p, fam, surf, out);
+    }
+    (void)p; (void)fam;
     *out = VK_TRUE;
     return VK_SUCCESS;
 }
 
 static VkResult klvk_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice p,
         VkSurfaceKHR surf, VkSurfaceCapabilitiesKHR *c) {
-    (void)p;
     klvk_surface *s = surf_of(surf);
+    if (surf && !s) {
+        PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real =
+            KLVK_REAL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+        if (real) {
+            VkResult r = real(p, surf, c);
+            // The capture and the copy guards want TRANSFER_SRC on swapchain
+            // images; a CAMetalLayer surface offers it anyway.
+            VKT("real surface caps: %ux%u, %u..%u images, usage %#x\n",
+                c->currentExtent.width, c->currentExtent.height, c->minImageCount,
+                c->maxImageCount, (unsigned)c->supportedUsageFlags);
+            return r;
+        }
+    }
     uint32_t w = s ? s->w : 1024, h = s ? s->h : 1024;
     memset(c, 0, sizeof *c);
     c->minImageCount = 2;
@@ -718,7 +915,12 @@ static const VkFormat k_surf_formats[] = {
 
 static VkResult klvk_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice p,
         VkSurfaceKHR surf, uint32_t *count, VkSurfaceFormatKHR *out) {
-    (void)p; (void)surf;
+    if (surf && !surf_of(surf)) {
+        PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real =
+            KLVK_REAL(vkGetPhysicalDeviceSurfaceFormatsKHR);
+        if (real) return real(p, surf, count, out);
+    }
+    (void)p;
     uint32_t n = sizeof k_surf_formats / sizeof *k_surf_formats;
     if (!out) { *count = n; return VK_SUCCESS; }
     uint32_t give = *count < n ? *count : n;
@@ -732,7 +934,12 @@ static VkResult klvk_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice p,
 
 static VkResult klvk_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice p,
         VkSurfaceKHR surf, uint32_t *count, VkPresentModeKHR *out) {
-    (void)p; (void)surf;
+    if (surf && !surf_of(surf)) {
+        PFN_vkGetPhysicalDeviceSurfacePresentModesKHR real =
+            KLVK_REAL(vkGetPhysicalDeviceSurfacePresentModesKHR);
+        if (real) return real(p, surf, count, out);
+    }
+    (void)p;
     static const VkPresentModeKHR modes[] = {
         VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
         VK_PRESENT_MODE_IMMEDIATE_KHR,
@@ -768,6 +975,15 @@ static int  klvk_img_reg_has(VkImage img);
 
 static VkResult klvk_CreateSwapchainKHR(VkDevice dev, const VkSwapchainCreateInfoKHR *ci,
         const VkAllocationCallbacks *alloc, VkSwapchainKHR *out) {
+    if (ci && ci->surface && !surf_of(ci->surface)) {
+        PFN_vkCreateSwapchainKHR real = KLVK_REAL(vkCreateSwapchainKHR);
+        if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+        VkResult r = real(dev, ci, alloc, out);
+        VKI("vkCreateSwapchainKHR -> MoltenVK swapchain %ux%u fmt %d, %u image(s): %d\n",
+            ci->imageExtent.width, ci->imageExtent.height, (int)ci->imageFormat,
+            ci->minImageCount, r);
+        return r;
+    }
     (void)alloc;
     klvk_device *d = dev_find(dev);
     if (!d) return VK_ERROR_INITIALIZATION_FAILED;
@@ -834,9 +1050,13 @@ static klvk_swapchain *swap_of(VkSwapchainKHR h) {
 
 static void klvk_DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR h,
                                      const VkAllocationCallbacks *alloc) {
-    (void)alloc;
     klvk_swapchain *sc = swap_of(h);
-    if (!sc) return;
+    if (!sc) {
+        PFN_vkDestroySwapchainKHR real = KLVK_REAL(vkDestroySwapchainKHR);
+        if (real && h) real(dev, h, alloc);
+        return;
+    }
+    (void)alloc;
     klvk_device *d = sc->d;
     if (d->DeviceWaitIdle) d->DeviceWaitIdle(dev);
     for (uint32_t i = 0; i < sc->n; i++) {
@@ -851,9 +1071,17 @@ static void klvk_DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR h,
 
 static VkResult klvk_GetSwapchainImagesKHR(VkDevice dev, VkSwapchainKHR h,
         uint32_t *count, VkImage *out) {
-    (void)dev;
     klvk_swapchain *sc = swap_of(h);
-    if (!sc) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!sc) {
+        PFN_vkGetSwapchainImagesKHR real = KLVK_REAL(vkGetSwapchainImagesKHR);
+        if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+        VkResult r = real(dev, h, count, out);
+        // Registered, so the wild-handle guards on copies and views (see
+        // klvk_CmdCopyImage) know these are real images, not garbage.
+        for (uint32_t i = 0; out && r >= 0 && i < *count; i++) klvk_img_reg_add(out[i]);
+        return r;
+    }
+    (void)dev;
     if (!out) { *count = sc->n; return VK_SUCCESS; }
     uint32_t give = *count < sc->n ? *count : sc->n;
     memcpy(out, sc->images, give * sizeof *out);
@@ -875,9 +1103,12 @@ static VkResult klvk_GetSwapchainImagesKHR(VkDevice dev, VkSwapchainKHR h,
 // make it a race with no error surface.
 static VkResult klvk_AcquireNextImageKHR(VkDevice dev, VkSwapchainKHR h,
         uint64_t timeout, VkSemaphore sem, VkFence fence, uint32_t *index) {
-    (void)timeout;
     klvk_swapchain *sc = swap_of(h);
-    if (!sc) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!sc) {
+        PFN_vkAcquireNextImageKHR real = KLVK_REAL(vkAcquireNextImageKHR);
+        return real ? real(dev, h, timeout, sem, fence, index) : VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    (void)timeout;
     klvk_device *d = sc->d;
 
     *index = sc->next;
@@ -2472,6 +2703,15 @@ void kl_vulkan_frame_done(int stage) {
 }
 
 static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    for (uint32_t i = 0; pi && i < pi->swapchainCount; i++)
+        if (!swap_of(pi->pSwapchains[i])) {
+            PFN_vkQueuePresentKHR real = KLVK_REAL(vkQueuePresentKHR);
+            unsigned f = g_presented++;
+            VkResult r = real ? real(q, pi) : VK_ERROR_DEVICE_LOST;
+            if (f == 0 || (f < 1000 && !(f & (f - 1))))
+                VKI("vkQueuePresentKHR (window) frame %u -> %d\n", f, r);
+            return r;
+        }
     klvk_device *d = dev_of_queue(q);
     unsigned this_frame = g_presented++;
 
@@ -5997,6 +6237,7 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
                                                               const char *name) {
     vk_init();
     if (!name) return NULL;
+    VKT("vkGetInstanceProcAddr(%p, %s)\n", (void *)inst, name);
     if (!strcmp(name, "vkGetInstanceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetInstanceProcAddr;
     if (!strcmp(name, "vkGetDeviceProcAddr"))

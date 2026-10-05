@@ -57,7 +57,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/gfx/kl_vulkan.c \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
-           runtime/guest/kl_gles3jni.c runtime/guest/kl_glibc.c runtime/guest/kl_driver.c \
+           runtime/guest/kl_gles3jni.c runtime/guest/kl_glibc.c runtime/guest/kl_glibc_sdl.c \
+           runtime/guest/kl_driver.c \
            runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
            runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
@@ -392,11 +393,11 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
-build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
               runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
 	  runtime/gfx/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)

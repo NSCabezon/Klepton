@@ -69,6 +69,7 @@
 #include "klepton.h"
 #include "kl_va.h"
 #include "kl_glibc_shim.h"
+#include "kl_glibc_sdl.h"
 
 #define LX_ENOSYS 38
 #define LX_ENOENT 2
@@ -416,6 +417,19 @@ static double klg_strtod_l(const char *s, char **e, void *l) { (void)l; return s
 static float  klg_strtof_l(const char *s, char **e, void *l) { (void)l; return strtof(s, e); }
 static long long klg_strtoll_l(const char *s, char **e, int b, void *l) { (void)l; return strtoll(s, e, b); }
 static unsigned long long klg_strtoull_l(const char *s, char **e, int b, void *l) { (void)l; return strtoull(s, e, b); }
+
+// Every other *_l a glibc library calls directly (pango's strtod_l among them):
+// the locale_t it passes is OURS (the glibc-shaped struct above), so it must
+// never reach Darwin's *_l functions, which validate it and trap.
+static long klg_strtol_l(const char *s, char **e, int b, void *l) { (void)l; return strtol(s, e, b); }
+static unsigned long klg_strtoul_l(const char *s, char **e, int b, void *l) { (void)l; return strtoul(s, e, b); }
+#define CT_L(fn) static int klg_##fn##_l(int c, void *l) { (void)l; return fn(c); }
+CT_L(isalnum) CT_L(isalpha) CT_L(isblank) CT_L(iscntrl) CT_L(isdigit) CT_L(isgraph)
+CT_L(islower) CT_L(isprint) CT_L(ispunct) CT_L(isspace) CT_L(isupper) CT_L(isxdigit)
+CT_L(tolower) CT_L(toupper)
+#undef CT_L
+static int klg_strcasecmp_l(const char *a, const char *b, void *l) { (void)l; return strcasecmp(a, b); }
+static int klg_strncasecmp_l(const char *a, const char *b, size_t n, void *l) { (void)l; return strncasecmp(a, b, n); }
 
 // gettext: no catalogues, so every message is its own translation.
 static char *klg_gettext(const char *m) { return (char *)m; }
@@ -820,7 +834,23 @@ static const klg_entry g_glibc[] = {
     D("__strftime_l", klg_strftime_l), D("strftime_l", klg_strftime_l),
     D("__wcsftime_l", klg_wcsftime_l),
     D("__strtod_l", klg_strtod_l), D("__strtof_l", klg_strtof_l),
-    A("__strtold_l", "strtold_l"),
+    D("strtod_l", klg_strtod_l), D("strtof_l", klg_strtof_l),
+    A("__strtold_l", "strtold"), A("strtold_l", "strtold"),
+    D("strtol_l", klg_strtol_l), D("__strtol_l", klg_strtol_l),
+    D("strtoul_l", klg_strtoul_l), D("__strtoul_l", klg_strtoul_l),
+    D("strtoll_l", klg_strtoll_l), D("__strtoll_l", klg_strtoll_l),
+    D("strtoull_l", klg_strtoull_l), D("__strtoull_l", klg_strtoull_l),
+    D("isalnum_l", klg_isalnum_l), D("isalpha_l", klg_isalpha_l), D("isblank_l", klg_isblank_l),
+    D("iscntrl_l", klg_iscntrl_l), D("isdigit_l", klg_isdigit_l), D("isgraph_l", klg_isgraph_l),
+    D("islower_l", klg_islower_l), D("isprint_l", klg_isprint_l), D("ispunct_l", klg_ispunct_l),
+    D("isspace_l", klg_isspace_l), D("isupper_l", klg_isupper_l), D("isxdigit_l", klg_isxdigit_l),
+    D("tolower_l", klg_tolower_l), D("toupper_l", klg_toupper_l),
+    D("__tolower_l", klg_tolower_l), D("__toupper_l", klg_toupper_l),
+    D("towlower_l", klg_towlower_l), D("towupper_l", klg_towupper_l),
+    D("wcscoll_l", klg_wcscoll_l), D("wcsxfrm_l", klg_wcsxfrm_l),
+    D("iswctype_l", klg_iswctype_l), D("wctype_l", klg_wctype_l),
+    D("wcsftime_l", klg_wcsftime_l),
+    D("strcasecmp_l", klg_strcasecmp_l), D("strncasecmp_l", klg_strncasecmp_l),
     D("gettext", klg_gettext), D("dgettext", klg_dgettext), D("dcgettext", klg_dcgettext),
     D("dcngettext", klg_dcngettext), D("textdomain", klg_textdomain),
     D("bindtextdomain", klg_bindtextdomain),
@@ -900,6 +930,11 @@ static const klg_entry g_glibc[] = {
 };
 
 void *kl_glibc_lookup(const char *name) {
+    // SDL's video half first (kl_glibc_sdl.c): Panorama imports some of it
+    // directly, and those imports must land on the same seam the engine's
+    // dlsym table does.
+    void *sdl = kl_glibc_sdl_lookup(name);
+    if (sdl) return sdl;
     for (size_t i = 0; i < sizeof g_glibc / sizeof *g_glibc; i++) {
         const klg_entry *e = &g_glibc[i];
         if (strcmp(e->name, name)) continue;

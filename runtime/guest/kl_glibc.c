@@ -31,7 +31,11 @@
 #include "kl_glibc.h"
 #include "kl_tls.h"
 #include "kl_glibc_shim.h"
+#include "kl_glibc_sdl.h"
+#include "kl_flatwin.h"
+#include "kl_vulkan.h"
 #include "kl_x18.h"
+#include "kl_jni.h"
 
 static void *glibc_dlsym_override(const char *name, void *real);
 static char      g_err[512];
@@ -181,6 +185,21 @@ static int glibc_resolve(const char *name, char *path, size_t cap) {
                 return KL_NEED_LOAD;
             }
     }
+    // A development name ("libpangoft2-1.0.so") that the install only has as
+    // a versioned file: on Linux hlvr.sh creates exactly these symlinks
+    // (libfoo.so -> libfoo.so.N.M) in the bin directory before launch, and the
+    // depot carries them as empty placeholders. Same answer, without writing
+    // into the install: the shortest file named <name>.<version>, game tree first.
+    size_t bl = strlen(b);
+    if (bl > 3 && !strcmp(b + bl - 3, ".so")) {
+        const ent *best = NULL;
+        for (unsigned i = 0; i < g_nidx; i++)
+            if (!strncmp(g_idx[i].file, b, bl) && g_idx[i].file[bl] == '.' &&
+                (!best || g_idx[i].dir < best->dir ||
+                 (g_idx[i].dir == best->dir && strlen(g_idx[i].file) < strlen(best->file))))
+                best = &g_idx[i];
+        if (best) { snprintf(path, cap, "%s", best->path); return KL_NEED_LOAD; }
+    }
     return KL_NEED_MISSING;
 }
 
@@ -225,6 +244,7 @@ int kl_glibc_configure(const char *target, const char *libdir, const char *entry
     // here on, relocation and dlsym alike (kl_glibc_shim.c).
     kl_set_abi_lookup(kl_glibc_lookup);
     kl_dl_set_dlsym_override(glibc_dlsym_override);
+    kl_vulkan_advertise_linux_wsi(1);
     kl_glibc_set_exe_path(g_entry);
     // V8 must run --jitless: no guest may map executable memory on visionOS,
     // and the host shim refuses it too (KL_GUEST_JIT). Panorama sets its own
@@ -306,6 +326,8 @@ static void *glibc_dlsym_override(const char *name, void *real) {
     (void)real;
     if (kl_env_on("KL_TRACE_DLSYM", 0)) fprintf(stderr, "  [glibc] dlsym %s\n", name);
     if (!strcmp(name, "SDL_ShowSimpleMessageBox")) return (void *)klg_sdl_msgbox;
+    void *seam = kl_glibc_sdl_lookup(name);
+    if (seam) return seam;
     if (!strcmp(name, "SDL_ShowMessageBox")) return (void *)klg_sdl_msgbox_full;
     return NULL;
 }
@@ -323,8 +345,27 @@ static char g_root[1024];
 static char g_content[4][1024];
 static int  g_ncontent;
 
+// ...and the WRITABLE layer over both. The engine writes beside itself once it
+// has chdir'd into the root (cfg/, the console log, shader caches), and the
+// install is not ours to write into — on visionOS it is the sealed app bundle.
+// So a path under the root resolves, in order: a FILE the guest already wrote
+// into the userdata layer (<userdata>/gameroot/<rel>); the install itself; a
+// content directory; and, for a path that exists nowhere yet — i.e. one about
+// to be created — the userdata layer, with its parent directory made. A
+// directory present in both stays the install's, so a probe that created an
+// empty directory in the layer cannot hide the shipped one.
+static char g_wlayer[1024];
+
+static void mkdir_p(const char *dir) {
+    char tmp[2048];
+    snprintf(tmp, sizeof tmp, "%s", dir);
+    for (char *p = tmp + 1; *p; p++)
+        if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
+    mkdir(tmp, 0755);
+}
+
 static const char *content_overlay(const char *path, char *buf, size_t cap) {
-    if (!g_ncontent || !path || !*path) return NULL;
+    if (!path || !*path || !g_root[0]) return NULL;
     char abs[2048];
     if (path[0] == '/') snprintf(abs, sizeof abs, "%s", path);
     else {
@@ -334,18 +375,31 @@ static const char *content_overlay(const char *path, char *buf, size_t cap) {
     }
     size_t rl = strlen(g_root);
     if (strncmp(abs, g_root, rl) != 0 || (abs[rl] != '/' && abs[rl] != 0)) return NULL;
+    const char *rel = abs + rl;
+    struct stat st;
+    char cand[2048];
+    if (g_wlayer[0]) {
+        snprintf(cand, sizeof cand, "%s%s", g_wlayer, rel);
+        if (stat(cand, &st) == 0 && !S_ISDIR(st.st_mode)) goto take;
+    }
     if (access(abs, F_OK) == 0) return NULL;          // the install has it
     for (int i = 0; i < g_ncontent; i++) {
-        char cand[2048];
-        snprintf(cand, sizeof cand, "%s%s", g_content[i], abs + rl);
-        if (access(cand, F_OK) == 0) {
-            if (kl_env_on("KL_TRACE_CONTENT", 0))
-                fprintf(stderr, "  [glibc] content: %s -> %s\n", path, cand);
-            snprintf(buf, cap, "%s", cand);
-            return buf;
-        }
+        snprintf(cand, sizeof cand, "%s%s", g_content[i], rel);
+        if (access(cand, F_OK) == 0) goto take;
     }
-    return NULL;
+    if (!g_wlayer[0] || !rel[0]) return NULL;
+    snprintf(cand, sizeof cand, "%s%s", g_wlayer, rel);
+    {
+        char parent[2048];
+        snprintf(parent, sizeof parent, "%s", cand);
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) { *sl = 0; mkdir_p(parent); }
+    }
+take:
+    if (kl_env_on("KL_TRACE_CONTENT", 0))
+        fprintf(stderr, "  [glibc] path: %s -> %s\n", path, cand);
+    snprintf(buf, cap, "%s", cand);
+    return buf;
 }
 
 static void setup_root(void) {
@@ -369,6 +423,12 @@ static void setup_root(void) {
             free(r2);
         }
     }
+    // The writable layer: KL_GLIBC_WRITE, else <userdata>/gameroot.
+    const char *wl = getenv("KL_GLIBC_WRITE");
+    char def[1100];
+    snprintf(def, sizeof def, "%s/gameroot", kl_userdata_dir(g_target));
+    snprintf(g_wlayer, sizeof g_wlayer, "%s", wl && *wl ? wl : def);
+    mkdir_p(g_wlayer);
     kl_set_guest_path_hook(content_overlay);
 }
 
@@ -390,7 +450,7 @@ int kl_glibc_load(FILE *out, int run) {
             fprintf(stderr, "  [glibc] chdir(%s): %s\n", g_root, strerror(errno));
         setenv("ENABLE_PATHMATCH", "1", 0);
         if (out) {
-            fprintf(out, "  game root: %s\n", g_root);
+            fprintf(out, "  game root: %s\n  writes:    %s\n", g_root, g_wlayer);
             for (int i = 0; i < g_ncontent; i++)
                 fprintf(out, "  content overlay: %s\n", g_content[i]);
         }
@@ -820,8 +880,12 @@ double kl_glibc_pump(double seconds, const volatile int *quit) {
     struct timespec t0, now;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     double el = 0;
+    // This thread is the window system's (the main thread, on the host): the
+    // flat-window backend, if one is registered, is pumped here.
+    const kl_flatwin_backend *be = kl_flatwin_backend_now();
     while ((!quit || !*quit) && (seconds < 0 || el < seconds)) {
-        usleep(100 * 1000);
+        if (be && be->pump) { be->pump(); usleep(5 * 1000); }
+        else usleep(100 * 1000);
         clock_gettime(CLOCK_MONOTONIC, &now);
         el = (double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
     }

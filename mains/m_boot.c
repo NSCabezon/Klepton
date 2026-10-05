@@ -28,6 +28,7 @@
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
 #include "../runtime/gfx/kl_view.h"
+#include "../runtime/gfx/kl_hostwin.h"
 #include "../runtime/diag/kl_sample.h"
 #include "../runtime/diag/kl_mprobe.h"
 #include "../runtime/diag/kl_metadump.h"
@@ -873,6 +874,11 @@ int main(int argc, char **argv) {
         kl_target_apply_host(TARGET, NULL);
     }
     kl_driver_init(TARGET, LIBDIR, DOOR);
+    // A flat glibc guest (Half-Life: Alyx) gets a real window for its SDL
+    // window and Vulkan surface (kl_hostwin.c). KL_GLIBC_HEADLESS=1 leaves the
+    // slot empty, and the surface falls back to kl_vulkan's synthetic one.
+    if (TARGET->kind == KL_GUEST_GLIBC && !kl_env_on("KL_GLIBC_HEADLESS", 0))
+        kl_flatwin_set_backend(kl_hostwin_backend());
 
     // Re-entry of the re-exec'd recon child (see below).
     if (getenv("KL_RECON_CHILD"))

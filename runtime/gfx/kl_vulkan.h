@@ -226,4 +226,9 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
 // be exported.
 void *kl_vulkan_xr_image_mtl(unsigned long long image);
 
+// Advertise the Linux WSI instance extensions (xlib/xcb/wayland) and swap any
+// the guest enables for VK_EXT_metal_surface — for a Linux (glibc) guest whose
+// render system insists on one being listed. Off by default.
+void kl_vulkan_advertise_linux_wsi(int on);
+
 #endif

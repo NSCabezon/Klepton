@@ -2128,6 +2128,20 @@ nothing, and prints the unresolved imports grouped by category.
   Panorama's own flags (default `--jitless`).
 - `KL_TRACE_DLSYM=1` — every symbol the guest fetches from a loaded image with
   dlsym (Source 2 takes all of SDL that way).
+- `KL_GLIBC_WRITE=<dir>` — the writable layer over the game root: files the
+  engine creates under it (cfg/, console.log, caches) land here instead of in
+  the install (default `<userdata>/alyx/gameroot`).
+- `KL_GLIBC_HEADLESS=1` — (`mains/m_boot.c`) no host window: the SDL seam
+  hands the render system kl_vulkan's synthetic surface instead of a
+  CAMetalLayer, which is the shape the VR backend takes.
+- `KL_GLIBC_SDL_SEAM=0` — leave all of SDL to the guest's own libSDL2 (its
+  video subsystem then fails: no X11/Wayland). The A/B for the seam.
+- `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface).
+- `KL_X18_RECOVER=0` — (`runtime/kl_fault.c`) do not "recover" a fault at pc 0
+  as an x18-veneer race. In a GCC-built guest x18 is an ordinary scratch
+  register, so a genuine call through a NULL pointer looks the same, and
+  recovering it turns a named crash into a silent spin — this is how the
+  libpangoft2 dependency-dlsym gap was found.
 
 ## Spikes (`spikes/`)
 
