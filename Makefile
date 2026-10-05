@@ -864,7 +864,7 @@ angle-ios: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="device" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false' && \
 	  autoninja -C out/ios libEGL libGLESv2
 
 # The simulator slice. Same trick one platform over: an iOS *simulator* build
@@ -876,7 +876,7 @@ angle-ios-sim: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="simulator" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false' && \
 	  autoninja -C out/ios-sim libEGL libGLESv2
 
 # The retarget itself is a script (tools/angle_retarget.sh) — it rewrites the
@@ -993,7 +993,7 @@ ovrpabi:
 .PHONY: angle-debug
 angle-debug: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
-	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"' && \
+	  gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false' && \
 	  autoninja -C out/Debug libEGL libGLESv2
 
 # ---- vendor/ — the ANGLE checkout, which we MODIFY ----
