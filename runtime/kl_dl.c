@@ -1,5 +1,6 @@
 // Guest dlopen/dlsym/dladdr, backed by klepton's own image registry.
 // The guest's dynamic-linking API maps almost one-to-one onto kl_load/kl_sym.
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -813,6 +814,25 @@ static int kl_core_shim_claims(const char *path) {
 
 static int kl_core_shim_is_handle(void *h) { return h == (void *)&g_core_shim_handle; }
 
+// Names a guest dlopen was already refused, so the refusal is logged once.
+// Hashes rather than strings: a collision only costs one missing log line.
+static int refusal_seen(const char *path) {
+    static _Atomic uint32_t seen[64];
+    uint32_t h = 2166136261u;
+    for (const char *c = path; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    if (!h) h = 1;
+    for (int i = 0; i < 64; i++) {
+        uint32_t v = atomic_load(&seen[i]);
+        if (v == h) return 1;
+        if (!v) {
+            uint32_t z = 0;
+            if (atomic_compare_exchange_strong(&seen[i], &z, h)) return 0;
+            if (z == h) return 1;
+        }
+    }
+    return 0;
+}
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
@@ -890,8 +910,12 @@ void *klb_dlopen(const char *path, int flags) {
             snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" %s",
                      basename_of(path), how == KL_NEED_SKIP ? "not loaded by policy"
                                                            : "not found");
-            fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> NULL (%s)\n", path,
-                    how == KL_NEED_SKIP ? "not loaded by policy" : "not found");
+            // Once per name: Source 2's input layer re-probes libusb and libudev
+            // every frame, and the answer never changes.
+            if (!refusal_seen(path))
+                fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> NULL (%s; "
+                                "not reported again)\n", path,
+                        how == KL_NEED_SKIP ? "not loaded by policy" : "not found");
             return NULL;
         }
         if (how == KL_NEED_LOAD) path = full;

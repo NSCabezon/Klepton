@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <time.h>
 
 #include "klepton.h"
@@ -89,6 +90,10 @@ typedef struct { const char *ver, *cls; const char *const *slots; } iface_desc;
 #define KL_OVR_IFACE(ver, cls, ...) { ver, cls, (const char *const[]){ __VA_ARGS__, NULL } },
 static const iface_desc g_desc[] = {
 #include "kl_openvr_vtables.h"
+// Private SteamVR interfaces, not in openvr.h: slot order reversed from
+// libvr.so's call sites (see the implementations below).
+KL_OVR_IFACE("IVRMailbox_001", "IVRMailbox (private)",
+             "RegisterMailbox", "UndoRegisterMailbox", "SendMessage", "ReadMessage")
 };
 #undef KL_OVR_IFACE
 
@@ -448,8 +453,15 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
         y0 = (int32_t)(fminf(b->vMin, b->vMax) * t->m_nHeight);
         y1 = (int32_t)(fmaxf(b->vMin, b->vMax) * t->m_nHeight);
     }
-    uint32_t w = (uint32_t)(x1 - x0), h = (uint32_t)(y1 - y0);
-    if (!w || !h) return -1;
+    // The stage images are one fixed size — the render target size we
+    // recommend — and whatever the guest submits is BLITTED to fill them. Alyx
+    // renders at a dynamic resolution and alternates between textures of
+    // different sizes (2688x2880 and 1728x1824 on consecutive frames), and
+    // sizing the stage images to the submission re-created and re-exported
+    // them every frame.
+    uint32_t w, h;
+    eye_size(&w, &h);
+    if (!w || !h || x1 <= x0 || y1 <= y0) return -1;
     if (V.w[eye] != w || V.h[eye] != h || V.fmt[eye] != t->m_nFormat) {
         for (int k = 0; k < OVR_STAGES; k++) {
             V.dst[eye][k] = kl_vulkan_xr_image(w, h, 1, 1, (long long)t->m_nFormat, 0);
@@ -482,12 +494,21 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     };
     V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 0, NULL, 2, bar);
-    VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                        .srcOffset = { x0, y0, 0 },
-                        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                        .dstOffset = { 0, 0, 0 }, .extent = { w, h, 1 } };
-    V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    if (x0 == 0 && y0 == 0 && (uint32_t)x1 == w && (uint32_t)y1 == h &&
+        t->m_nWidth == w && t->m_nHeight == h) {
+        VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .extent = { w, h, 1 } };
+        V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    } else {
+        VkImageBlit reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .srcOffsets = { { x0, y0, 0 }, { x1, y1, 1 } },
+                            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .dstOffsets = { { 0, 0, 0 }, { (int32_t)w, (int32_t)h, 1 } } };
+        V.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg, VK_FILTER_LINEAR);
+    }
     VkImageMemoryBarrier done = bar[1];
     done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -508,6 +529,10 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
 static unsigned g_submitted_mask;
 static int g_stage;
 static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t *b) {
+    static int seen;
+    if (seen++ < 4)
+        fprintf(stderr, "  [openvr] Submit(eye %d, texture type %d, handle %p, color %d)\n", eye,
+                tex ? tex->eType : -1, tex ? tex->handle : NULL, tex ? (int)tex->eColorSpace : -1);
     if (eye < 0 || eye > 1 || !tex || !tex->handle) return 101;          // InvalidTexture
     if (tex->eType != 2) {
         static int said;
@@ -547,7 +572,9 @@ static int co_true(void *s) { (void)s; return 1; }
 static float co_time_remaining(void *s) { (void)s; return 0.005f; }
 static uint32_t co_vk_inst_ext(void *s, char *buf, uint32_t n) { (void)s; if (buf && n) buf[0] = 0; return 1; }
 static uint32_t co_vk_dev_ext(void *s, void *pd, char *buf, uint32_t n) { (void)s; (void)pd; if (buf && n) buf[0] = 0; return 1; }
-static uint32_t co_focus_process(void *s) { (void)s; return 0; }
+// The scene focus belongs to us: libvr compares this with its own pid, and 0
+// (no scene app) reads as "another app has focus".
+static uint32_t co_focus_process(void *s) { (void)s; return (uint32_t)getpid(); }
 
 // ---- IVRInput ------------------------------------------------------------------------------------
 //
@@ -686,6 +713,39 @@ static void read_src(int src, int hand, int *on, float *x, float *y) {
     default: break;
     }
 }
+// IVRSystem::GetControllerState — the legacy input path, which Alyx still
+// polls (outside its action sets, e.g. for "Press Trigger To Start" while a
+// level loads). VRControllerState_t: packet number, pressed and touched masks
+// by EVRButtonId, and five axes; axis 0 the stick, axis 1 the trigger, axis 2
+// the grip, which is where a Touch controller's driver reports them.
+typedef struct { float x, y; } VRControllerAxis_t;
+typedef struct __attribute__((packed, aligned(4))) {
+    uint32_t unPacketNum; uint64_t ulButtonPressed, ulButtonTouched; VRControllerAxis_t rAxis[5];
+} VRControllerState_t;
+static int sys_controller_state(void *s, uint32_t dev, VRControllerState_t *st, uint32_t size) {
+    (void)s;
+    if (!st || size < sizeof *st || (dev != DEV_LEFT && dev != DEV_RIGHT)) return 0;
+    int hand = dev == DEV_RIGHT;
+    uint32_t b = 0, t = 0; float trig = 0, grip = 0, sx = 0, sy = 0;
+    if (!kl_ovrp_controller_input(hand, &b, &t, &trig, &grip, &sx, &sy)) return 0;
+    static uint32_t packet;
+    memset(st, 0, sizeof *st);
+    st->unPacketNum = ++packet;
+    uint64_t p = 0;
+    if (b & KL_OVRP_RAW_START) p |= 1ull << 1;                                  // ApplicationMenu
+    if (grip > 0.5f) p |= 1ull << 2 | 1ull << 34;                              // Grip, Axis2
+    if (b & (hand ? KL_OVRP_RAW_A : KL_OVRP_RAW_X)) p |= 1ull << 7;             // A
+    if (b & (hand ? KL_OVRP_RAW_B : KL_OVRP_RAW_Y)) p |= 1ull << 1;             // B/Y as the menu button
+    if (b & (hand ? KL_OVRP_RAW_RTHUMBSTICK : KL_OVRP_RAW_LTHUMBSTICK)) p |= 1ull << 32;
+    if (trig > 0.5f) p |= 1ull << 33;                                          // Axis1 = trigger
+    st->ulButtonPressed = p;
+    st->ulButtonTouched = p;
+    st->rAxis[0] = (VRControllerAxis_t){ sx, sy };
+    st->rAxis[1].x = trig;
+    st->rAxis[2].x = grip;
+    return 1;
+}
+
 // Which hands an action reads: the restriction the guest asked for, else the
 // binding's own hand, else both (OR / larger magnitude).
 static int hands_for(const action *a, uint64_t restrict_to, int out[2]) {
@@ -812,6 +872,63 @@ static void st_get_string(void *s, const char *sec, const char *k, char *buf, ui
     (void)s; (void)sec; (void)k; if (buf && n) buf[0] = 0; if (err) *err = 2;
 }
 
+// ---- IVRMailbox: SteamVR's message bus, private ------------------------------------------------
+// The layout, from libvr.so (CVr owns the object at +0x800):
+//   #0 RegisterMailbox(name, &handle) -> error     (0x95b38, the handle at +0x250)
+//   #1 UndoRegisterMailbox(handle)                  (0xb610c)
+//   #2 SendMessage(handle, address, json) -> error  (0x98be8)
+//   #3 ReadMessage(handle, buf, size, &needed) -> error: 0 a message, 2 the
+//      buffer is short (resized to needed and read again), anything else none
+//      (0xb579c, polled every frame)
+// Messages are JSON dispatched on "type". Half-Life: Alyx registers
+// "hlvr/mailbox", waits for {"type":"ready"} from the SteamVR web helper that
+// hosts its VR menu ("Mongoose"), and 15 s without one is a message box and
+// exit ("Timed out waiting for response from Mongoose"). There is no web
+// helper here, so every mailbox is told "ready" once, on its first read; what
+// the game sends back is logged and dropped.
+#define MBOX_MAX 8
+static struct { char name[96]; int told; } g_mbox[MBOX_MAX];
+static int g_nmbox;
+static pthread_mutex_t g_mbmu = PTHREAD_MUTEX_INITIALIZER;
+static int mb_register(void *s, const char *name, uint64_t *h) {
+    (void)s;
+    pthread_mutex_lock(&g_mbmu);
+    int i = g_nmbox < MBOX_MAX ? g_nmbox++ : -1;
+    if (i >= 0) { snprintf(g_mbox[i].name, sizeof g_mbox[i].name, "%s", name ? name : ""); g_mbox[i].told = 0; }
+    pthread_mutex_unlock(&g_mbmu);
+    fprintf(stderr, "  [openvr] IVRMailbox::RegisterMailbox(\"%s\") -> %d\n", name ? name : "", i + 1);
+    if (i < 0) return 1;
+    if (h) *h = (uint64_t)i + 1;
+    return 0;
+}
+static int mb_unregister(void *s, uint64_t h) { (void)s; (void)h; return 0; }
+static int mb_send(void *s, uint64_t h, const char *addr, const char *msg) {
+    (void)s;
+    static int n;
+    if (n++ < 16)
+        fprintf(stderr, "  [openvr] IVRMailbox::SendMessage(#%llu -> \"%s\"): %.200s\n",
+                (unsigned long long)h, addr ? addr : "", msg ? msg : "");
+    return 0;
+}
+static int mb_read(void *s, uint64_t h, char *buf, uint32_t size, uint32_t *needed) {
+    (void)s;
+    static const char ready[] = "{\"type\":\"ready\"}";
+    if (h < 1 || h > MBOX_MAX) return 1;
+    pthread_mutex_lock(&g_mbmu);
+    int told = g_mbox[h - 1].told;
+    pthread_mutex_unlock(&g_mbmu);
+    if (told) return 1;
+    if (needed) *needed = sizeof ready;
+    if (!buf || size < sizeof ready) return 2;
+    memcpy(buf, ready, sizeof ready);
+    pthread_mutex_lock(&g_mbmu);
+    g_mbox[h - 1].told = 1;
+    pthread_mutex_unlock(&g_mbmu);
+    fprintf(stderr, "  [openvr] IVRMailbox: told \"%s\" %s (no SteamVR web helper here)\n",
+            g_mbox[h - 1].name, ready);
+    return 0;
+}
+
 // ---- implemented slots ----------------------------------------------------------------------------
 #define SYS "IVRSystem_026"
 #define COMP "IVRCompositor_029"
@@ -819,6 +936,10 @@ static void st_get_string(void *s, const char *sec, const char *k, char *buf, ui
 #define CHAP "IVRChaperone_004"
 #define SETT "IVRSettings_003"
 static const impl g_impl[] = {
+    { "IVRMailbox_001", "RegisterMailbox", (void *)mb_register },
+    { "IVRMailbox_001", "UndoRegisterMailbox", (void *)mb_unregister },
+    { "IVRMailbox_001", "SendMessage", (void *)mb_send },
+    { "IVRMailbox_001", "ReadMessage", (void *)mb_read },
     { SYS, "GetRecommendedRenderTargetSize", (void *)sys_rt_size },
     { SYS, "GetProjectionMatrix", (void *)sys_proj }, { SYS, "GetProjectionRaw", (void *)sys_proj_raw },
     { SYS, "ComputeDistortion", (void *)sys_distortion },
@@ -841,6 +962,7 @@ static const impl g_impl[] = {
     { SYS, "GetArrayTrackedDeviceProperty", (void *)sys_prop_array },
     { SYS, "GetStringTrackedDeviceProperty", (void *)sys_prop_string },
     { SYS, "GetPropErrorNameFromEnum", (void *)sys_prop_err_name },
+    { SYS, "GetControllerState", (void *)sys_controller_state },
     { SYS, "PollNextEvent", (void *)sys_poll }, { SYS, "PollNextEventWithPose", (void *)sys_poll_pose },
     { SYS, "GetHiddenAreaMesh", (void *)sys_hidden },
     { SYS, "IsInputAvailable", (void *)sys_true }, { SYS, "IsSteamVRDrawingControllers", (void *)sys_false },
@@ -940,6 +1062,20 @@ static void *vr_generic(const char *ver, int *err) {
     if (ver && !strncmp(ver, "FnTable:", 8)) {
         fprintf(stderr, "  [openvr] %s: FnTable interfaces are not served\n", ver);
         if (err) *err = 105;                           // VRInitError_Init_InterfaceNotFound
+        return NULL;
+    }
+    // SteamVR's private shared-texture service. libvr's CVr::CreateSwapchain
+    // uses it to allocate the eye swapchains in vrserver and import them back
+    // by fd (VK_KHR_external_memory_fd), which MoltenVK cannot import. Without
+    // it libvr says "No IPCResourceManagerClient available. Using copies!" and
+    // renders into its own images, which IVRCompositor::Submit hands us — the
+    // path kl_openvr already serves. A logging stub here instead answered
+    // NewSharedVulkanImage with false and the engine crashed on the NULL
+    // swapchain (CVr::CreateSwapchain NewSharedVulkanImage failed).
+    if (ver && !strncmp(ver, "IVRIPCResourceManagerClient", 27)) {
+        fprintf(stderr, "  [openvr] %s: refused — libvr falls back to its own eye images "
+                        "and Submit\n", ver);
+        if (err) *err = 105;
         return NULL;
     }
     return iface(ver);
