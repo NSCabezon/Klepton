@@ -2136,7 +2136,7 @@ nothing, and prints the unresolved imports grouped by category.
   CAMetalLayer, which is the shape the VR backend takes.
 - `KL_GLIBC_SDL_SEAM=0` — leave all of SDL to the guest's own libSDL2 (its
   video subsystem then fails: no X11/Wayland). The A/B for the seam.
-- `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface).
+- `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface) and pointer capture: SetRelativeMouseMode, SetWindowGrab, ShowCursor, CaptureMouse, the first warp, focus changes and button presses (with the relative/grab state at the time).
 - `KL_GLIBC_LOG=0` — do not register the backdoor listener that copies the
   engine's own tier0 LoggingSystem output to stderr as `[hlvr] ...` lines.
 - `KL_TRACE_MMAP=1` — every guest mmap and Plat_VirtualAlloc, with hint, size,

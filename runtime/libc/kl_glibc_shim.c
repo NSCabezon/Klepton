@@ -58,6 +58,8 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/sem.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -744,6 +746,48 @@ static void *klg_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t
     return p;
 }
 
+// ---------- 4 KB pages on a 16 KB host ----------
+// The guest was built for 4 KB pages and several Source 2 allocators hard-code
+// that rather than ask sysconf: panorama's arenas reserve 64 KB and then commit
+// 4 KB at a time, which tier0's Plat_VirtualAlloc turns into mprotect(RW) on a
+// 4 KB-aligned address. Darwin arm64 pages are 16 KB and mprotect refuses an
+// unaligned start (EINVAL), so the second commit into every arena failed and the
+// engine reported "OUT OF MEMORY ... 4096" right as the main menu came up.
+// Granting access rounds OUTWARD to whole host pages — the neighbours are part
+// of the same reservation (a host mapping never shares a host page) and being
+// readable early costs nothing. Taking access away, unmapping or discarding
+// rounds INWARD: a neighbour still in use must never lose its page or its data,
+// so only host pages wholly inside the range are touched and the rest is left
+// committed (a little memory kept, never a fault).
+static int host_span(void *addr, size_t len, int outward, uintptr_t *a, size_t *n) {
+    uintptr_t pg = (uintptr_t)getpagesize(), s = (uintptr_t)addr, e = s + len;
+    if (outward) { s &= ~(pg - 1); e = (e + pg - 1) & ~(pg - 1); }
+    else         { s = (s + pg - 1) & ~(pg - 1); e &= ~(pg - 1); }
+    if (e <= s) return 0;
+    *a = s; *n = e - s;
+    return 1;
+}
+int klb_mprotect(void *addr, size_t len, int prot);
+int klb_madvise(void *a, size_t n, int advice);
+static int klg_mprotect(void *addr, size_t len, int prot) {
+    uintptr_t a; size_t n;
+    if (!host_span(addr, len, prot != PROT_NONE, &a, &n)) return 0;
+    return klb_mprotect((void *)a, n, prot);
+}
+static int klg_munmap(void *addr, size_t len) {
+    uintptr_t a; size_t n;
+    if ((uintptr_t)addr & ((uintptr_t)getpagesize() - 1)) {
+        if (!host_span(addr, len, 0, &a, &n)) return 0;
+        return munmap((void *)a, n);
+    }
+    return munmap(addr, len);                    // aligned start: Darwin rounds the length
+}
+static int klg_madvise(void *addr, size_t len, int advice) {
+    uintptr_t a; size_t n;
+    if (!host_span(addr, len, 0, &a, &n)) return 0;
+    return klb_madvise((void *)a, n, advice);
+}
+
 // Plat_VirtualAlloc(addr, size, type, access, maxAddress) — tier0's, interposed
 // on its importers. vscript asks it for LuaJIT's heap below 2 GB (a leftover of
 // the x86-64 non-GC64 build), which tier0 serves by probing hints upward from
@@ -786,6 +830,40 @@ static void *klg_plat_virtualalloc(void *addr, size_t size, uint32_t type, uint3
     return r;
 }
 
+// ---------- SysV semaphores ----------
+// semget/semop forward as they are (struct sembuf is the same 6 bytes), but
+// semctl cannot: glibc numbers the commands GETPID 11 ... SETALL 17 where Darwin
+// has 3 ... 9, and the fourth argument is VARIADIC — the guest passes it in x3,
+// Darwin's semctl reads it from the stack. tier0's process-shared semaphores
+// called semctl(GETNCNT) and friends, and Darwin's IPC_STAT path wrote a
+// semid_ds through whatever pointer it found there: the guest's frame record,
+// and a return to 0x14000001f5 later.
+union klg_semun { int val; void *buf; unsigned short *array; };
+static int klg_semctl(int id, int num, int cmd, uintptr_t arg) {
+    union klg_semun u;
+    memset(&u, 0, sizeof u);
+    int d;
+    switch (cmd) {
+    case 0:  d = IPC_RMID; break;
+    case 11: d = GETPID; break;
+    case 12: d = GETVAL; break;
+    case 13: d = GETALL; u.array = (unsigned short *)arg; break;
+    case 14: d = GETNCNT; break;
+    case 15: d = GETZCNT; break;
+    case 16: d = SETVAL; u.val = (int)arg; break;
+    case 17: d = SETALL; u.array = (unsigned short *)arg; break;
+    default: {
+        // IPC_STAT / IPC_SET / IPC_INFO and friends: the structs differ in
+        // layout, and nothing here needs them answered.
+        static int said;
+        if (!said++) fprintf(stderr, "  [glibc] semctl cmd %d not translated -> EINVAL\n", cmd);
+        errno = EINVAL;
+        return -1;
+    }
+    }
+    return semctl(id, num, d, u);
+}
+
 // ---------- the table ----------
 enum { DIRECT = 0, ALIAS, STUB_M1, STUB_NULL, STUB_ERR, STUB_ZERO };
 typedef struct { const char *name; const void *fn; int kind; } klg_entry;
@@ -813,6 +891,7 @@ static const klg_entry g_glibc[] = {
     D("__fpending", klg___fpending), D("__sysconf", klg___sysconf),
     D("sysconf", klg_sysconf),
     D("readlink", klg_readlink),
+    D("semctl", klg_semctl),
     D("Plat_VirtualAlloc", klg_plat_virtualalloc),
     D("eventfd", klg_eventfd), D("eventfd_read", klg_eventfd_read),
     D("eventfd_write", klg_eventfd_write),
@@ -854,6 +933,7 @@ static const klg_entry g_glibc[] = {
     // LFS: off_t is 64-bit everywhere here, so *64 is the plain name
     A("open64", "open"), A("fcntl64", "fcntl"),
     D("mmap", klg_mmap), D("mmap64", klg_mmap),
+    D("mprotect", klg_mprotect), D("munmap", klg_munmap), D("madvise", klg_madvise),
     A("readdir64", "readdir"), A("scandir64", "scandir"), A("alphasort64", "alphasort"),
     A("statfs64", "statfs"), A("statvfs64", "statvfs"), A("fstatvfs64", "fstatvfs"),
     A("getrlimit64", "getrlimit"), A("setrlimit64", "setrlimit"),

@@ -877,7 +877,12 @@ int main(int argc, char **argv) {
     // A flat glibc guest (Half-Life: Alyx) gets a real window for its SDL
     // window and Vulkan surface (kl_hostwin.c). KL_GLIBC_HEADLESS=1 leaves the
     // slot empty, and the surface falls back to kl_vulkan's synthetic one.
-    if (TARGET->kind == KL_GUEST_GLIBC && !kl_env_on("KL_GLIBC_HEADLESS", 0))
+    // So does KL_VIEW: the viewer owns the main thread there and never pumps
+    // the host window's request queue, so a -vr run's companion window would
+    // wait forever for a window nobody creates; its eyes reach the viewer
+    // through IVRCompositor::Submit instead.
+    if (TARGET->kind == KL_GUEST_GLIBC && !kl_env_on("KL_GLIBC_HEADLESS", 0) &&
+        !getenv("KL_VIEW"))
         kl_flatwin_set_backend(kl_hostwin_backend());
 
     // Re-entry of the re-exec'd recon child (see below).

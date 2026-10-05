@@ -35,6 +35,7 @@ typedef enum {
     KL_FW_RESIZED,      // x = w, y = h (window points); dx/dy = drawable pixels
     KL_FW_FOCUS,        // down = gained
     KL_FW_CLOSE,
+    KL_FW_ENTER,        // down = the pointer entered the window, 0 = left it
 } kl_fw_kind;
 
 typedef struct {
@@ -58,6 +59,12 @@ typedef struct {
     void  (*set_size)(void *win, int w, int h);
     void  (*show)(void *win, int shown);
     void  (*set_relative_mouse)(int on);
+    // Pointer state the guest asks for many times a frame (a warp per frame
+    // in some engines), so these only record what is wanted: pump() applies
+    // the latest on the window system's thread and the caller never waits.
+    void  (*set_grab)(int on);
+    void  (*show_cursor)(int shown);
+    void  (*warp)(int x, int y);           // window points
     // The display: size in points, refresh in Hz.
     void  (*display)(int *w, int *h, int *hz);
     // Next pending event, 1 if one was written. Any thread.

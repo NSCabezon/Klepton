@@ -162,11 +162,9 @@ static void sdl_noop_win(void *p) { (void)p; }
 static void sdl_noop_win_i(void *p, int v) { (void)p; (void)v; }
 static int  sdl_ret0_win_i(void *p, uint32_t v) { (void)p; (void)v; return 0; }
 static int  sdl_ret0_win_p(void *p, const void *v) { (void)p; (void)v; return 0; }
-static int  sdl_GetWindowGrab(void *p) { (void)p; return 0; }
 static int  sdl_GetWindowDisplayIndex(void *p) { (void)p; return 0; }
 static void *sdl_GetKeyboardFocus(void) { return focus_win(); }
 static void *sdl_GetMouseFocus(void) { return focus_win(); }
-static void *sdl_GetGrabbedWindow(void) { return NULL; }
 // SDL_GetWindowWMInfo: no X11 Window or Wayland surface to give. SDL_FALSE is
 // the documented answer for "this driver has none", and the Vulkan path does
 // not need one — the surface comes from SDL_Vulkan_CreateSurface.
@@ -208,15 +206,58 @@ static int sdl_GetDisplayDPI(int d, float *dd, float *hd, float *vd) {
 static const char *sdl_GetDisplayName(int d) { (void)d; return "Klepton host display"; }
 
 // ---- mouse, cursor, keyboard odds and ends ------------------------------------------
+// The pointer as the guest's own SDL would know it. Its libSDL2 never sees the
+// host's mouse (events are pushed past its video layer, which is what updates
+// its mouse state), so the state queries are answered here from the same
+// events: SDL_GetMouseState is Panorama's cursor, and the grab, cursor and
+// focus answers are what tier0 consults before it re-captures the pointer.
+// KL_TRACE_SDL=1 prints every capture-related call.
+static int g_grab, g_cursor_shown = 1, g_mx, g_my, g_mbuttons, g_rdx, g_rdy;
+#define TRACE_MOUSE(...) do { if (kl_env_on("KL_TRACE_SDL", 0)) fprintf(stderr, "  [sdl] " __VA_ARGS__); } while (0)
+
 static int  sdl_SetRelativeMouseMode(int on) {
+    TRACE_MOUSE("SDL_SetRelativeMouseMode(%d) (was %d)\n", on, g_relative);
     g_relative = on;
+    g_rdx = g_rdy = 0;
     if (g_be && g_be->set_relative_mouse) g_be->set_relative_mouse(on);
     return 0;
 }
 static int  sdl_GetRelativeMouseMode(void) { return g_relative; }
-static void sdl_WarpMouseInWindow(void *p, int x, int y) { (void)p; (void)x; (void)y; }
-static int  sdl_WarpMouseGlobal(int x, int y) { (void)x; (void)y; return 0; }
-static int  sdl_ShowCursor(int t) { (void)t; return 1; }
+static void sdl_SetWindowGrab(void *p, int on) {
+    TRACE_MOUSE("SDL_SetWindowGrab(%p, %d)\n", p, on);
+    g_grab = on;
+    if (g_be && g_be->set_grab) g_be->set_grab(on);
+}
+static int  sdl_GetWindowGrab(void *p) { (void)p; return g_grab; }
+static void sdl_SetWindowKeyboardGrab(void *p, int on) { (void)p; (void)on; }
+static void *sdl_GetGrabbedWindow(void) { return (g_grab || g_relative) ? focus_win() : NULL; }
+static void sdl_WarpMouseInWindow(void *p, int x, int y) {
+    static int said;
+    if (!said++) TRACE_MOUSE("SDL_WarpMouseInWindow(%p, %d, %d) (first; not traced again)\n", p, x, y);
+    g_mx = x; g_my = y;
+    if (g_be && g_be->warp) g_be->warp(x, y);
+}
+static int  sdl_WarpMouseGlobal(int x, int y) { sdl_WarpMouseInWindow(focus_win(), x, y); return 0; }
+static int  sdl_ShowCursor(int t) {
+    if (t >= 0 && t != g_cursor_shown) {
+        TRACE_MOUSE("SDL_ShowCursor(%d)\n", t);
+        g_cursor_shown = !!t;
+        if (g_be && g_be->show_cursor) g_be->show_cursor(g_cursor_shown);
+    }
+    return g_cursor_shown;
+}
+static int  sdl_CaptureMouse(int on) { TRACE_MOUSE("SDL_CaptureMouse(%d)\n", on); return 0; }
+static uint32_t sdl_GetMouseState(int *x, int *y) {
+    if (x) *x = g_mx;
+    if (y) *y = g_my;
+    return (uint32_t)g_mbuttons;
+}
+static uint32_t sdl_GetRelativeMouseState(int *x, int *y) {
+    if (x) *x = g_rdx;
+    if (y) *y = g_rdy;
+    g_rdx = g_rdy = 0;
+    return (uint32_t)g_mbuttons;
+}
 static int  g_cursor_tok;
 static void *sdl_CreateCursor_any(void) { return &g_cursor_tok; }
 static void *sdl_CreateCursor(const void *a, const void *b, int w, int h, int x, int y) {
@@ -340,7 +381,15 @@ static int translate(const kl_fw_event *f, sdl_event *e) {
     case KL_FW_CLOSE:
         put_u32(e, 0, SDL_WINDOWEVENT_); put_u32(e, 8, wid); e->b[12] = 14; return 1;
     case KL_FW_FOCUS:
+        TRACE_MOUSE("focus %s\n", f->down ? "gained" : "lost");
+        if (w) w->flags = f->down ? (w->flags | SDL_WINDOW_INPUT_FOCUS)
+                                  : (w->flags & ~SDL_WINDOW_INPUT_FOCUS);
         put_u32(e, 0, SDL_WINDOWEVENT_); put_u32(e, 8, wid); e->b[12] = f->down ? 12 : 13;
+        return 1;
+    case KL_FW_ENTER:
+        if (w) w->flags = f->down ? (w->flags | SDL_WINDOW_MOUSE_FOCUS)
+                                  : (w->flags & ~SDL_WINDOW_MOUSE_FOCUS);
+        put_u32(e, 0, SDL_WINDOWEVENT_); put_u32(e, 8, wid); e->b[12] = f->down ? 10 : 11;
         return 1;
     case KL_FW_RESIZED:
         if (w) { w->w = f->x; w->h = f->y; w->pw = f->dx; w->ph = f->dy; }
@@ -358,12 +407,21 @@ static int translate(const kl_fw_event *f, sdl_event *e) {
         memcpy(e->b + 12, f->text, 31);
         return 1;
     case KL_FW_MOTION:
+        g_mx = f->x; g_my = f->y; g_mbuttons = f->buttons;
+        g_rdx += f->dx; g_rdy += f->dy;
         put_u32(e, 0, SDL_MOUSEMOTION_); put_u32(e, 8, wid);
         put_u32(e, 16, (uint32_t)f->buttons);
         put_i32(e, 20, f->x); put_i32(e, 24, f->y);
         put_i32(e, 28, f->dx); put_i32(e, 32, f->dy);
         return 1;
     case KL_FW_BUTTON:
+        if (f->down) TRACE_MOUSE("button %d down at %d,%d (relative %d, grab %d)\n",
+                                 f->button, f->x, f->y, g_relative, g_grab);
+        if (f->button > 0 && f->button <= 32) {
+            uint32_t bit = 1u << (f->button - 1);
+            g_mbuttons = f->down ? (int)((uint32_t)g_mbuttons | bit) : (int)((uint32_t)g_mbuttons & ~bit);
+        }
+        g_mx = f->x; g_my = f->y;
         put_u32(e, 0, f->down ? SDL_MOUSEBUTTONDOWN_ : SDL_MOUSEBUTTONUP_); put_u32(e, 8, wid);
         e->b[16] = (uint8_t)f->button; e->b[17] = f->down ? 1 : 0;
         e->b[18] = (uint8_t)(f->clicks ? f->clicks : 1);
@@ -439,7 +497,12 @@ static const entry g_sdl[] = {
     F("SDL_MaximizeWindow", sdl_noop_win), F("SDL_RestoreWindow", sdl_noop_win),
     F("SDL_SetWindowFullscreen", sdl_ret0_win_i), F("SDL_SetWindowBordered", sdl_noop_win_i),
     F("SDL_SetWindowResizable", sdl_noop_win_i),
-    F("SDL_SetWindowGrab", sdl_noop_win_i), F("SDL_GetWindowGrab", sdl_GetWindowGrab),
+    F("SDL_SetWindowGrab", sdl_SetWindowGrab), F("SDL_GetWindowGrab", sdl_GetWindowGrab),
+    F("SDL_SetWindowMouseGrab", sdl_SetWindowGrab), F("SDL_GetWindowMouseGrab", sdl_GetWindowGrab),
+    F("SDL_SetWindowKeyboardGrab", sdl_SetWindowKeyboardGrab),
+    F("SDL_CaptureMouse", sdl_CaptureMouse), F("SDL_GetMouseState", sdl_GetMouseState),
+    F("SDL_GetGlobalMouseState", sdl_GetMouseState),
+    F("SDL_GetRelativeMouseState", sdl_GetRelativeMouseState),
     F("SDL_SetWindowIcon", sdl_ret0_win_p), F("SDL_SetWindowGammaRamp", sdl_ret0),
     F("SDL_GetWindowDisplayIndex", sdl_GetWindowDisplayIndex),
     F("SDL_GetWindowDisplayMode", sdl_GetWindowDisplayMode),

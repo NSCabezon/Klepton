@@ -81,6 +81,17 @@ static void hw_set_size(void *win, int w, int h) {
 static void hw_show(void *win, int on) { request r = { .kind = RQ_SHOW, .win = win, .on = on }; post(&r); }
 static void hw_relmouse(int on) { request r = { .kind = RQ_RELMOUSE, .on = on }; post(&r); }
 
+// Grab, cursor and warp: latest-wins state for pump() to apply (kl_flatwin.h).
+// -1 = nothing pending.
+static int g_want_grab = -1, g_want_cursor = -1, g_want_warp, g_warp_x, g_warp_y;
+static void hw_grab(int on)    { pthread_mutex_lock(&g_mu); g_want_grab = !!on; pthread_mutex_unlock(&g_mu); }
+static void hw_cursor(int on)  { pthread_mutex_lock(&g_mu); g_want_cursor = !!on; pthread_mutex_unlock(&g_mu); }
+static void hw_warp(int x, int y) {
+    pthread_mutex_lock(&g_mu);
+    g_want_warp = 1; g_warp_x = x; g_warp_y = y;
+    pthread_mutex_unlock(&g_mu);
+}
+
 static void hw_display(int *w, int *h, int *hz) {
     // Read once on the main thread by pump(); before that, a sane desktop.
     static int cw, ch, chz;
@@ -102,7 +113,13 @@ static int hw_poll(kl_fw_event *e) {
 static void serve(request *r) {
     switch (r->kind) {
     case RQ_CREATE: {
-        SDL_WindowFlags f = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        // No HIGH_PIXEL_DENSITY: one drawable pixel per point. With it the
+        // CAMetalLayer was 2x on Retina, so MoltenVK's currentExtent (and the
+        // swapchain) disagreed with the window size the engine sizes its
+        // viewport from, and the frame filled only the top-left quarter.
+        // Points everywhere keeps window, drawable, surface extent, display
+        // mode and mouse coordinates in one space, and costs a quarter the fill.
+        SDL_WindowFlags f = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE;
         SDL_Window *w = SDL_CreateWindow(r->title, r->w, r->h, f);
         if (!w) { fprintf(stderr, "  [hostwin] SDL_CreateWindow: %s\n", SDL_GetError()); break; }
         SDL_MetalView v = SDL_Metal_CreateView(w);
@@ -138,6 +155,8 @@ static void translate(const SDL_Event *s) {
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED: e.kind = KL_FW_CLOSE; break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED: e.kind = KL_FW_FOCUS; e.down = 1; break;
     case SDL_EVENT_WINDOW_FOCUS_LOST: e.kind = KL_FW_FOCUS; break;
+    case SDL_EVENT_WINDOW_MOUSE_ENTER: e.kind = KL_FW_ENTER; e.down = 1; break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE: e.kind = KL_FW_ENTER; break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
         SDL_Window *w = SDL_GetWindowFromID(s->window.windowID);
         if (!w) return;
@@ -200,6 +219,15 @@ static void hw_pump(void) {
         pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
     }
+    pthread_mutex_lock(&g_mu);
+    int grab = g_want_grab, cur = g_want_cursor, warp = g_want_warp, wx = g_warp_x, wy = g_warp_y;
+    g_want_grab = g_want_cursor = -1; g_want_warp = 0;
+    pthread_mutex_unlock(&g_mu);
+    if (g_win && grab >= 0) SDL_SetWindowMouseGrab(g_win, grab ? true : false);
+    if (cur >= 0) { if (cur) SDL_ShowCursor(); else SDL_HideCursor(); }
+    // A warp in relative mode is the engine re-centring a pointer it is not
+    // reading; SDL3 would turn it into a motion event that undoes the look.
+    if (g_win && warp && !g_rel) SDL_WarpMouseInWindow(g_win, (float)wx, (float)wy);
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) translate(&ev);
 }
@@ -208,6 +236,7 @@ static const kl_flatwin_backend g_backend = {
     .name = "host window (SDL3 + CAMetalLayer)",
     .create = hw_create, .destroy = hw_destroy, .set_title = hw_set_title,
     .set_size = hw_set_size, .show = hw_show, .set_relative_mouse = hw_relmouse,
+    .set_grab = hw_grab, .show_cursor = hw_cursor, .warp = hw_warp,
     .display = hw_display, .poll = hw_poll, .pump = hw_pump,
 };
 const kl_flatwin_backend *kl_hostwin_backend(void) { return &g_backend; }
