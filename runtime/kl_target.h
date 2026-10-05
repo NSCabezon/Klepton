@@ -60,6 +60,12 @@ typedef enum {
     // handle threaded through onStart/onResume/onSurface*. Half-Life on Xash3D
     // (hl1, com.drbeef.lambda1vr) is here; kl_jkxr keeps JKXR's own data layout.
     KL_GUEST_GLES3JNI,
+    // A Linux glibc AArch64 game — kl_glibc's door. No APK and no Java at all:
+    // the entry is an ELF executable (hlvr, a PIE) whose libraries come from the
+    // game tree and a Steam Runtime sysroot under versioned sonames, and whose
+    // thread-locals are real ELF TLS (TLSDESC / initial-exec, kl_tls.c).
+    // Half-Life: Alyx's linuxsteamrtarm64 build is the first.
+    KL_GUEST_GLIBC,
 } kl_guest_kind;
 
 typedef struct {

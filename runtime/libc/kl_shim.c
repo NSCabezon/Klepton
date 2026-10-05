@@ -90,6 +90,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
+#include "kl_tls.h"
 
 // ---------- bionic stack-guard canary in Darwin TSD slot 5 ----------
 #define TLS_SLOT_STACK_GUARD 5
@@ -97,6 +98,9 @@ static uint64_t g_canary = 0x0000BEEFCAFE0000ULL;
 void kl_thread_init(void) {
     uint64_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
     ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;
+    // ...and the static ELF TLS blocks a glibc guest's initial-exec accesses
+    // read at a fixed TP offset (kl_tls.c). A no-op until a module needs one.
+    kl_tls_thread_init();
 }
 
 // The guest installs its own fatal-signal handlers — IL2CPP does this for crash

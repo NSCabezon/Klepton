@@ -15,8 +15,9 @@ RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
-# RUNTIME_SHIP — everything that links the runtime needs them.
-LDLIBS  := -lz -framework AudioToolbox \
+# RUNTIME_SHIP — everything that links the runtime needs them. CoreAudio is
+# kl_audio.c's input-device query (AudioObjectGetPropertyData), likewise shipped.
+LDLIBS  := -lz -framework AudioToolbox -framework CoreAudio \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
            -framework CoreFoundation -framework AVFoundation -framework Foundation
 # The host/ship split is a source-list boundary, not a runtime getenv.
@@ -55,7 +56,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/gfx/kl_vulkan.c \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
-           runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
+           runtime/guest/kl_gles3jni.c runtime/guest/kl_glibc.c runtime/guest/kl_driver.c \
+           runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
            runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \

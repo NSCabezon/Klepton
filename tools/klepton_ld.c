@@ -103,7 +103,7 @@ static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused
     size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
         if ((w[i] & 0xffffffe0u) != 0xd53bd040u) continue;
-        if (kl_x18_is_data(w, n, i)) {
+        if (kl_tls_site_is_data(w, n, i)) {
             (*refused)++;
             fprintf(stderr, "klepton-ld: TLS site at +0x%llx left alone — its "
                             "neighbourhood reads as data. If it IS code, "

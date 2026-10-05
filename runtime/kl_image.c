@@ -25,6 +25,7 @@
 #include "klepton.h"
 #include "kl_x18.h"
 #include "kl_guestpatch.h"
+#include "kl_tls.h"
 
 
 // ---------- ELF64 subset ----------
@@ -46,6 +47,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define SHT_NOBITS 8
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
+#define PT_TLS 7
 #define PT_GNU_RELRO 0x6474e552
 #define PF_X 1
 #define PF_W 2
@@ -87,7 +89,15 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define R_AARCH64_GLOB_DAT  1025
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE  1027
+// ELF TLS (kl_tls.c). Only the glibc guests use these: a bionic guest's
+// thread-locals go through emutls, which is an ordinary function import.
+#define R_AARCH64_TLS_TPREL64 1030
+#define R_AARCH64_TLSDESC     1031
 #define STB_WEAK 2
+#define STT_TLS  6
+// GNU-style hash table. Every glibc library ships it (and most ship nothing
+// else — no DT_HASH); see kl_sym for when it is used.
+#define DT_GNU_HASH 0x6ffffef5
 
 struct kl_image {
     uint8_t   *base;        // ELF vaddr V lives at base + V (V relative to the
@@ -114,6 +124,13 @@ struct kl_image {
     unsigned    weak_n, weak_cap;
     void       *dl_handle;     // set when the image arrived as a translated
                                // Mach-O dylib; then dyld owns the mapping
+    // Every slot bound to an unresolved stub, for kl_rebind_pending: a
+    // dependency cycle means some of them name exports that simply had not been
+    // mapped yet when this image was relocated.
+    struct { uint64_t *slot; const char *name; int64_t addend; } *pend;
+    unsigned    pend_n, pend_cap;
+    size_t      tls_modid;     // kl_tls module id, 0 if the image has no PT_TLS
+    const uint32_t *gnu_hash;  // DT_GNU_HASH, NULL if absent
 };
 
 static void record_missing(kl_image *img, const char *nm) {
@@ -136,6 +153,17 @@ static void record_weak(kl_image *img, const char *nm) {
         img->weak = realloc(img->weak, img->weak_cap * sizeof *img->weak);
     }
     img->weak[img->weak_n++] = nm;
+}
+
+static void record_pending(kl_image *img, uint64_t *slot, const char *nm, int64_t addend) {
+    if (img->pend_n == img->pend_cap) {
+        img->pend_cap = img->pend_cap ? img->pend_cap * 2 : 64;
+        img->pend = realloc(img->pend, img->pend_cap * sizeof *img->pend);
+    }
+    img->pend[img->pend_n].slot = slot;
+    img->pend[img->pend_n].name = nm;
+    img->pend[img->pend_n].addend = addend;
+    img->pend_n++;
 }
 
 const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
@@ -345,7 +373,7 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
     size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
         if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {
-            if (kl_x18_is_data(w, n, i)) {
+            if (kl_tls_site_is_data(w, n, i)) {
                 st->tls_refused++;
                 fprintf(stderr, "  [klepton] %s: TLS site at +0x%llx left alone — its "
                                 "neighbourhood reads as data. If it IS code, "
@@ -391,6 +419,45 @@ static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
     return (uint64_t)(uintptr_t)ext;      // 0 if unresolved
 }
 
+// Which TLS module and which offset in it a TLS relocation's symbol names.
+// Symbol 0 and this image's own definitions are this image's module; an
+// undefined one is searched for among the other loaded images' STT_TLS
+// exports. Non-zero if nothing defines it.
+static int tls_target(kl_image *img, uint32_t sidx, const char **name_out,
+                      size_t *mod, uint64_t *off) {
+    *mod = 0; *off = 0;
+    if (sidx == 0) { *mod = img->tls_modid; return *mod ? 0 : -1; }
+    const Elf64_Sym *s = &img->symtab[sidx];
+    const char *nm = img->strtab + s->st_name;
+    if (name_out) *name_out = nm;
+    if (s->st_shndx != 0) {
+        *mod = img->tls_modid;
+        *off = s->st_value;
+        return *mod ? 0 : -1;
+    }
+    return kl_guest_tls_global(nm, mod, off);
+}
+
+// An initial-exec access (TLS_TPREL64) bakes a constant TP offset into a GOT
+// word, so the module it names must live in the static area — and must be
+// placed there before ANY relocation is written, since this image's TLSDESC
+// descriptors and every later thread have to agree on where it is. Hence a
+// pass of its own ahead of apply_relocs.
+static int prescan_tprel(kl_image *img, const Elf64_Rela *r, size_t count) {
+    for (size_t i = 0; i < count; i++, r++) {
+        if (ELF64_R_TYPE(r->r_info) != R_AARCH64_TLS_TPREL64) continue;
+        size_t mod; uint64_t off; const char *nm = NULL;
+        if (tls_target(img, ELF64_R_SYM(r->r_info), &nm, &mod, &off) != 0)
+            continue;                    // unresolved: apply_relocs records it
+        char why[256];
+        if (kl_tls_make_static(mod, why, sizeof why) != 0) {
+            err("%s: initial-exec TLS (%s): %s", img->path, nm ? nm : "local", why);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
     for (size_t i = 0; i < count; i++, r++) {
         uint64_t *slot = (uint64_t *)(img->base + r->r_offset);
@@ -432,6 +499,7 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
                 // Dedupe: libil2cpp has 711k relocations; per-site logging would flood.
                 img->stats.imports_missing++;
                 record_missing(img, nm);
+                record_pending(img, slot, nm, r->r_addend);
                 v = (uint64_t)(uintptr_t)unresolved_stub(nm);
             } else if (img->symtab[sidx].st_shndx == 0) {
                 img->stats.imports_bound++;
@@ -440,6 +508,35 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
             if (type == R_AARCH64_ABS64) img->stats.abs64++;
             else if (type == R_AARCH64_GLOB_DAT) img->stats.glob_dat++;
             else img->stats.jump_slot++;
+            break;
+        }
+        // Thread-locals (kl_tls.c). Both name a module and an offset inside its
+        // block: this image's own (symbol 0, or a symbol it defines) or another
+        // image's exported STT_TLS symbol.
+        case R_AARCH64_TLSDESC:
+        case R_AARCH64_TLS_TPREL64: {
+            size_t mod = 0;
+            uint64_t off = 0;
+            if (tls_target(img, sidx, &nm, &mod, &off) != 0) {
+                // Unresolved: the descriptor still gets the resolver, which
+                // fails by name on first touch. A TPREL64 has no such door, so
+                // it is left pointing at nothing and counted the same way.
+                img->stats.imports_missing++;
+                record_missing(img, nm);
+            }
+            off += (uint64_t)r->r_addend;
+            if (type == R_AARCH64_TLSDESC) {
+                const kl_tls_arg *a = kl_tls_desc_arg(mod, off, nm);
+                if (!a) { err("out of memory for a TLS descriptor"); return -1; }
+                slot[0] = (uint64_t)(uintptr_t)kl_tlsdesc_dynamic;
+                slot[1] = (uint64_t)(uintptr_t)a;
+                img->stats.tlsdesc++;
+            } else {
+                // The module was made static by prescan_tprel() before any
+                // relocation ran, so its offset from TP is fixed by now.
+                *slot = mod ? (uint64_t)kl_tls_static_offset(mod) + off : 0;
+                img->stats.tls_tprel++;
+            }
             break;
         }
         default:
@@ -559,10 +656,28 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
             case DT_ANDROID_RELRSZ: relrsz = dp->d_val; break;
             case DT_ANDROID_RELA:   arela   = (const uint8_t *)(img->base + dp->d_val); break;
             case DT_ANDROID_RELASZ: arelasz = dp->d_val; break;
+            case DT_GNU_HASH: img->gnu_hash = (const uint32_t *)(img->base + dp->d_val); break;
             }
         }
     }
     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
+
+    // PT_TLS: register the module BEFORE relocating, because the image's own
+    // TLS relocations name it. The template pointer is into the mapped image,
+    // so the RELATIVE relocations below that land in .tdata are already applied
+    // by the time any thread copies it (blocks are made lazily, after this).
+    for (int i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_TLS || !ph[i].p_memsz) continue;
+        img->tls_modid = kl_tls_register_module(img->path, img->base + ph[i].p_vaddr - lo,
+                                                (size_t)ph[i].p_filesz,
+                                                (size_t)ph[i].p_memsz,
+                                                (size_t)ph[i].p_align);
+        if (!img->tls_modid) { err("%s: TLS module table full", img->path); return -1; }
+        break;
+    }
+    if ((rela   && prescan_tprel(img, rela,   relasz / sizeof(Elf64_Rela)) != 0) ||
+        (jmprel && prescan_tprel(img, jmprel, pltsz  / sizeof(Elf64_Rela)) != 0))
+        return -1;
 
     // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
     // every relative table must run before kl_run_init: the .init_array pointers
@@ -572,6 +687,10 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
         return -1;
     if (relr) apply_relr(img, relr, relrsz / sizeof(uint64_t));
     if (arela && apply_android_packed(img, arela, arelasz) != 0) return -1;
+    // The loading thread may run this image's code next (its init arrays), so
+    // seed its copy of any static block now that the template is relocated.
+    // Every other thread does it in kl_thread_init.
+    if (img->tls_modid) kl_tls_thread_init();
     return 0;
 }
 
@@ -1196,12 +1315,128 @@ kl_image *kl_load(const char *path) {
     return img;
 }
 
+// Retry this image's unresolved imports against the guest images loaded since
+// it was relocated, and patch the ones that now resolve. A DT_NEEDED cycle is
+// what leaves such names behind: Alyx's libharfbuzz and libfreetype each need
+// the other, so whichever is relocated first sees none of the other's exports
+// (kl_dl.c). Linux relocates after mapping the whole set; this is the same
+// answer, one pass late. Only the shim misses were recorded, so only the guest
+// registry is asked again.
+//
+// The slots may sit in pages protect_pages already made read-only (RELRO, and
+// with BIND_NOW the whole GOT is RELRO), so each write opens its page and puts
+// back what was there. Host-loaded images only: a translated dylib's data
+// belongs to dyld.
+unsigned kl_rebind_pending(kl_image *img) {
+    if (!img || img->dl_handle || !img->pend_n) return 0;
+    const uintptr_t pg = (uintptr_t)getpagesize();
+    unsigned fixed = 0;
+    for (unsigned i = 0; i < img->pend_n; i++) {
+        if (!img->pend[i].slot) continue;
+        void *v = kl_guest_sym_global(img->pend[i].name);
+        if (!v) continue;
+        uint64_t *slot = img->pend[i].slot;
+        vm_address_t ra = (vm_address_t)((uintptr_t)slot & ~(pg - 1));
+        vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        int prot = PROT_READ | PROT_WRITE;
+        if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS)
+            prot = info.protection & (PROT_READ | PROT_WRITE | PROT_EXEC);
+        void *page = (void *)((uintptr_t)slot & ~(pg - 1));
+        if (!(prot & PROT_WRITE) &&
+            mprotect(page, pg, (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE) != 0)
+            continue;
+        *slot = (uint64_t)(uintptr_t)v + (uint64_t)img->pend[i].addend;
+        if (!(prot & PROT_WRITE)) mprotect(page, pg, prot);
+        img->pend[i].slot = NULL;
+        img->stats.imports_missing--;
+        img->stats.imports_bound++;
+        fixed++;
+    }
+    // A name leaves the missing list once none of its slots is still pending.
+    // Names with no slot here at all (an unresolved thread-local) stay.
+    unsigned w = 0;
+    for (unsigned m = 0; m < img->missing_n; m++) {
+        unsigned seen = 0, open = 0;
+        for (unsigned i = 0; i < img->pend_n; i++)
+            if (!strcmp(img->pend[i].name, img->missing[m])) {
+                seen++;
+                if (img->pend[i].slot) open++;
+            }
+        if (!seen || open) img->missing[w++] = img->missing[m];
+    }
+    img->missing_n = w;
+    return fixed;
+}
+
 void kl_run_init(kl_image *img) {
     for (size_t i = 0; i < img->init_count; i++)
         if (img->init_array[i]) img->init_array[i]();
 }
 
+// DT_GNU_HASH lookup: the bloom filter, then one bucket's chain. Only defined
+// symbols are in the table (the undefined ones sit below symoffset), which is
+// exactly the set kl_sym answers from, and a chain is in symbol-index order, so
+// the first match is the one the linear scan would have found.
+//
+// Opt-in (kl_sym_use_hash), because no bionic target needed it and a change to
+// how EVERY import binds is not one to make for them on the side. The glibc
+// guests are where it stops being optional: ~90 images, several of them with
+// tens of thousands of exports, and every import the shim misses walks all of
+// them — linearly, that is billions of strcmp before the first line of guest
+// code. Any doubt about the two agreeing is one run with it off.
+static int g_sym_hash;
+void kl_sym_use_hash(int on) { g_sym_hash = on; }
+
+static const Elf64_Sym *gnu_hash_lookup(kl_image *img, const char *name) {
+    const uint32_t *ht = img->gnu_hash;
+    uint32_t nbuckets = ht[0], symoffset = ht[1], bloom_size = ht[2], shift = ht[3];
+    if (!nbuckets || !bloom_size) return NULL;
+    const uint64_t *bloom   = (const uint64_t *)(ht + 4);
+    const uint32_t *buckets = (const uint32_t *)(bloom + bloom_size);
+    const uint32_t *chain   = buckets + nbuckets;
+
+    uint32_t h = 5381;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) h = h * 33 + *p;
+    uint64_t word = bloom[(h / 64) % bloom_size];
+    uint64_t mask = (1ull << (h % 64)) | (1ull << ((h >> shift) % 64));
+    if ((word & mask) != mask) return NULL;
+
+    uint32_t idx = buckets[h % nbuckets];
+    if (idx < symoffset) return NULL;
+    for (;; idx++) {
+        uint32_t h2 = chain[idx - symoffset];
+        if ((h | 1) == (h2 | 1)) {
+            const Elf64_Sym *s = &img->symtab[idx];
+            if (s->st_shndx != 0 && s->st_name &&
+                strcmp(img->strtab + s->st_name, name) == 0)
+                return s;
+        }
+        if (h2 & 1) return NULL;
+    }
+}
+
+static const Elf64_Sym *find_defined(kl_image *img, const char *name);
+
 void *kl_sym(kl_image *img, const char *name) {
+    const Elf64_Sym *s = find_defined(img, name);
+    return s ? img->base + s->st_value : NULL;
+}
+
+// A defined STT_TLS export: which module, and its offset in that module's block.
+int kl_tls_sym(kl_image *img, const char *name, size_t *modid, uint64_t *off) {
+    const Elf64_Sym *s = find_defined(img, name);
+    if (!s || (s->st_info & 0xf) != STT_TLS || !img->tls_modid) return -1;
+    *modid = img->tls_modid;
+    *off   = s->st_value;
+    return 0;
+}
+
+static const Elf64_Sym *find_defined(kl_image *img, const char *name) {
+    if (g_sym_hash && img->gnu_hash) return gnu_hash_lookup(img, name);
     // Linear scan of .dynsym.
     //
     // The count comes from DT_HASH's nchain, never from the gap between symtab
@@ -1230,7 +1465,7 @@ void *kl_sym(kl_image *img, const char *name) {
         const char *nm = img->strtab + s->st_name;
         if (nm < lo_p || nm >= hi_p) continue;               // not a real name
         if (strcmp(nm, name) == 0)
-            return img->base + s->st_value;
+            return s;
     }
     return NULL;
 }
@@ -1294,6 +1529,42 @@ static int elf_list_needed(const uint8_t *img, int vaddr_layout, char names[][12
         for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && n < max; dp++)
             if (dp->d_tag == DT_NEEDED) { snprintf(names[n], 128, "%s", strtab + dp->d_val); n++; }
     return n;
+}
+
+// An ELF file's DT_SONAME, without loading it — the glibc door indexes a whole
+// sysroot by it, because a DT_NEEDED names the soname (libavutil.so.56) and the
+// file on disk is often called something else (libavutil.so.56.51.100).
+// Returns 0 with `out` set, -1 for a non-ELF or a library with no soname.
+int kl_elf_soname(const char *path, char *out, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size < (off_t)sizeof(Elf64_Ehdr)) { close(fd); return -1; }
+    uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file == MAP_FAILED) return -1;
+    int rc = -1;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183 &&
+        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) <= (uint64_t)sb.st_size) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
+        const Elf64_Dyn *dyn = NULL;
+        for (int i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_DYNAMIC) {
+                dyn = (const Elf64_Dyn *)elf_vptr(file, ph, eh->e_phnum, 0, 0, ph[i].p_vaddr);
+                break;
+            }
+        const char *strtab = NULL;
+        uint64_t so = UINT64_MAX;
+        for (const Elf64_Dyn *dp = dyn; dp && dp->d_tag != DT_NULL; dp++) {
+            if (dp->d_tag == DT_STRTAB)
+                strtab = (const char *)elf_vptr(file, ph, eh->e_phnum, 0, 0, dp->d_val);
+            else if (dp->d_tag == 14 /* DT_SONAME */) so = dp->d_val;
+        }
+        if (strtab && so != UINT64_MAX) { snprintf(out, cap, "%s", strtab + so); rc = 0; }
+    }
+    munmap(file, (size_t)sb.st_size);
+    return rc;
 }
 
 // The DT_NEEDED sonames of an image, without loading it. Two sources, because the

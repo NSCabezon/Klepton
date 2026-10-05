@@ -20,7 +20,9 @@
 #include "kl_aaudio.h"
 #include "kl_openxr.h"
 
-#define KL_MAX_IMAGES 64
+// 64 held every bionic chain with room to spare; the glibc door maps the whole
+// game tree plus the runtime sysroot it pulls in, which is ~90 images.
+#define KL_MAX_IMAGES 256
 typedef struct { char soname[128]; kl_image *img; } entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
@@ -103,6 +105,13 @@ void kl_register_image(const char *soname, kl_image *img) {
     // here — not searching for any GL library, which klepton.h warns breaks Steam
     // Link/VRChat/RE4 — routes them to gl4es for every driver.
     if (!strcmp(base, "libgl4es.so")) kl_shim_set_guest_gl(img);
+}
+
+int kl_dl_image_count(void) { return g_nimgs; }
+kl_image *kl_dl_image_at(int i, const char **soname) {
+    if (i < 0 || i >= g_nimgs) return NULL;
+    if (soname) *soname = g_imgs[i].soname;
+    return g_imgs[i].img;
 }
 
 kl_image *kl_find_image(const char *soname) {
@@ -302,6 +311,20 @@ void *kl_guest_sym_global(const char *name) {
     return v;
 }
 
+int kl_guest_tls_global(const char *name, size_t *modid, uint64_t *off) {
+    int rc = -1;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nimgs && rc != 0; i++)
+        rc = kl_tls_sym(g_imgs[i].img, name, modid, off);
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+static int (*g_needed_resolver)(const char *name, char *path, size_t cap);
+void kl_dl_set_needed_resolver(int (*fn)(const char *name, char *path, size_t cap)) {
+    g_needed_resolver = fn;
+}
+
 // Load an .so together with its DT_NEEDED chain, dependencies first, so each
 // image's relocation-time imports can bind against the images it needs
 // (kl_guest_sym_global). Names with no file in the library path are assumed
@@ -348,9 +371,33 @@ static void kl_maybe_jni_onload(const char *path, kl_image *img) {
             b, r);
 }
 
-kl_image *kl_load_recursive(const char *path) {
+kl_image *kl_load_recursive(const char *path) { return kl_load_chain(path, 1); }
+
+// The libraries whose DT_NEEDED walk is in progress, innermost last. A real
+// cycle exists in the wild — Alyx's libfreetype and libharfbuzz each NEED the
+// other — and kl_find_image cannot see it, because an image is registered only
+// once it has been loaded, i.e. after its dependencies. Without this the walk
+// recursed until the stack ran out.
+static kl_image *load_chain_inner(const char *path, int run_init);
+static char g_walk[64][128];
+static int  g_walk_n;
+static int  in_walk(const char *path) {
+    const char *b = basename_of(path);
+    for (int i = 0; i < g_walk_n; i++) if (!strcmp(g_walk[i], b)) return 1;
+    return 0;
+}
+
+kl_image *kl_load_chain(const char *path, int run_init) {
     kl_image *have = kl_find_image(path);
-    if (have) return have;                       // cycle guard / already loaded
+    if (have) return have;                       // already loaded
+    if (g_walk_n >= 64) { snprintf(g_dlerr, sizeof g_dlerr, "DT_NEEDED nesting too deep"); return NULL; }
+    snprintf(g_walk[g_walk_n++], sizeof g_walk[0], "%s", basename_of(path));
+    kl_image *img = load_chain_inner(path, run_init);
+    g_walk_n--;
+    return img;
+}
+
+static kl_image *load_chain_inner(const char *path, int run_init) {
 
     char names[32][128];
     int nn = kl_list_needed(path, names, 32);
@@ -360,6 +407,43 @@ kl_image *kl_load_recursive(const char *path) {
         fflush(stderr);
     }
     for (int i = 0; i < nn; i++) {
+        char full[1024];
+        // A door with its own idea of where a soname lives (kl_glibc.c) answers
+        // first; KL_NEED_DEFAULT hands the name to the rules below.
+        int how = g_needed_resolver
+                ? g_needed_resolver(names[i], full, sizeof full) : KL_NEED_DEFAULT;
+        if (how == KL_NEED_SHIM || how == KL_NEED_SKIP) {
+            if (kl_env_on("KL_TRACE_NEEDED", 1))
+                fprintf(stderr, "  [dl]     %s -> %s (skip)\n", names[i],
+                        how == KL_NEED_SHIM ? "shim-served" : "NOT LOADED by policy");
+            continue;
+        }
+        if (how == KL_NEED_MISSING) {
+            fprintf(stderr, "  [klepton] DT_NEEDED %s of %s is neither loadable "
+                    "nor shim-served — its imports will be UNRESOLVED\n",
+                    names[i], path);
+            continue;
+        }
+        if (how == KL_NEED_LOAD && in_walk(full)) {
+            // A dependency cycle. The library is already being loaded further up
+            // this walk and will be mapped once we return to it; until then its
+            // exports do not exist, so THIS image's imports from it bind to
+            // nothing (they appear in the gap under their own names). Linux
+            // relocates after mapping the whole set, which is the real fix.
+            fprintf(stderr, "  [dl]     %s -> CYCLE (already being loaded above "
+                            "%s; its exports are not visible to it)\n", names[i], path);
+            continue;
+        }
+        if (how == KL_NEED_LOAD) {
+            if (kl_env_on("KL_TRACE_NEEDED", 1))
+                fprintf(stderr, "  [dl]     %s -> loading (%s)\n", names[i], full);
+            if (!kl_load_chain(full, run_init)) {
+                fprintf(stderr, "  [klepton] dependency %s of %s failed to load: %s\n",
+                        names[i], path, kl_error());
+                return NULL;
+            }
+            continue;
+        }
         // The OpenXR loader ships as a real file, and some guests
         // pull it in through DT_NEEDED rather than dlopen. Loading it would run
         // the real Khronos loader, which then hunts for an Android runtime
@@ -387,7 +471,6 @@ kl_image *kl_load_recursive(const char *path) {
                 fprintf(stderr, "  [dl]     %s -> shim-served (skip)\n", names[i]);
             continue;
         }
-        char full[1024];
         if (strchr(names[i], '/')) snprintf(full, sizeof full, "%s", names[i]);
         else snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
         // Framework-aware, NOT a raw access() on "<dir>/libfoo.so": on device the
@@ -404,9 +487,14 @@ kl_image *kl_load_recursive(const char *path) {
                     names[i], path);
             continue;
         }
+        if (in_walk(full)) {
+            fprintf(stderr, "  [dl]     %s -> CYCLE (already being loaded above "
+                            "%s; its exports are not visible to it)\n", names[i], path);
+            continue;
+        }
         if (kl_env_on("KL_TRACE_NEEDED", 1))
             fprintf(stderr, "  [dl]     %s -> loading (%s)\n", names[i], full);
-        if (!kl_load_recursive(full)) {
+        if (!kl_load_chain(full, run_init)) {
             fprintf(stderr, "  [klepton] dependency %s of %s failed to load: %s\n",
                     names[i], path, kl_error());
             return NULL;
@@ -416,6 +504,7 @@ kl_image *kl_load_recursive(const char *path) {
     kl_image *img = kl_load_auto(path);
     if (!img) return NULL;
     kl_register_image(path, img);
+    if (!run_init) return img;
     kl_run_init(img);
     kl_maybe_jni_onload(path, img);
     return img;

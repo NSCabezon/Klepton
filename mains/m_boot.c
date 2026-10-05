@@ -552,7 +552,8 @@ static int recon_run(int view_pump) {
     kl_driver_set_alarm(getenv("KL_ALARM")
                         ? (unsigned)strtoul(getenv("KL_ALARM"), NULL, 10) : 20);
     if (TARGET->kind == KL_GUEST_STEAMLINK) return steamlink_run(view_pump);
-    if (TARGET->kind == KL_GUEST_UE4 || TARGET->kind == KL_GUEST_JKXR)
+    if (TARGET->kind == KL_GUEST_UE4 || TARGET->kind == KL_GUEST_JKXR ||
+        TARGET->kind == KL_GUEST_GLIBC)
         return native_door_run(view_pump);
 
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
@@ -951,6 +952,7 @@ int main(int argc, char **argv) {
            TARGET->kind == KL_GUEST_UE4       ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
            : TARGET->kind == KL_GUEST_JKXR    ? "the GLES3JNILib lifecycle ran with no unimplemented JNI calls"
            : TARGET->kind == KL_GUEST_STEAMLINK ? "the Steam Link chain ran with no unimplemented JNI calls"
+           : TARGET->kind == KL_GUEST_GLIBC   ? "the glibc chain is mapped and relocated"
                                                : "initJni completed with no unimplemented JNI calls");
     return 0;
 }

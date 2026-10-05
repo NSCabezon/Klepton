@@ -17,6 +17,7 @@
 #include "kl_native.h"
 #include "kl_sdl2.h"
 #include "kl_gles3jni.h"
+#include "kl_glibc.h"
 #include "kl_jni.h"
 #include "kl_mediandk.h"
 #include "kl_opensl.h"
@@ -153,7 +154,8 @@ int kl_driver_owns_frame_loop(void) {
     case KL_GUEST_JKXR:
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
-    case KL_GUEST_GLES3JNI: return 1;
+    case KL_GUEST_GLES3JNI:
+    case KL_GUEST_GLIBC:    return 1;
     default:            return 0;
     }
 }
@@ -403,6 +405,24 @@ static int boot_gles3jni(FILE *out) {
     return 0;
 }
 
+static int boot_glibc(FILE *out) {
+    phase("glibc configure");
+    if (kl_glibc_configure(g_target->name, g_libdir, g_target->entry_lib, out) != 0)
+        return fail(kl_glibc_error());
+    phase("glibc load");
+    // Mapped and relocated in full, nothing run. A library that failed to map
+    // is reported and the census still printed: the gap is most useful exactly
+    // when the chain is incomplete.
+    int rc = kl_glibc_load(out);
+    char err[512];
+    snprintf(err, sizeof err, "%s", kl_glibc_error());
+    kl_glibc_gap(out);
+    if (rc != 0) return fail(err);
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the glibc chain is mapped and relocated ===\n");
+    return 0;
+}
+
 int kl_driver_boot(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     g_gap_only = kl_env_on("KL_GAP_ONLY", 0);
@@ -414,6 +434,7 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
     case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
     case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
+    case KL_GUEST_GLIBC:     rc = boot_glibc(out);     break;
     default:                 rc = boot_unity(out);     break;
     }
     if (rc == 0 && g_gap_only)
@@ -617,6 +638,13 @@ static int begin_native(FILE *out) {
     return 0;
 }
 
+static int begin_glibc(FILE *out) {
+    phase("glibc begin");
+    P(out, "\n=== glibc: init arrays + _start ===\n");
+    if (kl_glibc_begin(out) != 0) return fail(kl_glibc_error());
+    return 0;
+}
+
 int kl_driver_lifecycle_begin(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     switch (kl_driver_kind()) {
@@ -626,6 +654,7 @@ int kl_driver_lifecycle_begin(FILE *out) {
     case KL_GUEST_NATIVE:    return begin_native(out);
     case KL_GUEST_SDL2:      return begin_sdl2(out);
     case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
+    case KL_GUEST_GLIBC:     return begin_glibc(out);
     default:                 return begin_unity(out);
     }
 }
@@ -672,6 +701,7 @@ double kl_driver_pump(double seconds, const volatile int *quit) {
     case KL_GUEST_NATIVE: return kl_native_pump(seconds, quit);
     case KL_GUEST_SDL2: return kl_sdl2_pump(seconds, quit);
     case KL_GUEST_GLES3JNI: return kl_gles3jni_pump(seconds, quit);
+    case KL_GUEST_GLIBC: return kl_glibc_pump(seconds, quit);
     default:            return 0.0;
     }
 }
@@ -724,6 +754,10 @@ void kl_driver_report(FILE *out) {
     case KL_GUEST_GLES3JNI:
         fprintf(out, "\n=== the GLES3JNILib run ===\n");
         kl_gles3jni_report(out);
+        return;
+    case KL_GUEST_GLIBC:
+        fprintf(out, "\n=== the glibc run ===\n");
+        kl_glibc_report(out);
         return;
     default: break;
     }

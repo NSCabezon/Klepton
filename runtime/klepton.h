@@ -37,6 +37,12 @@ int kl_can_load(const char *path);
 int kl_can_dlopen(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
+// Answer kl_sym through DT_GNU_HASH where the image has one, instead of a linear
+// scan. Off by default; the glibc door turns it on (see kl_image.c).
+void       kl_sym_use_hash(int on);
+// A defined STT_TLS export: its TLS module id and offset in the module's block
+// (kl_tls.h). Non-zero if the image does not define `name` as thread-local.
+int        kl_tls_sym(kl_image *img, const char *name, size_t *modid, uint64_t *off);
 // Answer a guest symbol with a function of ours, at relocation time. This
 // reaches every call the compiler routed through the PLT — which for a guest
 // built with default visibility is every cross-translation-unit call — so it is
@@ -45,6 +51,9 @@ void      *kl_sym(kl_image *img, const char *name);
 // is how an interposer calls through. Diagnostic: nothing in a shipping path
 // registers one.
 void       kl_interpose(const char *name, void *fn);
+// Re-bind an image's unresolved imports against guest images loaded after it
+// (a DT_NEEDED cycle leaves some behind). Returns how many slots it patched.
+unsigned   kl_rebind_pending(kl_image *img);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
 void       kl_run_init(kl_image *img);
 void       kl_unload(kl_image *img);
@@ -87,6 +96,10 @@ typedef struct {
     // veneer machinery, counted apart because the x18 numbers above are exact
     // and `make check` gates on them.
     unsigned ctr_sites, ctr_patched, ctr_refused;
+    // ELF TLS relocations (kl_tls.c): descriptors handed the dynamic resolver,
+    // and initial-exec GOT words bound to a static-area offset. Zero for every
+    // bionic guest — their thread-locals are emutls function calls.
+    unsigned tlsdesc, tls_tprel;
 } kl_stats;
 const kl_stats *kl_get_stats(kl_image *img);
 
@@ -125,11 +138,32 @@ void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
 // Load an .so plus its DT_NEEDED chain, dependencies first (kl_dl.c).
 kl_image *kl_load_recursive(const char *path);
+// ...the same walk, with DT_INIT_ARRAY optional: run_init 0 maps and relocates
+// the whole chain and runs nothing, which is what a shim-gap census wants.
+kl_image *kl_load_chain(const char *path, int run_init);
+// How kl_load_chain turns a DT_NEEDED name into a file, for a guest whose
+// libraries are not all in one directory under their own names (the glibc
+// door: versioned sonames, a game tree plus a runtime sysroot). Writes the
+// path and returns KL_NEED_LOAD, or says the name is served by our shims
+// (KL_NEED_SHIM), deliberately not loaded (KL_NEED_SKIP — still reported), or
+// nowhere (KL_NEED_MISSING). KL_NEED_DEFAULT falls back to the built-in rule.
+// NULL restores the built-in rule for every name.
+enum { KL_NEED_DEFAULT = -2, KL_NEED_MISSING = -1, KL_NEED_SHIM = 0,
+       KL_NEED_LOAD = 1, KL_NEED_SKIP = 2 };
+void kl_dl_set_needed_resolver(int (*fn)(const char *name, char *path, size_t cap));
+// Every registered image, in registration (dependencies-first) order.
+int       kl_dl_image_count(void);
+kl_image *kl_dl_image_at(int i, const char **soname);
 // Read a file's DT_NEEDED sonames without loading it (kl_image.c).
 int       kl_list_needed(const char *path, char names[][128], int max);
+// ...and its DT_SONAME (kl_image.c). -1 if not an AArch64 ELF or none is set.
+int       kl_elf_soname(const char *path, char *out, size_t cap);
 // Search every registered guest image for an export (kl_dl.c); used by the
 // loader's import binding after the shim misses.
 void     *kl_guest_sym_global(const char *name);
+// ...and the thread-local form: which loaded image defines `name` as STT_TLS,
+// as a kl_tls module id and offset. Non-zero if none does.
+int       kl_guest_tls_global(const char *name, size_t *modid, uint64_t *off);
 // The image's program headers, as mapped. Every guest lib's first PT_LOAD maps
 // file offset 0 at vaddr 0, so the phdr array is live at base + e_phoff and the
 // load bias is simply the base. This is what dl_iterate_phdr hands the guest's

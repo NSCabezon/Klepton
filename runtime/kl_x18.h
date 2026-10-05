@@ -229,6 +229,10 @@ int  kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
 // the loader acts on. `index` is a WORD index into `code`; the window is
 // clamped to the buffer, so pass the same chunk the scanner is walking.
 int kl_x18_is_data(const void *code, size_t size, size_t index);
+// ...and the TLS rewrite's version of the same question: kl_x18_is_data, except
+// that a TP read opening a TLSDESC call sequence is always code. Both the
+// loader and klepton-ld ask this one, so the two passes keep agreeing.
+int kl_tls_site_is_data(const void *code, size_t size, size_t index);
 
 // Count sites that will need a VENEER — x18 sites plus the CTR_EL0 reads
 // — without emitting anything. klepton-ld sizes its pool with it, so it has to

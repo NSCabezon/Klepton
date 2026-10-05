@@ -11,6 +11,7 @@
 #error "include this through runtime/kl_target.c"
 #endif
 
+KL_TARGET_ROW("alyx", "alyx", "alyx.apk", "alyx/assets", "../../game/bin/game/bin/linuxsteamrtarm64", "hlvr", "alyx", "obb", KL_GUEST_GLIBC)
 KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "beatsaber", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "bonelab", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2)

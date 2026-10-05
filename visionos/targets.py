@@ -641,6 +641,29 @@ TARGETS = {
         "product": "KleptonPortalVR",
         "display": "Portal",
     },
+
+    # ---- Linux glibc ports ----
+    "alyx": {
+        # Half-Life: Alyx, the linuxsteamrtarm64 build (Source 2, glibc). NOT an
+        # APK: the srcdir is the depot's own bin directory, which sits OUTSIDE
+        # this repo (../../game is the AlyxAVP checkout's download area — see
+        # its PLAN.md), and the entry is the `hlvr` executable rather than a
+        # library. kl_glibc.c derives the other two search directories from it
+        # (hlvr/bin/linuxsteamrtarm64 for client/server/host, and the SteamRT4
+        # arm64 sysroot for libstdc++ & co.); KL_GLIBC_MODDIRS / _SYSROOT
+        # override both. tree/apk/assets are placeholders nothing reads yet.
+        "libs":    None,
+        "srcdir":  "../../game/bin/game/bin/linuxsteamrtarm64",
+        "tree":    "alyx",
+        "apk":     "alyx.apk",
+        "assets":  "alyx/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "hlvr",
+        "kind":    "glibc",
+        "product": "KleptonAlyx",
+        "display": "Half-Life: Alyx",
+    },
 }
 
 DEFAULT = "beatsaber"

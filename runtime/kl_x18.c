@@ -531,6 +531,29 @@ int kl_x18_is_data(const void *code, size_t size, size_t index) {
     return klx_looks_like_data((const uint32_t *)code, size / 4, index);
 }
 
+// The TLS pass's verdict: the data detector, overruled by the one context that
+// cannot be data — the start of a TLS-descriptor call. A glibc guest reads TP
+// at the head of
+//
+//     mrs  xN, tpidr_el0 ; adrp x0, :tlsdesc: ; ldr xM, [x0, ...] ;
+//     add  x0, x0, ... ; blr xM
+//
+// and libtier0 (Alyx) places one of those right after an inline asm string in
+// .text (JmpToAlternateStack), so the window test saw ASCII and refused a site
+// that is plainly code. An ADRP and a BLR in the next six words is not
+// something a constant table produces by accident next to this exact word.
+int kl_tls_site_is_data(const void *code, size_t size, size_t index) {
+    if (!kl_x18_is_data(code, size, index)) return 0;
+    const uint32_t *w = (const uint32_t *)code;
+    size_t n = size / 4;
+    int adrp = 0, blr = 0;
+    for (size_t k = index + 1; k < n && k <= index + 6; k++) {
+        if ((w[k] & 0x9f000000u) == 0x90000000u) adrp = 1;
+        if ((w[k] & 0xfffffc1fu) == 0xd63f0000u && adrp) { blr = 1; break; }
+    }
+    return !(adrp && blr);
+}
+
 // One survey feeding both the count and the emitter, so a chunk with no real
 // sites still reports its data words. The emitter returns early in that case —
 // correctly, there is nothing to veneer — and counting there alone silently

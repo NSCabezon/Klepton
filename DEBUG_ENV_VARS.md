@@ -2095,6 +2095,27 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
 - `KL_TIMEOUT=<s>` — wrapper only: the outer timeout around the run
   (default 180).
 
+## glibc guests (`runtime/guest/kl_glibc.c`, `runtime/kl_tls.c`) — Half-Life: Alyx
+
+The `alyx` target's door (kind `glibc`). `./build_run_host.sh alyx --gap` maps
+and relocates the whole game tree plus the SteamRT4 libraries it pulls in, runs
+nothing, and prints the unresolved imports grouped by category.
+
+- `KL_GLIBC_MODDIRS=<dir>[:<dir>...]` — the game directories; every library in
+  them is loaded as a root (the engine dlopens them by name). Default for
+  `alyx`: the target libdir and `<libdir>/../../hlvr/bin/linuxsteamrtarm64`.
+- `KL_GLIBC_SYSROOT=<dir>[:<dir>...]` — runtime directories searched for
+  DT_NEEDED only, after the game tree. Default for `alyx`:
+  `<libdir>/../../../../steamrt4-arm64/files/lib/aarch64-linux-gnu`.
+- `KL_GLIBC_SKIP=<prefix>[,<prefix>...]` — extra soname prefixes never to load,
+  on top of the built-in list (freedreno, X11/xcb, wayland, drm, ...).
+- `KL_GLIBC_ROOTS=entry` — map only the executable's own DT_NEEDED closure
+  instead of every library in the game tree.
+- `KL_GAP_OUT=<path>` — where the full grouped gap list is written (default
+  `build/<target>_gap.txt`).
+- `KL_TRACE_TLS=1` — one line per registered ELF TLS module (template size,
+  .tbss, alignment).
+
 ## Spikes (`spikes/`)
 
 Standalone reproducers, not part of the runtime; each reads its own knobs.
