@@ -26,8 +26,9 @@
 # the manifest for this device), --settle <s> (default 600; see below).
 #
 # WHERE IT LANDS, and why the binaries depot is not part of it. kl_app.c, for
-# a glibc target, makes the game ROOT <Documents>/android-files/<stage_files>
-# = android-files/alyx, and the executable "lives" in
+# a glibc target, makes the game ROOT <Documents>/android-files/<stage_files>/game
+# = android-files/alyx/game (Source 2 finds its install by looking for a
+# directory named game/ above the executable), and the executable "lives" in
 # <root>/bin/linuxsteamrtarm64, which it mkdirs itself: every library there
 # (and hlvr/bin/linuxsteamrtarm64, the mod dir) is a translated FRAMEWORK in the
 # signed bundle, found by stem through KL_DYLIB_DIR, and KL_GLIBC_MODDIRS is
@@ -59,7 +60,7 @@ cd "$(dirname "$0")"
 ROOT=".."
 eval "$(python3 targets.py alyx | grep -v '^KLT_LIBS=')"
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
-DEST_REL="Documents/android-files/${KLT_STAGE_FILES:-alyx}"
+DEST_REL="Documents/android-files/${KLT_STAGE_FILES:-alyx}/game"
 
 DRY=0; VERIFY=0; LIST_EXCL=0; EXTRAS=0; RESET=0; SKIP_SPACE=0
 FREE_GB=""; ONLY=""; SETTLE="${KL_STAGE_SETTLE:-600}"
