@@ -470,7 +470,8 @@ static int vk_setup(const VRVulkanTextureData_t *t) {
     return 0;
 }
 
-static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b) {
+static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b,
+                       uint32_t layer) {
     if (vk_setup(t) != 0) return -1;
     int32_t x0 = 0, y0 = 0, x1 = (int32_t)t->m_nWidth, y1 = (int32_t)t->m_nHeight;
     if (b) {
@@ -478,6 +479,9 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
         y0 = (int32_t)(fminf(b->vMin, b->vMax) * t->m_nHeight);
         y1 = (int32_t)(fmaxf(b->vMin, b->vMax) * t->m_nHeight);
     }
+    // vMin > vMax is OpenVR's way of saying "flipped vertically" (a GL-style
+    // bottom-up image); the blit flips it back by reading the rows reversed.
+    int vflip = b && b->vMin > b->vMax;
     // The stage images are one fixed size — the render target size we
     // recommend — and whatever the guest submits is BLITTED to fill them. Alyx
     // renders at a dynamic resolution and alternates between textures of
@@ -507,11 +511,12 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     V.BeginCommandBuffer(cb, &bi);
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 };
     VkImageMemoryBarrier bar[2] = {
         { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
           .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = src, .subresourceRange = rng },
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = src, .subresourceRange = srng },
         { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0,
           .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
           .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -519,16 +524,16 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     };
     V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 0, NULL, 2, bar);
-    if (x0 == 0 && y0 == 0 && (uint32_t)x1 == w && (uint32_t)y1 == h &&
+    if (!vflip && x0 == 0 && y0 == 0 && (uint32_t)x1 == w && (uint32_t)y1 == h &&
         t->m_nWidth == w && t->m_nHeight == h) {
-        VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 },
                             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                             .extent = { w, h, 1 } };
         V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
     } else {
-        VkImageBlit reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                            .srcOffsets = { { x0, y0, 0 }, { x1, y1, 1 } },
+        VkImageBlit reg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 },
+                            .srcOffsets = { { x0, vflip ? y1 : y0, 0 }, { x1, vflip ? y0 : y1, 1 } },
                             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                             .dstOffsets = { { 0, 0, 0 }, { (int32_t)w, (int32_t)h, 1 } } };
         V.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
@@ -553,11 +558,29 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
 
 static unsigned g_submitted_mask;
 static int g_stage;
-static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t *b) {
+// Submit flags that change what the texture handle points at.
+#define SUBMIT_TEXTURE_WITH_POSE   0x08     // Texture_t is a VRTextureWithPose_t (same handle)
+#define SUBMIT_VULKAN_ARRAY_DATA   0x40     // handle is a VRVulkanTextureArrayData_t
+// VRVulkanTextureArrayData_t: the texture data plus which layer of an array
+// image this eye is. Alyx renders both eyes into ONE two-layer image and
+// submits it twice with this flag — layer 0 left, layer 1 right — with full
+// bounds. Ignoring the flag copied layer 0 into both eyes: two identical
+// pictures shown with two different eye poses, which reads as wrong depth and
+// a shifted, cropped image in a headset (and is invisible in a one-eye viewer).
+typedef struct { VRVulkanTextureData_t t; uint32_t m_unArrayIndex, m_unArraySize; } VRVulkanTextureArrayData_t;
+
+static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t *b, int flags,
+                          int layer_override) {
     static int seen;
-    if (seen++ < 4)
-        fprintf(stderr, "  [openvr] Submit(eye %d, texture type %d, handle %p, color %d)\n", eye,
-                tex ? tex->eType : -1, tex ? tex->handle : NULL, tex ? (int)tex->eColorSpace : -1);
+    if (seen++ < 6) {
+        const VRVulkanTextureData_t *vt = tex && tex->eType == 2 ? tex->handle : NULL;
+        fprintf(stderr, "  [openvr] Submit(eye %d, type %d, color %d, flags %#x%s) texture %ux%u fmt %u, "
+                        "bounds u %.3f..%.3f v %.3f..%.3f\n", eye,
+                tex ? tex->eType : -1, tex ? (int)tex->eColorSpace : -1, flags,
+                vt && (flags & SUBMIT_VULKAN_ARRAY_DATA) ? " array" : "",
+                vt ? vt->m_nWidth : 0, vt ? vt->m_nHeight : 0, vt ? vt->m_nFormat : 0,
+                b ? b->uMin : 0.f, b ? b->uMax : 1.f, b ? b->vMin : 0.f, b ? b->vMax : 1.f);
+    }
     if (eye < 0 || eye > 1 || !tex || !tex->handle) return 101;          // InvalidTexture
     if (tex->eType != 2) {
         static int said;
@@ -565,7 +588,10 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         return 101;
     }
 #ifdef KLOVR_VULKAN
-    if (vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b) != 0) return 101;
+    uint32_t layer = layer_override >= 0 ? (uint32_t)layer_override : 0;
+    if (layer_override < 0 && (flags & SUBMIT_VULKAN_ARRAY_DATA))
+        layer = ((const VRVulkanTextureArrayData_t *)tex->handle)->m_unArrayIndex;
+    if (vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
 #else
     (void)b;
     return 101;
@@ -584,12 +610,12 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
     return 0;
 }
 static int co_submit(void *s, int eye, const Texture_t *tex, const VRTextureBounds_t *b, int flags) {
-    (void)s; (void)flags;
-    return co_submit_impl(eye, tex, b);
+    (void)s;
+    return co_submit_impl(eye, tex, b, flags, -1);
 }
 static int co_submit_array(void *s, int eye, const Texture_t *tex, uint32_t idx, const VRTextureBounds_t *b, int flags) {
-    (void)s; (void)flags; (void)idx;
-    return co_submit_impl(eye, tex, b);
+    (void)s;
+    return co_submit_impl(eye, tex, b, flags, (int)idx);
 }
 static void co_void(void *s) { (void)s; }
 // Fades and the grid are the compositor's to draw, and there is no compositor

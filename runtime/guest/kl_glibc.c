@@ -438,6 +438,81 @@ static void mkdir_p(const char *dir) {
     mkdir(tmp, 0755);
 }
 
+// Directory names that define WHERE the install is: Source 2 finds its game
+// root by probing for game/ and bin/<platform>/ above and beside the
+// executable, so a write-layer directory with one of these names is never
+// legitimate — it can only be the leftover of a probe, and its mere existence
+// moves the game root (see content_overlay). content/ is the same probe for the
+// CONTENT root.
+static int layout_name(const char *c, size_t n) {
+    return (n == 4 && !strncmp(c, "game", 4)) || (n == 7 && !strncmp(c, "content", 7));
+}
+// Does `rel` ("/a/b/c") name a place only a probe could have put something?
+// game/ or content/ directly under the root, or game/, content/ or another bin/
+// anywhere under <root>/bin — <root>/bin/<platform> itself is real. Deeper
+// directories that happen to be called game (inside hlvr/, say) are content.
+static int rel_is_phantom(const char *rel) {
+    int depth = 0, in_bin = 0;
+    for (const char *p = rel; *p; ) {
+        while (*p == '/') p++;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        size_t n = (size_t)(e - p);
+        if (!n) break;
+        int is_bin = n == 3 && !strncmp(p, "bin", 3);
+        if (depth == 0) {
+            if (layout_name(p, n)) return 1;      // <root>/game, <root>/content
+            in_bin = is_bin;
+        } else if (in_bin && (layout_name(p, n) || is_bin)) {
+            return 1;                              // bin/game, bin/<plat>/game, bin/bin ...
+        }
+        depth++;
+        p = e;
+    }
+    return 0;
+}
+static void rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d))) {
+                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+                char sub[2048];
+                snprintf(sub, sizeof sub, "%s/%s", path, de->d_name);
+                rm_rf(sub);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+// Remove what earlier runs' probes left in the write layer (before this rule
+// existed, every probed path had its parent created there). Walks the layer and
+// deletes any subtree whose path is phantom. Counted, so a run says so.
+static int prune_phantoms(const char *dir, const char *rel) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char sub[2048], srel[2048];
+        snprintf(sub, sizeof sub, "%s/%s", dir, de->d_name);
+        snprintf(srel, sizeof srel, "%s/%s", rel, de->d_name);
+        struct stat st;
+        if (lstat(sub, &st) != 0) continue;
+        if (rel_is_phantom(srel)) { rm_rf(sub); n++; }
+        else if (S_ISDIR(st.st_mode)) n += prune_phantoms(sub, srel);
+    }
+    closedir(d);
+    return n;
+}
+
 static const char *content_overlay(const char *path, char *buf, size_t cap) {
     if (!path || !*path || !g_root[0]) return NULL;
     char abs[2048];
@@ -452,6 +527,10 @@ static const char *content_overlay(const char *path, char *buf, size_t cap) {
     const char *rel = abs + rl;
     struct stat st;
     char cand[2048];
+    // A path no install has (game/ or content/ below the root, bin/ nested in
+    // bin/) is answered by the install alone: absent. The write layer must not
+    // make it exist, or the engine's install probe adopts it as its game root.
+    if (rel_is_phantom(rel)) return NULL;
     if (g_wlayer[0]) {
         snprintf(cand, sizeof cand, "%s%s", g_wlayer, rel);
         if (stat(cand, &st) == 0 && !S_ISDIR(st.st_mode)) goto take;
@@ -564,6 +643,9 @@ static void setup_root(void) {
     snprintf(def, sizeof def, "%s/gameroot", kl_userdata_dir(g_target));
     snprintf(g_wlayer, sizeof g_wlayer, "%s", wl && *wl ? wl : def);
     mkdir_p(g_wlayer);
+    int pruned = prune_phantoms(g_wlayer, "");
+    if (pruned) fprintf(stderr, "  write layer: pruned %d probe-created path(s) "
+                                "(game/, content/, bin/bin ...) left by earlier runs\n", pruned);
     kl_set_guest_path_hook(content_overlay);
     kl_dl_set_exist_filter(library_location);
 }
