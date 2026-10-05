@@ -410,6 +410,16 @@ set -e
 APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+# CODE_SIGNING_ALLOWED=NO leaves the embedded frameworks unsigned, and the
+# simulator's dyld refuses an unsigned dylib by dlopen ("code signature
+# invalid") — which every translated guest library is: the app launches, maps
+# nothing and reports the entry as unmappable. Ad-hoc signing (no identity, no
+# team) is all the simulator asks for; frameworks first, then the app around
+# them.
+for F in "$APP"/Frameworks/*.framework; do
+  [ -d "$F" ] && codesign -f -s - "$F" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $F"
+done
+codesign -f -s - "$APP" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $APP"
 
 echo "[4/5] installing + staging…"
 xcrun simctl install "$UDID" "$APP"

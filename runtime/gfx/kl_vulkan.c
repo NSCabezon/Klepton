@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <TargetConditionals.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -3082,6 +3083,23 @@ static int klvk_astc_sub_has(VkImage img) {
     pthread_mutex_unlock(&g_astc_sub_lock);
     return found;
 }
+static VkPhysicalDevice live_phys0(void);
+// Whether this device can back `fmt` at all (any tiling, any feature). Cached;
+// unknown (no instance yet) answers yes.
+static int klvk_format_backed(VkFormat fmt) {
+    static signed char known[256];          // core formats only; 0 unknown, 1 yes, -1 no
+    if ((unsigned)fmt >= 256) return 1;
+    if (known[fmt]) return known[fmt] > 0;
+    VkPhysicalDevice pd = live_phys0();
+    PFN_vkGetPhysicalDeviceFormatProperties gfp = pd && real_gipa
+        ? (PFN_vkGetPhysicalDeviceFormatProperties)real_gipa(g_instance, "vkGetPhysicalDeviceFormatProperties")
+        : NULL;
+    if (!gfp) return 1;
+    VkFormatProperties fp = {0};
+    gfp(pd, fmt, &fp);
+    known[fmt] = (fp.optimalTilingFeatures || fp.linearTilingFeatures) ? 1 : -1;
+    return known[fmt] > 0;
+}
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
     static PFN_vkCreateImage real;
@@ -3126,7 +3144,40 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
                 "garbled colour; world colourful => gray was ASTC decode\n",
                 ci->extent.width, ci->extent.height); }
     }
-    VkResult r = real(dev, ci, alloc, out);
+    // A format this GPU cannot back at all is not always REJECTED: the visionOS
+    // simulator's MTLSimDevice has no BC (and some other) pixel formats, MoltenVK
+    // maps them to MTLPixelFormatInvalid, and Metal's descriptor validation then
+    // ABORTS the process ("MTLTextureDescriptor has invalid pixelFormat (0)")
+    // instead of returning an error. So a format whose properties are all zero
+    // is treated as rejected without asking — the fallback below substitutes.
+#if TARGET_OS_SIMULATOR
+    // The simulator's MTLSimDevice caps a 2D texture at 8192 per side while
+    // MoltenVK still reports the hardware's 16384, and Metal's descriptor
+    // validation aborts the process on anything larger rather than failing the
+    // call. Alyx makes an 8194-wide image at startup. Clamped here, simulator
+    // only: the guest's copies into the tail are lost, which on a debugging
+    // target is a wrong texel row, not a dead process. Hardware is untouched.
+    if (ci && (ci->extent.width > 8192 || ci->extent.height > 8192)) {
+        if (ci != &mod) { mod = *ci; ci = &mod; }
+        static int said;
+        if (said < 8) { said++;
+            VKI("vkCreateImage: %ux%u clamped to the simulator's 8192 limit\n",
+                mod.extent.width, mod.extent.height); }
+        if (mod.extent.width > 8192)  mod.extent.width = 8192;
+        if (mod.extent.height > 8192) mod.extent.height = 8192;
+    }
+#endif
+    VkResult r;
+    if (ci && !klvk_format_backed(ci->format)) {
+        static int said;
+        if (said < 8) { said++;
+            VKI("vkCreateImage: format %d has no features on this device — not "
+                "created (Metal would abort on it); substituting\n", (int)ci->format); }
+        if (out) *out = VK_NULL_HANDLE;
+        r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    } else {
+        r = real(dev, ci, alloc, out);
+    }
     // MoltenVK rejects some formats outright (Wanderer: VK_FORMAT_ASTC_8x8_UNORM/
     // SRGB come back VK_ERROR_FEATURE_NOT_PRESENT) and leaves *out NULL. A null
     // image is not inert: the guest does not check, and the next call on it —
