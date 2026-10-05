@@ -828,6 +828,46 @@ unsigned kl_glibc_gap(FILE *out) {
     return (unsigned)nr;
 }
 
+// The engine's own log. Source 2 routes every message through tier0's
+// LoggingSystem, whose listeners are the console window, the -condebug file
+// and the debugger — none of which exists here, so a failing Init() says
+// nothing. A listener of ours, registered before _start, puts it on stderr.
+// ILoggingListener is one virtual, Log(const LoggingContext_t *, const char *);
+// every slot points at the same function in case the build has more.
+static int printable(const char *p) {
+    if ((uintptr_t)p < 0x100000000ull) return 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (!c) return i > 0;
+        if (c < 9 || c > 126) return 0;
+    }
+    return 1;
+}
+#define LOGSLOT(k) static void log_slot##k(void *self, void *a, void *b, void *c, void *d) { \
+    (void)self; void *v[4] = { a, b, c, d }; static int said; \
+    const char *best = NULL; size_t bl = 0; \
+    for (int i = 0; i < 4; i++) if (printable(v[i])) { \
+        size_t n = strlen(v[i]); if (n > bl) { bl = n; best = v[i]; } } \
+    if (best) { fprintf(stderr, "[hlvr] %.*s%s", (int)bl, best, \
+                        best[bl - 1] == '\n' ? "" : "\n"); return; } \
+    if (said++ < 3) fprintf(stderr, "  [glibc] log listener slot %d: no message among %p %p %p %p\n", \
+                            k, a, b, c, d); }
+LOGSLOT(0) LOGSLOT(1) LOGSLOT(2) LOGSLOT(3) LOGSLOT(4) LOGSLOT(5) LOGSLOT(6) LOGSLOT(7)
+static void *g_log_vt[8] = {
+    (void *)log_slot0, (void *)log_slot1, (void *)log_slot2, (void *)log_slot3,
+    (void *)log_slot4, (void *)log_slot5, (void *)log_slot6, (void *)log_slot7,
+};
+static struct { void **vt; } g_log_obj = { g_log_vt };
+static void hook_engine_log(void) {
+    if (!kl_env_on("KL_GLIBC_LOG", 1)) return;
+    // The BACKDOOR listener: the engine pushes logging states of its own (each
+    // with its own listener set), and only a backdoor listener sees them all.
+    void (*reg)(void *) = (void (*)(void *))kl_guest_sym_global("LoggingSystem_RegisterBackdoorLoggingListener");
+    void (*en)(int) = (void (*)(int))kl_guest_sym_global("LoggingSystem_EnableBackdoorLoggingListeners");
+    if (reg) reg(&g_log_obj);
+    if (en) en(1);
+}
+
 // The guest's main thread: a host pthread with a Linux-sized stack, entered at
 // _start with a kernel-shaped argc/argv/envp/auxv block (klg_enter).
 void klg_enter(void *entry, const uint64_t *block, size_t nwords);
@@ -837,6 +877,7 @@ static void *glibc_main_thread(void *arg) {
     (void)arg;
     kl_thread_init();                       // canary + static TLS seed
     pthread_setname_np("hlvr-main");
+    hook_engine_log();
     size_t nenv = 0;
     while (g_envp && g_envp[nenv]) nenv++;
     size_t n = 1 + (size_t)g_argc + 1 + nenv + 1 + 2;

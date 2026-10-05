@@ -5,6 +5,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_fault.h"
@@ -857,7 +858,11 @@ void *klb_dlopen(const char *path, int flags) {
     // three have to land on the one image already mapped for that file.
     if (g_needed_resolver) {
         int how;
-        if (strchr(path, '/') && access(path, R_OK) == 0) {
+        // An existing path is taken at its word — unless it is one of the
+        // empty placeholders the depot ships where Linux would have a symlink
+        // (libpangoft2-1.0.so), which the resolver maps by name instead.
+        struct stat pst;
+        if (strchr(path, '/') && stat(path, &pst) == 0 && pst.st_size > 0) {
             snprintf(full, sizeof full, "%s", path);
             how = KL_NEED_LOAD;
         } else {

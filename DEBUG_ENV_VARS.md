@@ -2137,6 +2137,14 @@ nothing, and prints the unresolved imports grouped by category.
 - `KL_GLIBC_SDL_SEAM=0` — leave all of SDL to the guest's own libSDL2 (its
   video subsystem then fails: no X11/Wayland). The A/B for the seam.
 - `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface).
+- `KL_GLIBC_LOG=0` — do not register the backdoor listener that copies the
+  engine's own tier0 LoggingSystem output to stderr as `[hlvr] ...` lines.
+- `KL_TRACE_MMAP=1` — every guest mmap and Plat_VirtualAlloc, with hint, size,
+  flags, result and the calling image.
+- `KL_STEAM_STUB=0` — (`runtime/guest/kl_steam.c`) leave libsteam_api's entry
+  points to the guest's own library (which then looks for a running Steam and
+  fails). `KL_TRACE_STEAM=1` logs callback registration and every loopback
+  connection state change; `KL_STEAM_NAME` is the persona name (Gordon).
 - `KL_X18_RECOVER=0` — (`runtime/kl_fault.c`) do not "recover" a fault at pc 0
   as an x18-veneer race. In a GCC-built guest x18 is an ordinary scratch
   register, so a genuine call through a NULL pointer looks the same, and

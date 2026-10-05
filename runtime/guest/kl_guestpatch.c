@@ -448,7 +448,29 @@ static const kl_gp_word k_hl2_matqueue_allow[] = {
     { 0xe49f8, 0x0a150308, 0x320003e8, "and w8,w24,w21 -> mov w8,#1  (allow=1 forced)" },
 };
 
+// Half-Life: Alyx (linuxsteamrtarm64), libvscript.so — the Lua VM's heap.
+//
+// vscript reserves LuaJIT's arena with Plat_VirtualAlloc(..., max = 2 GB) and
+// then checks the answer itself:
+//
+//   0x4dfd4  cmp  x0, x1          ; base vs 2 GB - size
+//   0x4dfd8  b.hi 0x4e08c         ; "Lua allocation of %llu failed"
+//
+// a constraint carried over from the x86-64 non-GC64 build. ARM64 LuaJIT is
+// GC64-only and takes any 47-bit address, while arm64 Darwin maps nothing below
+// 4 GB (__PAGEZERO, which an arm64 executable may not shrink), so without this
+// the VM is never created and AnimationSystem's Init() fails. The bound passed
+// to Plat_VirtualAlloc is dropped by the glibc ABI tier (kl_glibc_shim.c); this
+// is the check on the result.
+static const kl_gp_word k_alyx_lua_low4g[] = {
+    { 0x4dfd8, 0x540005a8, 0xd503201f, "NOP the below-2GB check on the Lua arena" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "alyx-lua-arena-anywhere", "libvscript.so",
+      "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
+      k_alyx_lua_low4g, sizeof k_alyx_lua_low4g / sizeof *k_alyx_lua_low4g },
+
     // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
     // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
     // which never got past "no usable vertex shader variant". We now commit to

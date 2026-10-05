@@ -70,6 +70,7 @@
 #include "kl_va.h"
 #include "kl_glibc_shim.h"
 #include "kl_glibc_sdl.h"
+#include "kl_steam.h"
 
 #define LX_ENOSYS 38
 #define LX_ENOENT 2
@@ -727,6 +728,63 @@ static int klg_close(int fd) {
     return ((int (*)(int))shim_fn("close"))(fd);
 }
 
+// mmap, traced (KL_TRACE_MMAP=1): hint, size, flags and what came back.
+void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+static void *klg_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    void *p = klb_mmap(addr, len, prot, flags, fd, off);
+    static int tr = -1;
+    if (tr < 0) tr = kl_env_on("KL_TRACE_MMAP", 0);
+    if (tr) {
+        size_t o = 0;
+        const char *img = kl_addr_image(__builtin_return_address(0), &o);
+        fprintf(stderr, "  [glibc] mmap(%p, %#zx, prot %d, flags %#x, fd %d) -> %p  [%s+%#zx]\n",
+                addr, len, prot, flags, fd, p, img ? img : "?", o);
+    }
+    return p;
+}
+
+// Plat_VirtualAlloc(addr, size, type, access, maxAddress) — tier0's, interposed
+// on its importers. vscript asks it for LuaJIT's heap below 2 GB (a leftover of
+// the x86-64 non-GC64 build), which tier0 serves by probing hints upward from
+// 64 KB. On arm64 Darwin the first 4 GB is __PAGEZERO and an executable may not
+// shrink it, so nothing below 4 GB can ever be mapped and the Lua VM is never
+// created. LuaJIT on ARM64 is GC64-only and takes any 47-bit address, so the
+// bound is dropped (once, by name) and the real allocator runs unbounded.
+static void *klg_plat_virtualalloc(void *addr, size_t size, uint32_t type, uint32_t access,
+                                   uintptr_t max) {
+    static void *(*real)(void *, size_t, uint32_t, uint32_t, uintptr_t);
+    if (!real) real = (void *(*)(void *, size_t, uint32_t, uint32_t, uintptr_t))
+                      kl_guest_sym_global("Plat_VirtualAlloc");
+    if (max && max <= 0x100000000ull) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glibc] Plat_VirtualAlloc below %#lx requested (%#zx bytes) — "
+                            "nothing below 4 GB is mappable here; bound dropped\n",
+                    (unsigned long)max, size);
+        max = 0;
+    }
+    // ...and it commits that arena read-write-EXECUTE (access 7), because the
+    // same allocator serves LuaJIT's machine code on x86-64. No guest may map
+    // executable memory here (kl_libc.c refuses it), so the commit failed and
+    // vscript retried with a fresh arena forever. The heap only needs RW; a
+    // trace LuaJIT then fails to compile simply runs in the interpreter.
+    if (access == 7) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glibc] Plat_VirtualAlloc: RWX commit requested — committing "
+                            "RW (no executable memory for guests)\n");
+        access = 3;
+    }
+    void *r = real ? real(addr, size, type, access, max) : NULL;
+    if (kl_env_on("KL_TRACE_MMAP", 0)) {
+        size_t o = 0;
+        const char *img = kl_addr_image(__builtin_return_address(0), &o);
+        fprintf(stderr, "  [glibc] Plat_VirtualAlloc(%p, %#zx, type %u, access %u) -> %p  [%s+%#zx]\n",
+                addr, size, type, access, r, img ? img : "?", o);
+    }
+    return r;
+}
+
 // ---------- the table ----------
 enum { DIRECT = 0, ALIAS, STUB_M1, STUB_NULL, STUB_ERR, STUB_ZERO };
 typedef struct { const char *name; const void *fn; int kind; } klg_entry;
@@ -754,6 +812,7 @@ static const klg_entry g_glibc[] = {
     D("__fpending", klg___fpending), D("__sysconf", klg___sysconf),
     D("sysconf", klg_sysconf),
     D("readlink", klg_readlink),
+    D("Plat_VirtualAlloc", klg_plat_virtualalloc),
     D("eventfd", klg_eventfd), D("eventfd_read", klg_eventfd_read),
     D("eventfd_write", klg_eventfd_write),
     D("read", klg_read), D("write", klg_write), D("close", klg_close),
@@ -792,7 +851,8 @@ static const klg_entry g_glibc[] = {
     S("__isoc23_swscanf", STUB_M1), S("__isoc23_vswscanf", STUB_M1),
 
     // LFS: off_t is 64-bit everywhere here, so *64 is the plain name
-    A("open64", "open"), A("fcntl64", "fcntl"), A("mmap64", "mmap"),
+    A("open64", "open"), A("fcntl64", "fcntl"),
+    D("mmap", klg_mmap), D("mmap64", klg_mmap),
     A("readdir64", "readdir"), A("scandir64", "scandir"), A("alphasort64", "alphasort"),
     A("statfs64", "statfs"), A("statvfs64", "statvfs"), A("fstatvfs64", "fstatvfs"),
     A("getrlimit64", "getrlimit"), A("setrlimit64", "setrlimit"),
@@ -935,6 +995,9 @@ void *kl_glibc_lookup(const char *name) {
     // dlsym table does.
     void *sdl = kl_glibc_sdl_lookup(name);
     if (sdl) return sdl;
+    // ...and libsteam_api's, for a Steam that is not running (kl_steam.c).
+    void *steam = kl_steam_lookup(name);
+    if (steam) return steam;
     for (size_t i = 0; i < sizeof g_glibc / sizeof *g_glibc; i++) {
         const klg_entry *e = &g_glibc[i];
         if (strcmp(e->name, name)) continue;

@@ -58,6 +58,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_glibc.c runtime/guest/kl_glibc_sdl.c \
+           runtime/guest/kl_steam.c \
            runtime/guest/kl_driver.c \
            runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
