@@ -1579,8 +1579,17 @@ static const char *kl_gameinfo_synth(const char *resolved, char *buf, size_t cap
     return buf;
 }
 
+// A door's own path map, applied after everything above (kl_glibc.c's content
+// overlay). NULL for every Android door.
+static const char *(*g_path_hook)(const char *path, char *buf, size_t cap);
+void kl_set_guest_path_hook(const char *(*fn)(const char *, char *, size_t)) { g_path_hook = fn; }
+
 const char *kl_guest_path(const char *path, char *buf, size_t cap) {
     const char *r = kl_guest_path_inner(path, buf, cap);
+    if (g_path_hook && r) {
+        const char *h = g_path_hook(r, buf, cap);
+        if (h) return h;
+    }
     // A gameinfo.txt the guest names but that isn't staged: serve a synthetic one
     // so an Xash mod (cstrike) registers instead of falling back to valve. Cheap:
     // only fires for paths ending in "gameinfo.txt", which is a handful per boot.
@@ -2865,13 +2874,29 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     case LX_F_SETOWN:        return fcntl(fd, F_SETOWN, (int)arg);
     case LX_F_GETOWN:        return fcntl(fd, F_GETOWN);
     // struct flock is laid out differently on the two platforms (Linux leads
-    // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
-    // pointer would silently lock a different range. Refused by name until
-    // something needs it — no guest has yet.
-    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
-        warn_once("fcntl file locking (struct flock layout differs) — refused");
-        errno = EINVAL;
-        return -1;
+    // with l_type/l_whence, Darwin with l_start/l_len) and the lock types are
+    // numbered differently (Linux RD/WR/UN = 0/1/2, Darwin 1/3/2), so it is
+    // translated both ways. Source 2 takes a single-instance lock this way
+    // (source_engine_<hash>.lock in $TMPDIR) and treats a refusal as "another
+    // copy is running".
+    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW: {
+        struct lx_flock { int16_t l_type, l_whence; int32_t pad;
+                          int64_t l_start, l_len; int32_t l_pid, pad2; } *lf = (void *)arg;
+        if (!lf) { errno = EFAULT; return -1; }
+        static const short to_d[3] = { F_RDLCK, F_WRLCK, F_UNLCK };
+        struct flock d = { .l_start = lf->l_start, .l_len = lf->l_len,
+                           .l_pid = lf->l_pid, .l_whence = lf->l_whence,
+                           .l_type = (lf->l_type >= 0 && lf->l_type < 3)
+                                   ? to_d[lf->l_type] : F_UNLCK };
+        int dcmd = cmd == LX_F_GETLK ? F_GETLK : cmd == LX_F_SETLK ? F_SETLK : F_SETLKW;
+        int r = fcntl(fd, dcmd, &d);
+        if (r == 0 && cmd == LX_F_GETLK) {
+            lf->l_type  = d.l_type == F_RDLCK ? 0 : d.l_type == F_WRLCK ? 1 : 2;
+            lf->l_whence = d.l_whence;
+            lf->l_start = d.l_start; lf->l_len = d.l_len; lf->l_pid = d.l_pid;
+        }
+        return r;
+    }
     default:
         fcntl_warn_once("fcntl", cmd);
         errno = EINVAL;

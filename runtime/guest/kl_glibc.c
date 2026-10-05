@@ -19,6 +19,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -28,7 +30,10 @@
 #include "kl_env.h"
 #include "kl_glibc.h"
 #include "kl_tls.h"
+#include "kl_glibc_shim.h"
+#include "kl_x18.h"
 
+static void *glibc_dlsym_override(const char *name, void *real);
 static char      g_err[512];
 static char      g_target[64];
 static char      g_entry[1024];
@@ -57,7 +62,11 @@ static void add_dirs(const char *list, int *count) {
     for (char *save = NULL, *t = strtok_r(buf, ":", &save); t && g_ndirs < MAX_DIRS;
          t = strtok_r(NULL, ":", &save)) {
         if (!*t) continue;
-        snprintf(g_dirs[g_ndirs++], sizeof g_dirs[0], "%s", t);
+        // Absolute: the engine chdirs into its game directory early on, and
+        // every relative library path stops resolving at that moment.
+        char *rp = realpath(t, NULL);
+        snprintf(g_dirs[g_ndirs++], sizeof g_dirs[0], "%s", rp ? rp : t);
+        free(rp);
         if (count) (*count)++;
     }
 }
@@ -125,6 +134,13 @@ static const char *const k_skip_prefixes[] = {
     "libXi", "libXcursor", "libXfixes", "libXrender", "libXss", "libxkbcommon",
     "libwayland-", "libdrm", "libxshmfence", "libdisplay-info", "libSPIRV-Tools",
     "libGL.so", "libGLX", "libEGL.so", "libgbm",
+    // SDL's optional desktop-session services: no D-Bus daemon or udev here,
+    // and SDL runs without both.
+    "libdbus-1", "libudev", "libibus", "libpulse", "libasound", "libpipewire",
+    "libdecor", "libsystemd",
+    // Raw USB (SDL's HIDAPI backend through libusb): Linux timerfd/udev all the
+    // way down, and controllers reach SDL another way on Darwin.
+    "libusb",
 };
 
 static int skipped_by_policy(const char *name) {
@@ -195,14 +211,25 @@ int kl_glibc_configure(const char *target, const char *libdir, const char *entry
     add_dirs(kl_env_str("KL_GLIBC_SYSROOT", def_sys), NULL);
 
     // The entry is an executable, named without a ".so".
-    snprintf(g_entry, sizeof g_entry, "%s/%s", libdir, entry);
+    char *alib = realpath(libdir, NULL);
+    snprintf(g_entry, sizeof g_entry, "%s/%s", alib ? alib : libdir, entry);
     if (access(g_entry, R_OK) != 0)
-        snprintf(g_entry, sizeof g_entry, "%s/%s.so", libdir, entry);
+        snprintf(g_entry, sizeof g_entry, "%s/%s.so", alib ? alib : libdir, entry);
+    free(alib);
     if (access(g_entry, R_OK) != 0)
         return fail("entry executable not found: %s", g_entry);
 
     build_index();
     kl_dl_set_needed_resolver(glibc_resolve);
+    // The glibc ABI tier goes in front of the bionic table for every bind from
+    // here on, relocation and dlsym alike (kl_glibc_shim.c).
+    kl_set_abi_lookup(kl_glibc_lookup);
+    kl_dl_set_dlsym_override(glibc_dlsym_override);
+    kl_glibc_set_exe_path(g_entry);
+    // V8 must run --jitless: no guest may map executable memory on visionOS,
+    // and the host shim refuses it too (KL_GUEST_JIT). Panorama sets its own
+    // flags through this one call, so it carries ours in front of them.
+    kl_interpose("_ZN2v82V818SetFlagsFromStringEPKcm", (void *)klg_v8_set_flags);
     // ~90 images, several with tens of thousands of exports: see kl_image.c.
     kl_sym_use_hash(1);
     if (out) {
@@ -217,10 +244,166 @@ int kl_glibc_configure(const char *target, const char *libdir, const char *entry
 
 static int has_so(const char *file) { return strstr(file, ".so") != NULL; }
 
-int kl_glibc_load(FILE *out) {
+// ---- the process image: argv / envp, as _start and the constructors see them ----
+static int    g_argc;
+static char  *g_argv[64];
+static char **g_envp;
+
+static void build_args(void) {
+    extern char **environ;
+    static char exe[1024], argbuf[2048];
+    snprintf(exe, sizeof exe, "%s", g_entry);
+    char *rp = realpath(g_entry, NULL);
+    if (rp) { snprintf(exe, sizeof exe, "%s", rp); free(rp); }
+    g_argc = 0;
+    g_argv[g_argc++] = exe;
+    // A desktop, no-headset boot: -novr keeps engine2 from adding the "vr"
+    // system (which wants SteamVR), -vulkan is the only render system that maps
+    // to anything here (MoltenVK). KL_GLIBC_ARGS replaces the list outright.
+    snprintf(argbuf, sizeof argbuf, "%s",
+             kl_env_str("KL_GLIBC_ARGS", "-novr -vulkan -console +sv_cheats 1"));
+    for (char *save = NULL, *t = strtok_r(argbuf, " ", &save); t && g_argc < 63;
+         t = strtok_r(NULL, " ", &save))
+        g_argv[g_argc++] = t;
+    g_argv[g_argc] = NULL;
+    g_envp = environ;
+}
+
+// v8::V8::SetFlagsFromString(const char *, size_t), with --jitless first.
+static void (*g_v8_set_flags_real)(const char *, size_t);
+void klg_v8_set_flags(const char *f, size_t n) {
+    if (!g_v8_set_flags_real)
+        g_v8_set_flags_real = (void (*)(const char *, size_t))
+            kl_guest_sym_global("_ZN2v82V818SetFlagsFromStringEPKcm");
+    if (!g_v8_set_flags_real) return;
+    static int once;
+    if (!once) {
+        once = 1;
+        const char *j = kl_env_str("KL_V8_FLAGS", "--jitless");
+        fprintf(stderr, "  [glibc] V8 flags: %s (then the guest's: %.*s)\n", j, (int)n, f);
+        g_v8_set_flags_real(j, strlen(j));
+    }
+    g_v8_set_flags_real(f, n);
+}
+
+// SDL's message box is how Source 2 reports a fatal error, and on a host with
+// no X11 SDL forks a zenity that cannot exec — so the text never shows. Print
+// it, and answer "the first button was pressed".
+static int klg_sdl_msgbox(uint32_t flags, const char *title, const char *msg, void *win) {
+    (void)win;
+    fprintf(stderr, "\n  [glibc] MESSAGEBOX (flags %#x) \"%s\": %s\n", flags,
+            title ? title : "", msg ? msg : "");
+    fflush(stderr);
+    return 0;
+}
+static int klg_sdl_msgbox_full(const void *data, int *button) {
+    // SDL_MessageBoxData: flags, window, title, message, ...
+    const struct { uint32_t flags; void *win; const char *title, *msg; } *d = data;
+    if (button) *button = 0;
+    return klg_sdl_msgbox(d ? d->flags : 0, d ? d->title : NULL, d ? d->msg : NULL, NULL);
+}
+static void *glibc_dlsym_override(const char *name, void *real) {
+    (void)real;
+    if (kl_env_on("KL_TRACE_DLSYM", 0)) fprintf(stderr, "  [glibc] dlsym %s\n", name);
+    if (!strcmp(name, "SDL_ShowSimpleMessageBox")) return (void *)klg_sdl_msgbox;
+    if (!strcmp(name, "SDL_ShowMessageBox")) return (void *)klg_sdl_msgbox_full;
+    return NULL;
+}
+
+// ---- the install root, and a content overlay beside it ----
+// hlvr.sh cds to the game root (<root>/bin/linuxsteamrtarm64/hlvr) before
+// exec, and the engine looks for <root>/hlvr/gameinfo.gi, <root>/core/... from
+// there. The binaries depot alone has none of that: the content is a separate
+// depot (546561), and the game directory is not ours to write into. So
+// KL_GLIBC_CONTENT names directories laid out like <root> that are searched,
+// in order, for any path under <root> that does not exist there — the seam the
+// content depot (or a hand-made gameinfo.gi) plugs into without touching the
+// install.
+static char g_root[1024];
+static char g_content[4][1024];
+static int  g_ncontent;
+
+static const char *content_overlay(const char *path, char *buf, size_t cap) {
+    if (!g_ncontent || !path || !*path) return NULL;
+    char abs[2048];
+    if (path[0] == '/') snprintf(abs, sizeof abs, "%s", path);
+    else {
+        char cwd[1024];
+        if (!getcwd(cwd, sizeof cwd)) return NULL;
+        snprintf(abs, sizeof abs, "%s/%s", cwd, path);
+    }
+    size_t rl = strlen(g_root);
+    if (strncmp(abs, g_root, rl) != 0 || (abs[rl] != '/' && abs[rl] != 0)) return NULL;
+    if (access(abs, F_OK) == 0) return NULL;          // the install has it
+    for (int i = 0; i < g_ncontent; i++) {
+        char cand[2048];
+        snprintf(cand, sizeof cand, "%s%s", g_content[i], abs + rl);
+        if (access(cand, F_OK) == 0) {
+            if (kl_env_on("KL_TRACE_CONTENT", 0))
+                fprintf(stderr, "  [glibc] content: %s -> %s\n", path, cand);
+            snprintf(buf, cap, "%s", cand);
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+static void setup_root(void) {
+    char tmp[1100], exe_dir[1024];
+    snprintf(exe_dir, sizeof exe_dir, "%s", g_entry);
+    char *slash = strrchr(exe_dir, '/');
+    if (slash) *slash = 0;
+    snprintf(tmp, sizeof tmp, "%s/../..", exe_dir);
+    char *rp = realpath(tmp, NULL);
+    snprintf(g_root, sizeof g_root, "%s", rp ? rp : tmp);
+    free(rp);
+    g_ncontent = 0;
+    const char *c = getenv("KL_GLIBC_CONTENT");
+    if (c && *c) {
+        char list[4096];
+        snprintf(list, sizeof list, "%s", c);
+        for (char *save = NULL, *t = strtok_r(list, ":", &save); t && g_ncontent < 4;
+             t = strtok_r(NULL, ":", &save)) {
+            char *r2 = realpath(t, NULL);
+            snprintf(g_content[g_ncontent++], sizeof g_content[0], "%s", r2 ? r2 : t);
+            free(r2);
+        }
+    }
+    kl_set_guest_path_hook(content_overlay);
+}
+
+int kl_glibc_load(FILE *out, int run) {
     if (out) { fprintf(out, "=== %s (entry) ===\n", g_entry); fflush(out); }
     g_failed = 0;
-    g_entry_img = kl_load_chain(g_entry, 0);
+    if (run) {
+        setup_root();
+        // hlvr.sh's environment: cd to the root, and case-insensitive path
+        // matching for loose files.
+        // Host paths that are relative to the repo stop resolving once we
+        // chdir: pin them first. (MoltenVK is found as
+        // vendor-moltenvk/out/macos relative to the cwd by default.)
+        if (!getenv("KL_MVK_DIR") && !getenv("KL_MVK_DYLIB")) {
+            char *mv = realpath("vendor-moltenvk/out/macos", NULL);
+            if (mv) { setenv("KL_MVK_DIR", mv, 1); free(mv); }
+        }
+        if (chdir(g_root) != 0)
+            fprintf(stderr, "  [glibc] chdir(%s): %s\n", g_root, strerror(errno));
+        setenv("ENABLE_PATHMATCH", "1", 0);
+        if (out) {
+            fprintf(out, "  game root: %s\n", g_root);
+            for (int i = 0; i < g_ncontent; i++)
+                fprintf(out, "  content overlay: %s\n", g_content[i]);
+        }
+        // As ld.so would: the executable's DT_NEEDED closure, constructors run
+        // dependencies-first with (argc, argv, envp), the executable's own last.
+        // Everything else arrives through the engine's own dlopen calls.
+        build_args();
+        kl_set_init_args(g_argc, g_argv, g_envp);
+        if (out) { fprintf(out, "  constructors run as the chain maps (argv:");
+                   for (int i = 0; i < g_argc; i++) fprintf(out, " %s", g_argv[i]);
+                   fprintf(out, ")\n"); fflush(out); }
+    }
+    g_entry_img = kl_load_chain(g_entry, run);
     if (!g_entry_img) {
         fprintf(stderr, "  [glibc] FAILED to map the entry %s: %s\n", g_entry, kl_error());
         return fail("entry did not map: %s", kl_error());
@@ -231,7 +414,7 @@ int kl_glibc_load(FILE *out) {
     // executable's own closure (mimalloc + libstdc++) is a tiny fraction of
     // what will run. A versioned twin (libavcodec.so beside
     // libavcodec.so.58.91.100) is the same soname and is loaded once.
-    if (strcmp(kl_env_str("KL_GLIBC_ROOTS", "all"), "entry") != 0) {
+    if (!run && strcmp(kl_env_str("KL_GLIBC_ROOTS", "all"), "entry") != 0) {
         for (unsigned i = 0; i < g_nidx; i++) {
             const ent *e = &g_idx[i];
             if (e->dir >= g_nmoddirs || !has_so(e->file)) continue;
@@ -282,6 +465,7 @@ int kl_glibc_load(FILE *out) {
         fprintf(out, "  chain mapped: %d images, %.1f MiB, %u TLSDESC + %u TLS_TPREL64 "
                      "relocations, %u root(s) failed\n", n, mb, tlsdesc, tprel, g_failed);
         kl_tls_report(out);
+        kl_x18_report(out);
         fflush(out);
     }
     return g_failed ? fail("%s", "some libraries did not map/relocate (see FAILED above)") : 0;
@@ -584,18 +768,64 @@ unsigned kl_glibc_gap(FILE *out) {
     return (unsigned)nr;
 }
 
+// The guest's main thread: a host pthread with a Linux-sized stack, entered at
+// _start with a kernel-shaped argc/argv/envp/auxv block (klg_enter).
+void klg_enter(void *entry, const uint64_t *block, size_t nwords);
+static volatile int g_main_running;
+
+static void *glibc_main_thread(void *arg) {
+    (void)arg;
+    kl_thread_init();                       // canary + static TLS seed
+    pthread_setname_np("hlvr-main");
+    size_t nenv = 0;
+    while (g_envp && g_envp[nenv]) nenv++;
+    size_t n = 1 + (size_t)g_argc + 1 + nenv + 1 + 2;
+    uint64_t *blk = calloc(n, sizeof *blk);
+    size_t k = 0;
+    blk[k++] = (uint64_t)g_argc;
+    for (int i = 0; i < g_argc; i++) blk[k++] = (uint64_t)(uintptr_t)g_argv[i];
+    blk[k++] = 0;
+    for (size_t i = 0; i < nenv; i++) blk[k++] = (uint64_t)(uintptr_t)g_envp[i];
+    blk[k++] = 0;
+    blk[k++] = 0;                           // AT_NULL
+    blk[k++] = 0;
+    g_main_running = 1;
+    klg_enter(kl_image_entry(g_entry_img), blk, k);
+    return NULL;                            // not reached: _start ends in exit()
+}
+
 int kl_glibc_begin(FILE *out) {
-    (void)out;
-    // Phase B: the init arrays (libstdc++ and tier0 first), then the entry —
-    // hlvr's e_entry is _start, which hands main to __libc_start_main, so the
-    // shim for that one function is the whole front door.
-    return fail("%s", "the glibc door stops at the gap: running init arrays and "
-                      "_start is not implemented yet (phase B)");
+    if (!g_entry_img || !kl_image_entry(g_entry_img))
+        return fail("%s", "no entry point: the executable did not map");
+    if (out) {
+        size_t off = 0;
+        kl_addr_image(kl_image_entry(g_entry_img), &off);
+        fprintf(out, "  entering _start (%s+0x%zx) on a new thread\n",
+                strrchr(g_entry, '/') ? strrchr(g_entry, '/') + 1 : g_entry, off);
+        fflush(out);
+    }
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    // Linux gives the main thread 8 MB and grows it; Source 2 is used to that.
+    pthread_attr_setstacksize(&a, (size_t)kl_env_uint("KL_GLIBC_STACK_MB", 64) << 20);
+    pthread_t t;
+    int r = pthread_create(&t, &a, glibc_main_thread, NULL);
+    pthread_attr_destroy(&a);
+    if (r != 0) return fail("%s", "could not create the guest main thread");
+    pthread_detach(t);
+    return 0;
 }
 
 double kl_glibc_pump(double seconds, const volatile int *quit) {
-    (void)seconds; (void)quit;
-    return 0.0;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double el = 0;
+    while ((!quit || !*quit) && (seconds < 0 || el < seconds)) {
+        usleep(100 * 1000);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        el = (double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+    }
+    return el;
 }
 
 void kl_glibc_report(FILE *out) {

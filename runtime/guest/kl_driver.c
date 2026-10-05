@@ -413,7 +413,7 @@ static int boot_glibc(FILE *out) {
     // Mapped and relocated in full, nothing run. A library that failed to map
     // is reported and the census still printed: the gap is most useful exactly
     // when the chain is incomplete.
-    int rc = kl_glibc_load(out);
+    int rc = kl_glibc_load(out, !g_gap_only);
     char err[512];
     snprintf(err, sizeof err, "%s", kl_glibc_error());
     kl_glibc_gap(out);
@@ -640,7 +640,7 @@ static int begin_native(FILE *out) {
 
 static int begin_glibc(FILE *out) {
     phase("glibc begin");
-    P(out, "\n=== glibc: init arrays + _start ===\n");
+    P(out, "\n=== glibc: _start ===\n");
     if (kl_glibc_begin(out) != 0) return fail(kl_glibc_error());
     return 0;
 }
@@ -717,6 +717,7 @@ double kl_driver_pump_default(void) {
                                   ? strtod(getenv("KL_UE4_WAIT"), NULL) : 5.0;
     case KL_GUEST_JKXR:      return kl_env_str("KL_JKXR_WAIT", NULL)
                                   ? strtod(getenv("KL_JKXR_WAIT"), NULL) : 5.0;
+    case KL_GUEST_GLIBC:     return (double)kl_env_uint("KL_GLIBC_WAIT", 30);
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
     case KL_GUEST_GLES3JNI:  return kl_env_str("KL_NATIVE_WAIT", NULL)

@@ -2259,8 +2259,20 @@ void *(*kl_shim_override)(const char *name);
 static kl_image *g_guest_gl;
 void kl_shim_set_guest_gl(kl_image *img) { g_guest_gl = img; }
 
+// Tier 0.5: an ABI tier a door installs ahead of the bionic table — the glibc
+// door's (kl_glibc_shim.c), for names whose glibc meaning differs from
+// bionic's. NULL for every Android guest, so this costs them one test.
+static void *(*g_abi_lookup)(const char *name);
+void kl_set_abi_lookup(void *(*fn)(const char *name)) { g_abi_lookup = fn; }
+
 void *kl_shim_lookup(const char *name) {
     if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
+    if (g_abi_lookup) { void *a = g_abi_lookup(name); if (a) return a; }
+    return kl_shim_lookup_base(name);
+}
+
+// ...and the bionic answer alone, for the ABI tier's own aliases.
+void *kl_shim_lookup_base(const char *name) {
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
     // Tier 4: the NDK surface lives in its own table — it is a different

@@ -23,7 +23,7 @@
 // 64 held every bionic chain with room to spare; the glibc door maps the whole
 // game tree plus the runtime sysroot it pulls in, which is ~90 images.
 #define KL_MAX_IMAGES 256
-typedef struct { char soname[128]; kl_image *img; } entry;
+typedef struct { char soname[128]; kl_image *img; char *path; } entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
 static char   g_libdir[512] = ".";
@@ -93,6 +93,9 @@ void kl_register_image(const char *soname, kl_image *img) {
     if (g_nimgs < KL_MAX_IMAGES) {
         snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
         g_imgs[g_nimgs].img = img;
+        // The absolute path, for dladdr's dli_fname under a door that wants
+        // glibc's answer (see klb_dladdr).
+        g_imgs[g_nimgs].path = realpath(soname, NULL);
         g_nimgs++;
     }
     pthread_mutex_unlock(&g_lock);
@@ -321,6 +324,7 @@ int kl_guest_tls_global(const char *name, size_t *modid, uint64_t *off) {
 }
 
 static int (*g_needed_resolver)(const char *name, char *path, size_t cap);
+static void *(*g_dlsym_override)(const char *name, void *real);
 void kl_dl_set_needed_resolver(int (*fn)(const char *name, char *path, size_t cap)) {
     g_needed_resolver = fn;
 }
@@ -394,6 +398,12 @@ kl_image *kl_load_chain(const char *path, int run_init) {
     snprintf(g_walk[g_walk_n++], sizeof g_walk[0], "%s", basename_of(path));
     kl_image *img = load_chain_inner(path, run_init);
     g_walk_n--;
+    // The walk is over: give imports a dependency cycle hid their second
+    // chance (kl_rebind_pending). Only under a door's resolver — the glibc
+    // one, where such cycles exist — because each pass re-asks the whole
+    // registry for every name still missing, which no bionic chain needs.
+    if (img && !g_walk_n && g_needed_resolver)
+        for (int i = 0; i < g_nimgs; i++) kl_rebind_pending(g_imgs[i].img);
     return img;
 }
 
@@ -840,14 +850,40 @@ void *klb_dlopen(const char *path, int flags) {
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> shim-served handle\n", path);
         return (void *)&g_core_shim_handle;
     }
+    char full[1024];
+    // A door with its own soname rules (kl_glibc.c) decides what a name means:
+    // Source 2 dlopens its modules by absolute path built from
+    // /proc/self/exe, by bare name, and by soname (libSDL2-2.0.so.0), and all
+    // three have to land on the one image already mapped for that file.
+    if (g_needed_resolver) {
+        int how;
+        if (strchr(path, '/') && access(path, R_OK) == 0) {
+            snprintf(full, sizeof full, "%s", path);
+            how = KL_NEED_LOAD;
+        } else {
+            how = g_needed_resolver(basename_of(path), full, sizeof full);
+        }
+        if (how == KL_NEED_SHIM) return (void *)&g_core_shim_handle;
+        if (how == KL_NEED_SKIP || how == KL_NEED_MISSING) {
+            snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" %s",
+                     basename_of(path), how == KL_NEED_SKIP ? "not loaded by policy"
+                                                           : "not found");
+            fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> NULL (%s)\n", path,
+                    how == KL_NEED_SKIP ? "not loaded by policy" : "not found");
+            return NULL;
+        }
+        if (how == KL_NEED_LOAD) path = full;
+    }
+
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
     if (found) return found;
 
-    char full[1024];
-    if (strchr(path, '/')) snprintf(full, sizeof full, "%s", path);
-    else                   snprintf(full, sizeof full, "%s/%s", g_libdir, path);
+    if (path != full) {
+        if (strchr(path, '/')) snprintf(full, sizeof full, "%s", path);
+        else                   snprintf(full, sizeof full, "%s/%s", g_libdir, path);
+    }
 
     kl_image *img = kl_load_recursive(full);
     if (!img) {
@@ -970,7 +1006,16 @@ void *klb_dlsym(void *handle, const char *name) {
     if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
               return klb_dlsym_null(name); }
     { void *w = kl_dl_interpose(name, v); if (w) return w; }
+    if (g_dlsym_override) { void *w = g_dlsym_override(name, v); if (w) return w; }
     return v;
+}
+
+// A door's own answer for a symbol the guest fetches from a loaded image with
+// dlsym — the seam for guests that reach a library only that way (Source 2
+// takes SDL's whole API through dlsym). `real` is what the image exports;
+// return NULL to keep it.
+void kl_dl_set_dlsym_override(void *(*fn)(const char *name, void *real)) {
+    g_dlsym_override = fn;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1151,11 @@ int klb_dladdr(const void *addr, kl_dl_info *info) {
     for (int i = 0; i < g_nimgs; i++) {
         uint8_t *b = kl_base(g_imgs[i].img);
         if ((const uint8_t *)addr >= b && (const uint8_t *)addr < b + kl_span(g_imgs[i].img)) {
-            info->dli_fname = g_imgs[i].soname;
+            // bionic answers the soname; glibc the path the object was loaded
+            // from, and Source 2's tier0 derives its install directory from
+            // it (Plat_GetModuleFilename), so the glibc door gets the path.
+            info->dli_fname = g_needed_resolver && g_imgs[i].path ? g_imgs[i].path
+                                                                  : g_imgs[i].soname;
             info->dli_fbase = b;
             info->dli_sname = NULL;      // TODO: reverse-lookup nearest .dynsym entry
             info->dli_saddr = NULL;

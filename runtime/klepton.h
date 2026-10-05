@@ -54,6 +54,11 @@ void       kl_interpose(const char *name, void *fn);
 // Re-bind an image's unresolved imports against guest images loaded after it
 // (a DT_NEEDED cycle leaves some behind). Returns how many slots it patched.
 unsigned   kl_rebind_pending(kl_image *img);
+// (argc, argv, envp) for every constructor kl_run_init calls from now on, and
+// DT_INIT enabled (the glibc door; see kl_image.c).
+void       kl_set_init_args(int argc, char **argv, char **envp);
+// The relocated ELF entry point (e_entry), NULL if none.
+void      *kl_image_entry(kl_image *img);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
 void       kl_run_init(kl_image *img);
 void       kl_unload(kl_image *img);
@@ -112,6 +117,10 @@ const char *const *kl_weak_imports(kl_image *img, unsigned *count);
 // ---- shim ----
 // Resolve a bionic/NDK import by name. Returns NULL if unimplemented.
 void *kl_shim_lookup(const char *name);
+// The bionic table alone, without any ABI tier a door installed in front of it.
+void *kl_shim_lookup_base(const char *name);
+// Install an ABI tier consulted before the bionic table (the glibc door).
+void  kl_set_abi_lookup(void *(*fn)(const char *name));
 // Install the bionic stack-guard canary into Darwin TSD slot 5 for this thread.
 // Must be called on every thread that will execute guest code.
 void  kl_thread_init(void);
@@ -151,6 +160,9 @@ kl_image *kl_load_chain(const char *path, int run_init);
 enum { KL_NEED_DEFAULT = -2, KL_NEED_MISSING = -1, KL_NEED_SHIM = 0,
        KL_NEED_LOAD = 1, KL_NEED_SKIP = 2 };
 void kl_dl_set_needed_resolver(int (*fn)(const char *name, char *path, size_t cap));
+// A door's answer for dlsym(<loaded image>, name), given what the image itself
+// exports; NULL keeps the image's (kl_dl.c).
+void kl_dl_set_dlsym_override(void *(*fn)(const char *name, void *real));
 // Every registered image, in registration (dependencies-first) order.
 int       kl_dl_image_count(void);
 kl_image *kl_dl_image_at(int i, const char **soname);
@@ -185,6 +197,9 @@ void kl_dl_report_images(FILE *f);
 // it; returns `path` unchanged otherwise. Every guest file entry point goes
 // through this — Unity reads its CPU and memory configuration out of procfs.
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
+// A door's path map, consulted after the built-in ones: return the mapped path
+// (written into buf) or NULL to keep it. kl_glibc.c's content overlay.
+void kl_set_guest_path_hook(const char *(*fn)(const char *path, char *buf, size_t cap));
 // Register the APK -> unpacked-tree mapping for raw "<apk>/assets/..." opens
 // (split assets). See the implementation comment in kl_libc.c.
 void kl_guest_path_map(const char *apk, const char *unpacked_dir);

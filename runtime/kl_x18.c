@@ -644,6 +644,18 @@ static uint32_t reenc_adrp(uint32_t w, uint64_t oldpc, uint64_t newpc, int *ok) 
     return (w & ~((0x7ffffu << 5) | (3u << 29))) | ((v >> 2) << 5) | ((v & 3) << 29);
 }
 
+// `adrp rd, target` + `add rd, rd, #:lo12:target`, built at `pc`: the
+// position-independent way to name any address within +/-4 GB, which is what
+// the pool needs wherever the original used a 1 MB `adr`. Two words into out.
+static int enc_adrp_add(unsigned rd, uint64_t pc, uint64_t target, uint32_t *out) {
+    int64_t d = ((int64_t)(target & ~0xFFFULL) - (int64_t)(pc & ~0xFFFULL)) >> 12;
+    if (d < -(1LL << 20) || d >= (1LL << 20)) return 0;
+    uint32_t v = (uint32_t)((uint64_t)d & 0x1fffff);
+    out[0] = 0x90000000u | ((v & 3) << 29) | ((v >> 2) << 5) | rd;
+    out[1] = 0x91000000u | ((uint32_t)(target & 0xFFF) << 10) | (rd << 5) | rd;
+    return 1;
+}
+
 static uint64_t br_target(uint32_t w, uint64_t pc, unsigned kind) {
     int64_t imm = (kind == KLX_PC_CBZ) ? (int64_t)((w >> 5) & 0x7ffff)
                                        : (int64_t)((w >> 5) & 0x3fff);
@@ -849,6 +861,119 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             w[i] = patch;
             st->patched++;
             continue;
+        }
+
+        // Three shapes GCC-built (glibc) guests use x18 in, and which the
+        // general veneer below cannot express. Bionic-era clang never emitted
+        // them, so all three were refusals until Half-Life: Alyx (79 sites).
+        //
+        // `blr x18` — GCC treats x18 as an ordinary temporary and calls
+        // through it. Same shape as the `br x18` case above, with the return
+        // address set FIRST, pc-relatively, to the instruction after the site,
+        // so the callee returns to the guest and an unwinder walking through
+        // the call sees the guest's own pc, not a pool address:
+        //
+        //      adrp x30, site+4 ; add x30, x30, :lo12:site+4
+        //      mrs  x18, tpidrro_el0 ; ldr x18, [x18, #slot*8] ; br x18
+        //
+        // x30 is the blr's own output, so writing it early clobbers nothing.
+        // The one-instruction window before `br` is the same one the `br x18`
+        // case documents, and kl_fault.c's window recovery covers both.
+        if (word == 0xD63F0240u) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = out + VEN_MAX_INSN <= pool_end;
+            if (ok) ok = enc_adrp_add(30, vpc, spc + 4, body);
+            k = 2;
+            body[k++] = enc_mrs_tpidrro(18);
+            body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = 0xD61F0240u;               // br x18
+            if (ok) ok = enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // `stp xT, x18, [sp, #-n]!` / `ldp xT, x18, [sp], #n` — a prologue and
+        // epilogue saving x18 like any callee-saved pair. The general veneer
+        // spills scratch registers to the stack, which it cannot do around an
+        // instruction that moves sp itself, so these are rebuilt around xT
+        // (the stp's xT is already saved by then; the ldp's is about to be
+        // overwritten) and, for the restore, one spilled scratch:
+        //
+        //   stp:  stp xT, xzr, [sp, #-n]! ; mrs xT, tpidrro_el0
+        //         ldr xT, [xT, #slot*8] ; str xT, [sp, #8] ; ldr xT, [sp]
+        //   ldp:  ldr xT, [sp, #8] ; str xS, [sp, #-16]! ; mrs xS, tpidrro_el0
+        //         str xT, [xS, #slot*8] ; ldr xS, [sp], #16 ; ldr xT, [sp], #n
+        {
+            unsigned rt = word & 31u, rn = (word >> 5) & 31u, rt2 = (word >> 10) & 31u;
+            int stp_pre = (word & 0xFFC00000u) == 0xA9800000u;
+            int ldp_post = (word & 0xFFC00000u) == 0xA8C00000u;
+            if ((stp_pre || ldp_post) && rn == 31 && rt2 == 18 && rt != 18 && rt != 31 &&
+                out + VEN_MAX_INSN <= pool_end) {
+                int32_t imm7 = (int32_t)((word >> 15) & 0x7f);
+                imm7 = (imm7 << 25) >> 25;
+                uint32_t body[VEN_MAX_INSN], patch;
+                unsigned k = 0;
+                if (stp_pre) {
+                    body[k++] = (word & ~(31u << 10)) | (31u << 10);      // xzr in x18's place
+                    body[k++] = enc_mrs_tpidrro(rt);
+                    body[k++] = enc_ldr(rt, rt, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = enc_str(rt, 31, 8);
+                    body[k++] = enc_ldr(rt, 31, 0);
+                } else {
+                    unsigned sc = rt == 16 ? 17 : 16;
+                    body[k++] = enc_ldr(rt, 31, 8);
+                    body[k++] = 0xF8000C00u | ((uint32_t)(-16 & 0x1ff) << 12) | (31u << 5) | sc;
+                    body[k++] = enc_mrs_tpidrro(sc);
+                    body[k++] = enc_str(rt, sc, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = 0xF8400400u | (16u << 12) | (31u << 5) | sc;
+                    body[k++] = 0xF8400400u | ((uint32_t)((imm7 * 8) & 0x1ff) << 12) | (31u << 5) | rt;
+                }
+                int ok = enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                if (ok) ok = enc_b(spc, vpc, &patch);
+                if (ok) {
+                    memcpy(out, body, k * 4);
+                    out += k;
+                    w[i] = patch;
+                    st->patched++;
+                    continue;
+                }
+            }
+        }
+
+        // `adr x18, label`: the general veneer with the adr rebuilt as an
+        // adrp/add pair, since the pool is generally out of adr's 1 MB reach.
+        if (in.pcrel == KLX_PC_ADR && !in.hazard && (word & 31u) == 18 &&
+            out + VEN_MAX_INSN <= pool_end) {
+            int64_t imm = (int64_t)((((word >> 5) & 0x7ffff) << 2) | ((word >> 29) & 3));
+            imm = (imm << 43) >> 43;
+            uint64_t target = spc + (uint64_t)imm;
+            unsigned a, b2;
+            pick_scratch(in.gp_used, &a, &b2);
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            body[k++] = enc_stp(a, b2, -16);
+            int ok = enc_adrp_add(b2, vpc + k * 4, target, body + k); k += 2;
+            body[k++] = enc_mrs_tpidrro(a);
+            body[k++] = enc_str(b2, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_ldp(a, b2, -16);
+            if (ok) { ok = enc_b(vpc + k * 4, spc + 4, &body[k]); k++; }
+            if (ok) ok = enc_b(spc, vpc, &patch);
+            if (ok) {
+                memcpy(out, body, k * 4);
+                out += k;
+                w[i] = patch;
+                st->patched++;
+                continue;
+            }
         }
 
         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||

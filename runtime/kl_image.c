@@ -116,6 +116,7 @@ struct kl_image {
     const char *strtab;
     void     (**init_array)(void);
     size_t     init_count;
+    void     (*dt_init)(void);   // DT_INIT, run only when kl_set_init_args enabled it
     kl_stats   stats;
     char       path[512];
     const char **missing;      // unique unresolved import names
@@ -648,6 +649,7 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
             case DT_RELASZ: relasz = dp->d_val; break;
             case DT_JMPREL: jmprel = (const Elf64_Rela *)(img->base + dp->d_val); break;
             case DT_PLTRELSZ: pltsz = dp->d_val; break;
+            case 12 /* DT_INIT */: img->dt_init = (void (*)(void))(img->base + dp->d_val); break;
             case DT_INIT_ARRAY:   img->init_array = (void (**)(void))(img->base + dp->d_val); break;
             case DT_INIT_ARRAYSZ: img->init_count = dp->d_val / sizeof(void *); break;
             case DT_RELR:
@@ -1372,9 +1374,35 @@ unsigned kl_rebind_pending(kl_image *img) {
     return fixed;
 }
 
+// What a constructor is called with. glibc's ld.so (and bionic's linker) pass
+// (argc, argv, envp) to DT_INIT and every DT_INIT_ARRAY entry, and glibc-built
+// libraries do read them (libstdc++'s and glib's do not, but SDL's and
+// tier0's command-line capture may). Unset — every Android door — passes
+// zeros, which is no worse than the garbage the bare call used to leave in
+// x0-x2. DT_INIT itself runs only once a door has asked for this: no bionic
+// guest has relied on it, and it is not a change to make for them on the side.
+static int    g_init_argc;
+static char **g_init_argv, **g_init_envp;
+static int    g_run_dt_init;
+void kl_set_init_args(int argc, char **argv, char **envp) {
+    g_init_argc = argc; g_init_argv = argv; g_init_envp = envp;
+    g_run_dt_init = 1;
+}
+
 void kl_run_init(kl_image *img) {
+    typedef void (*ctor)(int, char **, char **);
+    if (g_run_dt_init && img->dt_init)
+        ((ctor)img->dt_init)(g_init_argc, g_init_argv, g_init_envp);
     for (size_t i = 0; i < img->init_count; i++)
-        if (img->init_array[i]) img->init_array[i]();
+        if (img->init_array[i] && img->init_array[i] != (void (*)(void))(intptr_t)-1)
+            ((ctor)img->init_array[i])(g_init_argc, g_init_argv, g_init_envp);
+}
+
+// The ELF header's entry point, relocated — a PIE executable's _start.
+void *kl_image_entry(kl_image *img) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img->base;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || !eh->e_entry) return NULL;
+    return img->base + eh->e_entry;
 }
 
 // DT_GNU_HASH lookup: the bloom filter, then one bucket's chain. Only defined

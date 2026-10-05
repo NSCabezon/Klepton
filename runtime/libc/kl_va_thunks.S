@@ -126,3 +126,56 @@ _\name:
 KL_LDTHUNK klv_strtold,   strtod
 KL_LDTHUNK klv_wcstold,   wcstod
 KL_LDTHUNK klv_strtold_l, strtod_l
+
+// ---- glibc guests (kl_glibc_shim.c) ----
+// The fortified printf family carries an extra named `flag` argument before the
+// format, which only moves where the variadic part starts.
+KL_VTHUNK klv___printf_chk,       klg___printf_chk,      2
+KL_VTHUNK klv___fprintf_chk,      klg___fprintf_chk,     3
+KL_VTHUNK klv___asprintf_chk,     klg___asprintf_chk,    3
+KL_VTHUNK klv___dprintf_chk,      klg___dprintf_chk,     3
+KL_VTHUNK klv___syslog_chk,       klg___syslog_chk,      3
+KL_VTHUNK klv_g_err,              klg_err,               2
+KL_VTHUNK klv_g_errx,             klg_errx,              2
+KL_VTHUNK klv_g_warn,             klg_warn,              1
+
+// glibc's _setjmp/setjmp never save the signal mask, but every longjmp flavour
+// a glibc guest calls is bound to Darwin's siglongjmp (glibc's own longjmp
+// restores the mask iff the buffer saved one). siglongjmp reads its "saved a
+// mask" flag from the int after Darwin's _JBLEN (48 ints) — a word _setjmp
+// never writes — so zero it first and tail-branch: no frame of ours may sit
+// between the guest and the real _setjmp, or longjmp would return into it.
+// glibc's jmp_buf is 312 bytes, so the flag word (offset 192) is the guest's.
+    .globl _klg_setjmp
+    .p2align 2
+_klg_setjmp:
+    str     wzr, [x0, #192]
+    b       __setjmp
+
+// void klg_enter(void *entry, const uint64_t *block, size_t nwords)
+//
+// Enter a glibc executable's _start the way the kernel does: sp pointing at
+// argc, then argv[], NULL, envp[], NULL, auxv pairs — `block`, copied onto the
+// top of the CURRENT stack (a host thread made for it, so the guest's main
+// thread has a real pthread under it) — x0 = rtld_fini (none), and no frame
+// to return to. _start never returns; it ends in exit() or abort().
+    .globl _klg_enter
+    .p2align 2
+_klg_enter:
+    mov     x16, x0
+    add     x3, x2, #1
+    and     x3, x3, #0xfffffffffffffffe   // whole 16-byte units: sp stays aligned
+    lsl     x3, x3, #3
+    sub     sp, sp, x3
+    mov     x4, sp
+    mov     x5, #0
+1:  cmp     x5, x2
+    b.hs    2f
+    ldr     x6, [x1, x5, lsl #3]
+    str     x6, [x4, x5, lsl #3]
+    add     x5, x5, #1
+    b       1b
+2:  mov     x0, #0
+    mov     x29, #0
+    mov     x30, #0
+    br      x16

@@ -1,6 +1,7 @@
 #ifndef KL_GLIBC_H
 #define KL_GLIBC_H
 #include <stdio.h>
+#include <stddef.h>
 
 // A Linux (glibc) AArch64 guest — the first one is Half-Life: Alyx's
 // linuxsteamrtarm64 build. Not an APK: no Java, no NativeActivity, no bionic.
@@ -30,9 +31,13 @@
 int         kl_glibc_configure(const char *target, const char *libdir,
                                const char *entry, FILE *out);
 const char *kl_glibc_error(void);
-int         kl_glibc_load(FILE *out);    // map + relocate everything, run nothing
+// run 0: map + relocate the whole tree, run nothing (the gap census).
+// run 1: the entry's closure only, constructors run in dependency order.
+int         kl_glibc_load(FILE *out, int run);
 unsigned    kl_glibc_gap(FILE *out);     // grouped unresolved imports + file
-int         kl_glibc_begin(FILE *out);   // phase B: not yet — fails by name
+int         kl_glibc_begin(FILE *out);   // _start on a new thread (main via __libc_start_main)
 double      kl_glibc_pump(double seconds, const volatile int *quit);
 void        kl_glibc_report(FILE *out);
+// The interposer that puts --jitless (KL_V8_FLAGS) in front of V8's flags.
+void        klg_v8_set_flags(const char *flags, size_t len);
 #endif

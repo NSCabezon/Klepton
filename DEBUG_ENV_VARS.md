@@ -2115,6 +2115,19 @@ nothing, and prints the unresolved imports grouped by category.
   `build/<target>_gap.txt`).
 - `KL_TRACE_TLS=1` — one line per registered ELF TLS module (template size,
   .tbss, alignment).
+- `KL_GLIBC_ARGS="<args>"` — the guest's command line after argv[0] (default
+  `-novr -vulkan -console +sv_cheats 1`: a desktop boot with no headset).
+- `KL_GLIBC_CONTENT=<dir>[:<dir>...]` — directories laid out like the game
+  root, searched for any path under the root that the install does not have
+  (the content depot, or a hand-made `hlvr/gameinfo.gi`). The install itself
+  is never written to. `KL_TRACE_CONTENT=1` logs each redirected path.
+- `KL_GLIBC_STACK_MB=<n>` — the guest main thread's stack (default 64).
+- `KL_GLIBC_WAIT=<s>` — how long the host driver lets the guest run after
+  `_start` before reporting (default 30).
+- `KL_V8_FLAGS="<flags>"` — what is passed to V8's SetFlagsFromString ahead of
+  Panorama's own flags (default `--jitless`).
+- `KL_TRACE_DLSYM=1` — every symbol the guest fetches from a loaded image with
+  dlsym (Source 2 takes all of SDL that way).
 
 ## Spikes (`spikes/`)
 
