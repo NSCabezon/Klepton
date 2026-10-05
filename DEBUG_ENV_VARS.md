@@ -2149,7 +2149,9 @@ nothing, and prints the unresolved imports grouped by category.
   entry points to the guest's own library (which looks for a SteamVR install
   and fails). With it on (default), `-vr` boots against Klepton's runtime: HMD
   + two Touch-style controllers from kl_ovrp, frames filed through the same
-  compositor seams as OpenXR. `KL_TRACE_OPENVR=1` logs action bindings;
+  compositor seams as OpenXR. `KL_TRACE_OPENVR=1` logs action bindings,
+  the first read of each digital action and every change after it, the
+  start-of-session events PollNextEvent hands out, and SuspendRendering;
   `KL_OPENVR_EYE_W` / `_H` set the render-target size when no frontend has.
 - `KL_GLIBC_MANIFEST=<path>` — where a `--gap` run writes the packaging
   manifest ("<framework stem>\t<source path>" per mapped image; default

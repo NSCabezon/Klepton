@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include "klepton.h"
@@ -336,8 +337,32 @@ static uint32_t sys_prop_array(void *s, uint32_t dev, int prop, uint32_t tag, vo
     return 0;
 }
 static const char *sys_prop_err_name(void *s, int e) { (void)s; return e ? "TrackedProp_UnknownProperty" : "TrackedProp_Success"; }
-static int sys_poll(void *s, void *ev, uint32_t n) { (void)s; (void)ev; (void)n; return 0; }
-static int sys_poll_pose(void *s, int o, void *ev, uint32_t n, void *p) { (void)s; (void)o; (void)ev; (void)n; (void)p; return 0; }
+// Events: what a freshly started SteamVR session tells a scene app once —
+// every device activated, the user interacting with the headset (worn), and
+// nobody else holding input focus or the dashboard. VREvent_t is packed 4 on
+// Linux: type, device, age, then the data union at +12.
+static const struct { uint32_t type, dev; } k_start_events[] = {
+    { 100, DEV_HMD }, { 100, DEV_LEFT }, { 100, DEV_RIGHT },        // TrackedDeviceActivated
+    { 103, DEV_HMD },                                                // TrackedDeviceUserInteractionStarted
+    { 401, 0xFFFFFFFFu },                                            // InputFocusReleased
+    { 503, 0xFFFFFFFFu },                                            // DashboardDeactivated
+};
+static _Atomic int g_ev_next;
+static int sys_poll(void *s, void *ev, uint32_t n) {
+    (void)s;
+    if (!ev || n < 12) return 0;
+    int i = atomic_fetch_add(&g_ev_next, 1);
+    if (i >= (int)(sizeof k_start_events / sizeof *k_start_events)) {
+        atomic_store(&g_ev_next, 64);
+        return 0;
+    }
+    memset(ev, 0, n);
+    uint32_t *e = ev;
+    e[0] = k_start_events[i].type; e[1] = k_start_events[i].dev;
+    TRACE("PollNextEvent -> %u (device %d)\n", e[0], (int)e[1]);
+    return 1;
+}
+static int sys_poll_pose(void *s, int o, void *ev, uint32_t n, void *p) { (void)o; (void)p; return sys_poll(s, ev, n); }
 static HiddenAreaMesh_t sys_hidden(void *s, int eye, int type) { (void)s; (void)eye; (void)type; return (HiddenAreaMesh_t){ NULL, 0 }; }
 static const char *sys_runtime_version(void *s) { (void)s; return "2.5.1"; }
 static int sys_set_sdk(void *s, uint32_t maj, uint32_t min, uint32_t build) {
@@ -567,6 +592,20 @@ static int co_submit_array(void *s, int eye, const Texture_t *tex, uint32_t idx,
     return co_submit_impl(eye, tex, b);
 }
 static void co_void(void *s) { (void)s; }
+// Fades and the grid are the compositor's to draw, and there is no compositor
+// layer for them here: both read as fully clear. Typed, because a float or an
+// HmdColor_t comes back in s0-s3 and a generic stub leaves those as garbage.
+typedef struct { float r, g, b, a; } HmdColor_t;
+static HmdColor_t co_fade_color(void *s, int background) { (void)s; (void)background; return (HmdColor_t){ 0, 0, 0, 0 }; }
+static float co_grid_alpha(void *s) { (void)s; return 0.0f; }
+static void co_fade_to(void *s, float t, float r, float g, float b, float a, int bg) {
+    (void)s; (void)t; (void)r; (void)g; (void)b; (void)a; (void)bg;
+}
+static void co_fade_grid(void *s, float t, int in) { (void)s; (void)t; (void)in; }
+static void co_suspend(void *s, int on) {
+    (void)s;
+    TRACE("SuspendRendering(%d)\n", on);
+}
 static int co_false(void *s) { (void)s; return 0; }
 static int co_true(void *s) { (void)s; return 1; }
 static float co_time_remaining(void *s) { (void)s; return 0.005f; }
@@ -624,7 +663,12 @@ static const bind k_bind[] = {
 };
 
 #define MAX_ACTIONS 256
-typedef struct { char name[128]; int src, hand; int prev[2]; } action;
+// prev/cur/seen per restriction (any, left, right): bChanged is "since the
+// previous UpdateActionState", not "since the previous read", so the state a
+// read compares against is the one latched at the last update. Per-read made a
+// press read as changed on every call once the guest asked for both hands.
+typedef struct { char name[128]; int src, hand; int prev[3], cur[3]; unsigned seen[3]; int polled; } action;
+static unsigned g_update_n;
 static action g_actions[MAX_ACTIONS];
 static int g_nactions;
 static char g_sets[32][96];
@@ -682,6 +726,7 @@ static int in_source_handle(void *s, const char *path, uint64_t *h) {
 }
 static int in_update(void *s, const VRActiveActionSet_t *sets, uint32_t size, uint32_t n) {
     (void)s; (void)sets; (void)size; (void)n;
+    g_update_n++;
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     g_input_time = (float)t.tv_sec + (float)t.tv_nsec * 1e-9f;
     return 0;
@@ -767,14 +812,24 @@ static int in_digital(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t r
         read_src(a->src, hs[i], &o, &x, &y);
         if (o && !on) { on = 1; src_hand = hs[i]; }
     }
-    int slot = restrict_to == H_SOURCE_RIGHT ? 1 : 0;
+    int slot = restrict_to == H_SOURCE_RIGHT ? 2 : restrict_to == H_SOURCE_LEFT ? 1 : 0;
     d[0] = 1;                                                         // bActive
     uint64_t origin = src_hand ? H_SOURCE_RIGHT : H_SOURCE_LEFT;
     memcpy(d + 8, &origin, 8);
     d[16] = (uint8_t)on;
+    if (a->seen[slot] != g_update_n) {               // first read since an update
+        a->prev[slot] = a->cur[slot];
+        a->seen[slot] = g_update_n;
+    }
+    a->cur[slot] = on;
     d[17] = (uint8_t)(on != a->prev[slot]);
-    a->prev[slot] = on;
     float ut = 0; memcpy(d + 20, &ut, 4);
+    if (!a->polled || (d[17] && kl_env_on("KL_TRACE_OPENVR", 0))) {
+        a->polled = 1;
+        TRACE("digital %s%s: state %d changed %d\n", a->name,
+              restrict_to == H_SOURCE_LEFT ? " (left)" : restrict_to == H_SOURCE_RIGHT ? " (right)" : "",
+              d[16], d[17]);
+    }
     return 0;
 }
 static int in_analog(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t restrict_to) {
@@ -974,6 +1029,9 @@ static const impl g_impl[] = {
     { COMP, "WaitGetPoses", (void *)co_wait_get_poses }, { COMP, "GetLastPoses", (void *)co_last_poses },
     { COMP, "GetLastPoseForTrackedDeviceIndex", (void *)co_last_pose_idx },
     { COMP, "Submit", (void *)co_submit }, { COMP, "SubmitWithArrayIndex", (void *)co_submit_array },
+    { COMP, "FadeToColor", (void *)co_fade_to }, { COMP, "GetCurrentFadeColor", (void *)co_fade_color },
+    { COMP, "FadeGrid", (void *)co_fade_grid }, { COMP, "GetCurrentGridAlpha", (void *)co_grid_alpha },
+    { COMP, "SuspendRendering", (void *)co_suspend },
     { COMP, "ClearLastSubmittedFrame", (void *)co_void }, { COMP, "PostPresentHandoff", (void *)co_void },
     { COMP, "GetFrameTiming", (void *)co_false }, { COMP, "GetFrameTimeRemaining", (void *)co_time_remaining },
     { COMP, "IsFullscreen", (void *)co_true }, { COMP, "CanRenderScene", (void *)co_true },

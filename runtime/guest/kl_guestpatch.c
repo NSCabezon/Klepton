@@ -466,10 +466,34 @@ static const kl_gp_word k_alyx_lua_low4g[] = {
     { 0x4dfd8, 0x540005a8, 0xd503201f, "NOP the below-2GB check on the Lua arena" },
 };
 
+// Half-Life: Alyx (linuxsteamrtarm64), libclient.so — the startup map's pause.
+//
+// After the startup map loads, the main-menu controller counts frames and then
+// pauses the game under the menu:
+//
+//   0xf81bd8  ldr  w1, [x0, #0x78]   ; frames left before the pause (-1 after)
+//   0xf81be0  b.le 0xf81c80          ; none armed: skip the countdown
+//   ...       setpause, [x0, #0x98] = 1
+//
+// On SteamVR the pause lands after the map's opening fade has cleared. Here it
+// landed while the fade was still fully opaque, and a paused client never
+// advances its fades, so the VR loading interstitial (which waits for the
+// screen to be anything but solid black, sleeping 100 ms a frame meanwhile)
+// never ended: "Gordon paused the game", then black at ~9 fps forever. Taking
+// the branch unconditionally skips the countdown, so the startup map runs
+// unpaused behind its menu, which is all that map is. The 0x120 path (an
+// explicit pause request) is left as it is.
+static const kl_gp_word k_alyx_startup_nopause[] = {
+    { 0xf81be0, 0x5400050d, 0x14000028, "b.le 0xf81c80 -> b 0xf81c80 (skip the startup-pause countdown)" },
+};
+
 static const kl_gp_patch k_patches[] = {
     { "alyx-lua-arena-anywhere", "libvscript.so",
       "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
       k_alyx_lua_low4g, sizeof k_alyx_lua_low4g / sizeof *k_alyx_lua_low4g },
+    { "alyx-startup-no-pause", "libclient.so",
+      "the startup map is not paused under its menu while its fade is still opaque",
+      k_alyx_startup_nopause, sizeof k_alyx_startup_nopause / sizeof *k_alyx_startup_nopause },
 
     // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
     // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
