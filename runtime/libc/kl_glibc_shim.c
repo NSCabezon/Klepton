@@ -242,12 +242,16 @@ typedef struct {
 _Static_assert(sizeof(klg_stat) == 128, "glibc aarch64 struct stat");
 static int klg_lstat(const char *p, klg_stat *b) {
     if (p && !strcmp(p, "/proc/self/exe") && g_exe_path[0]) {
-        int r = klb_lstat(g_exe_path, b);
-        if (r == 0) {
-            b->st_mode = (b->st_mode & ~0170000u) | 0120000u | 0777u;   // S_IFLNK
-            b->st_size = (int64_t)strlen(g_exe_path);
-        }
-        return r;
+        // The executable need not exist: on device (and in the simulator) every
+        // library, hlvr included, is a framework in the bundle and the libdir
+        // only names where they "live". The link itself is ours, so it is
+        // answered whether or not its target is there — tier0 treats a failed
+        // lstat here as a fatal "Unable to get executable filename".
+        if (klb_lstat(g_exe_path, b) != 0) memset(b, 0, sizeof *b);
+        b->st_mode = (b->st_mode & ~0170000u) | 0120000u | 0777u;      // S_IFLNK
+        b->st_nlink = b->st_nlink ? b->st_nlink : 1;
+        b->st_size = (int64_t)strlen(g_exe_path);
+        return 0;
     }
     return klb_lstat(p, b);
 }

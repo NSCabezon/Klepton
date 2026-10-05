@@ -355,19 +355,27 @@ int kl_app_configure(const char *resources, const char *container) {
     // is the bundle: the log, the heartbeat, the guest thread, the compositor's
     // pacing and the handoff.
     // A glibc guest (Half-Life: Alyx) is laid out like its depot: the game root
-    // is the staged <files>/<stage_files> (hlvr/, core/ — the content), and the
-    // executable "lives" in <root>/bin/linuxsteamrtarm64, which only has to
+    // is the staged <files>/<stage_files>/game (hlvr/, core/ — the content), and
+    // the executable "lives" in <root>/bin/linuxsteamrtarm64, which only has to
     // exist: every library in it is a framework found by stem (KL_DYLIB_DIR),
     // and Source 2 derives its whole install from /proc/self/exe = that path.
     // Writes go to the container (the door's write layer), never the bundle; it
     // boots straight into VR — the OpenVR runtime (kl_openvr.c) presents
     // through Compositor Services' seams, and SDL's window is the synthetic
     // surface because no flat-window backend is registered on device.
+    //
+    // The root is <files>/<name>/game, not <files>/<name>: Source 2 locates its
+    // install by probing upward from the executable for a directory literally
+    // named game/ holding bin/linuxsteamrtarm64 (the depot ships
+    // <install>/game/{bin,core,hlvr}), and then opens <install>/game/hlvr/
+    // gameinfo.gi. With the root one level up, every probe missed and the
+    // engine stopped at "unable to load gameinfo.gi file from directory hlvr".
     if (g_target->kind == KL_GUEST_GLIBC) {
-        snprintf(g_libdir, sizeof g_libdir, "%s/%s/bin/linuxsteamrtarm64", g_files, g_target->name);
         char tmp[1100];
         snprintf(tmp, sizeof tmp, "%s/%s", g_files, g_target->name); mkdir(tmp, 0755);
-        snprintf(tmp, sizeof tmp, "%s/%s/bin", g_files, g_target->name); mkdir(tmp, 0755);
+        snprintf(tmp, sizeof tmp, "%s/%s/game", g_files, g_target->name); mkdir(tmp, 0755);
+        snprintf(tmp, sizeof tmp, "%s/%s/game/bin", g_files, g_target->name); mkdir(tmp, 0755);
+        snprintf(g_libdir, sizeof g_libdir, "%s/%s/game/bin/linuxsteamrtarm64", g_files, g_target->name);
         mkdir(g_libdir, 0755);
         setenv("KL_GLIBC_MODDIRS", g_libdir, 0);
         setenv("KL_GLIBC_SYSROOT", "", 0);

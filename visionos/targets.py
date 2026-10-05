@@ -661,8 +661,8 @@ TARGETS = {
         "obb":     "obb",
         # On device: translated frameworks only (mkguest.sh, from the --gap
         # manifest), the game data staged into the container under the root
-        # stage_files names — <container>/android-files/alyx is laid out like
-        # the depot's game/ directory (hlvr/, core/, plus hlvr/bin and bin/ left
+        # stage_files names — <container>/android-files/alyx/game is laid out
+        # like the depot's game/ directory (hlvr/, core/, plus hlvr/bin and bin/ left
         # empty: the libraries are frameworks), and the door finds its
         # libraries through KL_DYLIB_DIR by stem.
         "stage_files": "alyx",
