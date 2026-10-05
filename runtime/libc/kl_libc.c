@@ -2254,6 +2254,7 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 // so a wakeup cannot slip through the gap.
 #define KL_SYS_futex 98                 // aarch64 Linux
 #define KL_SYS_getrandom 278            // ...and the other one a guest depends on
+#define KL_SYS_tgkill 131
 #define KL_SYS_gettid 178               // ...and the third, via libc++'s guards
 
 enum {
@@ -2594,6 +2595,19 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // different hat: the guard would then compare an id from one door against an
     // id from the other and call every acquisition recursive.
     if (n == KL_SYS_gettid) return klb_gettid();
+
+    // tgkill(getpid(), tid, 0) — "is this thread still alive", which is how
+    // Source 2's libvideo checks its decoder threads before touching their
+    // state (0x114ee0). Refusing it read as "dead", the player tore down a
+    // live thread's context, and a worker faulted at NULL+0x48 when the
+    // intro video started. Signal 0 delivers nothing, so the honest answer
+    // for a thread of this process is yes; actually delivering a signal to a
+    // tid (sig != 0) stays refused.
+    if (n == KL_SYS_tgkill) {
+        if (a3 == 0 && a1 == (long)getpid() && a2 > 0) return 0;
+        errno = ENOSYS;
+        return -1;
+    }
 
     syscall_warn_once(n, __builtin_return_address(0));
     errno = ENOSYS;
