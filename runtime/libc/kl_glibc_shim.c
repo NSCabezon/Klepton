@@ -71,6 +71,7 @@
 #include "kl_glibc_shim.h"
 #include "kl_glibc_sdl.h"
 #include "kl_steam.h"
+#include "kl_openvr.h"
 
 #define LX_ENOSYS 38
 #define LX_ENOENT 2
@@ -998,6 +999,9 @@ void *kl_glibc_lookup(const char *name) {
     // ...and libsteam_api's, for a Steam that is not running (kl_steam.c).
     void *steam = kl_steam_lookup(name);
     if (steam) return steam;
+    // ...and libopenvr_api's, for a SteamVR that is not there (kl_openvr.c).
+    void *ovr = kl_openvr_lookup(name);
+    if (ovr) return ovr;
     for (size_t i = 0; i < sizeof g_glibc / sizeof *g_glibc; i++) {
         const klg_entry *e = &g_glibc[i];
         if (strcmp(e->name, name)) continue;

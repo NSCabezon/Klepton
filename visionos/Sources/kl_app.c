@@ -84,7 +84,8 @@ int kl_app_target_wants_full(void) {
     // cs1/hl2/portal (SDL2). KL_FULL=0 forces .mixed back for development.
     return g_target && (g_target->kind == KL_GUEST_NATIVE ||
                         g_target->kind == KL_GUEST_GLES3JNI ||
-                        g_target->kind == KL_GUEST_SDL2);
+                        g_target->kind == KL_GUEST_SDL2 ||
+                        g_target->kind == KL_GUEST_GLIBC);
 }
 int kl_app_target_owns_frame_loop(void) {
     return g_target ? kl_driver_owns_frame_loop() : 0;
@@ -195,7 +196,8 @@ int kl_app_configure(const char *resources, const char *container) {
     // APK/asset path); only the existence check is skipped.
     int folder_fed = g_target->kind == KL_GUEST_NATIVE   ||
                      g_target->kind == KL_GUEST_GLES3JNI ||
-                     g_target->kind == KL_GUEST_SDL2;
+                     g_target->kind == KL_GUEST_SDL2     ||
+                     g_target->kind == KL_GUEST_GLIBC;
     if (!folder_fed && !have(g_assets))
         return missing("staged assets (run stage_assets.sh)", g_assets);
     if (!folder_fed && !have(g_apk))
@@ -352,6 +354,25 @@ int kl_app_configure(const char *resources, const char *container) {
     // kl_driver's, shared verbatim with `build/m_boot`. What is left in this file
     // is the bundle: the log, the heartbeat, the guest thread, the compositor's
     // pacing and the handoff.
+    // A glibc guest (Half-Life: Alyx) is laid out like its depot: the game root
+    // is the staged <files>/<stage_files> (hlvr/, core/ — the content), and the
+    // executable "lives" in <root>/bin/linuxsteamrtarm64, which only has to
+    // exist: every library in it is a framework found by stem (KL_DYLIB_DIR),
+    // and Source 2 derives its whole install from /proc/self/exe = that path.
+    // Writes go to the container (the door's write layer), never the bundle; it
+    // boots straight into VR — the OpenVR runtime (kl_openvr.c) presents
+    // through Compositor Services' seams, and SDL's window is the synthetic
+    // surface because no flat-window backend is registered on device.
+    if (g_target->kind == KL_GUEST_GLIBC) {
+        snprintf(g_libdir, sizeof g_libdir, "%s/%s/bin/linuxsteamrtarm64", g_files, g_target->name);
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s/%s", g_files, g_target->name); mkdir(tmp, 0755);
+        snprintf(tmp, sizeof tmp, "%s/%s/bin", g_files, g_target->name); mkdir(tmp, 0755);
+        mkdir(g_libdir, 0755);
+        setenv("KL_GLIBC_MODDIRS", g_libdir, 0);
+        setenv("KL_GLIBC_SYSROOT", "", 0);
+        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console", 0);
+    }
     kl_driver_init(g_target, g_libdir, g_door);
     kl_driver_set_phase_hook(app_phase);
     // 120 s, not the driver's 20: there is no shell here to notice a hang and no

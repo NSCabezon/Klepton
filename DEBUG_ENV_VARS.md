@@ -2145,6 +2145,16 @@ nothing, and prints the unresolved imports grouped by category.
   points to the guest's own library (which then looks for a running Steam and
   fails). `KL_TRACE_STEAM=1` logs callback registration and every loopback
   connection state change; `KL_STEAM_NAME` is the persona name (Gordon).
+- `KL_OPENVR=0` — (`runtime/guest/kl_openvr.c`) leave libopenvr_api's VR_*
+  entry points to the guest's own library (which looks for a SteamVR install
+  and fails). With it on (default), `-vr` boots against Klepton's runtime: HMD
+  + two Touch-style controllers from kl_ovrp, frames filed through the same
+  compositor seams as OpenXR. `KL_TRACE_OPENVR=1` logs action bindings;
+  `KL_OPENVR_EYE_W` / `_H` set the render-target size when no frontend has.
+- `KL_GLIBC_MANIFEST=<path>` — where a `--gap` run writes the packaging
+  manifest ("<framework stem>\t<source path>" per mapped image; default
+  `build/<target>_images.txt`), which `visionos/mkguest.sh` and `targets.py`
+  read for a glibc target.
 - `KL_X18_RECOVER=0` — (`runtime/kl_fault.c`) do not "recover" a fault at pc 0
   as an x18-veneer race. In a GCC-built guest x18 is an ordinary scratch
   register, so a genuine call through a NULL pointer looks the same, and

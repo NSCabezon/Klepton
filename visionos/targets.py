@@ -659,6 +659,13 @@ TARGETS = {
         "assets":  "alyx/assets",
         "qtplugins": "",
         "obb":     "obb",
+        # On device: translated frameworks only (mkguest.sh, from the --gap
+        # manifest), the game data staged into the container under the root
+        # stage_files names — <container>/android-files/alyx is laid out like
+        # the depot's game/ directory (hlvr/, core/, plus hlvr/bin and bin/ left
+        # empty: the libraries are frameworks), and the door finds its
+        # libraries through KL_DYLIB_DIR by stem.
+        "stage_files": "alyx",
         "entry":   "hlvr",
         "kind":    "glibc",
         "product": "KleptonAlyx",
@@ -691,6 +698,34 @@ def libs_for(srcdir):
               file=sys.stderr)
         sys.exit(1)
     return libs
+
+
+# A glibc target's library set is not one directory of .so files: it is the
+# game tree, a second game directory and the runtime sysroot, under versioned
+# names. The glibc door already computes it — every `--gap` run writes
+# build/<target>_images.txt, one "<framework stem>\t<source path>" line per
+# image it mapped — so the bundle embeds exactly that set and mkguest.sh
+# translates each line's source. Missing manifest is a hard failure, for the
+# reason libs_for gives: a quietly incomplete bundle is a dlopen on device that
+# cannot fall back to anything.
+def glibc_manifest(name):
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "build", f"{name}_images.txt")
+
+
+def glibc_libs_for(name):
+    path = glibc_manifest(name)
+    try:
+        with open(path) as f:
+            stems = [l.split("\t", 1)[0] for l in f if l.strip()]
+    except OSError:
+        stems = []
+    if not stems:
+        print(f"!! no {path} — run `./build_run_host.sh {name} --gap` first; it "
+              f"writes the list of images this target maps", file=sys.stderr)
+        sys.exit(1)
+    return " ".join(stems)
 
 
 # A bundle id is GLOBAL, so the one in the table is not usable as it stands.
@@ -750,7 +785,7 @@ def resolve(name):
     t["name"] = name
     t["bundle"] = bundle_for(name)
     if t["libs"] is None:
-        t["libs"] = libs_for(t["srcdir"])
+        t["libs"] = glibc_libs_for(name) if t["kind"] == "glibc" else libs_for(t["srcdir"])
     return t
 
 

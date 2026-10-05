@@ -163,12 +163,20 @@ void kl_dl_set_needed_resolver(int (*fn)(const char *name, char *path, size_t ca
 // A door's answer for dlsym(<loaded image>, name), given what the image itself
 // exports; NULL keeps the image's (kl_dl.c).
 void kl_dl_set_dlsym_override(void *(*fn)(const char *name, void *real));
+// For a door that knows where its libraries may live: kl_can_dlopen (and so a
+// guest's stat/access of a library path) only answers from a translation when
+// fn(path) says the path is a plausible library location (kl_dl.c).
+void kl_dl_set_exist_filter(int (*fn)(const char *path));
 // Every registered image, in registration (dependencies-first) order.
 int       kl_dl_image_count(void);
 kl_image *kl_dl_image_at(int i, const char **soname);
+// ...and the absolute path it was loaded from (NULL if unknown).
+const char *kl_dl_image_path(int i);
 // Read a file's DT_NEEDED sonames without loading it (kl_image.c).
 int       kl_list_needed(const char *path, char names[][128], int max);
-// ...and its DT_SONAME (kl_image.c). -1 if not an AArch64 ELF or none is set.
+// ...and its DT_SONAME (kl_image.c), from a raw .so or a translation's __klelf.
+// -1 if there is no AArch64 ELF there at all, -2 if there is but it names no
+// soname (an executable, or a library linked without -soname).
 int       kl_elf_soname(const char *path, char *out, size_t cap);
 // Search every registered guest image for an export (kl_dl.c); used by the
 // loader's import binding after the shim misses.

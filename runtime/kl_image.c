@@ -1563,6 +1563,37 @@ static int elf_list_needed(const uint8_t *img, int vaddr_layout, char names[][12
 // sysroot by it, because a DT_NEEDED names the soname (libavutil.so.56) and the
 // file on disk is often called something else (libavutil.so.56.51.100).
 // Returns 0 with `out` set, -1 for a non-ELF or a library with no soname.
+// DT_SONAME out of an in-memory AArch64 ELF64 image, in either layout (see
+// elf_vptr): a raw .so (file layout) or the __klelf a translation carries
+// (vaddr layout).
+static int elf_soname_mem(const uint8_t *img, size_t size, int vaddr_layout, char *out, size_t cap) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    if (size < sizeof *eh || memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_machine != 183 ||
+        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > (uint64_t)size)
+        return -1;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img + eh->e_phoff);
+    uint64_t lo = UINT64_MAX;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+    if (lo == UINT64_MAX) lo = 0;
+    const Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC) {
+            dyn = (const Elf64_Dyn *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, ph[i].p_vaddr);
+            break;
+        }
+    const char *strtab = NULL;
+    uint64_t so = UINT64_MAX;
+    for (const Elf64_Dyn *dp = dyn; dp && dp->d_tag != DT_NULL; dp++) {
+        if (dp->d_tag == DT_STRTAB)
+            strtab = (const char *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, dp->d_val);
+        else if (dp->d_tag == 14 /* DT_SONAME */) so = dp->d_val;
+    }
+    if (!strtab || so == UINT64_MAX) return -2;          // an ELF, without a soname
+    snprintf(out, cap, "%s", strtab + so);
+    return 0;
+}
+
 int kl_elf_soname(const char *path, char *out, size_t cap) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -1571,25 +1602,25 @@ int kl_elf_soname(const char *path, char *out, size_t cap) {
     uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (file == MAP_FAILED) return -1;
-    int rc = -1;
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
-    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183 &&
-        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) <= (uint64_t)sb.st_size) {
-        const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
-        const Elf64_Dyn *dyn = NULL;
-        for (int i = 0; i < eh->e_phnum; i++)
-            if (ph[i].p_type == PT_DYNAMIC) {
-                dyn = (const Elf64_Dyn *)elf_vptr(file, ph, eh->e_phnum, 0, 0, ph[i].p_vaddr);
-                break;
+    int rc = elf_soname_mem(file, (size_t)sb.st_size, 0, out, cap);
+    int raw_elf = rc == -2;
+    // ...or a klepton-ld translation, whose ELF rides in __TEXT,__klelf — what
+    // the device has instead of the .so tree (see kl_list_needed).
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)file;
+    if (rc != 0 && !raw_elf && (size_t)sb.st_size >= sizeof *mh && mh->magic == MH_MAGIC_64) {
+        const uint8_t *lc = file + sizeof *mh;
+        for (uint32_t i = 0; i < mh->ncmds && rc != 0; i++) {
+            const struct load_command *cmd = (const struct load_command *)lc;
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                const struct section_64 *sec = (const struct section_64 *)(lc + sizeof *seg);
+                for (uint32_t k = 0; k < seg->nsects; k++)
+                    if (!strcmp(sec[k].sectname, "__klelf") &&
+                        (uint64_t)sec[k].offset + sec[k].size <= (uint64_t)sb.st_size)
+                        rc = elf_soname_mem(file + sec[k].offset, (size_t)sec[k].size, 1, out, cap);
             }
-        const char *strtab = NULL;
-        uint64_t so = UINT64_MAX;
-        for (const Elf64_Dyn *dp = dyn; dp && dp->d_tag != DT_NULL; dp++) {
-            if (dp->d_tag == DT_STRTAB)
-                strtab = (const char *)elf_vptr(file, ph, eh->e_phnum, 0, 0, dp->d_val);
-            else if (dp->d_tag == 14 /* DT_SONAME */) so = dp->d_val;
+            lc += cmd->cmdsize;
         }
-        if (strtab && so != UINT64_MAX) { snprintf(out, cap, "%s", strtab + so); rc = 0; }
     }
     munmap(file, (size_t)sb.st_size);
     return rc;

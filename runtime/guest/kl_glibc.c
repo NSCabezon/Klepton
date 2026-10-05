@@ -41,6 +41,7 @@ static void *glibc_dlsym_override(const char *name, void *real);
 static char      g_err[512];
 static char      g_target[64];
 static char      g_entry[1024];
+static char      g_libdir_abs[1024];  // the target libdir, absolute: where virtual paths live
 static kl_image *g_entry_img;
 static unsigned  g_failed;           // roots that did not map/relocate
 
@@ -117,6 +118,58 @@ static void build_index(void) {
     // Directory order first (the game tree shadows the sysroot), then by name,
     // so which file answers a soname does not depend on readdir's order.
     qsort(g_idx, g_nidx, sizeof *g_idx, ent_cmp);
+}
+
+// The DEVICE's index. The bundle carries no .so tree — only the klepton-ld
+// translations, one framework per library, named by the stem dylib_candidate
+// maps a path to (libavutil.so.56 -> libavutil, libstdc++.so.6 -> libstdcxx).
+// Each translation still embeds its ELF, so its DT_SONAME is readable
+// (kl_elf_soname), and the index entry gets a VIRTUAL path in the libdir under
+// its framework STEM ("<stem>.so"), findable by that name and by its soname:
+// kl_load_auto resolves such a path back to the framework by stem, so the
+// resolver needs no second idea of where a library lives.
+static void build_index_from_translations(void) {
+    const char *dir = kl_env_str("KL_DYLIB_DIR", NULL);
+    if (!dir || !*dir || !g_ndirs) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char stem[256], bin[1280];
+        size_t n = strlen(de->d_name);
+        if (n > 10 && !strcmp(de->d_name + n - 10, ".framework")) {
+            snprintf(stem, sizeof stem, "%.*s", (int)(n - 10), de->d_name);
+            snprintf(bin, sizeof bin, "%s/%s/%s", dir, de->d_name, stem);
+        } else if (n > 6 && !strcmp(de->d_name + n - 6, ".dylib")) {
+            snprintf(stem, sizeof stem, "%.*s", (int)(n - 6), de->d_name);
+            snprintf(bin, sizeof bin, "%s/%s", dir, de->d_name);
+        } else continue;
+        char so[128];
+        int rc = kl_elf_soname(bin, so, sizeof so);
+        if (rc == -1) continue;            // no ELF inside: ANGLE, MoltenVK — not a guest
+        if (rc == -2) {
+            // An executable or a library without a soname: its file name is
+            // the stem (hlvr) or the stem plus ".so" (libvideo, libopenvr_api).
+            if (!strcmp(stem, "hlvr")) snprintf(so, sizeof so, "%s", stem);
+            else snprintf(so, sizeof so, "%s.so", stem);
+        }
+        if (g_nidx == g_capidx) {
+            g_capidx = g_capidx ? g_capidx * 2 : 256;
+            g_idx = realloc(g_idx, g_capidx * sizeof *g_idx);
+        }
+        // Named by the STEM, not the soname: libSDL2.so's soname is
+        // libSDL2-2.0.so.0, and only "<stem>.so" maps back to its framework.
+        ent *e = &g_idx[g_nidx++];
+        if (!strcmp(stem, "hlvr")) snprintf(e->file, sizeof e->file, "%s", stem);
+        else snprintf(e->file, sizeof e->file, "%s.so", stem);
+        snprintf(e->soname, sizeof e->soname, "%s", so);
+        snprintf(e->path, sizeof e->path, "%s/%s", g_libdir_abs, e->file);
+        e->dir = 0;
+    }
+    closedir(d);
+    if (g_nidx)
+        fprintf(stderr, "  [glibc] no ELF tree here: %u translated libraries indexed from %s\n",
+                g_nidx, dir);
 }
 
 // glibc itself. Never loaded: these names are what Klepton's shims stand in
@@ -231,14 +284,16 @@ int kl_glibc_configure(const char *target, const char *libdir, const char *entry
 
     // The entry is an executable, named without a ".so".
     char *alib = realpath(libdir, NULL);
+    snprintf(g_libdir_abs, sizeof g_libdir_abs, "%s", alib ? alib : libdir);
     snprintf(g_entry, sizeof g_entry, "%s/%s", alib ? alib : libdir, entry);
     if (access(g_entry, R_OK) != 0)
         snprintf(g_entry, sizeof g_entry, "%s/%s.so", alib ? alib : libdir, entry);
     free(alib);
-    if (access(g_entry, R_OK) != 0)
+    if (access(g_entry, R_OK) != 0 && !kl_can_load(g_entry))
         return fail("entry executable not found: %s", g_entry);
 
     build_index();
+    if (!g_nidx) build_index_from_translations();
     kl_dl_set_needed_resolver(glibc_resolve);
     // The glibc ABI tier goes in front of the bionic table for every bind from
     // here on, relocation and dlsym alike (kl_glibc_shim.c).
@@ -402,6 +457,22 @@ take:
     return buf;
 }
 
+// Where a library of this install can be: <root>/bin/<platform>/ or
+// <root>/<mod>/bin/<platform>/ — the two places Source 2 keeps binaries.
+static int library_location(const char *path) {
+    size_t rl = strlen(g_root);
+    if (!rl || strncmp(path, g_root, rl) || path[rl] != '/') return 0;
+    const char *rel = path + rl + 1;
+    int parts = 1;
+    for (const char *p = rel; *p; p++) if (*p == '/') parts++;
+    if (parts == 3) return !strncmp(rel, "bin/", 4);
+    if (parts == 4) {
+        const char *sl = strchr(rel, '/');
+        return strncmp(rel, "bin/", 4) && !strncmp(sl + 1, "bin/", 4);
+    }
+    return 0;
+}
+
 static void setup_root(void) {
     char tmp[1100], exe_dir[1024];
     snprintf(exe_dir, sizeof exe_dir, "%s", g_entry);
@@ -430,6 +501,32 @@ static void setup_root(void) {
     snprintf(g_wlayer, sizeof g_wlayer, "%s", wl && *wl ? wl : def);
     mkdir_p(g_wlayer);
     kl_set_guest_path_hook(content_overlay);
+    kl_dl_set_exist_filter(library_location);
+}
+
+// The packaging manifest, written by every --gap run: one line per mapped
+// image, "<framework stem>\t<absolute path>". It is exactly the set a device
+// build has to translate (visionos/mkguest.sh reads it for a glibc target, and
+// targets.py names the frameworks from it), because it is exactly the set this
+// door maps. KL_GLIBC_MANIFEST moves it from build/<target>_images.txt.
+static void write_manifest(FILE *out) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s", kl_env_str("KL_GLIBC_MANIFEST", ""));
+    if (!*path) snprintf(path, sizeof path, "build/%s_images.txt", g_target);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    int n = kl_dl_image_count(), w = 0;
+    for (int i = 0; i < n; i++) {
+        const char *p = kl_dl_image_path(i);
+        if (!p) continue;
+        const char *b = strrchr(p, '/');
+        b = b ? b + 1 : p;
+        const char *so = strstr(b, ".so");
+        fprintf(f, "%.*s\t%s\n", so ? (int)(so - b) : (int)strlen(b), b, p);
+        w++;
+    }
+    fclose(f);
+    if (out) fprintf(out, "  packaging manifest: %d image(s) -> %s\n", w, path);
 }
 
 int kl_glibc_load(FILE *out, int run) {
@@ -528,6 +625,7 @@ int kl_glibc_load(FILE *out, int run) {
         kl_x18_report(out);
         fflush(out);
     }
+    if (!run) write_manifest(out);
     return g_failed ? fail("%s", "some libraries did not map/relocate (see FAILED above)") : 0;
 }
 

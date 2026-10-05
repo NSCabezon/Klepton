@@ -96,7 +96,11 @@ void kl_register_image(const char *soname, kl_image *img) {
         g_imgs[g_nimgs].img = img;
         // The absolute path, for dladdr's dli_fname under a door that wants
         // glibc's answer (see klb_dladdr).
+        // A translated library on device is loaded through a VIRTUAL path (the
+        // glibc door's index: <libdir>/<stem>.so, a file that need not exist),
+        // so an absolute path that does not resolve is kept as it is.
         g_imgs[g_nimgs].path = realpath(soname, NULL);
+        if (!g_imgs[g_nimgs].path && soname[0] == '/') g_imgs[g_nimgs].path = strdup(soname);
         g_nimgs++;
     }
     pthread_mutex_unlock(&g_lock);
@@ -112,6 +116,9 @@ void kl_register_image(const char *soname, kl_image *img) {
 }
 
 int kl_dl_image_count(void) { return g_nimgs; }
+const char *kl_dl_image_path(int i) {
+    return (i >= 0 && i < g_nimgs) ? g_imgs[i].path : NULL;
+}
 kl_image *kl_dl_image_at(int i, const char **soname) {
     if (i < 0 || i >= g_nimgs) return NULL;
     if (soname) *soname = g_imgs[i].soname;
@@ -589,8 +596,18 @@ void kl_dl_report_images(FILE *f) {
 // kl_can_load instead of stat(), and this is what kl_can_load itself cannot
 // see.
 static int kl_core_shim_claims(const char *path);
+static int (*g_exist_filter)(const char *path);
+void kl_dl_set_exist_filter(int (*fn)(const char *path)) { g_exist_filter = fn; }
+
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
+    // A door that knows its install's layout says which paths a library can
+    // live at; elsewhere only a real file counts. Source 2 finds its root by
+    // probing "<dir>/bin/linuxsteamrtarm64/libtier0.so" upward from the
+    // executable, and answering "yes" for every directory — which is what a
+    // name-only match does — puts the root in the wrong place.
+    if (g_exist_filter && strchr(path, '/') && !g_exist_filter(path))
+        return access(path, F_OK) == 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||

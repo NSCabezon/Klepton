@@ -51,8 +51,20 @@ FIRST_PLAT=$(printf '%s' "$PLATS" | awk '{print $1}')
 # runtime.
 rm -rf "build/guest/$KLT_NAME" "$OUT"; mkdir -p "build/guest/$KLT_NAME" "$OUT"
 
+# A glibc target's libraries come from several directories under versioned
+# names, so each NAME (a framework stem) is looked up in the manifest the host
+# --gap run wrote (targets.py glibc_libs_for); every other kind is <srcdir>/<NAME>.so.
+MANIFEST="$ROOT/build/${KLT_NAME}_images.txt"
+src_of() {
+  if [ "$KLT_KIND" = glibc ]; then
+    awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$MANIFEST"
+  else
+    printf '%s\n' "$SRC/$1.so"
+  fi
+}
 for NAME in $LIBS; do
-  [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }
+  SOFILE="$(src_of "$NAME")"
+  [ -n "$SOFILE" ] && [ -f "$SOFILE" ] || { echo "!! source for $NAME missing (${SOFILE:-not in $MANIFEST})"; exit 1; }
   # Bundle identifiers admit only alphanumerics, '-' and '.'. Several of these
   # names contain '_', and libc++_shared contains '+' — which the previous
   # underscores-only rewrite let through, and Xcode rejects at the EMBED step
@@ -72,7 +84,7 @@ for NAME in $LIBS; do
     esac
     FW="build/guest/$KLT_NAME/$PLAT/$FWNAME.framework"
     mkdir -p "$FW"
-    "$LD" "$SRC/$NAME.so" -o "$FW/$FWNAME" --platform "$KLPLAT" \
+    "$LD" "$SOFILE" -o "$FW/$FWNAME" --platform "$KLPLAT" \
           --install-name "@rpath/$FWNAME.framework/$FWNAME" --quiet
     cat > "$FW/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
