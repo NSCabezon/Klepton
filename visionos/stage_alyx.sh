@@ -63,7 +63,7 @@ BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 DEST_REL="Documents/android-files/${KLT_STAGE_FILES:-alyx}/game"
 
 DRY=0; VERIFY=0; LIST_EXCL=0; EXTRAS=0; RESET=0; SKIP_SPACE=0
-FREE_GB=""; ONLY=""; SETTLE="${KL_STAGE_SETTLE:-600}"
+FREE_GB=""; ONLY=""; SETTLE="${KL_STAGE_SETTLE:-600}"; JOBS="${KL_STAGE_JOBS:-1}"
 DEVID="${KLEPTON_DEVICE:-}"
 SRC="${KL_ALYX_CONTENT:-$ROOT/../../game/content/game}"
 while [ $# -gt 0 ]; do
@@ -77,6 +77,7 @@ while [ $# -gt 0 ]; do
     --free-gb)          FREE_GB="$2"; shift 2 ;;
     --only)             ONLY="$2"; shift 2 ;;
     --settle)           SETTLE="$2"; shift 2 ;;
+    --jobs)             JOBS="$2"; shift 2 ;;
     --device)           DEVID="$2"; shift 2 ;;
     --src)              SRC="$2"; shift 2 ;;
     -h|--help)          sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -194,11 +195,12 @@ PY
 fi
 
 # ---- plan (and, unless --dry-run, transfer) ---------------------------------
-export SRC DEST_REL MANIFEST DEVID BUNDLE_ID DRY VERIFY LIST_EXCL EXTRAS ONLY SETTLE \
+export SRC DEST_REL MANIFEST DEVID BUNDLE_ID DRY VERIFY LIST_EXCL EXTRAS ONLY SETTLE JOBS \
        REMOTE_JSON FREE_BYTES SKIP_SPACE TMPD
 rc=0
 python3 - <<'PY' || rc=$?
-import fnmatch, json, os, shutil, signal, subprocess, sys, time
+import fnmatch, json, os, shutil, signal, subprocess, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
 
 E = os.environ
 SRC, DEST = E["SRC"], E["DEST_REL"]
@@ -207,6 +209,7 @@ DRY, VERIFY, LIST_EXCL = E["DRY"] == "1", E["VERIFY"] == "1", E["LIST_EXCL"] == 
 EXTRAS, ONLY, SETTLE = E["EXTRAS"] == "1", E.get("ONLY", "").strip("/"), int(E["SETTLE"])
 REMOTE_JSON, FREE = E.get("REMOTE_JSON", ""), E.get("FREE_BYTES", "")
 SKIP_SPACE, TMPD = E["SKIP_SPACE"] == "1", E["TMPD"]
+JOBS = max(1, int(E.get("JOBS", "1") or 1))
 SMALL = 16 << 20            # files under this ride in per-directory batches
 BATCH_BYTES, BATCH_FILES = 256 << 20, 400
 MARGIN = 2 << 30            # headroom left free on the device
@@ -403,8 +406,13 @@ def on_int(*_):
 signal.signal(signal.SIGINT, on_int)
 
 sent, nfiles, t0, failed = 0, 0, time.time(), 0
-for i, (kind, d, lst) in enumerate(units, 1):
-    if stop: break
+lock = threading.Lock()
+
+def run_unit(i, kind, d, lst):
+    # One unit per worker; with --jobs N several devicectl copies overlap,
+    # which hides the fixed per-copy setup cost on the many ~110 MB pak01s.
+    global sent, nfiles, failed, stop
+    if stop: return
     nb = sum(t[2] for t in lst)
     if kind == "F":
         rel, full = lst[0][0], lst[0][1]
@@ -420,19 +428,27 @@ for i, (kind, d, lst) in enumerate(units, 1):
             if subprocess.run(["cp", "-c", full, out], capture_output=True).returncode != 0:
                 shutil.copy2(full, out)
         label, src, dst = f"{d}/ ({len(lst)} files)", mirror, f"{DEST}/{d}"
-    el = time.time() - t0
-    rate = sent / el if el > 1 and sent else 0
-    eta = f", ETA {int((need - sent) / rate / 60)} min" if rate and sent > (256 << 20) else ""
-    print(f"[stage] [{i}/{len(units)}] {gb(sent)}/{gb(need)}{eta}  {label} ({gb(nb)})", flush=True)
-    if devicectl_copy(src, dst, nb):
-        record(lst); sent += nb; nfiles += len(lst)
-    else:
-        failed += 1
-        print(f"   !! giving up on {label} for this run", flush=True)
-        if failed >= 5:
-            print("!! five units failed — the device is probably gone (asleep? locked?). Re-run to resume.")
-            break
+    with lock:
+        el = time.time() - t0
+        rate = sent / el if el > 1 and sent else 0
+        eta = f", ETA {int((need - sent) / rate / 60)} min" if rate and sent > (256 << 20) else ""
+        print(f"[stage] [{i}/{len(units)}] {gb(sent)}/{gb(need)}{eta}  {label} ({gb(nb)})", flush=True)
+    ok = devicectl_copy(src, dst, nb)
+    with lock:
+        if ok:
+            record(lst); sent += nb; nfiles += len(lst)
+        else:
+            failed += 1
+            print(f"   !! giving up on {label} for this run", flush=True)
+            if failed >= 5 and not stop:
+                print("!! five units failed — the device is probably gone (asleep? locked?). Re-run to resume.")
+                stop = True
     if kind == "D": shutil.rmtree(os.path.dirname(src), ignore_errors=True)
+
+if JOBS > 1: print(f"[stage] {JOBS} copies in parallel", flush=True)
+with ThreadPoolExecutor(max_workers=JOBS) as pool:
+    for f in [pool.submit(run_unit, i, *u) for i, u in enumerate(units, 1)]:
+        f.result()
 
 mf.close()
 rewrite_manifest()
