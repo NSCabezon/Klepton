@@ -23,6 +23,8 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -253,6 +255,23 @@ static int glibc_resolve(const char *name, char *path, size_t cap) {
                 best = &g_idx[i];
         if (best) { snprintf(path, cap, "%s", best->path); return KL_NEED_LOAD; }
     }
+    // ...and the other way round: a VERSIONED file name ("libmpg123_hlvr.so.0")
+    // that, translated, only exists as its stem. A translated library is
+    // indexed as <stem>.so with its DT_SONAME, and neither is that name when
+    // the file's own name carries the version and its soname is different
+    // (libmpg123_hlvr.so.0's is libmpg123.so.0). On the host the file is there
+    // under its real name; on device the framework is libmpg123_hlvr.
+    const char *v = strstr(b, ".so.");
+    if (v) {
+        char stem[256];
+        snprintf(stem, sizeof stem, "%.*s.so", (int)(v - b), b);
+        for (int d = 0; d < g_ndirs; d++)
+            for (unsigned i = 0; i < g_nidx; i++)
+                if (g_idx[i].dir == d && !strcmp(g_idx[i].file, stem)) {
+                    snprintf(path, cap, "%s", g_idx[i].path);
+                    return KL_NEED_LOAD;
+                }
+    }
     return KL_NEED_MISSING;
 }
 
@@ -445,10 +464,33 @@ static const char *content_overlay(const char *path, char *buf, size_t cap) {
     if (!g_wlayer[0] || !rel[0]) return NULL;
     snprintf(cand, sizeof cand, "%s%s", g_wlayer, rel);
     {
-        char parent[2048];
+        // A miss lands in the write layer, so a file the engine creates goes
+        // there. Its parent is created only when that directory really exists
+        // somewhere (the install or a content root): this hook also sees every
+        // stat() and access() PROBE, and Source 2 probes for its install by
+        // asking whether <exe>/game/hlvr, <exe>/../game/... exist. Creating
+        // the parent of every probed path made those directories appear, the
+        // next probe found them, and the engine adopted
+        // bin/linuxsteamrtarm64/game/ as its game root — an empty tree, so
+        // every resource read was ERROR_FILEOPEN. A directory the engine makes
+        // itself still works: mkdir() comes through here too, and its parent
+        // is then in the write layer.
+        char parent[2048], prel[2048];
         snprintf(parent, sizeof parent, "%s", cand);
-        char *sl = strrchr(parent, '/');
-        if (sl && sl != parent) { *sl = 0; mkdir_p(parent); }
+        snprintf(prel, sizeof prel, "%s", rel);
+        char *sl = strrchr(parent, '/'), *psl = strrchr(prel, '/');
+        if (sl && sl != parent && psl) {
+            *sl = 0; *psl = 0;
+            int real = 0;
+            char probe[2048];
+            snprintf(probe, sizeof probe, "%s%s", g_root, prel);
+            if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) real = 1;
+            for (int i = 0; !real && i < g_ncontent; i++) {
+                snprintf(probe, sizeof probe, "%s%s", g_content[i], prel);
+                if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) real = 1;
+            }
+            if (real) mkdir_p(parent);
+        }
     }
 take:
     if (kl_env_on("KL_TRACE_CONTENT", 0))
@@ -473,7 +515,29 @@ static int library_location(const char *path) {
     return 0;
 }
 
+// File descriptors. Source 2 keeps every VPK chunk it mounts open — Alyx's
+// hlvr/ alone is 467 archive files — and an app is launched with launchd's
+// soft limit of 256, where a shell typically has far more. Past 256 every
+// open() failed with EMFILE and the engine reported it as missing content
+// ("Error loading resource file ... ERROR_FILEOPEN", then "Problem loading
+// error.vpcf" and a fatal error): fine from a terminal, broken as an app.
+// The soft limit goes to the hard one, capped at OPEN_MAX (Darwin's setrlimit
+// refuses more).
+static void raise_fd_limit(FILE *out) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+    rlim_t want = rl.rlim_max;
+    if (want == RLIM_INFINITY || want > OPEN_MAX) want = OPEN_MAX;
+    if (rl.rlim_cur >= want) return;
+    rlim_t was = rl.rlim_cur;
+    rl.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &rl) == 0 && out)
+        fprintf(out, "  file descriptors: soft limit %llu -> %llu\n",
+                (unsigned long long)was, (unsigned long long)want);
+}
+
 static void setup_root(void) {
+    raise_fd_limit(stderr);
     char tmp[1100], exe_dir[1024];
     snprintf(exe_dir, sizeof exe_dir, "%s", g_entry);
     char *slash = strrchr(exe_dir, '/');
