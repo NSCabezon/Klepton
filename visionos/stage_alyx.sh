@@ -464,10 +464,19 @@ def run_unit(i, kind, d, lst):
                 stop = True
     if kind == "D": shutil.rmtree(os.path.dirname(src), ignore_errors=True)
 
-if JOBS > 1: print(f"[stage] {JOBS} copies in parallel", flush=True)
+# --jobs only applies to small units (< BIG): the per-copy setup cost is what
+# parallelism hides, and a big file is bandwidth-bound anyway. Big units then
+# go one at a time.
+BIG = 256 << 20
+numbered = list(enumerate(units, 1))
+small = [(i, u) for i, u in numbered if sum(t[2] for t in u[2]) < BIG]
+big = [(i, u) for i, u in numbered if sum(t[2] for t in u[2]) >= BIG]
+if JOBS > 1: print(f"[stage] {len(small)} small unit(s) {JOBS} at a time, then {len(big)} big one(s) one at a time", flush=True)
 with ThreadPoolExecutor(max_workers=JOBS) as pool:
-    for f in [pool.submit(run_unit, i, *u) for i, u in enumerate(units, 1)]:
+    for f in [pool.submit(run_unit, i, *u) for i, u in small]:
         f.result()
+for i, u in big:
+    run_unit(i, *u)
 
 mf.close()
 rewrite_manifest()
