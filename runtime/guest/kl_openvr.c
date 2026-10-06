@@ -409,12 +409,11 @@ static int co_get_space(void *s) { (void)s; return g_origin; }
 // are measured here: WaitGetPoses to WaitGetPoses (the client interval) and
 // WaitGetPoses to the second Submit returning (Submit waits for the eye copy,
 // which is queued behind the game's own GPU work on its queue, so that span is
-// the frame's CPU+GPU time). OFF by default (KL_OPENVR_FRAME_TIMING=1 turns it
-// on): measured on the Mac it made things WORSE — 51 fps against 62 without —
-// because the game reads the span as GPU time, and on a CPU-bound host the
-// auto-fidelity system oscillates between levels (0.78x <-> 1.2x render scale,
-// 2x <-> 4x MSAA) instead of settling. Kept for the device A/B, where the GPU
-// is the bottleneck. The guest fps line below is printed either way.
+// the frame's CPU+GPU time). ON by default; KL_OPENVR_FRAME_TIMING=0 answers
+// "no timing" again. Measured on device (GPU-bound): 25-31 fps against ~20
+// without, at no visible cost. On the Mac (CPU-bound) it is the other way —
+// 51 fps against 62 — because the game reads the span as GPU time and its
+// auto-fidelity oscillates between levels there; set it to 0 for host work.
 typedef struct { uint32_t index; double t_wait, t_submit, interval_ms, work_ms; } frame_time;
 #define FT_RING 32
 static frame_time g_ft[FT_RING];
@@ -453,7 +452,7 @@ static void ft_submitted(void) {
 // ClientFrameInterval, ...), the HMD pose at +96.
 static int co_frame_timing(void *s, uint8_t *t, uint32_t frames_ago) {
     (void)s;
-    if (!t || !kl_env_on("KL_OPENVR_FRAME_TIMING", 0)) return 0;
+    if (!t || !kl_env_on("KL_OPENVR_FRAME_TIMING", 1)) return 0;
     uint32_t idx = __atomic_load_n(&g_ft_index, __ATOMIC_ACQUIRE);
     if (frames_ago + 1 >= FT_RING || idx <= frames_ago + 1) return 0;
     // The newest COMPLETE frame is the one before the frame in flight.
@@ -541,6 +540,7 @@ static struct {
     VkCommandPool pool;
     VkCommandBuffer cb[2][OVR_STAGES];
     VkFence fence[2][OVR_STAGES];
+    VkFence sync;                         // the zero-copy path's "the game's frame is done"
     uint64_t dst[2][OVR_STAGES];
     uint32_t w[2], h[2], fmt[2];
     PFN_vkCreateCommandPool CreateCommandPool;
@@ -668,6 +668,68 @@ static void vk_dump(const VRVulkanTextureData_t *t, VkImage img, uint32_t layer,
     }
     FreeMemory(V.dev, mem, NULL);
     DestroyBuffer(V.dev, buf, NULL);
+}
+
+// ---- zero copy -----------------------------------------------------------------------
+// The compositor samples the game's own eye image in place: the MTLTexture
+// MoltenVK keeps behind the VkImage the game submitted, the eye's array layer
+// as the slice. That removes, per eye per frame, a full-resolution blit
+// (4608x2880 -> the stage image, on device) — and its read and its write of
+// ~50 MB — which is a large share of a GPU-bound frame.
+//
+// Taken only when nothing would need the copy's help: full bounds (the
+// compositor has no per-frame sub-rect for an external frame) and no vertical
+// flip. Anything else falls back to the copy, per submit.
+//
+// Ordering: the game submitted its rendering before Submit, on the queue it
+// handed us. One empty submission with a fence on that queue, waited on once
+// per frame (after the second eye), is "the picture is complete" — the same
+// point the copy's fence used to mark, minus the copy. Reuse: the game rotates
+// two eye images (measured — "2 distinct"), so the image a frame was filed with
+// is not rewritten until the frame after next, by which time the compositor has
+// moved on to the newer one. A game that renders into ONE image would race the
+// compositor; that case is detected and sends this back to the copy.
+// EXPERIMENTAL, OFF by default (KL_OPENVR_ZEROCOPY=1 turns it on). Not yet
+// solid: on the Mac the in-place source showed full-height vertical stripes
+// (a slice/array-view or texcoord mismatch in the compositor's sampling of the
+// game's 2-layer image, not found yet), and the same-image detector tripped
+// after a few hundred frames although the game rotates two images.
+static int vk_zero_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t,
+                            const VRTextureBounds_t *b, uint32_t layer) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OPENVR_ZEROCOPY", 0);
+    if (!on) return -1;
+    if (b && (b->uMin != 0.0f || b->uMax != 1.0f || b->vMin != 0.0f || b->vMax != 1.0f)) return -1;
+    // One image rewritten every frame: not safe to sample in place.
+    static uint64_t prev[2]; static int same[2];
+    same[eye & 1] = t->m_nImage == prev[eye & 1] ? same[eye & 1] + 1 : 0;
+    prev[eye & 1] = t->m_nImage;
+    if (same[eye & 1] >= 2) {
+        static int said;
+        if (!said) { said = 1;
+            fprintf(stderr, "  [openvr] the game submits the SAME eye image every frame — "
+                            "zero-copy off, copying (it would race the compositor)\n"); }
+        return -1;
+    }
+    if (vk_setup(t) != 0) return -1;
+    void *mtl = kl_vulkan_xr_image_mtl(t->m_nImage);
+    if (!mtl) return -1;
+    kl_glfb_note_eye_mtl_texture(eye, stage, mtl, (int)layer, (int)t->m_nWidth, (int)t->m_nHeight);
+    static int said;
+    if (!said) { said = 1;
+        fprintf(stderr, "  [openvr] zero-copy: the compositor samples the game's %ux%u eye "
+                        "image in place (no per-eye blit)\n", t->m_nWidth, t->m_nHeight); }
+    if (eye == 1) {                       // both eyes in: wait for the game's frame
+        if (!V.sync) {
+            VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (V.CreateFence(V.dev, &fci, NULL, &V.sync) != VK_SUCCESS) return -1;
+        }
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        if (V.QueueSubmit(V.q, 1, &si, V.sync) != VK_SUCCESS) return -1;
+        V.WaitForFences(V.dev, 1, &V.sync, VK_TRUE, UINT64_MAX);
+        V.ResetFences(V.dev, 1, &V.sync);
+    }
+    return 0;
 }
 
 static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b,
@@ -832,8 +894,20 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         static int said;
         if (said < 4) { said++;
             fprintf(stderr, "  [openvr] eye %d <- array layer %u\n", eye, layer); }
+        // How many distinct images the game rotates its eyes through — whether
+        // the compositor could sample them in place (see the zero-copy path).
+        static uint64_t seen[8]; static int nseen, reported;
+        uint64_t im = ((const VRVulkanTextureData_t *)tex->handle)->m_nImage;
+        int k = 0;
+        while (k < nseen && seen[k] != im) k++;
+        if (k == nseen && nseen < 8) seen[nseen++] = im;
+        if (!reported && g_frames >= 600) {
+            reported = 1;
+            fprintf(stderr, "  [openvr] the game's eye images: %d distinct over 600 frames\n", nseen);
+        }
     }
-    if (vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
+    if (vk_zero_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0 &&
+        vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
 #else
     (void)b;
     return 101;
