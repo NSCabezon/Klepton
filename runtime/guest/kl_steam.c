@@ -40,6 +40,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <CoreFoundation/CoreFoundation.h>
+
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_steam.h"
@@ -211,7 +213,38 @@ static int us_begin_auth(void *s, const void *t, int cb, uint64_t id) { (void)s;
 static uint32_t ut_appid(void *s) { (void)s; return APP_ID; }
 static uint32_t ut_time(void *s) { (void)s; return (uint32_t)time(NULL); }
 static const char *ut_country(void *s) { (void)s; return "US"; }
-static const char *ut_lang(void *s) { (void)s; return "english"; }
+// The game language: KL_STEAM_LANG (a Steam language API name: english,
+// spanish, latam, french, german, ...) or else the system's first preferred
+// language. Alyx ships English voices only; this picks UI text and subtitles.
+static const char *steam_lang(void) {
+    static char lang[32];
+    if (lang[0]) return lang;
+    const char *e = getenv("KL_STEAM_LANG");
+    if (e && *e) { snprintf(lang, sizeof lang, "%s", e); return lang; }
+    char code[64] = "en";
+    CFArrayRef pref = CFLocaleCopyPreferredLanguages();
+    if (pref) {
+        if (CFArrayGetCount(pref) > 0)
+            CFStringGetCString(CFArrayGetValueAtIndex(pref, 0), code, sizeof code, kCFStringEncodingUTF8);
+        CFRelease(pref);
+    }
+    static const struct { const char *pfx, *name; } map[] = {
+        {"es-ES", "spanish"}, {"es-", "latam"}, {"es", "spanish"},
+        {"pt-BR", "brazilian"}, {"pt", "portuguese"}, {"zh-Hant", "tchinese"}, {"zh", "schinese"},
+        {"fr", "french"}, {"de", "german"}, {"it", "italian"}, {"ja", "japanese"}, {"ko", "koreana"},
+        {"ru", "russian"}, {"pl", "polish"}, {"nl", "dutch"}, {"sv", "swedish"}, {"da", "danish"},
+        {"fi", "finnish"}, {"nb", "norwegian"}, {"no", "norwegian"}, {"cs", "czech"}, {"hu", "hungarian"},
+        {"tr", "turkish"}, {"uk", "ukrainian"}, {"th", "thai"}, {"el", "greek"}, {"bg", "bulgarian"},
+        {"ro", "romanian"}, {"vi", "vietnamese"},
+    };
+    const char *name = "english";
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (strncmp(code, map[i].pfx, strlen(map[i].pfx)) == 0) { name = map[i].name; break; }
+    snprintf(lang, sizeof lang, "%s", name);
+    fprintf(stderr, "  [steam] game language: %s (system %s)\n", lang, code);
+    return lang;
+}
+static const char *ut_lang(void *s) { (void)s; return steam_lang(); }
 static int ut_universe(void *s) { (void)s; return 1; }
 static uint8_t ut_battery(void *s) { (void)s; return 255; }
 static int ut_call_done(void *s, uint64_t call, int *failed) {
@@ -245,7 +278,7 @@ static int ap_true(void *s) { (void)s; return 1; }
 static int ap_false(void *s) { (void)s; return 0; }
 static int ap_subscribed_app(void *s, uint32_t app) { (void)s; return app == APP_ID; }
 static int ap_installed(void *s, uint32_t app) { (void)s; return app == APP_ID; }
-static const char *ap_lang(void *s) { (void)s; return "english"; }
+static const char *ap_lang(void *s) { (void)s; return steam_lang(); }
 static uint32_t ap_purchase(void *s, uint32_t app) { (void)s; (void)app; return 1600000000u; }
 static int ap_beta(void *s, char *buf, int n) { (void)s; if (buf && n) buf[0] = 0; return 0; }
 static uint32_t ap_install_dir(void *s, uint32_t app, char *buf, uint32_t n) {
