@@ -63,7 +63,7 @@ BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 DEST_REL="Documents/android-files/${KLT_STAGE_FILES:-alyx}/game"
 
 DRY=0; VERIFY=0; LIST_EXCL=0; EXTRAS=0; RESET=0; SKIP_SPACE=0
-FREE_GB=""; ONLY=""; SETTLE="${KL_STAGE_SETTLE:-600}"; JOBS="${KL_STAGE_JOBS:-1}"
+FREE_GB=""; ONLY=""; SKIP=""; SETTLE="${KL_STAGE_SETTLE:-600}"; JOBS="${KL_STAGE_JOBS:-1}"
 DEVID="${KLEPTON_DEVICE:-}"
 SRC="${KL_ALYX_CONTENT:-$ROOT/../../game/content/game}"
 while [ $# -gt 0 ]; do
@@ -76,6 +76,7 @@ while [ $# -gt 0 ]; do
     --skip-space-check) SKIP_SPACE=1; shift ;;
     --free-gb)          FREE_GB="$2"; shift 2 ;;
     --only)             ONLY="$2"; shift 2 ;;
+    --skip)             SKIP="${SKIP:+$SKIP,}$2"; shift 2 ;;
     --settle)           SETTLE="$2"; shift 2 ;;
     --jobs)             JOBS="$2"; shift 2 ;;
     --device)           DEVID="$2"; shift 2 ;;
@@ -195,7 +196,7 @@ PY
 fi
 
 # ---- plan (and, unless --dry-run, transfer) ---------------------------------
-export SRC DEST_REL MANIFEST DEVID BUNDLE_ID DRY VERIFY LIST_EXCL EXTRAS ONLY SETTLE JOBS \
+export SRC DEST_REL MANIFEST DEVID BUNDLE_ID DRY VERIFY LIST_EXCL EXTRAS ONLY SKIP SETTLE JOBS \
        REMOTE_JSON FREE_BYTES SKIP_SPACE TMPD
 rc=0
 python3 - <<'PY' || rc=$?
@@ -207,6 +208,7 @@ SRC, DEST = E["SRC"], E["DEST_REL"]
 MANIFEST, DEVID, BUNDLE = E["MANIFEST"], E.get("DEVID", ""), E["BUNDLE_ID"]
 DRY, VERIFY, LIST_EXCL = E["DRY"] == "1", E["VERIFY"] == "1", E["LIST_EXCL"] == "1"
 EXTRAS, ONLY, SETTLE = E["EXTRAS"] == "1", E.get("ONLY", "").strip("/"), int(E["SETTLE"])
+SKIP = [x.strip("/") for x in E.get("SKIP", "").split(",") if x.strip("/")]
 REMOTE_JSON, FREE = E.get("REMOTE_JSON", ""), E.get("FREE_BYTES", "")
 SKIP_SPACE, TMPD = E["SKIP_SPACE"] == "1", E["TMPD"]
 JOBS = max(1, int(E.get("JOBS", "1") or 1))
@@ -254,6 +256,8 @@ for dp, dns, fns in os.walk(SRC):
         if why:
             excl.setdefault(why, []).append((rel, st.st_size)); continue
         if ONLY and not (rel == ONLY or rel.startswith(ONLY + "/")): continue
+        if any(rel == k or rel.startswith(k + "/") for k in SKIP):
+            excl.setdefault("--skip", []).append((rel, st.st_size)); continue
         if now - st.st_mtime < SETTLE:
             settling.append((rel, st.st_size)); continue
         files.append((rel, full, st.st_size, int(st.st_mtime)))
