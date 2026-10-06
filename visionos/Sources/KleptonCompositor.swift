@@ -946,7 +946,14 @@ final class KleptonCompositor {
         }
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear; sd.magFilter = .linear
-        sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
+        // Clamp to ZERO, not to edge: when the reprojection turns the quad
+        // further than the guest's frame reaches (a fast head turn on a slow
+        // guest), what shows past the edge must be black. Clamp-to-edge smeared
+        // the frame's last column across the revealed area — on Half-Life:
+        // Alyx a coloured stripe on every quick turn. KL_CP_CLAMP_EDGE=1 is the A/B.
+        let edge = ProcessInfo.processInfo.environment["KL_CP_CLAMP_EDGE"] == "1"
+        sd.sAddressMode = edge ? .clampToEdge : .clampToZero
+        sd.tAddressMode = edge ? .clampToEdge : .clampToZero
         sampler = device.makeSamplerState(descriptor: sd)
     }
 

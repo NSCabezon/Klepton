@@ -12,8 +12,10 @@
 // MoltenVK's on the backend's CAMetalLayer (or kl_vulkan's synthetic one when
 // there is no window), and host input is pushed into the guest's own event
 // queue with its own SDL_PushEvent — on the guest's thread, inside the
-// SDL_PumpEvents/SDL_PollEvent family it was already calling. Joysticks, audio,
-// timers, threads, hints and the keyboard tables remain the real SDL.
+// SDL_PumpEvents/SDL_PollEvent family it was already calling. AUDIO OUTPUT is
+// answered here too (see "audio" below): the guest SDL's drivers are ALSA,
+// PulseAudio and PipeWire, none of which exist. Joysticks, timers, threads,
+// hints, audio-stream conversion and the keyboard tables remain the real SDL.
 //
 // Reached two ways, both from kl_glibc.c: the glibc ABI tier (imports bound at
 // relocation — Panorama's) and the dlsym override (the engine's SDL table).
@@ -30,6 +32,9 @@
 #include "kl_flatwin.h"
 #include "kl_vulkan.h"
 #include "kl_glibc_sdl.h"
+#include "kl_audio.h"
+#include <math.h>
+#include <unistd.h>
 
 static const kl_flatwin_backend *g_be;
 void kl_flatwin_set_backend(const kl_flatwin_backend *b) { g_be = b; }
@@ -280,9 +285,12 @@ static int  sdl_IsScreenSaverEnabled(void) { return 0; }
 static int  sdl_GL_SetAttribute(int a, int v) { (void)a; (void)v; return 0; }
 
 // ---- init: VIDEO is ours ----------------------------------------------------------------
+#define SDL_INIT_AUDIO           0x10u
+static int g_audio_inited;
 static int sdl_InitSubSystem(uint32_t flags) {
     if (flags & SDL_INIT_VIDEO) g_video_inited = 1;
-    uint32_t rest = flags & ~SDL_INIT_VIDEO;
+    if (flags & SDL_INIT_AUDIO) g_audio_inited = 1;
+    uint32_t rest = flags & ~(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     if (flags & SDL_INIT_VIDEO) rest |= SDL_INIT_EVENTS;
     if (!rest) return 0;
     int (*r)(uint32_t) = REAL(int (*)(uint32_t), "SDL_InitSubSystem");
@@ -291,15 +299,210 @@ static int sdl_InitSubSystem(uint32_t flags) {
 static int sdl_Init(uint32_t flags) { return sdl_InitSubSystem(flags); }
 static void sdl_QuitSubSystem(uint32_t flags) {
     if (flags & SDL_INIT_VIDEO) g_video_inited = 0;
+    if (flags & SDL_INIT_AUDIO) g_audio_inited = 0;
+    uint32_t rest = flags & ~(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     void (*r)(uint32_t) = REAL(void (*)(uint32_t), "SDL_QuitSubSystem");
-    if (r && (flags & ~SDL_INIT_VIDEO)) r(flags & ~SDL_INIT_VIDEO);
+    if (r && rest) r(rest);
 }
 static uint32_t sdl_WasInit(uint32_t flags) {
     uint32_t (*r)(uint32_t) = REAL(uint32_t (*)(uint32_t), "SDL_WasInit");
     uint32_t v = r ? r(flags) : 0;
     if (g_video_inited) v |= SDL_INIT_VIDEO & (flags ? flags : ~0u);
+    if (g_audio_inited) v |= SDL_INIT_AUDIO & (flags ? flags : ~0u);
     return v;
 }
+
+// ---- audio -------------------------------------------------------------------------------
+// One playback device, fed into kl_audio (CoreAudio; the same sink the OpenSL
+// and AAudio guests use). Source 2's tier0 opens it in QUEUE mode — no callback,
+// SDL_QueueAudio from its mixer, SDL_GetQueuedAudioSize to pace itself — but the
+// callback mode is served too. A feeder thread drains one period at a time into
+// kl_audio_write, which blocks for the period's duration: that is the device
+// clock, exactly as for the other guests. An empty queue plays silence, which is
+// what SDL does. Whatever the guest's format (s16, s32 or float; 1-8 channels),
+// it is converted to s16 stereo here, surround folded down; kl_audio resamples
+// 44.1 kHz to the hardware rate.
+//
+// SDL2's SDL_AudioSpec: freq int @0, format u16 @4, channels u8 @6, silence u8
+// @7, samples u16 @8, size u32 @12, callback @16, userdata @24.
+typedef struct {
+    int freq; uint16_t format; uint8_t channels, silence; uint16_t samples, padding;
+    uint32_t size; void (*callback)(void *, uint8_t *, int); void *userdata;
+} sdl_audiospec;
+_Static_assert(sizeof(sdl_audiospec) == 32, "SDL2 SDL_AudioSpec");
+#define AUDIO_S16LSB 0x8010u
+#define AUDIO_S32LSB 0x8020u
+#define AUDIO_F32LSB 0x8120u
+#define AUDIO_DEV_ID 2u
+
+static struct {
+    int open, paused, quit;
+    sdl_audiospec spec;
+    pthread_t th;
+    pthread_mutex_t mu;               // the queue, and SDL_LockAudioDevice
+    uint8_t *q; size_t qcap, qhead, qlen;
+    unsigned long long periods, starved;
+} g_au = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static int au_frame_bytes(void) { return (g_au.spec.format & 0xff) / 8 * g_au.spec.channels; }
+static float au_sample(const uint8_t *p, int i) {
+    switch (g_au.spec.format) {
+    case AUDIO_F32LSB: { float f; memcpy(&f, p + 4 * i, 4); return f; }
+    case AUDIO_S32LSB: { int32_t v; memcpy(&v, p + 4 * i, 4); return (float)v / 2147483648.0f; }
+    default:           { int16_t v; memcpy(&v, p + 2 * i, 2); return (float)v / 32768.0f; }
+    }
+}
+// n frames of guest audio -> n s16 stereo frames. Surround folds to stereo with
+// the usual -3 dB centre and surrounds (SDL's channel orders: 4 = FL FR BL BR,
+// 6 = FL FR C LFE SL SR, 8 = FL FR C LFE BL BR SL SR); LFE is dropped.
+static void au_convert(const uint8_t *in, int n, int16_t *out) {
+    int ch = g_au.spec.channels;
+    const float k = 0.7071f;
+    for (int f = 0; f < n; f++) {
+        const uint8_t *fr = in + (size_t)f * au_frame_bytes();
+        float l, r;
+        switch (ch) {
+        case 1:  l = r = au_sample(fr, 0); break;
+        case 2:  l = au_sample(fr, 0); r = au_sample(fr, 1); break;
+        case 4:  l = au_sample(fr, 0) + k * au_sample(fr, 2); r = au_sample(fr, 1) + k * au_sample(fr, 3); break;
+        case 6:  l = au_sample(fr, 0) + k * (au_sample(fr, 2) + au_sample(fr, 4));
+                 r = au_sample(fr, 1) + k * (au_sample(fr, 2) + au_sample(fr, 5)); break;
+        case 8:  l = au_sample(fr, 0) + k * (au_sample(fr, 2) + au_sample(fr, 4) + au_sample(fr, 6));
+                 r = au_sample(fr, 1) + k * (au_sample(fr, 2) + au_sample(fr, 5) + au_sample(fr, 7)); break;
+        default: l = au_sample(fr, 0); r = ch > 1 ? au_sample(fr, 1) : l; break;
+        }
+        if (ch > 2) { l *= 0.6f; r *= 0.6f; }           // headroom for the fold-down
+        l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+        r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+        out[2 * f] = (int16_t)lrintf(l * 32767.0f);
+        out[2 * f + 1] = (int16_t)lrintf(r * 32767.0f);
+    }
+}
+static void *au_feeder(void *arg) {
+    (void)arg;
+    if (g_au.spec.callback) kl_thread_init();         // the guest's callback runs here
+    size_t period = (size_t)g_au.spec.samples * au_frame_bytes();
+    uint8_t *buf = malloc(period);
+    int16_t *out = malloc((size_t)g_au.spec.samples * 4);
+    while (!g_au.quit) {
+        if (g_au.paused) { usleep(5000); continue; }
+        if (g_au.spec.callback) {
+            memset(buf, g_au.spec.silence, period);
+            pthread_mutex_lock(&g_au.mu);
+            g_au.spec.callback(g_au.spec.userdata, buf, (int)period);
+            pthread_mutex_unlock(&g_au.mu);
+        } else {
+            pthread_mutex_lock(&g_au.mu);
+            size_t take = g_au.qlen < period ? g_au.qlen : period;
+            for (size_t i = 0; i < take; i++) buf[i] = g_au.q[(g_au.qhead + i) % g_au.qcap];
+            g_au.qhead = g_au.qcap ? (g_au.qhead + take) % g_au.qcap : 0;
+            g_au.qlen -= take;
+            pthread_mutex_unlock(&g_au.mu);
+            if (take < period) { memset(buf + take, g_au.spec.silence, period - take); g_au.starved++; }
+        }
+        au_convert(buf, g_au.spec.samples, out);
+        g_au.periods++;
+        if (kl_audio_write(out, (size_t)g_au.spec.samples * 4) == 0) usleep(5000);
+    }
+    free(buf); free(out);
+    return NULL;
+}
+static uint32_t sdl_OpenAudioDevice(const char *name, int capture, const sdl_audiospec *want,
+                                    sdl_audiospec *have, int allowed) {
+    (void)allowed;
+    if (capture || !want) {
+        fprintf(stderr, "  [sdl] SDL_OpenAudioDevice(capture %d): no capture device\n", capture);
+        return 0;
+    }
+    if (g_au.open) return 0;                          // one device, as most backends
+    sdl_audiospec s = *want;
+    if (s.format != AUDIO_S16LSB && s.format != AUDIO_S32LSB && s.format != AUDIO_F32LSB)
+        s.format = AUDIO_F32LSB;
+    if (s.channels < 1 || s.channels > 8) s.channels = 2;
+    if (s.freq <= 0) s.freq = 48000;
+    if (!s.samples) s.samples = 1024;
+    s.silence = 0;
+    s.size = (uint32_t)s.samples * ((s.format & 0xff) / 8) * s.channels;
+    if (have) *have = s;
+    if (kl_audio_open((unsigned)s.freq, 2, 16) != 0) {
+        fprintf(stderr, "  [sdl] SDL_OpenAudioDevice: the host audio device did not open\n");
+        return 0;
+    }
+    g_au.spec = s;
+    g_au.paused = 1; g_au.quit = 0; g_au.qhead = g_au.qlen = 0;
+    g_au.open = 1;
+    pthread_create(&g_au.th, NULL, au_feeder, NULL);
+    fprintf(stderr, "  [sdl] SDL_OpenAudioDevice(\"%s\") -> %u: %d Hz, format %#x, %u channel(s), "
+                    "%u-frame periods, %s mode -> s16 stereo into the host sink\n",
+            name ? name : "default", AUDIO_DEV_ID, s.freq, s.format, s.channels, s.samples,
+            s.callback ? "callback" : "queue");
+    return AUDIO_DEV_ID;
+}
+static void sdl_PauseAudioDevice(uint32_t dev, int pause) {
+    if (dev != AUDIO_DEV_ID || !g_au.open) return;
+    g_au.paused = pause != 0;
+    if (pause) kl_audio_pause(); else kl_audio_play();
+}
+static int sdl_QueueAudio(uint32_t dev, const void *data, uint32_t len) {
+    if (dev != AUDIO_DEV_ID || !g_au.open || g_au.spec.callback) return -1;
+    pthread_mutex_lock(&g_au.mu);
+    if (g_au.qlen + len > g_au.qcap) {                // grow, unrolling the ring
+        size_t ncap = (g_au.qlen + len) * 2;
+        uint8_t *nq = malloc(ncap);
+        for (size_t i = 0; i < g_au.qlen; i++) nq[i] = g_au.q[(g_au.qhead + i) % g_au.qcap];
+        free(g_au.q);
+        g_au.q = nq; g_au.qcap = ncap; g_au.qhead = 0;
+    }
+    for (uint32_t i = 0; i < len; i++)
+        g_au.q[(g_au.qhead + g_au.qlen + i) % g_au.qcap] = ((const uint8_t *)data)[i];
+    g_au.qlen += len;
+    pthread_mutex_unlock(&g_au.mu);
+    return 0;
+}
+static uint32_t sdl_GetQueuedAudioSize(uint32_t dev) {
+    if (dev != AUDIO_DEV_ID || !g_au.open) return 0;
+    pthread_mutex_lock(&g_au.mu);
+    uint32_t n = (uint32_t)g_au.qlen;
+    pthread_mutex_unlock(&g_au.mu);
+    return n;
+}
+static void sdl_ClearQueuedAudio(uint32_t dev) {
+    if (dev != AUDIO_DEV_ID || !g_au.open) return;
+    pthread_mutex_lock(&g_au.mu);
+    g_au.qhead = g_au.qlen = 0;
+    pthread_mutex_unlock(&g_au.mu);
+}
+static void sdl_CloseAudioDevice(uint32_t dev) {
+    if (dev != AUDIO_DEV_ID || !g_au.open) return;
+    g_au.quit = 1;
+    pthread_join(g_au.th, NULL);
+    kl_audio_close();
+    g_au.open = 0;
+    fprintf(stderr, "  [sdl] SDL_CloseAudioDevice: %llu periods played, %llu of them short\n",
+            g_au.periods, g_au.starved);
+}
+static void sdl_LockAudioDevice(uint32_t dev)   { if (dev == AUDIO_DEV_ID) pthread_mutex_lock(&g_au.mu); }
+static void sdl_UnlockAudioDevice(uint32_t dev) { if (dev == AUDIO_DEV_ID) pthread_mutex_unlock(&g_au.mu); }
+static int  sdl_GetAudioDeviceStatus(uint32_t dev) {   // 0 stopped, 1 playing, 2 paused
+    return dev == AUDIO_DEV_ID && g_au.open ? (g_au.paused ? 2 : 1) : 0;
+}
+static int  sdl_OpenAudio(const sdl_audiospec *want, sdl_audiospec *have) {
+    sdl_audiospec tmp;
+    return sdl_OpenAudioDevice(NULL, 0, want, have ? have : &tmp, 0) == AUDIO_DEV_ID ? 0 : -1;
+}
+static void sdl_PauseAudio(int pause) { sdl_PauseAudioDevice(AUDIO_DEV_ID, pause); }
+static void sdl_CloseAudio(void)      { sdl_CloseAudioDevice(AUDIO_DEV_ID); }
+static void sdl_LockAudio(void)       { sdl_LockAudioDevice(AUDIO_DEV_ID); }
+static void sdl_UnlockAudio(void)     { sdl_UnlockAudioDevice(AUDIO_DEV_ID); }
+static int  sdl_GetNumAudioDevices(int capture) { return capture ? 0 : 1; }
+static const char *sdl_GetAudioDeviceName(int i, int capture) {
+    return !capture && i == 0 ? "Klepton audio" : NULL;
+}
+static int  sdl_GetNumAudioDrivers(void) { return 1; }
+static const char *sdl_GetAudioDriver(int i) { return i == 0 ? "klepton" : NULL; }
+static const char *sdl_GetCurrentAudioDriver(void) { return g_audio_inited ? "klepton" : NULL; }
+static int  sdl_AudioInit(const char *d) { (void)d; g_audio_inited = 1; return 0; }
+static void sdl_AudioQuit(void) { g_audio_inited = 0; }
 
 // ---- Vulkan ------------------------------------------------------------------------------
 typedef struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pLayer; } metal_surface_ci;
@@ -482,6 +685,17 @@ typedef struct { const char *name; void *fn; } entry;
 #define F(n, f) { n, (void *)(f) }
 static const entry g_sdl[] = {
     F("SDL_Init", sdl_Init), F("SDL_InitSubSystem", sdl_InitSubSystem),
+    F("SDL_OpenAudioDevice", sdl_OpenAudioDevice), F("SDL_PauseAudioDevice", sdl_PauseAudioDevice),
+    F("SDL_QueueAudio", sdl_QueueAudio), F("SDL_GetQueuedAudioSize", sdl_GetQueuedAudioSize),
+    F("SDL_ClearQueuedAudio", sdl_ClearQueuedAudio), F("SDL_CloseAudioDevice", sdl_CloseAudioDevice),
+    F("SDL_LockAudioDevice", sdl_LockAudioDevice), F("SDL_UnlockAudioDevice", sdl_UnlockAudioDevice),
+    F("SDL_GetAudioDeviceStatus", sdl_GetAudioDeviceStatus),
+    F("SDL_OpenAudio", sdl_OpenAudio), F("SDL_PauseAudio", sdl_PauseAudio), F("SDL_CloseAudio", sdl_CloseAudio),
+    F("SDL_LockAudio", sdl_LockAudio), F("SDL_UnlockAudio", sdl_UnlockAudio),
+    F("SDL_GetNumAudioDevices", sdl_GetNumAudioDevices), F("SDL_GetAudioDeviceName", sdl_GetAudioDeviceName),
+    F("SDL_GetNumAudioDrivers", sdl_GetNumAudioDrivers), F("SDL_GetAudioDriver", sdl_GetAudioDriver),
+    F("SDL_GetCurrentAudioDriver", sdl_GetCurrentAudioDriver),
+    F("SDL_AudioInit", sdl_AudioInit), F("SDL_AudioQuit", sdl_AudioQuit),
     F("SDL_QuitSubSystem", sdl_QuitSubSystem), F("SDL_WasInit", sdl_WasInit),
     F("SDL_CreateWindow", sdl_CreateWindow), F("SDL_DestroyWindow", sdl_DestroyWindow),
     F("SDL_GetWindowSize", sdl_GetWindowSize), F("SDL_SetWindowSize", sdl_SetWindowSize),

@@ -107,6 +107,16 @@ void kl_view_pace_wait(void) {
 #define KL_VIEW_EYE_HEIGHT       1.6f      // standing eye height, metres
 #define KL_VIEW_WIN_W            920       // half of 1832x1920, roughly one eye
 #define KL_VIEW_WIN_H            960
+// The window for a stereo guest. Both eyes side by side (kl_view_mtl.m) unless
+// KL_VIEW_EYE pins one, so the default is two eye-widths wide; each half is
+// letterboxed to its eye's own frustum, so the window's shape never stretches a
+// picture, only frames it. Resizable; KL_VIEW_WIN_W / KL_VIEW_WIN_H override.
+static void view_stereo_size(int *w, int *h) {
+    const char *e = getenv("KL_VIEW_EYE");
+    int sbs = !(e && (*e == '0' || *e == '1'));
+    *w = (int)kl_env_int("KL_VIEW_WIN_W", sbs ? 1600 : KL_VIEW_WIN_W);
+    *h = (int)kl_env_int("KL_VIEW_WIN_H", sbs ? 860 : KL_VIEW_WIN_H);
+}
 // The smallest guest panel worth resizing the window to. Below this it is a
 // placeholder surface rather than a picture — see the mono transition.
 #define KL_VIEW_MONO_MIN         64
@@ -392,8 +402,10 @@ int kl_view_main(const char *libdir, int hw) {
         fprintf(stderr, "view: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window *win = SDL_CreateWindow("Klepton", KL_VIEW_WIN_W, KL_VIEW_WIN_H,
-                                       hw ? SDL_WINDOW_METAL : 0);
+    int ww, wh;
+    view_stereo_size(&ww, &wh);
+    SDL_Window *win = SDL_CreateWindow("Klepton", ww, wh,
+                                       (hw ? SDL_WINDOW_METAL : 0) | SDL_WINDOW_RESIZABLE);
     if (!win) {
         fprintf(stderr, "view: SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
@@ -515,8 +527,12 @@ int kl_view_main(const char *libdir, int hw) {
                 // a guest that goes mono and THEN stereo (every Unity OpenXR
                 // title — the placeholder surface comes first) was left in a
                 // window sized for the panel it has stopped drawing.
-                SDL_SetWindowSize(win, KL_VIEW_WIN_W, KL_VIEW_WIN_H);
-                SDL_SetWindowTitle(win, "Klepton — VR guest (one eye)");
+                {
+                    int sw2, sh2;
+                    view_stereo_size(&sw2, &sh2);
+                    SDL_SetWindowSize(win, sw2, sh2);
+                }
+                SDL_SetWindowTitle(win, "Klepton — VR guest");
                 fprintf(stderr, "view: guest is STEREO — driving pose and hands\n");
             }
         }

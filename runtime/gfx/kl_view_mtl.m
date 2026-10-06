@@ -146,7 +146,23 @@ static float         g_grid_vp[4];
 //
 // Pairs with KL_OVRP_EYE_TAN, which is what gives a host run a canted display
 // to have the problem on in the first place.
+// Side by side (the default for a stereo guest): both eyes, left | right, each
+// letterboxed by its own frustum — the SteamVR mirror window's layout. While one
+// half is being drawn this names its eye, and everything that asks klvm_eye()
+// (uniforms, crop, overlays) answers for that half.
+static int g_cur_eye = -1;
+static int klvm_sbs(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("KL_VIEW_EYE");
+        on = !(e && (*e == '0' || *e == '1'));         // a pinned eye means single-eye
+        if (on) fprintf(stderr, "  [view] both eyes side by side (KL_VIEW_EYE=0 or 1 "
+                                "for one eye, full window)\n");
+    }
+    return on;
+}
 static int klvm_eye(void) {
+    if (g_cur_eye >= 0) return g_cur_eye;
     static int eye = -1;
     if (eye < 0) {
         eye = kl_env_int("KL_VIEW_EYE", 0);
@@ -818,6 +834,83 @@ static int klvm_present_flat(int win_w, int win_h) {
     return 1;
 }
 
+// The aspect a half (or the window) is letterboxed to: the frustum the picture
+// was rendered with, from the frame record. The texture's own shape is not it —
+// a guest that renders a wider field than the stage image's aspect (Alyx:
+// 3456x2880 of picture scaled into a 2290x2400 stage image) came out squeezed,
+// which is how the viewer showed a too-tall picture.
+static void klvm_eye_aspect(int stage, int eye, id<MTLTexture> src, double *w, double *h) {
+    kl_ovrp_render_pose r;
+    const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
+    if (t && t[0] + t[1] > 0 && t[2] + t[3] > 0) { *w = t[0] + t[1]; *h = t[2] + t[3]; return; }
+    *w = src ? (double)src.width : 1832; *h = src ? (double)src.height : 1920;
+}
+
+static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye,
+                             id<MTLTexture> src, kl_blit_uniforms bu, int flip) {
+        kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
+        [enc setRenderPipelineState:g_pipe_rp];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        // The unwarp grid. Identity until the guest's eye textures are
+        // foveated, at which point it carries the squeeze this pass has to
+        // undo (kl_reproject.h). A buffer rather than setVertexBytes: that
+        // path caps at 4 KB and a grid dense enough to land on the map's zone
+        // boundaries is bigger than that.
+        uint32_t gverts = 0;
+        // ...and the crop, from the same record the uniforms above came from,
+        // for the eye this window is showing. The two are not interchangeable
+        // — see klvm_eye — and the visionOS compositor, which draws both in one
+        // pass, carries a grid block per eye rather than picking.
+        kl_ovrp_render_pose vr;
+        float vp[4] = { 0, 0, 0, 0 };
+        if (kl_ovrp_stage_render_pose(stage, &vr)) {
+            for (int i = 0; i < 4; i++) vp[i] = (float)vr.viewport[eye][i];
+            // The same guard KleptonCompositor carries, and for the same reason:
+            // a rect measured against another eye texture describes nothing
+            // about this one, and cropping by it MAGNIFIES the picture by the
+            // ratio rather than mis-placing it (kl_ovrp.h, viewport_of). Refuse
+            // rather than rescale — with the two disagreeing, which texels the
+            // guest wrote is not known.
+            if (vp[2] > 0 && vr.viewport_of[0] > 0 && src &&
+                ((uint32_t)vr.viewport_of[0] != (uint32_t)src.width ||
+                 (uint32_t)vr.viewport_of[1] != (uint32_t)src.height)) {
+                static int said_skew;
+                if (!said_skew) {
+                    said_skew = 1;
+                    fprintf(stderr, "  [view] the render viewport is %dx%d of a %dx%d "
+                                    "eye texture, but the texture in hand is %ux%u — "
+                                    "NOT cropping, that rect describes another "
+                                    "texture\n",
+                            vr.viewport[eye][2], vr.viewport[eye][3],
+                            vr.viewport_of[0], vr.viewport_of[1],
+                            (unsigned)src.width, (unsigned)src.height);
+                }
+                vp[0] = vp[1] = vp[2] = vp[3] = 0;
+            }
+            // Once, and ALSO when it is zero — the same line KleptonCompositor
+            // prints, so a host run and a device run answer "did the rect reach
+            // the composite?" in the same words. `[ovrp] render viewport` is
+            // the guest's own thread saying what it submitted; this is the
+            // compositor saying what it read, and the two failures those
+            // separate are indistinguishable by eye.
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [view] first render viewport read from the frame "
+                                "record: %d,%d %dx%d (stage %d, serial %llu)%s\n",
+                        vr.viewport[eye][0], vr.viewport[eye][1], vr.viewport[eye][2],
+                        vr.viewport[eye][3], stage, (unsigned long long)vr.serial,
+                        vr.viewport[eye][2] <= 0
+                            ? "  <- ZERO, so no crop is applied; compare against "
+                              "the [ovrp] render viewport line" : "");
+            }
+        }
+        id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
+        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+}
+
 int kl_viewmtl_present(int win_w, int win_h) {
     if (!g_started) return 0;
     if (g_flat_tex) return klvm_present_flat(win_w, win_h);
@@ -946,7 +1039,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
             sw = et[0] + et[1];
             sh = et[2] + et[3];
         }
-    } else if (src) { sw = (double)src.width; sh = (double)src.height; }
+    } else if (src) { klvm_eye_aspect(stage, eye, src, &sw, &sh); }
     else {
         kl_ovrp_render_pose r;
         const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
@@ -980,6 +1073,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
     }
     [enc setFragmentSamplerState:g_samp atIndex:0];
     kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
+    int sbs_drawn = 0;
     if (nproj > 0) {
         // The per-layer composite. The frustum is the DISPLAY's — what this
         // window is looking through — and every layer is then placed inside it
@@ -1008,74 +1102,39 @@ int kl_viewmtl_present(int win_w, int win_h) {
         // Nothing to draw here; the cleared drawable is the background the
         // overlay pass draws its panel onto.
     } else if (g_pipe_rp) {
-        kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
-        [enc setRenderPipelineState:g_pipe_rp];
-        [enc setVertexBytes:&u length:sizeof u atIndex:0];
-        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        // The unwarp grid. Identity until the guest's eye textures are
-        // foveated, at which point it carries the squeeze this pass has to
-        // undo (kl_reproject.h). A buffer rather than setVertexBytes: that
-        // path caps at 4 KB and a grid dense enough to land on the map's zone
-        // boundaries is bigger than that.
-        uint32_t gverts = 0;
-        // ...and the crop, from the same record the uniforms above came from,
-        // for the eye this window is showing. The two are not interchangeable
-        // — see klvm_eye — and the visionOS compositor, which draws both in one
-        // pass, carries a grid block per eye rather than picking.
-        kl_ovrp_render_pose vr;
-        float vp[4] = { 0, 0, 0, 0 };
-        if (kl_ovrp_stage_render_pose(stage, &vr)) {
-            for (int i = 0; i < 4; i++) vp[i] = (float)vr.viewport[eye][i];
-            // The same guard KleptonCompositor carries, and for the same reason:
-            // a rect measured against another eye texture describes nothing
-            // about this one, and cropping by it MAGNIFIES the picture by the
-            // ratio rather than mis-placing it (kl_ovrp.h, viewport_of). Refuse
-            // rather than rescale — with the two disagreeing, which texels the
-            // guest wrote is not known.
-            if (vp[2] > 0 && vr.viewport_of[0] > 0 && src &&
-                ((uint32_t)vr.viewport_of[0] != (uint32_t)src.width ||
-                 (uint32_t)vr.viewport_of[1] != (uint32_t)src.height)) {
-                static int said_skew;
-                if (!said_skew) {
-                    said_skew = 1;
-                    fprintf(stderr, "  [view] the render viewport is %dx%d of a %dx%d "
-                                    "eye texture, but the texture in hand is %ux%u — "
-                                    "NOT cropping, that rect describes another "
-                                    "texture\n",
-                            vr.viewport[eye][2], vr.viewport[eye][3],
-                            vr.viewport_of[0], vr.viewport_of[1],
-                            (unsigned)src.width, (unsigned)src.height);
-                }
-                vp[0] = vp[1] = vp[2] = vp[3] = 0;
+        if (klvm_sbs()) {
+            // Two halves; each eye's own texture, frustum and letterbox.
+            for (int e = 0; e < 2; e++) {
+                int es = 0;
+                void *ep = kl_glfb_eye_mtl_texture(e, stage, &es);
+                if (!ep) continue;
+                id<MTLTexture> et = klvm_array_view((__bridge id<MTLTexture>)ep);
+                int ef = kl_glfb_eye_mtl_origin_top_left(e, stage);
+                double aw, ah;
+                klvm_eye_aspect(stage, e, et, &aw, &ah);
+                double hw = win_w * 0.5, sc = fmin(hw / aw, (double)win_h / ah);
+                double w2 = aw * sc, h2 = ah * sc;
+                [enc setViewport:(MTLViewport){ e * hw + (hw - w2) * 0.5, (win_h - h2) * 0.5,
+                                                w2, h2, 0.0, 1.0 }];
+                [enc setFragmentTexture:et atIndex:0];
+                [enc setFragmentTexture:et atIndex:1];
+                g_cur_eye = e;
+                kl_blit_uniforms ebu = { (uint32_t)es, (uint32_t)(ef ? 1 : 0) };
+                klvm_draw_eye_rp(enc, stage, e, et, ebu, ef);
+                klvm_draw_overlays(enc, e, stage);
+                g_cur_eye = -1;
             }
-            // Once, and ALSO when it is zero — the same line KleptonCompositor
-            // prints, so a host run and a device run answer "did the rect reach
-            // the composite?" in the same words. `[ovrp] render viewport` is
-            // the guest's own thread saying what it submitted; this is the
-            // compositor saying what it read, and the two failures those
-            // separate are indistinguishable by eye.
-            static int said;
-            if (!said) {
-                said = 1;
-                fprintf(stderr, "  [view] first render viewport read from the frame "
-                                "record: %d,%d %dx%d (stage %d, serial %llu)%s\n",
-                        vr.viewport[eye][0], vr.viewport[eye][1], vr.viewport[eye][2],
-                        vr.viewport[eye][3], stage, (unsigned long long)vr.serial,
-                        vr.viewport[eye][2] <= 0
-                            ? "  <- ZERO, so no crop is applied; compare against "
-                              "the [ovrp] render viewport line" : "");
-            }
+            sbs_drawn = 1;
+        } else {
+            klvm_draw_eye_rp(enc, stage, eye, src, bu, flip);
         }
-        id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
-        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
         klvm_note_delta(stage);
     } else {
         [enc setRenderPipelineState:g_pipe];
         [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
-    klvm_draw_overlays(enc, eye, stage);
+    if (!sbs_drawn) klvm_draw_overlays(enc, eye, stage);
     [enc endEncoding];
 
     // The liveness downsample, same source, same shader, 64x64. It is a second
