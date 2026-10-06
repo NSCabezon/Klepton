@@ -2145,6 +2145,10 @@ nothing, and prints the unresolved imports grouped by category.
   points to the guest's own library (which then looks for a running Steam and
   fails). `KL_TRACE_STEAM=1` logs callback registration and every loopback
   connection state change; `KL_STEAM_NAME` is the persona name (Gordon).
+- `KL_STEAM_LANG=<steam language>` — the game language the Steam stub reports
+  (`english`, `spanish`, `latam`, `french`, …). Default: the system's first
+  preferred language, mapped to Steam's name. Alyx has English voices only;
+  this picks UI text and subtitles.
 - `KL_OPENVR=0` — (`runtime/guest/kl_openvr.c`) leave libopenvr_api's VR_*
   entry points to the guest's own library (which looks for a SteamVR install
   and fails). With it on (default), `-vr` boots against Klepton's runtime: HMD
