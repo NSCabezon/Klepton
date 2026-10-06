@@ -588,9 +588,44 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         return 101;
     }
 #ifdef KLOVR_VULKAN
+    // Submit_TextureWithDepth (0x10, part of Alyx's 0x258 = TextureWithMotion):
+    // the Texture_t is a VRTextureWithPoseAndDepth_t, whose depth info carries
+    // the PROJECTION the picture was actually rendered with. Alyx does not render
+    // exactly the frustum GetProjectionRaw describes (on device it renders
+    // 4608x2880 for a 3072x2465 recommendation — a wider field), so filing the
+    // frame with our tangents stretched a wider picture into a narrower frustum:
+    // an image that looks rotated/shifted, and an edge of whatever lies past
+    // the rendered area. The frame's tangents come from that matrix instead
+    // (KL_OPENVR_SUBMIT_PROJ=0 keeps ours). Layout, pack 8: Texture_t 16, pose
+    // 48 at +16, depth { handle 8, HmdMatrix44 at +72, range } at +64.
+    if ((flags & 0x10) && kl_env_on("KL_OPENVR_SUBMIT_PROJ", 1)) {
+        const float *m = (const float *)((const uint8_t *)tex + 72);     // row-major 4x4
+        float m00 = m[0], m02 = m[2], m11 = m[5], m12 = m[6];
+        if (m00 != 0.0f && m11 != 0.0f) {
+            float rl = 2.0f / m00, sx = m02 * rl, bt = 2.0f / m11, sy = m12 * bt;
+            float r = (sx + rl) * 0.5f, l = (sx - rl) * 0.5f, b2 = (sy + bt) * 0.5f, t2 = (sy - bt) * 0.5f;
+            float tn[4] = { -l, r, -t2, b2 };                 // left, right, up, down; positive
+            // OpenVR's raw y points DOWN (see sys_proj_raw); a matrix built the
+            // other way round shows up as a negative "down" — flip it then.
+            if (tn[2] < 0 && tn[3] < 0) { tn[2] = -tn[2]; tn[3] = -tn[3]; }
+            static int said;
+            if (said < 4) { said++;
+                fprintf(stderr, "  [openvr] eye %d rendered with tangents l=%.4f r=%.4f u=%.4f d=%.4f "
+                                "(we offered l=%.4f r=%.4f u=%.4f d=%.4f)\n", eye, tn[0], tn[1], tn[2], tn[3],
+                        g_frame_tan[eye * 4 + 0], g_frame_tan[eye * 4 + 1],
+                        g_frame_tan[eye * 4 + 2], g_frame_tan[eye * 4 + 3]); }
+            if (tn[0] > 0 && tn[1] > 0 && tn[2] > 0 && tn[3] > 0)
+                memcpy(g_frame_tan + eye * 4, tn, sizeof tn);
+        }
+    }
     uint32_t layer = layer_override >= 0 ? (uint32_t)layer_override : 0;
     if (layer_override < 0 && (flags & SUBMIT_VULKAN_ARRAY_DATA))
         layer = ((const VRVulkanTextureArrayData_t *)tex->handle)->m_unArrayIndex;
+    {
+        static int said;
+        if (said < 4) { said++;
+            fprintf(stderr, "  [openvr] eye %d <- array layer %u\n", eye, layer); }
+    }
     if (vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
 #else
     (void)b;
