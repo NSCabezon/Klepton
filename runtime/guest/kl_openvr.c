@@ -168,10 +168,17 @@ static long ovr_unimpl(const char *name) {
 }
 
 // ---- IVRSystem ------------------------------------------------------------------------------------
+// KL_OPENVR_RT_SCALE scales the recommended render target size, and with it
+// every fidelity level Alyx derives from it (its levels are 0.78x..1.5x of this
+// size) and our stage images. 1 by default; 0.7 halves the pixels.
 static void eye_size(uint32_t *w, uint32_t *h) {
     int ew = 0, eh = 0;
     kl_ovrp_eye_texture_size(&ew, &eh);
     if (ew <= 0 || eh <= 0) { ew = kl_env_int("KL_OPENVR_EYE_W", 1832); eh = kl_env_int("KL_OPENVR_EYE_H", 1920); }
+    float sc = kl_env_float("KL_OPENVR_RT_SCALE", 1.0f);
+    if (sc > 0.2f && sc < 2.0f && sc != 1.0f) {
+        ew = (int)(ew * sc + 0.5f) & ~7; eh = (int)(eh * sc + 0.5f) & ~7;
+    }
     *w = (uint32_t)ew; *h = (uint32_t)eh;
 }
 static void sys_rt_size(void *s, uint32_t *w, uint32_t *h) { (void)s; eye_size(w, h); }
@@ -363,7 +370,22 @@ static int sys_poll(void *s, void *ev, uint32_t n) {
     return 1;
 }
 static int sys_poll_pose(void *s, int o, void *ev, uint32_t n, void *p) { (void)o; (void)p; return sys_poll(s, ev, n); }
-static HiddenAreaMesh_t sys_hidden(void *s, int eye, int type) { (void)s; (void)eye; (void)type; return (HiddenAreaMesh_t){ NULL, 0 }; }
+// The hidden-area mesh: what of the eye texture no lens shows. There is no such
+// area on a Vision Pro at our frustum, but answering an EMPTY mesh is not "no
+// mask" to Source 2 — with no mesh it builds a mask of its own, and builds the
+// same one for both eyes: left eye's (on the canted Vision Pro frustum, the
+// right ~11% of the texture plus a bottom-right block), so the RIGHT eye's
+// temporal edge was masked off and left at the render target's clear colour —
+// the magenta/pink stripe. One zero-area triangle is a mesh that hides nothing.
+// KL_OPENVR_HIDDEN_MESH=0 restores the empty answer.
+static HiddenAreaMesh_t sys_hidden(void *s, int eye, int type) {
+    (void)s; (void)eye;
+    static const float degenerate[6] = { 0, 0, 0, 0, 0, 0 };     // HmdVector2_t x3
+    if (!kl_env_on("KL_OPENVR_HIDDEN_MESH", 1)) return (HiddenAreaMesh_t){ NULL, 0 };
+    static int said;
+    if (said < 6) { said++; TRACE("GetHiddenAreaMesh(eye %d, type %d) -> one degenerate triangle\n", eye, type); }
+    return (HiddenAreaMesh_t){ degenerate, 1 };
+}
 static const char *sys_runtime_version(void *s) { (void)s; return "2.5.1"; }
 static int sys_set_sdk(void *s, uint32_t maj, uint32_t min, uint32_t build) {
     (void)s;
@@ -378,9 +400,101 @@ static unsigned long long g_frames;
 
 static void co_set_space(void *s, int o) { (void)s; g_origin = o; }
 static int co_get_space(void *s) { (void)s; return g_origin; }
+// ---- frame timing, for the game's auto-fidelity ---------------------------------
+// Alyx scales its render resolution (fidelity levels 0..8, 0.78x..1.5x of the
+// recommended size) from IVRCompositor::GetFrameTiming: frames that take longer
+// than a vsync drop a level. Answering "no timing" (false) left it at its
+// default level whatever the frame rate — 13 MP per eye at ~20 fps on device,
+// with the compositor reprojecting 70-80 ms old frames. So the frame intervals
+// are measured here: WaitGetPoses to WaitGetPoses (the client interval) and
+// WaitGetPoses to the second Submit returning (Submit waits for the eye copy,
+// which is queued behind the game's own GPU work on its queue, so that span is
+// the frame's CPU+GPU time). OFF by default (KL_OPENVR_FRAME_TIMING=1 turns it
+// on): measured on the Mac it made things WORSE — 51 fps against 62 without —
+// because the game reads the span as GPU time, and on a CPU-bound host the
+// auto-fidelity system oscillates between levels (0.78x <-> 1.2x render scale,
+// 2x <-> 4x MSAA) instead of settling. Kept for the device A/B, where the GPU
+// is the bottleneck. The guest fps line below is printed either way.
+typedef struct { uint32_t index; double t_wait, t_submit, interval_ms, work_ms; } frame_time;
+#define FT_RING 32
+static frame_time g_ft[FT_RING];
+static uint32_t g_ft_index;
+static double now_s(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static void ft_wait(void) {
+    double t = now_s();
+    frame_time *prev = &g_ft[g_ft_index % FT_RING];
+    frame_time *f = &g_ft[(g_ft_index + 1) % FT_RING];
+    memset(f, 0, sizeof *f);
+    f->index = g_ft_index + 1;
+    f->t_wait = t;
+    f->interval_ms = prev->t_wait > 0 ? (t - prev->t_wait) * 1000.0 : 0.0;
+    __atomic_store_n(&g_ft_index, f->index, __ATOMIC_RELEASE);
+}
+static void ft_submitted(void) {
+    frame_time *f = &g_ft[g_ft_index % FT_RING];
+    f->t_submit = now_s();
+    f->work_ms = (f->t_submit - f->t_wait) * 1000.0;
+    static double win_start; static unsigned win_n; static double win_work;
+    if (!win_start) win_start = f->t_submit;
+    win_n++; win_work += f->work_ms;
+    if (f->t_submit - win_start >= 5.0) {
+        fprintf(stderr, "  [openvr] guest %.1f fps, frame work %.1f ms (WaitGetPoses -> Submit), "
+                        "display %.0f Hz\n", win_n / (f->t_submit - win_start), win_work / win_n,
+                (double)kl_ovrp_display_frequency());
+        win_start = f->t_submit; win_n = 0; win_work = 0;
+    }
+}
+// Compositor_FrameTiming, packed 4 on Linux: six uint32, a double at +24,
+// sixteen floats from +32 (PreSubmitGpu, PostSubmitGpu, TotalRenderGpu,
+// CompositorRenderGpu, CompositorRenderCpu, CompositorIdleCpu,
+// ClientFrameInterval, ...), the HMD pose at +96.
+static int co_frame_timing(void *s, uint8_t *t, uint32_t frames_ago) {
+    (void)s;
+    if (!t || !kl_env_on("KL_OPENVR_FRAME_TIMING", 0)) return 0;
+    uint32_t idx = __atomic_load_n(&g_ft_index, __ATOMIC_ACQUIRE);
+    if (frames_ago + 1 >= FT_RING || idx <= frames_ago + 1) return 0;
+    // The newest COMPLETE frame is the one before the frame in flight.
+    const frame_time *f = &g_ft[(idx - 1 - frames_ago) % FT_RING];
+    if (!f->t_submit) return 0;
+    uint32_t size;
+    memcpy(&size, t, 4);
+    if (size < 96) return 0;
+    memset(t + 4, 0, size - 4);
+    float hz = kl_ovrp_display_frequency();
+    double vsync_ms = 1000.0 / (hz > 0 ? hz : 90.0);
+    uint32_t presents = 1, dropped = f->interval_ms > vsync_ms * 1.5
+                                   ? (uint32_t)(f->interval_ms / vsync_ms + 0.5) - 1 : 0;
+    float work = (float)f->work_ms, interval = (float)f->interval_ms;
+    memcpy(t + 4, &f->index, 4);
+    memcpy(t + 8, &presents, 4);
+    memcpy(t + 16, &dropped, 4);
+    memcpy(t + 24, &f->t_submit, 8);
+    memcpy(t + 32, &work, 4);            // PreSubmitGpuMs
+    memcpy(t + 40, &work, 4);            // TotalRenderGpuMs
+    memcpy(t + 56, &interval, 4);        // ClientFrameIntervalMs
+    if (size >= 96 + sizeof(TrackedDevicePose_t)) memcpy(t + 96, &g_last[0], sizeof(TrackedDevicePose_t));
+    return 1;
+}
+static uint32_t co_frame_timings(void *s, uint8_t *t, uint32_t n) {
+    uint32_t got = 0, size = 0;
+    if (!t || !n) return 0;
+    memcpy(&size, t, 4);
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t *e = t + (size_t)i * size;
+        memcpy(e, &size, 4);
+        if (!co_frame_timing(s, e, n - 1 - i)) continue;   // oldest first
+        got++;
+    }
+    return got;
+}
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
+    ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
     // the poses this frame will be drawn with.
     kl_ovrp_frame_latch();
@@ -418,6 +532,7 @@ static int co_last_pose_idx(void *s, uint32_t i, TrackedDevicePose_t *r, Tracked
 // submitted image to be in TRANSFER_SRC_OPTIMAL, so the copy needs no layout
 // change on the guest's side.
 #define OVR_STAGES 3
+static unsigned long long g_frames_for_dump;
 #ifdef KLOVR_VULKAN
 static struct {
     VkDevice dev;
@@ -436,6 +551,7 @@ static struct {
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkCmdCopyImage CmdCopyImage;
     PFN_vkCmdBlitImage CmdBlitImage;
+    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkCreateFence CreateFence;
     PFN_vkWaitForFences WaitForFences;
@@ -453,7 +569,7 @@ static int vk_setup(const VRVulkanTextureData_t *t) {
 #define R(f) V.f = (PFN_vk##f)gdpa(V.dev, "vk" #f)
     R(CreateCommandPool); R(AllocateCommandBuffers); R(BeginCommandBuffer); R(EndCommandBuffer);
     R(ResetCommandBuffer); R(CmdPipelineBarrier); R(CmdCopyImage); R(CmdBlitImage);
-    R(QueueSubmit); R(CreateFence); R(WaitForFences); R(ResetFences);
+    R(QueueSubmit); R(CreateFence); R(WaitForFences); R(ResetFences); R(CmdCopyImageToBuffer);
 #undef R
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qf };
@@ -468,6 +584,90 @@ static int vk_setup(const VRVulkanTextureData_t *t) {
     fprintf(stderr, "  [openvr] Vulkan submit path ready (device %p, queue family %u)\n",
             (void *)V.dev, V.qf);
     return 0;
+}
+
+// KL_OPENVR_DUMP=<dir>: write the guest's submitted image (the layer this eye
+// reads, whole, before any scaling) and our stage image after the copy, once,
+// at submitted frame KL_OPENVR_DUMP_AT (default 300), as quarter-size PPMs —
+// eyeN_src.ppm / eyeN_dst.ppm. The ground truth for "is it the picture or the
+// compositor": what the game drew versus what the compositor is handed.
+static void vk_dump(const VRVulkanTextureData_t *t, VkImage img, uint32_t layer, uint32_t w, uint32_t h,
+                    const char *name) {
+    const char *dir = getenv("KL_OPENVR_DUMP");
+    if (!dir || !*dir || !t->m_pPhysicalDevice) return;
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)kl_vulkan_sym("vkGetDeviceProcAddr");
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)kl_vulkan_sym("vkGetInstanceProcAddr");
+    if (!gdpa || !gipa) return;
+#define D(f) PFN_vk##f f = (PFN_vk##f)gdpa(V.dev, "vk" #f)
+    D(CreateBuffer); D(GetBufferMemoryRequirements); D(AllocateMemory); D(BindBufferMemory);
+    D(MapMemory); D(DestroyBuffer); D(FreeMemory);
+#undef D
+    PFN_vkGetPhysicalDeviceMemoryProperties gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        gipa((VkInstance)t->m_pInstance, "vkGetPhysicalDeviceMemoryProperties");
+    if (!CreateBuffer || !gmp) return;
+    VkDeviceSize sz = (VkDeviceSize)w * h * 4;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
+                               .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    VkBuffer buf; VkDeviceMemory mem; VkMemoryRequirements mr;
+    if (CreateBuffer(V.dev, &bci, NULL, &buf) != VK_SUCCESS) return;
+    GetBufferMemoryRequirements(V.dev, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mp; gmp((VkPhysicalDevice)t->m_pPhysicalDevice, &mp);
+    uint32_t ti = 0;
+    for (; ti < mp.memoryTypeCount; ti++)
+        if ((mr.memoryTypeBits & (1u << ti)) &&
+            (mp.memoryTypes[ti].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) break;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = ti };
+    if (ti == mp.memoryTypeCount || AllocateMemory(V.dev, &mai, NULL, &mem) != VK_SUCCESS) { DestroyBuffer(V.dev, buf, NULL); return; }
+    BindBufferMemory(V.dev, buf, mem, 0);
+    VkCommandBuffer cb = V.cb[0][0];
+    V.WaitForFences(V.dev, 1, &V.fence[0][0], VK_TRUE, UINT64_MAX);
+    V.ResetFences(V.dev, 1, &V.fence[0][0]);
+    V.ResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    V.BeginCommandBuffer(cb, &bi);
+    VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 } };
+    // The guest's image is already TRANSFER_SRC (OpenVR's contract); ours is
+    // SHADER_READ after the copy. Say so, or UNDEFINED would let it be discarded.
+    bar.oldLayout = name[5] == 's' ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    VkBufferImageCopy reg = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 },
+                              .imageExtent = { w, h, 1 } };
+    V.CmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    if (name[5] != 's') {                         // give ours back to the compositor as it was
+        bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    }
+    V.EndCommandBuffer(cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    V.QueueSubmit(V.q, 1, &si, V.fence[0][0]);
+    V.WaitForFences(V.dev, 1, &V.fence[0][0], VK_TRUE, UINT64_MAX);
+    uint8_t *px = NULL;
+    if (MapMemory(V.dev, mem, 0, sz, 0, (void **)&px) == VK_SUCCESS && px) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s.ppm", dir, name);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            uint32_t ow = w / 4, oh = h / 4;
+            fprintf(f, "P6\n%u %u\n255\n", ow, oh);
+            for (uint32_t y = 0; y < oh; y++)
+                for (uint32_t x = 0; x < ow; x++) {
+                    const uint8_t *p = px + ((size_t)(y * 4) * w + x * 4) * 4;
+                    fputc(p[0], f); fputc(p[1], f); fputc(p[2], f);
+                }
+            fclose(f);
+            fprintf(stderr, "  [openvr] dumped %s (%ux%u, layer %u)\n", path, w, h, layer);
+        }
+    }
+    FreeMemory(V.dev, mem, NULL);
+    DestroyBuffer(V.dev, buf, NULL);
 }
 
 static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b,
@@ -552,6 +752,13 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     // The compositor samples this image the moment the frame is filed, so it
     // has to be complete by then. One small copy; waiting is the honest answer.
     V.WaitForFences(V.dev, 1, &V.fence[eye][stage], VK_TRUE, UINT64_MAX);
+    if (g_frames_for_dump == (unsigned long long)kl_env_int("KL_OPENVR_DUMP_AT", 300) && getenv("KL_OPENVR_DUMP")) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "eye%d_src", eye);
+        vk_dump(t, src, layer, t->m_nWidth, t->m_nHeight, nm);
+        snprintf(nm, sizeof nm, "eye%d_dst", eye);
+        vk_dump(t, dst, 0, w, h, nm);
+    }
     return 0;
 }
 #endif
@@ -636,6 +843,10 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         // Both eyes in: file the frame through the same seams an OpenXR frame
         // uses, with the pose and frusta it was drawn with.
         kl_ovrp_frame_end_external(g_stage, g_frame_pose, g_frame_tan);
+        ft_submitted();
+#ifdef KLOVR_VULKAN
+        g_frames_for_dump++;
+#endif
         kl_vulkan_frame_done(g_stage);
         if (!g_frames++ || (g_frames & (g_frames - 1)) == 0)
             fprintf(stderr, "  [openvr] frame %llu submitted (stage %d)\n", g_frames - 1, g_stage);
@@ -1094,7 +1305,8 @@ static const impl g_impl[] = {
     { COMP, "FadeGrid", (void *)co_fade_grid }, { COMP, "GetCurrentGridAlpha", (void *)co_grid_alpha },
     { COMP, "SuspendRendering", (void *)co_suspend },
     { COMP, "ClearLastSubmittedFrame", (void *)co_void }, { COMP, "PostPresentHandoff", (void *)co_void },
-    { COMP, "GetFrameTiming", (void *)co_false }, { COMP, "GetFrameTimeRemaining", (void *)co_time_remaining },
+    { COMP, "GetFrameTiming", (void *)co_frame_timing },
+    { COMP, "GetFrameTimings", (void *)co_frame_timings }, { COMP, "GetFrameTimeRemaining", (void *)co_time_remaining },
     { COMP, "IsFullscreen", (void *)co_true }, { COMP, "CanRenderScene", (void *)co_true },
     { COMP, "GetCurrentSceneFocusProcess", (void *)co_focus_process },
     { COMP, "GetLastFrameRenderer", (void *)co_focus_process },
