@@ -78,12 +78,20 @@ final class SteamContentModel: ObservableObject {
     enum Stage: Equatable {
         case idle
         case connecting(String)
+        /// Username/password form (primary sign-in). Optional message (e.g. wrong password).
+        case signIn(String?)
+        /// Steam Guard: a code is needed (and/or the phone can approve).
+        case guardCode(type: String, canApprove: Bool, error: String?)
+        /// Waiting for approval in the Steam app / by e-mail.
+        case approve(String)
         case qr(String)
         case working
         case paused
         case complete
         case failed(String)
     }
+
+    enum Method { case saved, password(String, String), qr }
 
     @Published var stage: Stage = .idle
     @Published var progress = DownloadProgress()
@@ -96,6 +104,9 @@ final class SteamContentModel: ObservableObject {
     private var samples: [(t: Date, b: UInt64, n: UInt64)] = []
     private var task: Task<Void, Never>?
     private var session: SteamSession?
+    private var pendingAuth: CredentialsAuthSession?
+    private var pendingCodeType: SteamGuardType?
+    private var forceVerify = false
     private let store = KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam")
     var interruptedByBackground = false
 
@@ -105,7 +116,7 @@ final class SteamContentModel: ObservableObject {
     }
 
     var isBusy: Bool {
-        switch stage { case .connecting, .qr, .working: return true; default: return false }
+        switch stage { case .connecting, .qr, .working, .guardCode, .approve: return true; default: return false }
     }
 
     func refreshLocal() {
@@ -116,13 +127,39 @@ final class SteamContentModel: ObservableObject {
             .volumeAvailableCapacityForImportantUsage { freeBytes = UInt64(v) }
     }
 
+    /// Main button: use the saved sign-in if there is one, otherwise show the sign-in form.
     func start(forceVerify: Bool = false) {
-        guard task == nil else { return }
+        self.forceVerify = forceVerify
         UserDefaults.standard.set(false, forKey: AlyxContent.verifyNextLaunchKey)
+        launch(.saved)
+    }
+
+    /// Primary sign-in: account name + password (used once, RSA-encrypted for Steam, never stored).
+    func signIn(user: String, password: String) { launch(.password(user, password)) }
+
+    func signInWithQR() { launch(.qr) }
+
+    func submitCode(_ code: String) {
+        guard let session, let auth = pendingAuth, let type = pendingCodeType else { return }
+        stage = .connecting("Checking code…")
+        Task {
+            do {
+                try await session.submitGuardCode(auth, code: code, type: type)
+                // The poller in run() finishes the sign-in.
+                if case .connecting = stage { stage = .connecting("Code accepted, signing in…") }
+            } catch {
+                stage = .guardCode(type: type.description, canApprove: auth.canApproveOnDevice,
+                                   error: "That code was not accepted — try again.")
+            }
+        }
+    }
+
+    private func launch(_ method: Method) {
+        guard task == nil else { return }
         UIApplication.shared.isIdleTimerDisabled = true
         samples = []
         task = Task { [weak self] in
-            await self?.run(forceVerify: forceVerify)
+            await self?.run(method)
             await MainActor.run {
                 self?.task = nil
                 UIApplication.shared.isIdleTimerDisabled = false
@@ -136,6 +173,11 @@ final class SteamContentModel: ObservableObject {
         stage = .paused
     }
 
+    func cancelSignIn() {
+        task?.cancel()
+        stage = .signIn(nil)
+    }
+
     func signOut() {
         task?.cancel()
         try? store.clear()
@@ -145,57 +187,81 @@ final class SteamContentModel: ObservableObject {
 
     private func log(_ s: String) { NSLog("[steam] \(s)") }
 
-    private func run(forceVerify: Bool) async {
+    /// Token hand-off from the Mac: `steamdepot` on the Mac writes ~/.steamdepot/token.json;
+    /// copying it to <Documents>/steamdepot-token.json (devicectl) imports it into the Keychain.
+    private func importHandoffToken() {
+        let handoff = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("steamdepot-token.json")
+        if let imported = try? FileCredentialStore(url: handoff).load() {
+            try? store.save(imported)
+            try? FileManager.default.removeItem(at: handoff)
+            account = imported.accountName
+            log("imported Steam token for '\(imported.accountName)' from Documents/steamdepot-token.json")
+        }
+    }
+
+    private func run(_ method: Method) async {
         let session = SteamSession(log: { NSLog("[steam] %@", $0) })
         self.session = session
         defer { Task { await session.disconnect() } }
         do {
-            stage = .connecting("Connecting to Steam…")
-            try await session.connect()
-            // Token hand-off from the Mac: the QR is drawn inside the headset, where a phone camera
-            // cannot see it. `steamdepot` on the Mac writes ~/.steamdepot/token.json; copying that
-            // file to <Documents>/steamdepot-token.json (devicectl) imports it into the Keychain.
-            let handoff = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("steamdepot-token.json")
-            if let imported = try? FileCredentialStore(url: handoff).load() {
-                try? store.save(imported)
-                try? FileManager.default.removeItem(at: handoff)
-                log("imported Steam token for '\(imported.accountName)' from Documents/steamdepot-token.json")
-            }
-            var creds = try? store.load()
-            if creds != nil {
-                stage = .connecting("Signing in as \(creds!.accountName)…")
+            importHandoffToken()
+            var creds: SteamCredentials
+            switch method {
+            case .saved:
+                guard let saved = try? store.load() else { stage = .signIn(nil); return }
+                creds = saved
+            case .password(let user, let password):
+                stage = .connecting("Contacting Steam…")
+                try await session.connect()
+                let device = "Klepton (\(UIDevice.current.name))"
+                let auth: CredentialsAuthSession
                 do {
-                    try await session.logOn(creds!)
-                } catch SteamDepotError.logonFailed(let r) {
-                    log("saved token rejected (EResult \(r)); falling back to QR")
-                    try? store.clear()
-                    account = nil
-                    creds = nil
+                    auth = try await session.beginCredentialsAuth(accountName: user, password: password, deviceName: device,
+                                                                  guardData: (try? store.load())?.guardData)
+                } catch SteamDepotError.authFailed(let why) {
+                    stage = .signIn(why.prefix(1).uppercased() + why.dropFirst() + ".")
+                    return
                 }
-                if creds == nil {
-                    await session.disconnect()
-                    try await session.connect()
+                pendingAuth = auth
+                pendingCodeType = auth.needsCode
+                if let code = auth.needsCode {
+                    stage = .guardCode(type: code.description, canApprove: auth.canApproveOnDevice, error: nil)
+                } else if auth.canApproveOnDevice {
+                    stage = .approve("Approve this sign-in in the Steam app on your phone.")
+                } else if auth.canApproveByEmail {
+                    stage = .approve("Approve this sign-in from the e-mail Steam just sent you.")
+                } else {
+                    stage = .connecting("Signing in…")
                 }
-            }
-            if creds == nil {
+                creds = try await session.waitForCredentialsAuth(auth)
+                pendingAuth = nil
+                try store.save(creds)
+                log("signed in with account name/password as '\(creds.accountName)'")
+            case .qr:
+                stage = .connecting("Contacting Steam…")
+                try await session.connect()
                 let device = "Klepton (\(UIDevice.current.name))"
                 creds = try await session.authenticateWithQR(deviceName: device) { url in
-                    // Second fallback: the Mac can render this from the device log.
+                    // The Mac can render this from the device log.
                     NSLog("[steam] QR url: %@", url)
                     await MainActor.run { self.stage = .qr(url) }
                 }
-                try store.save(creds!)
-                stage = .connecting("Signing in as \(creds!.accountName)…")
-                do {
-                    try await session.logOn(creds!)
-                } catch SteamDepotError.logonFailed(let r) {
-                    try? store.clear()
-                    account = nil
-                    throw SteamDepotError.authFailed("Steam rejected the sign-in (EResult \(r)). Press Retry to sign in again.")
-                }
+                try store.save(creds)
             }
-            account = creds!.accountName
+
+            stage = .connecting("Signing in as \(creds.accountName)…")
+            if case .saved = method { try await session.connect() }
+            do {
+                try await session.logOn(creds)
+            } catch SteamDepotError.logonFailed(let r) {
+                log("saved sign-in rejected (EResult \(r))")
+                try? store.clear()
+                account = nil
+                stage = .signIn("Your saved Steam sign-in has expired. Please sign in again.")
+                return
+            }
+            account = creds.accountName
             stage = .working
             let downloader = SteamDepotDownloader(session: session, log: { NSLog("[steam] %@", $0) })
             let opts = DepotDownloadOptions(appID: AlyxContent.app, depotID: AlyxContent.depot, branch: "public",
@@ -210,11 +276,12 @@ final class SteamContentModel: ObservableObject {
                 + "\(summary.bytesDownloaded) bytes fetched, verified \(summary.verifiedBytes) in \(summary.verifyElapsed)s")
             stage = .complete
         } catch is CancellationError {
+            if case .signIn = stage { return }
             stage = .paused
         } catch SteamDepotError.cancelled {
             stage = .paused
         } catch {
-            if Task.isCancelled { stage = .paused; return }
+            if Task.isCancelled { if case .signIn = stage { return }; stage = .paused; return }
             log("failed: \(error)")
             stage = .failed("\(error)")
         }
@@ -309,6 +376,16 @@ struct SteamContentView: View {
         case .idle: idle
         case .connecting(let s):
             HStack(spacing: 12) { ProgressView(); Text(s) }
+        case .signIn(let message):
+            SteamSignInForm(model: model, message: message)
+        case .guardCode(let type, let canApprove, let error):
+            SteamGuardCodeForm(model: model, type: type, canApprove: canApprove, error: error)
+        case .approve(let text):
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Confirm the sign-in").font(.title2.bold())
+                HStack(spacing: 12) { ProgressView(); Text(text) }
+                Button("Cancel") { model.cancelSignIn() }
+            }
         case .qr(let url):
             HStack(alignment: .top, spacing: 28) {
                 if let img = qrImage(url) {
@@ -316,13 +393,11 @@ struct SteamContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Sign in to Steam").font(.title2.bold())
-                    Text("Open the Steam app on your phone, tap the Steam Guard shield, then “Scan a QR code”, and approve the sign-in.")
-                    Text("Or, from a Mac: copy a steamdepot token.json into the app's Documents as steamdepot-token.json and press Retry.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Text("Only a sign-in token is kept, in this device's Keychain. Your password never touches this app.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button("Cancel") { model.pause(); model.stage = .idle }
+                    Text("Sign in with a QR code").font(.title2.bold())
+                    Text("Scan it with the Steam app on a phone (Steam Guard shield → “Scan a QR code”). "
+                         + "A headset's own display can't be seen by a phone camera, so this mostly helps when "
+                         + "mirroring the view; the same link is written to the device log as “[steam] QR url:”.")
+                    Button("Back") { model.cancelSignIn() }
                 }
             }
         case .working: working
@@ -426,6 +501,114 @@ struct SteamContentMaintenance: View {
             Spacer()
         }
         .font(.callout)
+    }
+}
+#endif
+
+#if canImport(SteamDepot)
+/// Primary sign-in: Steam account name + password, with iCloud Keychain AutoFill.
+/// The password lives only in this view's state until it is handed to SteamDepot, which
+/// RSA-encrypts it for Steam; it is cleared right after and never written anywhere.
+struct SteamSignInForm: View {
+    @ObservedObject var model: SteamContentModel
+    let message: String?
+    @State private var user = UserDefaults.standard.string(forKey: "kl.steam.lastAccount") ?? ""
+    @State private var password = ""
+    @State private var showOther = false
+    @FocusState private var focus: Field?
+    enum Field { case user, password }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Sign in to Steam").font(.title2.bold())
+            Text("Use the Steam account that owns Half-Life: Alyx.").foregroundStyle(.secondary)
+            if let message { Label(message, systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
+            TextField("Steam account name", text: $user)
+                .textContentType(.username)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($focus, equals: .user)
+                .submitLabel(.next)
+                .onSubmit { focus = .password }
+                .frame(maxWidth: 420)
+            SecureField("Password", text: $password)
+                .textContentType(.password)
+                .focused($focus, equals: .password)
+                .submitLabel(.go)
+                .onSubmit(submit)
+                .frame(maxWidth: 420)
+            HStack(spacing: 16) {
+                Button("Sign in", action: submit)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(user.trimmingCharacters(in: .whitespaces).isEmpty || password.isEmpty)
+                Button(showOther ? "Hide other ways" : "Other ways to sign in…") { showOther.toggle() }
+            }
+            Text("Your password is sent to Steam encrypted and is never stored; only a sign-in token is kept, in this device's Keychain.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if showOther {
+                VStack(alignment: .leading, spacing: 8) {
+                    Button("Show a QR code (scan with the Steam app)") { model.signInWithQR() }
+                    Text("From a Mac: sign in with the steamdepot tool, then copy its token.json into this app's "
+                         + "Documents as steamdepot-token.json (devicectl) and press Download again.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
+            }
+        }
+        .onAppear { focus = user.isEmpty ? .user : .password }
+    }
+
+    private func submit() {
+        let u = user.trimmingCharacters(in: .whitespaces)
+        guard !u.isEmpty, !password.isEmpty else { return }
+        UserDefaults.standard.set(u, forKey: "kl.steam.lastAccount")
+        let p = password
+        password = ""
+        model.signIn(user: u, password: p)
+    }
+}
+
+struct SteamGuardCodeForm: View {
+    @ObservedObject var model: SteamContentModel
+    let type: String
+    let canApprove: Bool
+    let error: String?
+    @State private var code = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Steam Guard").font(.title2.bold())
+            if canApprove {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Approve this sign-in in the Steam app on your phone — or enter the \(type) below.")
+                }
+            } else {
+                Text("Enter the \(type).")
+            }
+            if let error { Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
+            TextField("Code", text: $code)
+                .textContentType(.oneTimeCode)
+                .textInputAutocapitalization(.characters)
+                .autocorrectionDisabled()
+                .focused($focused)
+                .onSubmit(submit)
+                .frame(maxWidth: 220)
+                .font(.title3.monospaced())
+            HStack(spacing: 16) {
+                Button("Submit", action: submit).buttonStyle(.borderedProminent).disabled(code.count < 5)
+                Button("Cancel") { model.cancelSignIn() }
+            }
+        }
+        .onAppear { focused = !canApprove }
+    }
+
+    private func submit() {
+        let c = code.trimmingCharacters(in: .whitespaces)
+        guard c.count >= 5 else { return }
+        code = ""
+        model.submitCode(c)
     }
 }
 #endif
