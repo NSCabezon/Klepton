@@ -1255,6 +1255,52 @@ static int in_haptic(void *s, uint64_t h, float start, float dur, float freq, fl
     return 0;
 }
 static int in_false(void *s) { (void)s; return 0; }
+// Where an action is bound. Measured on the Mac (KL_TRACE_OPENVR=1): Alyx
+// registers every action, calls GetActionOrigins / GetOriginLocalizedName /
+// GetBindingVariant, and then never calls GetDigitalActionData at all — while
+// those three were logging stubs returning None with the out-array left
+// zeroed, i.e. "bound to nothing" (k_ulInvalidInputValueHandle). The origins
+// are the hand source handles the action reads from.
+static int in_origins(void *s, uint64_t set, uint64_t h, uint64_t *out, uint32_t n) {
+    (void)s; (void)set;
+    if (!out || !n) return 4;                                          // InvalidParam
+    memset(out, 0, (size_t)n * sizeof *out);
+    action *a = act_of(h);
+    if (!a) return 3;                                                  // InvalidHandle
+    uint32_t k = 0;
+    if (a->src != SRC_NONE) {
+        if (a->hand != 1 && k < n) out[k++] = H_SOURCE_LEFT;
+        if (a->hand != 0 && k < n) out[k++] = H_SOURCE_RIGHT;
+    }
+    static int said;                       // called every frame for the skeletons
+    if (said < 64) { said++; TRACE("GetActionOrigins %s -> %u origin(s)\n", a->name, k); }
+    return 0;
+}
+static int in_origin_name(void *s, uint64_t origin, char *buf, uint32_t n, int32_t bits) {
+    (void)s; (void)bits;
+    const char *v = origin == H_SOURCE_LEFT ? "Left Hand" : origin == H_SOURCE_RIGHT ? "Right Hand"
+                  : origin == H_SOURCE_HEAD ? "Headset" : NULL;
+    if (!v) return 3;
+    if (!buf || n < strlen(v) + 1) return 14;                          // BufferTooSmall
+    memcpy(buf, v, strlen(v) + 1);
+    return 0;
+}
+typedef struct { uint64_t devicePath; uint32_t trackedDeviceIndex; char rchRenderModelComponentName[128]; } InputOriginInfo_t;
+static int in_origin_info(void *s, uint64_t origin, InputOriginInfo_t *o, uint32_t size) {
+    (void)s;
+    if (!o || size < sizeof *o) return 4;
+    memset(o, 0, size);
+    if (origin != H_SOURCE_LEFT && origin != H_SOURCE_RIGHT && origin != H_SOURCE_HEAD) return 3;
+    o->devicePath = origin;
+    o->trackedDeviceIndex = origin == H_SOURCE_LEFT ? DEV_LEFT : origin == H_SOURCE_RIGHT ? DEV_RIGHT : DEV_HMD;
+    return 0;
+}
+// No variant in the built-in bindings: the empty string, as SteamVR answers.
+static int in_binding_variant(void *s, uint64_t dev, char *buf, uint32_t n) {
+    (void)s; (void)dev;
+    if (buf && n) buf[0] = 0;
+    return 0;
+}
 
 // ---- IVRChaperone -------------------------------------------------------------------------------
 static int ch_state(void *s) { (void)s; return 1; }                     // ChaperoneCalibrationState_OK
@@ -1405,6 +1451,9 @@ static const impl g_impl[] = {
     { INP, "GetSkeletalSummaryData", (void *)in_summary },
     { INP, "TriggerHapticVibrationAction", (void *)in_haptic },
     { INP, "IsUsingLegacyInput", (void *)in_false },
+    { INP, "GetActionOrigins", (void *)in_origins }, { INP, "GetOriginLocalizedName", (void *)in_origin_name },
+    { INP, "GetOriginTrackedDeviceInfo", (void *)in_origin_info },
+    { INP, "GetBindingVariant", (void *)in_binding_variant },
 
     { CHAP, "GetCalibrationState", (void *)ch_state }, { CHAP, "GetPlayAreaSize", (void *)ch_size },
     { CHAP, "GetPlayAreaRect", (void *)ch_rect }, { CHAP, "AreBoundsVisible", (void *)co_false },
