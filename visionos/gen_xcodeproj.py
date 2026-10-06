@@ -239,6 +239,45 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonLauncher.swift", "KleptonHL1.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
+# The alyx build downloads its own game content from Steam (Sources/KleptonSteamContent.swift)
+# through the SteamDepot Swift package, which lives in the AlyxAVP checkout beside this repo
+# (vendor/Klepton/visionos -> ../../../SteamDepot), like the alyx srcdir does. Local package
+# reference, alyx only; KL_STEAMDEPOT_PKG overrides the path (relative to visionos/). Fixed
+# object ids rather than oid(): the counter would renumber every later object, and a kept,
+# hand-edited project is diffed against this output.
+def _fixed(tag): return ("KLEPT0N" + tag).upper().ljust(24, "0")[:24]
+STEAMDEPOT_PKG = os.environ.get("KL_STEAMDEPOT_PKG", "../../../SteamDepot")
+STEAMDEPOT = KLT["name"] == "alyx"
+if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package.swift")):
+    print(f"!! alyx: no SteamDepot package at {os.path.join(HERE, STEAMDEPOT_PKG)} "
+          "(set KL_STEAMDEPOT_PKG) - the in-app Steam download is left out", file=sys.stderr)
+    STEAMDEPOT = False
+PKG_REF, PKG_PROD, B_PKG = _fixed("SDPKGREF"), _fixed("SDPKGPROD"), _fixed("SDPKGBLD")
+if STEAMDEPOT:
+    swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
+PKG_BUILDFILE = (f'\t\t{B_PKG} /* SteamDepot in Frameworks */ = {{isa = PBXBuildFile; productRef = {PKG_PROD}; }};\n'
+                 if STEAMDEPOT else "")
+PKG_FRAMEWORK = f'\t\t\t\t{B_PKG} /* SteamDepot in Frameworks */,\n' if STEAMDEPOT else ""
+PKG_TARGET_DEPS = (f'\t\t\tpackageProductDependencies = (\n\t\t\t\t{PKG_PROD} /* SteamDepot */,\n\t\t\t);\n'
+                   if STEAMDEPOT else "")
+PKG_PROJECT_REFS = (f'\t\t\tpackageReferences = (\n\t\t\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */,\n\t\t\t);\n'
+                    if STEAMDEPOT else "")
+PKG_SECTIONS = (f'''/* Begin XCLocalSwiftPackageReference section */
+\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */ = {{
+\t\t\tisa = XCLocalSwiftPackageReference;
+\t\t\trelativePath = "{STEAMDEPOT_PKG}";
+\t\t}};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+\t\t{PKG_PROD} /* SteamDepot */ = {{
+\t\t\tisa = XCSwiftPackageProductDependency;
+\t\t\tpackage = {PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */;
+\t\t\tproductName = SteamDepot;
+\t\t}};
+/* End XCSwiftPackageProductDependency section */
+''' if STEAMDEPOT else "")
+
 swift_buildfiles = "\n".join(
     f'\t\t{s["bld"]} /* {s["name"]} in Sources */ = {{isa = PBXBuildFile; fileRef = {s["ref"]}; }};'
     for s in swift)
@@ -387,7 +426,7 @@ PBX = f"""// !$*UTF8*$!
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
-{buildfiles}
+{PKG_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -407,7 +446,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_RT_LNK},
-			);
+{PKG_FRAMEWORK}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
 /* End PBXFrameworksBuildPhase section */
@@ -480,7 +519,7 @@ PBX = f"""// !$*UTF8*$!
 			buildRules = ();
 			dependencies = ();
 			name = {NAME};
-			productName = {NAME};
+{PKG_TARGET_DEPS}			productName = {NAME};
 			productReference = {PRODUCT};
 			productType = "com.apple.product-type.application";
 		}};
@@ -504,7 +543,7 @@ PBX = f"""// !$*UTF8*$!
 			knownRegions = (en, Base, );
 			mainGroup = {G_ROOT};
 			productRefGroup = {G_PROD};
-			projectDirPath = "";
+{PKG_PROJECT_REFS}			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				{TARGET},
@@ -596,7 +635,8 @@ PBX = f"""// !$*UTF8*$!
 			defaultConfigurationName = Release;
 		}};
 /* End XCConfigurationList section */
-	}};
+
+{PKG_SECTIONS}	}};
 	rootObject = {PROJ};
 }}
 """
@@ -629,6 +669,8 @@ def main():
           f"{ENTITLEMENTS_FILE if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}"
           + (f"  (dropped: {', '.join(_dropped)})" if ENTITLEMENTS and _dropped else ""))
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
+    if STEAMDEPOT:
+        print(f"  Swift package SteamDepot: {STEAMDEPOT_PKG} (in-app Steam content download)")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
     print(f"  embedded ANGLE:            {', '.join(ANGLE)}")
     # Named either way. An absent MoltenVK is legitimate for three of the four
