@@ -127,7 +127,7 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST KL_REGEN_XCODEPROJ"
 FORWARD=""
 for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
                         -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \
@@ -156,7 +156,13 @@ if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 ./mkmvk.sh | tail -1
 
 echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*VR name + monogram icon + Boot button)" || echo "off (normal build; set KL_CUSTOM_LAUNCHER=1 to enable)")"
-python3 gen_xcodeproj.py | head -1
+# An existing project is kept as-is (hand edits in Xcode — signing, profile,
+# capabilities — survive); KL_REGEN_XCODEPROJ=1 regenerates it from targets.py.
+if [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
+  echo "  keeping existing $PRODUCT.xcodeproj (KL_REGEN_XCODEPROJ=1 to regenerate)"
+else
+  python3 gen_xcodeproj.py | head -1
+fi
 
 if [ "$MODE" = "device" ]; then
   # Device discovery goes through JSON: device names contain non-breaking
