@@ -111,6 +111,10 @@ enum Immersive {
 /// `KL_EXIT_ON_BACKGROUND=0` keeps the old behaviour, which is what a debugging
 /// session wants when the headset comes off with a capture still open.
 enum Lifecycle {
+    /// Set while the Steam content gate (KleptonSteamContent.swift) is on screen: no guest
+    /// has booted, so there is nothing to tear down, and exiting would kill a download.
+    static var keepAlive = false
+
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase)")
         // Coming back is the audio's cue, and it needs one: this OS silently
@@ -127,6 +131,10 @@ enum Lifecycle {
         // platform lies about.
         if phase == .active { kl_audio_resume() }
         guard phase == .background else { return }
+        guard !keepAlive else {
+            NSLog("[app] backgrounded during the Steam content gate; staying alive")
+            return
+        }
         guard klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) else {
             NSLog("[app] backgrounded; KL_EXIT_ON_BACKGROUND=0, staying alive")
             return
@@ -266,6 +274,18 @@ struct KeyboardEntryView: View {
     }
 }
 
+/// Whether the alyx build must show the Steam content gate before booting.
+func klSteamGateNeeded() -> Bool {
+    #if canImport(SteamDepot)
+    guard klTargetName() == "alyx" else { return false }
+    let ready = AlyxContent.isReady
+    NSLog("[steam] content gate: \(ready ? "content complete, booting" : "content not verified complete, showing gate")")
+    return !ready
+    #else
+    return false
+    #endif
+}
+
 struct BootView: View {
     @State private var log = ""
     @State private var status = "idle"
@@ -301,9 +321,18 @@ struct BootView: View {
         ["steamlink-vr", "hl1", "cs1"].contains(klTargetName())
     }
 
+    // alyx only: the Steam content gate (KleptonSteamContent.swift) takes the window until
+    // the game content is complete — or the player chooses to play what is there. Decided
+    // once at launch, offline; the boot window (and its autoboot) appears only after it.
+    @State private var steamGate = klSteamGateNeeded()
+
     var body: some View {
         Group {
-            if showShell { ShellWindow() } else { bootReport }
+            if steamGate {
+                #if canImport(SteamDepot)
+                SteamContentView(onPlay: { steamGate = false })
+                #endif
+            } else if showShell { ShellWindow() } else { bootReport }
         }
         .task { await watchPresentation() }
     }
@@ -412,6 +441,13 @@ struct BootView: View {
             // options (hl1's Xash panel; hl2/portal's thinner one). See
             // KleptonLauncher.swift / KleptonHL1.swift.
             if isLauncher { LauncherPanel() }
+
+            #if canImport(SteamDepot)
+            if klTargetName() == "alyx" {
+                DisclosureGroup("Game files (Steam)") { SteamContentMaintenance() }
+                    .font(.callout)
+            }
+            #endif
 
             // The controller-alignment sliders, in THIS window because it stays
             // open beside the immersive space — so the guest keeps rendering
