@@ -188,6 +188,9 @@ struct KLGameSettings: Codable, Equatable {
     var fullImmersion: Bool?
     /// The system draws the user's real hands over the game.
     var handMatting: Bool?
+    /// Draw a virtual PSVR2 controller where a real one rests while it is not
+    /// in a hand (KleptonHUD ghost controllers). nil = on.
+    var ghostControllers: Bool?
     /// KLGameLanguage raw value; nil or "system" = the headset's language.
     var language: String?
     /// Controller calibration — the Sense (PSVR2) grip correction and the
@@ -349,6 +352,11 @@ enum KLGameSettingsStore {
     static func language(for target: String) -> KLGameLanguage {
         KLGameLanguage(rawValue: load(target).language ?? "system") ?? .system
     }
+    static let defaultGhostControllers = true
+    /// Environment (KL_GHOST_CTRL) > saved > default (on).
+    static func ghostControllers(for target: String) -> Bool {
+        klEnvOn("KL_GHOST_CTRL", default: load(target).ghostControllers ?? defaultGhostControllers)
+    }
 
     /// Put the game's language into the environment the runtime reads, BEFORE
     /// kl_app_configure/boot: KL_LOCALE (Android Locale / AConfiguration / SDL /
@@ -361,6 +369,9 @@ enum KLGameSettingsStore {
     /// in the launch environment (a debugging override wins).
     static func applyBeforeBoot(for target: String) {
         applyLanguage(for: target)
+        // The compositor reads KL_GHOST_CTRL (KleptonHUD); a value already in
+        // the launch environment wins.
+        if let g = load(target).ghostControllers { setenv("KL_GHOST_CTRL", g ? "1" : "0", 0) }
         guard hasPerformance(target), let p = load(target).performance else { return }
         if let v = p.renderScale { setenv("KL_OPENVR_RT_SCALE", String(format: "%.3f", v), 0) }
         if let v = p.overscan    { setenv("KL_OPENVR_OVERSCAN", String(format: "%.3f", v), 0) }

@@ -509,7 +509,7 @@ The guest's own memory management, and the three seams that used to disable it.
   `passthrough` prints exactly that on every call while `remap` prints the full
   amount. Rate-limited to the first 8 calls, then every 256 MiB.
 - `KL_MEM_TOTAL_MB=<n>` — what `/proc/meminfo` reports as `MemTotal`, capped at
-  the host's real memory. **glibc guests (Alyx) default to 16384** (a Vision
+  the host's real memory. **glibc guests (Alyx) default to 12288** (12 GB: above the minimum, below a Vision
   Pro; `kl_glibc.c`): Alyx's VR menu warns "system memory below the minimum
   requirements" under ~11.2 GiB of `sysinfo()` total RAM. Android default **6144**, the Quest 2's RAM: this is part of
   the device identity we already present, and a 6 GB title sizes its streaming
@@ -2255,9 +2255,11 @@ nothing, and prints the unresolved imports grouped by category.
   `-> dry run`. Init lists every achievement with its real state and unlock
   time. `ClearAchievement`, `ResetAllStats` and `UpdateAvgRateStat` are never
   sent (local only). `GetNumAchievements` / `GetAchievementName` answer from
-  Steam's list; display attributes (name, desc) are not in the bridge
-  contract and still answer "". Without the bridge everything is local, as
-  before.
+  Steam's list; `GetAchievementDisplayAttribute` (name, desc, hidden) answers
+  from Steam's schema in the game language (`stats` and `store` carry
+  `"lang"` = the `KL_STEAM_LANG` answer). Unlocks a store confirms go to the
+  toast (`KL_TOAST`, visionOS app section). Without the bridge everything is
+  local, as before.
 - `KL_STEAM_LANG=<steam language>` — the game language the Steam stub reports
   (`GetCurrentGameLanguage`, `GetSteamUILanguage`, `GetAvailableGameLanguages`;
   glibc and Android stand-ins alike): `english`, `spanish`, `latam`, `french`,
@@ -2545,8 +2547,8 @@ except its own control vars (next section).
   (`runtime/kl_env.c`), so `KL_FULL=1` additionally turns on diagnostic
   logging knobs; to get `.full` without that, use the per-game setting.
 - **Per-game settings** (`KleptonChroma.swift`, `KLGameSettings`): UserDefaults
-  key `klepton.game.<target>`, JSON `{fullImmersion, handMatting, language,
-  calibration, performance}`, each optional (absent = the game's default).
+  key `klepton.game.<target>`, JSON `{fullImmersion, handMatting,
+  ghostControllers, language, calibration, performance}`, each optional (absent = the game's default).
   Edited from the gear button on the hub's game card; hand matting also from
   the boot window's Matting panel, and the calibration from its Controller
   alignment panel (both save to the running game). `calibration` holds only
@@ -2556,7 +2558,9 @@ except its own control vars (next section).
   `gripPitch`/`aimPitch`/`gripPivot`/`gripPos` (the extra OpenXR-guest grip
   tune). `performance` (alyx only) sets `KL_OPENVR_RT_SCALE`,
   `KL_OPENVR_OVERSCAN`, `KL_OPENVR_OVERSCAN_RT` before boot when saved.
-  Precedence: environment (`KL_FULL`, `KL_HAND_MATTING`, `KL_LOCALE`,
+  `ghostControllers` ("Show controllers when not held", default on) sets
+  `KL_GHOST_CTRL` before boot when saved.
+  Precedence: environment (`KL_FULL`, `KL_HAND_MATTING`, `KL_GHOST_CTRL`, `KL_LOCALE`,
   `KL_STEAM_LANG`, `KL_SENSE_*`, `KL_XR_GRIP_*`, `KL_XR_AIM_PITCH`,
   `KL_OPENVR_*`) > saved > default. The hub's Settings button (library header)
   shows the Steam account (sign out) and each game's downloaded data with
@@ -2566,6 +2570,42 @@ except its own control vars (next section).
   before the immersive space opens. Language: System (default) sets nothing;
   any other choice sets `KL_LOCALE`, `KL_STEAM_LANG` and `LANG` (only if not
   already set) before `kl_app_configure`.
+- `KL_GHOST_CTRL=0|1` — ghost controllers (`KleptonHUD.swift`): a light-grey
+  ring + grip drawn at a PSVR2 Sense controller's real pose (accessory
+  tracking, `.grip`, rendered correction, none of the game's calibration)
+  while it is NOT in a hand, faded out (~200 ms) when it is picked up. Default
+  on; per game from the hub's "Show controllers when not held". Read live, so
+  the hub's Play can set it after the immersive layer exists. In hand =
+  `AccessoryAnchor.heldChirality` set, OR input from it in the last
+  `KL_GHOST_INPUT_S` (2 s; buttons, capacitive touch, trigger/grip, stick),
+  OR it moved in the last 0.6 s while a palm is within 9 cm (leaves at 12 cm)
+  or while hand tracking sees no hands (holding controllers mutes it). Shown
+  again after 1 s with no evidence and a tracked hand away from it, else after
+  `KL_GHOST_SHOW_S` (2.5 s). Hidden when untracked or orientation-only. Logs
+  `[ghost] left: SHOWN — resting (...)` / `hidden — held (...)` and every
+  change of the platform's held flag.
+- `KL_GHOST_PLATFORM_HELD=0` — ignore `AccessoryAnchor.heldChirality` (if the
+  platform's held flag proves wrong on device); input, motion and hand
+  proximity still decide.
+- `KL_GHOST_ROT=x,y,z` (degrees) / `KL_GHOST_POS=x,y,z` (metres) — fit the ghost
+  model to the real plastic, in the grip frame. Default none.
+- `KL_TOAST=0` — no achievement toasts (`runtime/guest/kl_steam.c`): the
+  store's `unlocked` list is neither fetched for icons nor handed to the app.
+  Default on. Each unlock is logged `[toast] achievement unlocked: <api>
+  "<name>" — <desc> | icon <path>`; on device the app queues it
+  (`KleptonHUD.swift`) and shows a panel ~1.2 m ahead, 15 cm below the eyes,
+  following the head with a 0.35 s lag, "🏆 Logro desbloqueado" /
+  "🏆 Achievement unlocked" by the GAME's language (`KL_STEAM_LANG`), name,
+  description and icon. On the Mac the viewer (`kl_view_mtl.m`) draws the same
+  panel at the top of the window. With `KL_STEAM_STATS_DRYRUN=1` the bridge
+  still reports what WOULD unlock, so a dry-run store exercises the toast.
+- `KL_TOAST_TEST=1` — queue a fake toast 5 s after the immersive compositor
+  (device) or the viewer (Mac) starts, for a visual check without unlocking
+  anything.
+- `KL_TOAST_SECS=<s>` — how long each toast stays up, fades included
+  (default 5). Several unlocks queue and show one after another.
+- `KL_STEAM_ICON_TIMEOUT=<ms>` — the bridge `icon` fetch per unlocked
+  achievement (default 10000); a failure shows the toast with a placeholder.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
   **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
   two are one word apart and were briefly one name, which would have made each
