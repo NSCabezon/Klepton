@@ -354,6 +354,7 @@ static struct {
     // The 5-second window the feeder reports (KL_SDL_AUDIO_STATS, default on):
     // bytes the guest queued (under mu), and what the feeder played.
     unsigned long long w_in, w_periods, w_starved, w_queues, w_clears;
+    unsigned long long w_frames, w_nonfinite;   // frames converted / with a NaN or Inf in them
     int w_peak;
 } g_au = { .mu = PTHREAD_MUTEX_INITIALIZER };
 static uint32_t g_au_next_id = AUDIO_DEV_FIRST;
@@ -386,6 +387,11 @@ static void au_convert(const uint8_t *in, int n, int16_t *out) {
                  r = au_sample(fr, 1) + k * (au_sample(fr, 2) + au_sample(fr, 5) + au_sample(fr, 7)); break;
         default: l = au_sample(fr, 0); r = ch > 1 ? au_sample(fr, 1) : l; break;
         }
+        // A NaN converts to 0 below (lrintf of NaN is 0 here), so a mix poisoned
+        // by one bad source reads as exact SILENCE in the peak — counted apart,
+        // because "the guest mixed nothing" and "the guest mixed NaN" are
+        // different bugs (the second: a DSP stage, e.g. Steam Audio, emitting it).
+        if (!isfinite(l) || !isfinite(r)) g_au.w_nonfinite++;
         if (ch > 2) { l *= 0.6f; r *= 0.6f; }           // headroom for the fold-down
         l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
         r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
@@ -411,12 +417,17 @@ static void au_stats_maybe(double *t0) {
     size_t qlen = g_au.qlen;
     g_au.w_in = g_au.w_queues = g_au.w_clears = 0;
     pthread_mutex_unlock(&g_au.mu);
+    char nf[96] = "";
+    if (g_au.w_nonfinite)
+        snprintf(nf, sizeof nf, ", NON-FINITE %llu of %llu frames (NaN/Inf in the guest's mix)",
+                 g_au.w_nonfinite, g_au.w_frames);
     fprintf(stderr, "  [sdl-au] dev %u 5s: %s, %llu periods (%llu short), %s %llu KB in %llu calls, "
-                    "queue now %zu B, %llu clears, PCM peak %d/32767%s\n",
+                    "queue now %zu B, %llu clears, PCM peak %d/32767%s%s\n",
             g_au.id, g_au.paused ? "PAUSED" : "playing", g_au.w_periods, g_au.w_starved,
-            g_au.spec.callback ? "callback" : "queued", in >> 10, nq, qlen, ncl, g_au.w_peak,
+            g_au.spec.callback ? "callback" : "queued", in >> 10, nq, qlen, ncl, g_au.w_peak, nf,
             g_au.paused ? "" : g_au.w_peak ? "" : " — SILENT");
     g_au.w_periods = g_au.w_starved = 0;
+    g_au.w_frames = g_au.w_nonfinite = 0;
     g_au.w_peak = 0;
 }
 static void *au_feeder(void *arg) {
@@ -448,6 +459,7 @@ static void *au_feeder(void *arg) {
             }
         }
         au_convert(buf, g_au.spec.samples, out);
+        g_au.w_frames += g_au.spec.samples;
         for (int i = 0; i < g_au.spec.samples * 2; i++) {
             int v = out[i] < 0 ? -out[i] : out[i];
             if (v > g_au.w_peak) g_au.w_peak = v;
