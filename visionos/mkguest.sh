@@ -69,7 +69,10 @@ for NAME in $LIBS; do
   # names contain '_', and libc++_shared contains '+' — which the previous
   # underscores-only rewrite let through, and Xcode rejects at the EMBED step
   # rather than at build: "had an invalid CFBundleIdentifier in its Info.plist".
-  ID_NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9.-' '-')
+  # ...and the TARGET is part of it: the hub embeds several games, and two of
+  # them may ship a library of the same name (alyx and superhot both carry
+  # libphonon) — one bundle id for two embedded frameworks is a collision.
+  ID_NAME=$(printf '%s.%s' "$KLT_NAME" "$NAME" | tr -c 'A-Za-z0-9.-' '-')
   # The framework/executable NAME must not carry '+': App Store validation rejects a
   # CFBundleExecutable containing \ [ ] { } ( ) + * (error 90121), and libc++_shared
   # has one. Map it to a filesystem-safe name for the bundle; the guest still asks

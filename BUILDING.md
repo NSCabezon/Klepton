@@ -65,7 +65,7 @@ to override the the whole id.
 | target | APK | unpacked to | graphics | also needs |
 |---|---|---|---|---|
 | Beat Saber 1.40.8 | `beatsaber.apk` | `beatsaber/` | GLES (ANGLE) | one OBB, 1.3 GB |
-| SUPERHOT VR 1.161 | `superhot.apk` | `superhot/` | GLES (ANGLE) | — |
+| SUPERHOT VR 1.72 (Steam Frame, depot 617833 `shvr.apk`) | `superhot.apk` | `superhot/` | Vulkan (MoltenVK) | — (hub: downloaded in-app) |
 | BONELAB 1.2974 | `bonelab.apk` | `bonelab/` | Vulkan (MoltenVK) | two OBBs, 6.3 GB |
 | VRChat 2026.2.3 | `vrchat.apk` | `vrchat/` | GLES (ANGLE) | — |
 | Open Brush 2.30.0 | `openbrush.apk` | `openbrush/` | Vulkan (MoltenVK) | — |

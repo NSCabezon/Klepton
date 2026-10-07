@@ -33,6 +33,13 @@ struct KLHubGameRow: Identifiable, Hashable {
     let entry: String
     /// False in a UI-only build (KLEPTON_HUB_NO_GUESTS): no frameworks, cannot boot.
     let bundled: Bool
+    /// targets.py's tree and apk: where the runtime looks, relative to the game's
+    /// container root, for <tree>/assets, the metadata beside it, and the APK.
+    let tree: String
+    let apk: String
+    /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
+    /// for a guest that has none). Written beside <tree>/assets by HubPrep.
+    let meta: [String: String]
     var id: String { target }
 }
 
@@ -45,10 +52,13 @@ enum HubLaunch {
     static func scriptedGame() -> String? {
         HubStorage.migrateLegacyData()
         guard let t = ProcessInfo.processInfo.environment["KL_HUB_GAME"], !t.isEmpty else { return nil }
-        guard klHubGameRows.contains(where: { $0.target == t && $0.bundled }) else {
+        guard let row = klHubGameRows.first(where: { $0.target == t && $0.bundled }) else {
             NSLog("[hub] KL_HUB_GAME=\(t) is not a game this build carries; showing the library")
             return nil
         }
+        // Synchronous: there is no library to show progress in, and the runtime's
+        // own report names whatever is still missing.
+        if let err = HubPrep.prepare(row) { NSLog("[hub] \(t): could not prepare its data: \(err)") }
         select(t)
         return t
     }
@@ -140,6 +150,8 @@ final class HubLibraryModel: ObservableObject {
     /// Per game: why Play was refused (not owned), or the check in progress.
     @Published var playBlock: [String: String] = [:]
     @Published var verifying: String?
+    /// The game whose APK-derived files are being prepared before boot (HubPrep).
+    @Published var preparing: String?
     @Published var checking = false
     @Published var checkError: String?
     private var relay: [AnyCancellable] = []
@@ -252,6 +264,25 @@ final class HubLibraryModel: ObservableObject {
         #endif
     }
 
+    /// Derive what the runtime reads from the downloaded data (HubPrep: the APK
+    /// under the runtime's name, the small assets/ entries, the metadata), off the
+    /// main thread, then boot. Idempotent and cheap once done (a stamp per APK).
+    func prepare(_ target: String, then play: @escaping () -> Void) {
+        guard let row = games.first(where: { $0.target == target }), preparing == nil else { return }
+        preparing = target
+        playBlock[target] = nil
+        Task {
+            let err = await Task.detached(priority: .userInitiated) { HubPrep.prepare(row) }.value
+            preparing = nil
+            if let err {
+                NSLog("[hub] \(target): could not prepare its data: \(err)")
+                playBlock[target] = "Could not prepare the game's files: \(err)"
+            } else {
+                play()
+            }
+        }
+    }
+
     /// With a saved Steam sign-in: compare each game's installed manifests with
     /// Steam's latest, and fetch the account's library for the info section.
     func checkUpdates() {
@@ -319,7 +350,7 @@ struct HubLibraryView: View {
 
     private func play(_ target: String) {
         detail = nil          // back to the card, where a refusal is shown
-        model.checkOwnership(target) { onPlay(target) }
+        model.checkOwnership(target) { model.prepare(target) { onPlay(target) } }
     }
 
     private var library: some View {
@@ -371,6 +402,8 @@ struct HubLibraryView: View {
                 Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
             } else if model.verifying == g.target {
                 HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking your Steam license…").font(.callout) }
+            } else if model.preparing == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Preparing the game's files…").font(.callout) }
             }
             if !g.bundled {
                 Text("This build carries no game code (library-only build).").font(.caption).foregroundStyle(.secondary)
@@ -378,7 +411,7 @@ struct HubLibraryView: View {
             HStack(spacing: 12) {
                 Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil)
+                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil)
                 #if canImport(SteamDepot)
                 if model.content[g.target] != nil {
                     Button(manageTitle(st)) { detail = g.target }

@@ -56,6 +56,11 @@ struct SteamGameDescriptor: Sendable {
     let verifyNextLaunchKey: String
     var maxConcurrentDownloads = 12
     var verifyConcurrency = 4
+    /// An Android game's APK, depot-relative (nil = not an APK game). The runtime
+    /// opens <container>/<target's apk> as a zip (getPackageCodePath) and reads
+    /// <container>/<tree>/assets; the hub derives both from this file before boot
+    /// (KleptonHubPrep.swift), so nothing is staged from a Mac.
+    var apk: String? = nil
 
     /// <container>/<dataSubpath>.
     var root: URL { Paths.containerURL(for: target).appendingPathComponent(dataSubpath, isDirectory: true) }
@@ -154,9 +159,27 @@ enum SteamGames {
         return true
     }
 
+    /// SUPERHOT VR — the Steam Frame build: the Android depot is one APK (code and
+    /// data together, 646 MB) plus the Frame's display preferences. The code is in
+    /// the bundle (translated frameworks); the APK is still needed on device,
+    /// because Unity mounts it as a zip and reads its data out of it.
+    static let superhot = SteamGameDescriptor(
+        target: "superhot", title: "SUPERHOT VR", appID: 617830,
+        depots: [617833], osFilter: nil, branch: "public",
+        /// <container>/steam — the depot as Steam ships it, kept apart from what the
+        /// hub derives from it (<container>/superhot.apk, <container>/superhot/).
+        dataSubpath: "steam",
+        legacyDataSubpath: nil,
+        include: { ["shvr.apk", "vrpreferences.json"].contains($0.lowercased()) },
+        presenceProbes: ["shvr.apk"],
+        approxBytes: 650_000_000,
+        verifyNextLaunchKey: "kl.steam.verifyNextLaunch.superhot",
+        apk: "shvr.apk")
+
     /// One line per downloadable game.
     static let all: [String: SteamGameDescriptor] = [
         "alyx": alyx,
+        "superhot": superhot,
     ]
 
     static func descriptor(for target: String) -> SteamGameDescriptor? { all[target] }
