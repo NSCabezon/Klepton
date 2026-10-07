@@ -483,6 +483,26 @@ static const kl_gp_word k_alyx_lua_low4g[] = {
 // the branch unconditionally skips the countdown, so the startup map runs
 // unpaused behind its menu, which is all that map is. The 0x120 path (an
 // explicit pause request) is left as it is.
+//
+// DISABLED (2026-10-07): it broke every level after the menu. The countdown is
+// not the startup map's — the startup map never arms it now (its main-menu
+// object drops it straight to -1, 0xf9b7ac, measured with
+// KL_OPENVR_GATE_TRACE) — it is how EVERY level load reaches its "press
+// trigger to start" gate: armed to 3 frames, then "setpause" puts the menu
+// controller in state 3 (the gate), MenuDismiss in state 3 runs "unpause"
+// (0xf95c70 -> 0xf82f20), which sets the countdown to -1, and the gate test
+// (0xf83210: held while state is 0/3 or the countdown is >= 0) lets go:
+// "end_loading", the player's hands, the world's sound. With the branch taken
+// unconditionally the countdown sat at 3 forever, the state stayed 4 (which
+// MenuDismiss ignores), and the level never started: no hands, nothing to
+// grab, silence on the headset — until the pause menu's own "pause" reset the
+// countdown, which is why hands showed there and only there. Without the
+// patch, Mac: startup -> menu -> "load autosave" -> paused under the gate ->
+// trigger -> "unpaused the game" -> end_loading -> gloved hands, PCM peak 29158.
+// The opaque-fade freeze the patch was written for did not come back: the other
+// half of that commit (OpenVR startup events, the fade calls answered) is what
+// the menu needed.
+__attribute__((unused))  // not in k_patches[]
 static const kl_gp_word k_alyx_startup_nopause[] = {
     { 0xf81be0, 0x5400050d, 0x14000028, "b.le 0xf81c80 -> b 0xf81c80 (skip the startup-pause countdown)" },
 };
@@ -491,9 +511,11 @@ static const kl_gp_patch k_patches[] = {
     { "alyx-lua-arena-anywhere", "libvscript.so",
       "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
       k_alyx_lua_low4g, sizeof k_alyx_lua_low4g / sizeof *k_alyx_lua_low4g },
-    { "alyx-startup-no-pause", "libclient.so",
-      "the startup map is not paused under its menu while its fade is still opaque",
-      k_alyx_startup_nopause, sizeof k_alyx_startup_nopause / sizeof *k_alyx_startup_nopause },
+    // DISABLED: "alyx-startup-no-pause" kept every level behind its "press
+    // trigger" gate — see k_alyx_startup_nopause.
+    // { "alyx-startup-no-pause", "libclient.so",
+    //   "the startup map is not paused under its menu while its fade is still opaque",
+    //   k_alyx_startup_nopause, sizeof k_alyx_startup_nopause / sizeof *k_alyx_startup_nopause },
 
     // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
     // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
