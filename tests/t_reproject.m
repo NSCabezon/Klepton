@@ -578,7 +578,9 @@ static void check_crop_pixels(void) {
 // Memory row 0 is the picture's BOTTOM, exactly as in check_pixels and for
     // the same reason: this texture stands in for one GL wrote through an
     // EGLImage.
-    const uint8_t M[4] = { 255, 0, 255, 255 };          // magenta: never drawn
+    // Not magenta: the pass keys pure magenta (a render target's clear colour)
+    // to black (KL_CP_MAGENTA_KEY), which would hide the marker it looks for.
+    const uint8_t M[4] = { 0, 255, 255, 255 };          // cyan: never drawn
     uint8_t s[4 * 4 * 4];
     for (int i = 0; i < 4 * 4; i++) memcpy(s + i * 4, M, 4);
     const uint8_t pic[4][4] = {                          // the guest's 2x2
@@ -667,7 +669,7 @@ static void check_crop_pixels(void) {
 
     // ...and the failing direction, so a pass here cannot be an accident of the
     // marker colour never being sampled: the identity grid over the SAME source
-    // must show the magenta the crop excludes. If this one ever goes quiet, the
+    // must show the marker the crop excludes. If this one ever goes quiet, the
     // assertion above has stopped measuring anything.
     kl_reproject_grid_identity(grid);
     cmd = [q commandBuffer];
