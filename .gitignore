@@ -84,6 +84,9 @@ STYLE.md
 # vendored ANGLE toolchain + build, and MoltenVK
 vendor/
 vendor-moltenvk/
+vendor-moltenvk-fdm/
+# a worktree may symlink vendor/ (ANGLE) to the main checkout
+/vendor
 fbo_dump/
 tex_dump/
 metal_workload.trace/

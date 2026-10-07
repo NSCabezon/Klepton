@@ -842,6 +842,21 @@ static void *klg_plat_virtualalloc(void *addr, size_t size, uint32_t type, uint3
 // called semctl(GETNCNT) and friends, and Darwin's IPC_STAT path wrote a
 // semid_ds through whatever pointer it found there: the guest's frame record,
 // and a return to 0x14000001f5 later.
+// KL_GLIBC_SEM_SALT=<n>: XOR every key the guest asks semget for with n. Source 2
+// takes fixed-key, system-wide semaphores (keys 0x159f6adf.. on Alyx) and a
+// library constructor spins on them, so a SECOND Alyx on the same Mac waits
+// forever for the first to let go — two test runs (an A/B, or two agents) cannot
+// overlap. A salt gives a run its own set; pair it with a private TMPDIR for the
+// single-instance lock. IPC_PRIVATE (0) is left alone.
+static int klg_semget(key_t key, int nsems, int flags) {
+    static long salt = -1;
+    if (salt < 0) {
+        salt = kl_env_int("KL_GLIBC_SEM_SALT", 0);
+        if (salt) fprintf(stderr, "  [glibc] semget keys salted with %#lx (KL_GLIBC_SEM_SALT)\n", salt);
+    }
+    if (key != 0 && salt) key ^= (key_t)salt;
+    return semget(key, nsems, flags);
+}
 union klg_semun { int val; void *buf; unsigned short *array; };
 static int klg_semctl(int id, int num, int cmd, uintptr_t arg) {
     union klg_semun u;
@@ -895,7 +910,7 @@ static const klg_entry g_glibc[] = {
     D("__fpending", klg___fpending), D("__sysconf", klg___sysconf),
     D("sysconf", klg_sysconf),
     D("readlink", klg_readlink),
-    D("semctl", klg_semctl),
+    D("semctl", klg_semctl), D("semget", klg_semget),
     D("Plat_VirtualAlloc", klg_plat_virtualalloc),
     D("eventfd", klg_eventfd), D("eventfd_read", klg_eventfd_read),
     D("eventfd_write", klg_eventfd_write),
