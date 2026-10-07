@@ -564,6 +564,21 @@ static long long kl_phys_footprint(void) {
     return (long long)info.phys_footprint;
 }
 
+// [perf-audit 2026-10-07] Thermal pressure on the heartbeat line, so a device
+// log can tell thermal throttling from a heavier scene: Darwin's notify key
+// "com.apple.system.thermalpressurelevel" (OSThermalNotification.h), printed
+// raw: 0 is nominal and larger is hotter (macOS posts 0..4 = nominal, moderate,
+// heavy, trapping, sleeping; iOS-family kernels have used 0/10/20/30/40).
+// -1 if the key cannot be read.
+#include <notify.h>
+static long long kl_thermal_level(void) {
+    static int tok = -1, ok;
+    if (tok < 0) ok = notify_register_check("com.apple.system.thermalpressurelevel", &tok) == NOTIFY_STATUS_OK;
+    uint64_t st = 0;
+    if (!ok || notify_get_state(tok, &st) != NOTIFY_STATUS_OK) return -1;
+    return (long long)st;
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -579,9 +594,9 @@ static void *heartbeat(void *arg) {
             clock_gettime(CLOCK_REALTIME, &ts);
             struct tm tm;
             localtime_r(&ts.tv_sec, &tm);
-            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM\n",
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM thermal=%lld\n",
                     tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
-                    kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+                    kl_phys_footprint() >> 20, kl_avail_memory() >> 20, kl_thermal_level());
             fflush(stderr);
             last_phase = phase;
         }
