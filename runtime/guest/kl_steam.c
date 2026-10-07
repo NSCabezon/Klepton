@@ -19,8 +19,9 @@
 // "no", "none" or k_uAPICallInvalid. An interface version the SDK does not
 // describe (SteamAudio001, Valve-private) gets 128 such slots.
 //
-// WHO WE ARE: user 76561197960287930, logged on, owning app 546560 (Half-Life:
-// Alyx) and nothing else, language english, universe public, no overlay.
+// WHO WE ARE: user 76561197960287930 (KL_STEAM_ID), logged on, owning the
+// target's app (546560 Half-Life: Alyx, 2669410 Metro Awakening, 617830
+// SUPERHOT VR; see steam_app_id) and nothing else, language english, universe public, no overlay.
 //
 // NETWORKING: Source 2 runs even single player as a client connected to a
 // listen server in the same process, over ISteamNetworkingSockets. So that
@@ -44,10 +45,50 @@
 
 #include "klepton.h"
 #include "kl_env.h"
+#include "kl_driver.h"
+#include "kl_jni.h"
 #include "kl_steam.h"
 
-#define APP_ID      546560u
-#define USER_ID     76561197960287930ull
+// WHICH APP, WHICH USER. Both used to be constants, because Alyx was the only
+// guest; the Steam Frame's Android builds (Metro Awakening, UE5; SUPERHOT VR,
+// Unity + Steamworks.NET) link libsteam_api.so too, and the same stand-in serves
+// them — the flat entry points
+// and the C++ interface ABI are AAPCS64 + Itanium on both doors, so nothing
+// here is glibc-specific except where the lookup is installed (kl_shim.c's
+// Steamworks tier is the Android half). The app is the TARGET's: a stub that
+// says "you own 546560" to Metro answers BIsSubscribedApp(2669410) with no.
+//
+//   KL_STEAM_APPID  override the app id (default: the target's, below)
+//   KL_STEAM_ID     the 64-bit SteamID to report (default: a fixed fake one)
+//   KL_STEAM_NAME   the persona name (default "Gordon")
+//
+// The SteamID default is deliberately fake rather than read from anywhere: the
+// account that owns the game is the user's, and saying so in a log or a save
+// is the user's call (KL_STEAM_ID), not the stub's.
+static const struct { const char *target; uint32_t app; } g_apps[] = {
+    { "alyx",  546560u  },     // Half-Life: Alyx (Linux arm64 depot 546564)
+    { "metro", 2669410u },     // Metro Awakening (Android depot 2669412)
+    { "superhot", 617830u },   // SUPERHOT VR (Steam Frame Android depot 617833)
+};
+static uint32_t steam_app_id(void) {
+    static uint32_t app;
+    if (app) return app;
+    const char *e = getenv("KL_STEAM_APPID");
+    if (e && *e) return app = (uint32_t)strtoul(e, NULL, 10);
+    const char *t = kl_driver_target_name();
+    for (size_t i = 0; i < sizeof g_apps / sizeof *g_apps; i++)
+        if (t && !strcmp(t, g_apps[i].target)) return app = g_apps[i].app;
+    return app = 546560u;
+}
+static uint64_t steam_user_id(void) {
+    static uint64_t id;
+    if (id) return id;
+    const char *e = getenv("KL_STEAM_ID");
+    id = (e && *e) ? strtoull(e, NULL, 10) : 0;
+    return id ? id : (id = 76561197960287930ull);
+}
+#define APP_ID      steam_app_id()
+#define USER_ID     steam_user_id()
 #define SERVER_ID   90071992547409921ull
 
 // ---- interface objects ---------------------------------------------------------------
@@ -58,7 +99,11 @@ static const iface_desc g_desc[] = {
 };
 #undef KL_STEAM_IFACE
 
-typedef struct { void **vt; const char *ver; } sobj;   // vt first: it is a C++ object
+// vt first: it is a C++ object. `desc` is the row it was built from (NULL for a
+// version no SDK here describes), which the FLAT API needs: a flat call names
+// a class and a method, and only the object knows which version's slot order
+// it was laid out in.
+typedef struct { void **vt; const char *ver; const iface_desc *desc; } sobj;
 static sobj *g_objs[64];
 static int g_nobjs;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -67,11 +112,19 @@ typedef struct { const char *ver, *method; int nth; void *fn; } impl;
 static sobj *iface(const char *ver);
 
 // ---- the flat entry points -------------------------------------------------------------
+static void stats_received(void);
 static int  st_init(const char *versions, void *err) {
     (void)versions;
     if (err) memset(err, 0, 1024);
     fprintf(stderr, "  [steam] SteamAPI_Init -> OK (stub client: user %llu, app %u)\n",
             (unsigned long long)USER_ID, APP_ID);
+    // SDK 1.61 dropped RequestCurrentStats: the client loads the user's stats
+    // itself at init and announces them with UserStatsReceived_t, and a game
+    // that waits for that before touching achievements (Steamworks.NET's
+    // samples do) waits forever without it. Queued once; the first pump
+    // delivers it, whichever dispatch style the game uses.
+    static int stats_once;
+    if (!stats_once) { stats_once = 1; stats_received(); }
     return 0;                                     // k_ESteamAPIInitResult_OK
 }
 static int  st_init_bool(void) { st_init(NULL, NULL); return 1; }
@@ -89,6 +142,7 @@ static int  st_gs_hsteamuser(void) { return 2; }
 static int  st_true(void) { return 1; }
 static int  st_false(void) { return 0; }
 static void st_void(void) {}
+static const char *st_install_path(void) { return "/steam"; }
 static void *st_find_user(int hUser, const char *ver) { (void)hUser; return iface(ver); }
 static void *st_create_iface(const char *ver) { return iface(ver); }
 
@@ -109,7 +163,9 @@ static int g_ncbs;
 typedef struct { ccb *cb; uint64_t call; } cres;
 static cres g_cres[256];
 static int g_ncres;
-typedef struct { int id; uint64_t call; size_t n; void *data; } posted;
+// `announced`: a call result whose SteamAPICallCompleted_t the MANUAL dispatch
+// loop has already handed out; it stays queued until GetAPICallResult takes it.
+typedef struct { int id; uint64_t call; size_t n; void *data; int announced; } posted;
 static posted g_posted[256];
 static int g_nposted;
 static uint64_t g_next_call = 1;
@@ -148,7 +204,7 @@ static uint64_t post(int id, const void *data, size_t n, int as_call_result) {
     if (g_nposted < 256) {
         void *c = malloc(n);
         memcpy(c, data, n);
-        g_posted[g_nposted++] = (posted){ id, call, n, c };
+        g_posted[g_nposted++] = (posted){ id, call, n, c, 0 };
     }
     pthread_mutex_unlock(&g_cbmu);
     return call;
@@ -195,9 +251,11 @@ static uint64_t us_steamid(void *s) { (void)s; return USER_ID; }
 static uint64_t gs_steamid(void *s) { (void)s; return SERVER_ID; }
 static int us_userdata_folder(void *s, char *buf, int n) {
     (void)s;
-    const char *home = getenv("HOME");
-    snprintf(buf, (size_t)n, "%s/Library/Application Support/Klepton/userdata/alyx/steam",
-             home ? home : "/tmp");
+    // The TARGET's userdata, not Alyx's: this used to be a literal
+    // ".../userdata/alyx/steam", which on a second Steam guest would have put
+    // its Steam-side files in Alyx's directory.
+    const char *t = kl_driver_target_name();
+    snprintf(buf, (size_t)n, "%s/steam", kl_userdata_dir(t && *t ? t : "alyx"));
     return 1;
 }
 static int us_level(void *s) { (void)s; return 1; }
@@ -765,6 +823,86 @@ static int nu_id_parse(void *s, uint8_t *id, const char *str) {
     return 0;
 }
 
+// ---- ISteamUserStats: answered locally, and every call NAMED -----------------------------
+//
+// Achievements and stats are out of scope for now — nothing is forwarded to a
+// real Steam — but they must not FAIL: a game that sees SetAchievement or
+// StoreStats return false may retry every frame, show an error, or stop saving
+// progress. So the writes succeed, the reads report "nothing yet", and every
+// distinct call is logged once with its arguments under "[steam-stats]". That
+// log is the input for the later feature that forwards them to the user's real
+// Steam account: it lists exactly which stats and achievements each game uses.
+//
+// Callback structs are pack(4) on Linux/Android (VALVE_CALLBACK_PACK_SMALL).
+#pragma pack(push, 4)
+typedef struct { uint64_t game; int32_t result; uint64_t user; } st_stats_received;   // 1101
+typedef struct { uint64_t game; int32_t result; } st_stats_stored;                   // 1102
+typedef struct { uint64_t game; uint8_t group; char name[128];
+                 uint32_t cur, max; } st_ach_stored;                                 // 1103
+typedef struct { uint64_t call; int32_t id; uint32_t n; } st_call_completed;          // 703
+#pragma pack(pop)
+
+static void stats_note(const char *what, const char *name, const char *val) {
+    static char seen[256][160];
+    static int nseen;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    char key[160];
+    snprintf(key, sizeof key, "%s(%s%s%s)", what, name ? name : "", val ? ", " : "", val ? val : "");
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < nseen; i++) if (!strcmp(seen[i], key)) { pthread_mutex_unlock(&mu); return; }
+    if (nseen < 256) snprintf(seen[nseen++], sizeof seen[0], "%s", key);
+    pthread_mutex_unlock(&mu);
+    fprintf(stderr, "  [steam-stats] %s -> ok (local only, not sent to Steam)\n", key);
+}
+static void stats_received(void) {
+    st_stats_received r = { APP_ID, 1 /* k_EResultOK */, USER_ID };
+    post(1101, &r, sizeof r, 0);
+}
+static int  ss_get_i(void *s, const char *n, int32_t *v) { (void)s; if (v) *v = 0; stats_note("GetStat", n, NULL); return 1; }
+static int  ss_get_f(void *s, const char *n, float *v)   { (void)s; if (v) *v = 0; stats_note("GetStat", n, NULL); return 1; }
+static int  ss_set_i(void *s, const char *n, int32_t v) {
+    (void)s; char b[32]; snprintf(b, sizeof b, "%d", v); stats_note("SetStat", n, b); return 1;
+}
+static int  ss_set_f(void *s, const char *n, float v) {
+    (void)s; char b[32]; snprintf(b, sizeof b, "%g", v); stats_note("SetStat", n, b); return 1;
+}
+static int  ss_avg(void *s, const char *n, float v, double len) {
+    (void)s; char b[48]; snprintf(b, sizeof b, "%g over %g", v, len); stats_note("UpdateAvgRateStat", n, b); return 1;
+}
+static int  ss_get_ach(void *s, const char *n, uint8_t *got) { (void)s; if (got) *got = 0; stats_note("GetAchievement", n, NULL); return 1; }
+static int  ss_get_ach_t(void *s, const char *n, uint8_t *got, uint32_t *t) {
+    (void)s; if (got) *got = 0; if (t) *t = 0; stats_note("GetAchievementAndUnlockTime", n, NULL); return 1;
+}
+static int  ss_set_ach(void *s, const char *n) { (void)s; stats_note("SetAchievement", n, NULL); return 1; }
+static int  ss_clear_ach(void *s, const char *n) { (void)s; stats_note("ClearAchievement", n, NULL); return 1; }
+static int  ss_progress(void *s, const char *n, uint32_t cur, uint32_t max) {
+    (void)s; char b[32]; snprintf(b, sizeof b, "%u/%u", cur, max); stats_note("IndicateAchievementProgress", n, b);
+    st_ach_stored r = { APP_ID, 0, {0}, cur, max };
+    snprintf(r.name, sizeof r.name, "%s", n ? n : "");
+    post(1103, &r, sizeof r, 0);
+    return 1;
+}
+static int  ss_store(void *s) {
+    (void)s; stats_note("StoreStats", NULL, NULL);
+    st_stats_stored r = { APP_ID, 1 };
+    post(1102, &r, sizeof r, 0);
+    return 1;
+}
+static int  ss_reset(void *s, uint8_t ach) {
+    (void)s; stats_note("ResetAllStats", NULL, ach ? "and achievements" : "stats only"); return 1;
+}
+static uint32_t ss_num_ach(void *s) { (void)s; return 0; }
+static const char *ss_ach_attr(void *s, const char *n, const char *k) {
+    (void)s; (void)n; (void)k; return "";
+}
+// RequestUserStats / RequestCurrentStats (pre-1.61): answer with the same
+// UserStatsReceived_t init already queued, as a call result for the former.
+static uint64_t ss_request_user(void *s, uint64_t user) {
+    (void)s; st_stats_received r = { APP_ID, 1, user };
+    return post(1101, &r, sizeof r, 1);
+}
+static int  ss_request_current(void *s) { (void)s; stats_received(); return 1; }
+
 // ---- the implemented slots -----------------------------------------------------------------------------
 #define I(ver, m, f) { ver, m, 0, (void *)(f) }
 #define I2(ver, m, n, f) { ver, m, n, (void *)(f) }
@@ -776,6 +914,7 @@ static int nu_id_parse(void *s, uint8_t *id, const char *str) {
 #define FRV "SteamFriends018"
 #define NSV "SteamNetworkingSockets013"
 #define NUV "SteamNetworkingUtils004"
+#define SSV "STEAMUSERSTATS_INTERFACE_VERSION013"
 static const impl g_impl[] = {
     I(CLV, "CreateSteamPipe", cl_pipe), I(CLV, "BReleaseSteamPipe", cl_true),
     I(CLV, "ConnectToGlobalUser", cl_user), I(CLV, "BShutdownIfAllPipesClosed", cl_true),
@@ -840,6 +979,16 @@ static const impl g_impl[] = {
     I(NSV, "SetConnectionPollGroup", ns_set_poll),
     I(NSV, "ReceiveMessagesOnPollGroup", ns_recv_poll), I(NSV, "RunCallbacks", ns_run_callbacks),
 
+    I2(SSV, "GetStat", 0, ss_get_i), I2(SSV, "GetStat", 1, ss_get_f),
+    I2(SSV, "SetStat", 0, ss_set_i), I2(SSV, "SetStat", 1, ss_set_f),
+    I(SSV, "UpdateAvgRateStat", ss_avg), I(SSV, "GetAchievement", ss_get_ach),
+    I(SSV, "SetAchievement", ss_set_ach), I(SSV, "ClearAchievement", ss_clear_ach),
+    I(SSV, "GetAchievementAndUnlockTime", ss_get_ach_t), I(SSV, "StoreStats", ss_store),
+    I(SSV, "GetAchievementDisplayAttribute", ss_ach_attr),
+    I(SSV, "IndicateAchievementProgress", ss_progress), I(SSV, "GetNumAchievements", ss_num_ach),
+    I(SSV, "RequestUserStats", ss_request_user), I(SSV, "ResetAllStats", ss_reset),
+    I(SSV, "RequestCurrentStats", ss_request_current),
+
     I(NUV, "AllocateMessage", nu_alloc), I(NUV, "GetRelayNetworkStatus", nu_relay),
     I(NUV, "CheckPingDataUpToDate", nu_true), I(NUV, "GetLocalTimestamp", nu_time),
     I(NUV, "SetDebugOutputFunction", nu_debug), I(NUV, "SetConfigValue", nu_set_config),
@@ -868,7 +1017,24 @@ static long steam_unimpl(const char *name) {
     return 0;
 }
 
+// An OLDER version of an implemented interface takes the newer one's
+// implementations BY METHOD NAME. Only the slot ORDER differs between versions
+// (kl_steam_vtables.h has a row for each), and a method that keeps its name
+// keeps its signature in every SDK this has been checked against — the
+// implemented ones above are all plain getters. Metro Awakening (SDK 1.60) is
+// the guest that asks for these.
+static const struct { const char *old, *cur; } g_alias[] = {
+    { "SteamClient021",                 CLV },
+    { "SteamUtils010",                  UTV },
+    { "SteamFriends017",                FRV },
+    { "STEAMAPPS_INTERFACE_VERSION008", APV },
+    { "STEAMUSERSTATS_INTERFACE_VERSION012", SSV },
+    { "SteamNetworkingSockets012",      NSV },
+};
+
 static void *impl_for(const char *ver, const char *method, int nth) {
+    for (size_t a = 0; a < sizeof g_alias / sizeof *g_alias; a++)
+        if (!strcmp(ver, g_alias[a].old)) { ver = g_alias[a].cur; break; }
     for (int i = 0; i < g_nimpl; i++)
         if (!strcmp(g_impl[i].ver, ver) && !strcmp(g_impl[i].method, method) &&
             g_impl[i].nth == nth)
@@ -889,6 +1055,7 @@ static sobj *iface(const char *ver) {
     else n = 128;
     sobj *o = calloc(1, sizeof *o);
     o->ver = strdup(ver);
+    o->desc = d;
     o->vt = calloc((size_t)n + 1, sizeof *o->vt);
     for (int s = 0; s < n; s++) {
         void *fn = NULL;
@@ -909,6 +1076,129 @@ static sobj *iface(const char *ver) {
     fprintf(stderr, "  [steam] interface %s -> %p (%s, %d slots)\n", ver, (void *)o,
             d ? d->cls : "not in the SDK: every slot a logging stub", n);
     return o;
+}
+
+// ---- manual dispatch (Steamworks.NET) ------------------------------------------------------
+//
+// The C++ games here register CCallback objects and pump SteamAPI_RunCallbacks.
+// Steamworks.NET (every Unity title: SUPERHOT VR's Frame build) does not: it
+// calls SteamAPI_ManualDispatch_Init once, then every frame RunFrame and a
+// GetNextCallback / FreeLastCallback loop that hands it CallbackMsg_t records,
+// and it fetches call results itself with GetAPICallResult after the
+// SteamAPICallCompleted_t (703) that announces each one. Same queue as the
+// C++ pump (g_posted), drained the other way.
+typedef struct { int32_t user; int32_t id; uint8_t *param; int32_t n; } st_cbmsg;   // CallbackMsg_t
+static void *g_md_last;                      // the record FreeLastCallback releases
+static st_call_completed g_md_completed;     // storage for a 703's payload
+static void md_init(void) { fprintf(stderr, "  [steam] ManualDispatch_Init (Steamworks.NET dispatch)\n"); }
+static void md_run_frame(int pipe) { (void)pipe; net_dispatch(); }
+static int  md_next(int pipe, st_cbmsg *msg) {
+    (void)pipe;
+    int got = 0;
+    pthread_mutex_lock(&g_cbmu);
+    for (int i = 0; i < g_nposted && !got; i++) {
+        posted *p = &g_posted[i];
+        if (p->call && p->announced) continue;
+        if (p->call) {
+            p->announced = 1;
+            g_md_completed = (st_call_completed){ p->call, p->id, (uint32_t)p->n };
+            *msg = (st_cbmsg){ 1, 703, (uint8_t *)&g_md_completed, (int32_t)sizeof g_md_completed };
+        } else {
+            free(g_md_last);
+            g_md_last = p->data;
+            *msg = (st_cbmsg){ 1, p->id, p->data, (int32_t)p->n };
+            memmove(p, p + 1, (size_t)(g_nposted - i - 1) * sizeof *p);
+            g_nposted--;
+        }
+        got = 1;
+    }
+    pthread_mutex_unlock(&g_cbmu);
+    if (got && kl_env_on("KL_TRACE_STEAM", 0))
+        fprintf(stderr, "  [steam] ManualDispatch callback %d (%d bytes)\n", msg->id, msg->n);
+    return got;
+}
+static void md_free_last(int pipe) {
+    (void)pipe;
+    pthread_mutex_lock(&g_cbmu);
+    free(g_md_last); g_md_last = NULL;
+    pthread_mutex_unlock(&g_cbmu);
+}
+static int  md_call_result(int pipe, uint64_t call, void *out, int cb, int expected, int *failed) {
+    (void)pipe; return ut_call_result(NULL, call, out, cb, expected, failed);
+}
+static int  st_zero(void) { return 0; }
+
+// ---- the FLAT API ----------------------------------------------------------------------------
+//
+// Steamworks.NET binds `SteamAPI_ISteamClient_GetISteamUser(self, ...)` and a
+// thousand names like it by P/Invoke, i.e. dlsym off our libsteam_api handle,
+// one name at a time as the managed side first calls each. A flat function is
+// the C++ virtual with `this` made explicit, so each one is served by the SAME
+// vtable implementation: the stub hands the call to kl_steam_flat_tramp
+// (kl_steam_flat.S) with every argument register intact and the row below in
+// x16; the trampoline asks kl_steam_flat_target which slot of `self`'s vtable
+// that is — the object knows its interface VERSION, and the slot order is the
+// version's — and tail-branches there. Overloads have distinct flat names
+// (GetStatInt32 / GetStatFloat) and the row carries which overload it is.
+//
+// The cells are the pre-built, signed trace cells (kl_trace_stub): no code is
+// generated at runtime, so this works on visionOS too.
+//
+// Accessors (`SteamAPI_SteamUser_v023()`, no arguments) go through the other
+// trampoline, which turns the row's version string into iface(version).
+typedef struct { const char *flat, *cls, *method; int nth; } flat_row;
+typedef struct { const char *flat, *ver; } accessor_row;
+#define KL_STEAM_FLAT(f, c, m, n) { f, c, m, n },
+#define KL_STEAM_ACCESSOR(f, v)
+static const flat_row g_flat_rows[] = {
+#include "kl_steam_flat.h"
+};
+#undef KL_STEAM_FLAT
+#undef KL_STEAM_ACCESSOR
+#define KL_STEAM_FLAT(f, c, m, n)
+#define KL_STEAM_ACCESSOR(f, v) { f, v },
+static const accessor_row g_accessor_rows[] = {
+#include "kl_steam_flat.h"
+};
+#undef KL_STEAM_FLAT
+#undef KL_STEAM_ACCESSOR
+
+extern void kl_steam_flat_tramp(void);
+extern void kl_steam_accessor_tramp(void);
+
+// Called from kl_steam_flat_tramp with the row and `self` (the guest's x0).
+void *kl_steam_flat_target(const flat_row *r, sobj *self) {
+    int ours = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nobjs && !ours; i++) ours = g_objs[i] == self;
+    pthread_mutex_unlock(&g_mu);
+    if (!ours || !self->desc) {
+        fprintf(stderr, "  [steam] %s on %s object %p -> 0\n", r->flat,
+                ours ? "an undescribed" : "a foreign", (void *)self);
+        return (void *)st_zero;
+    }
+    if (strcmp(self->desc->cls, r->cls) != 0)
+        fprintf(stderr, "  [steam] %s called on a %s (%s) — dispatching by method name\n",
+                r->flat, self->desc->cls, self->ver);
+    for (int sl = 0, nth = 0; self->desc->slots[sl]; sl++)
+        if (!strcmp(self->desc->slots[sl], r->method) && nth++ == r->nth)
+            return self->vt[sl];
+    fprintf(stderr, "  [steam] %s: %s has no such method -> 0\n", r->flat, self->ver);
+    return (void *)st_zero;
+}
+
+// Called from kl_steam_accessor_tramp with the version string.
+void *kl_steam_accessor_target(const char *ver) { return iface(ver); }
+
+static void *flat_lookup(const char *name) {
+    for (size_t i = 0; i < sizeof g_accessor_rows / sizeof *g_accessor_rows; i++)
+        if (!strcmp(g_accessor_rows[i].flat, name))
+            return kl_trace_stub(name, (void *)g_accessor_rows[i].ver,
+                                 (void *)kl_steam_accessor_tramp);
+    for (size_t i = 0; i < sizeof g_flat_rows / sizeof *g_flat_rows; i++)
+        if (!strcmp(g_flat_rows[i].flat, name))
+            return kl_trace_stub(name, (void *)&g_flat_rows[i], (void *)kl_steam_flat_tramp);
+    return NULL;
 }
 
 // ---- the flat table ------------------------------------------------------------------------------------
@@ -939,6 +1229,14 @@ static const flat g_flat[] = {
     { "SteamAPI_WriteMiniDump", (void *)st_void },
     { "SteamGameServer_BSecure", (void *)st_false },
     { "SteamGameServer_GetSteamID", (void *)gs_steamid },
+    { "SteamAPI_ManualDispatch_Init", (void *)md_init },
+    { "SteamAPI_ManualDispatch_RunFrame", (void *)md_run_frame },
+    { "SteamAPI_ManualDispatch_GetNextCallback", (void *)md_next },
+    { "SteamAPI_ManualDispatch_FreeLastCallback", (void *)md_free_last },
+    { "SteamAPI_ManualDispatch_GetAPICallResult", (void *)md_call_result },
+    { "SteamAPI_ReleaseCurrentThreadMemory", (void *)st_void },
+    { "SteamGameServer_ReleaseCurrentThreadMemory", (void *)st_void },
+    { "SteamAPI_GetSteamInstallPath", (void *)st_install_path },
 };
 
 void *kl_steam_lookup(const char *name) {
@@ -948,5 +1246,16 @@ void *kl_steam_lookup(const char *name) {
     if (!kl_env_on("KL_STEAM_STUB", 1)) return NULL;
     for (size_t i = 0; i < sizeof g_flat / sizeof *g_flat; i++)
         if (!strcmp(g_flat[i].name, name)) return g_flat[i].fn;
+    void *f = flat_lookup(name);
+    if (f) return f;
+    // Anything else in the flat API's namespace — the SteamNetworkingIdentity /
+    // IPAddr struct helpers, the signalling objects — is a named stub that logs
+    // and returns 0, not NULL: a NULL here is a managed EntryPointNotFound that
+    // takes the game's whole Steam layer down with it (SUPERHOT), where a 0 is
+    // an answer the caller already has a path for. Only the flat namespace:
+    // the C++ guests' own SteamInternal_ / SteamAPI_ names keep the NULL that
+    // lets the glibc door fall through to the guest's library.
+    if (!strncmp(name, "SteamAPI_ISteam", 15) || !strncmp(name, "SteamAPI_Steam", 14))
+        return kl_named_stub(name, (void *)steam_unimpl);
     return NULL;
 }

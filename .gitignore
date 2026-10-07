@@ -43,6 +43,10 @@
 /portal/
 /vicecity/*
 /vicecity/
+# metro is a SYMLINK to game/metro/apk (outside the repo), so it needs the
+# bare-name form too: /metro/ only matches a real directory.
+/metro
+/metro/
 *.apk
 
 # robots and automata

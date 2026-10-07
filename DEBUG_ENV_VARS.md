@@ -43,6 +43,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 
 ## GL / null driver (`runtime/gfx/kl_egl.c`)
 
+- `KL_GL_VENDOR=<s>`, `KL_GL_RENDERER=<s>` — what the null driver answers for
+  `GL_VENDOR` / `GL_RENDERER` (default `Klepton` / `Klepton GLES`). Unreal
+  picks its Android device profile partly from the renderer string; tried as
+  `Qualcomm` / `Adreno (TM) 750` (the Steam Frame) for Metro Awakening, which
+  did not change its RHI choice. Diagnostic only.
 - `KL_DUMP_SHADERS=<dir>` — after the frame pump, write every captured
   `glShaderSource` text into `<dir>`. Read by m_boot; the dump runs in
   `kl_egl.c`. The only place Unity's GLSL ES exists in plain text.
@@ -386,6 +391,10 @@ Built for the loading-pace investigation; all default off.
   hypothesis died: bulk reads stop within seconds; the only continuing trickle
   is libunity re-reading `/proc/cpuinfo` once per frame.
 - `KL_TRACE_SLEEP=1` — once a second: usleep count/mean/max.
+- `KL_TRACE_SYSPROP=1` — every `__system_property_get` the guest makes and
+  the answer. A guest that branches on the device can ask natively as well as
+  over JNI (`Build.*`), and only the JNI half shows in the `[jni]` log.
+  (Metro Awakening asks only `ro.arch`; its device identity is all JNI.)
 - `KL_TRACE_SYSCONF=1` — every `sysconf()` the guest asks and the answer given.
   What to reach for when a guest sizes a thread pool or a heap to zero.
 - `KL_TRACE_THREADS=1` — one line per guest `pthread_create`: entry, arg, stack
@@ -2154,6 +2163,21 @@ nothing, and prints the unresolved imports grouped by category.
   points to the guest's own library (which then looks for a running Steam and
   fails). `KL_TRACE_STEAM=1` logs callback registration and every loopback
   connection state change; `KL_STEAM_NAME` is the persona name (Gordon).
+  The same stand-in serves the Steam Frame's ANDROID builds (Metro Awakening,
+  SUPERHOT VR): their imports bind through kl_shim.c's Steamworks tier and
+  their `dlopen("libsteam_api.so")` gets a stand-in handle (kl_dl.c); there
+  `KL_STEAM_STUB=0` lets the guest's own library load. With
+  `KL_TRACE_STEAM=1` the Steamworks.NET manual-dispatch loop also names every
+  callback it hands out.
+- `KL_STEAM_APPID=<id>` — the app id the stand-in owns. Default: the target's
+  (`alyx` 546560, `metro` 2669410, `superhot` 617830; table in kl_steam.c).
+- `KL_STEAM_ID=<steamid64>` — the SteamID the stand-in reports for the user.
+  Default: a fixed fake one (76561197960287930); set it to your own if a game
+  keys saves or cloud paths on it.
+- Stats and achievements (ISteamUserStats) are answered locally and never sent
+  anywhere: writes succeed, reads say "not yet", and every distinct call is
+  logged once as `[steam-stats] <Method>(<name>[, value])` — the list of stats
+  and achievements a game uses, for a later forwarder to real Steam.
 - `KL_STEAM_LANG=<steam language>` — the game language the Steam stub reports
   (`english`, `spanish`, `latam`, `french`, …). Default: the system's first
   preferred language, mapped to Steam's name. Alyx has English voices only;

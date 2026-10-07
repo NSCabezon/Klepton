@@ -339,6 +339,13 @@ const void *klb_sysprop_find(const char *n) {
 
 int klb_sysprop_get(const char *n, char *v) {
     const char *val = sysprop_value(n);
+    // KL_TRACE_SYSPROP=1: name every property the guest asks for and what it
+    // was told. A guest that branches on the device (Metro Awakening picks its
+    // store, XR loader and device profile from the hardware identity) asks
+    // natively as well as over JNI, and only one of the two shows up in the
+    // [jni] log.
+    if (getenv("KL_TRACE_SYSPROP"))
+        fprintf(stderr, "  [prop] %s -> %s\n", n ? n : "(null)", val ? val : "(unset)");
     if (!v) return val ? (int)strlen(val) : 0;
     if (!val) { v[0] = 0; return 0; }
     int len = snprintf(v, KLB_PROP_VALUE_MAX, "%s", val);

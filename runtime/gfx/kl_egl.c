@@ -379,8 +379,22 @@ static int klgl_ext_count(void) {
 static const char *klgl_GetString(uint32_t name) {
     static char ver[64], glsl[64], exts[256];
     switch (name) {
-    case GL_VENDOR:     return "Klepton";
-    case GL_RENDERER:   return "Klepton GLES";
+    // KL_GL_VENDOR / KL_GL_RENDERER: what the null driver says it is. Unreal
+    // picks its Android device profile — and with it Vulkan or GLES — from the
+    // GL_RENDERER string (its "GPU family") as well as the device make; Metro
+    // Awakening, told it is a Valve device, matches no profile for "Klepton
+    // GLES" and falls back to the GLES RHI, which needs ES 3.2 features ANGLE
+    // does not have (glTexBuffer). The Steam Frame is an Adreno 750. Measured:
+    // "Adreno (TM) 750" alone did NOT flip Metro back to Vulkan, so this is a
+    // diagnostic knob, not a fix; nothing sets it by default.
+    case GL_VENDOR: {
+        const char *v = getenv("KL_GL_VENDOR");
+        return v && *v ? v : "Klepton";
+    }
+    case GL_RENDERER: {
+        const char *r = getenv("KL_GL_RENDERER");
+        return r && *r ? r : "Klepton GLES";
+    }
     // Unity parses this to decide the GLES level it drives, so the shape matters
     // as much as the number: it expects "OpenGL ES <major>.<minor> <vendor>".
     case GL_VERSION:

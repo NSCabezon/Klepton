@@ -21,6 +21,7 @@
 #include "kl_vulkan.h"
 #include "kl_aaudio.h"
 #include "kl_openxr.h"
+#include "kl_steam.h"
 
 // 64 held every bionic chain with room to spare; the glibc door maps the whole
 // game tree plus the runtime sysroot it pulls in, which is ~90 images.
@@ -597,6 +598,7 @@ void kl_dl_report_images(FILE *f) {
 // kl_can_load instead of stat(), and this is what kl_can_load itself cannot
 // see.
 static int kl_core_shim_claims(const char *path);
+static int kl_steam_claims(const char *path);
 static int (*g_exist_filter)(const char *path);
 void kl_dl_set_exist_filter(int (*fn)(const char *path)) { g_exist_filter = fn; }
 
@@ -612,7 +614,8 @@ int kl_can_dlopen(const char *path) {
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
-           kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
+           kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_steam_claims(path) ||
+           kl_can_load(path);
 }
 
 // KL_DLOPEN_REFUSE=<substr>[,<substr>...] — refuse these by name, as if the
@@ -814,6 +817,27 @@ static int kl_core_shim_claims(const char *path) {
 
 static int kl_core_shim_is_handle(void *h) { return h == (void *)&g_core_shim_handle; }
 
+// libsteam_api.so, on the BIONIC door (Metro Awakening's Steam Frame build).
+// The import half is kl_shim.c's Steamworks tier; this is the dlopen half, and
+// it is not optional: Unreal's OnlineSubsystemSteam dlopens "libsteam_api.so"
+// itself and dlsyms its entry points, even though libUnreal ALSO links it. The
+// file is in the guest tree, so without this the guest's own copy maps and its
+// SteamAPI_Init goes looking for the Frame's Steam service — the stand-in the
+// imports were bound to would never be asked. Same shape as the OpenXR loader
+// above: claim the name, hand back a sentinel, and route dlsym on it to
+// kl_steam_lookup (NULL, with a dlerror, for anything it does not serve).
+//
+// The glibc door (Alyx) keeps its own path — kl_glibc_shim.c's ABI tier — so
+// this is restricted to the other kinds, and KL_STEAM_STUB=0 opts out as it
+// does for the imports.
+static const int g_steam_handle = 0;                 // address is the sentinel
+static int kl_steam_claims(const char *path) {
+    if (!path || strcmp(basename_of(path), "libsteam_api.so") != 0) return 0;
+    extern kl_guest_kind kl_driver_kind(void);
+    if (kl_driver_kind() == KL_GUEST_GLIBC) return 0;
+    return kl_env_on("KL_STEAM_STUB", 1);
+}
+
 // Names a guest dlopen was already refused, so the refusal is logged once.
 // Hashes rather than strings: a collision only costs one missing log line.
 static int refusal_seen(const char *path) {
@@ -881,6 +905,11 @@ void *klb_dlopen(const char *path, int flags) {
     // runtime broker. See kl_openxr.c.
     void *xrl = kl_openxr_dlopen(path);
     if (xrl) return xrl;
+    if (kl_steam_claims(path)) {
+        fprintf(stderr, "  [steam] guest dlopen(\"%s\") -> stand-in Steam client "
+                        "(kl_steam; the real one needs the Frame's Steam service)\n", path);
+        return (void *)&g_steam_handle;
+    }
     // The always-resident Android system libraries (libc/libdl/libm/...). No file
     // to open; served with a handle whose dlsym routes to the shim table. Must
     // come before the file-load fallthrough, which would fail and hand back NULL.
@@ -1016,6 +1045,11 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
     if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
+    if (handle == (void *)&g_steam_handle) {
+        void *s = kl_steam_lookup(name);
+        if (!s) snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+        return s;
+    }
     // A core system-library handle (libc.so &c.) resolves like RTLD_DEFAULT: the
     // shim serves libc, and the global image search covers anything a guest .so
     // exported. A name neither has is a clean undefined-symbol dlerror, not a

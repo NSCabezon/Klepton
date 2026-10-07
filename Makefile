@@ -58,7 +58,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_glibc.c runtime/guest/kl_glibc_sdl.c \
-           runtime/guest/kl_steam.c runtime/guest/kl_openvr.c \
+           runtime/guest/kl_steam.c runtime/guest/kl_steam_flat.S runtime/guest/kl_openvr.c \
            runtime/guest/kl_driver.c \
            runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
@@ -169,7 +169,10 @@ guest_elf_libs = $(shell for f in $(1)/*.so; do \
 GUEST_SOS = $(basename $(notdir $(call guest_elf_libs,$(LIBS))))
 
 # The exclusions are the libraries we REPLACE rather than translate
-GUEST_REPLACED := libOVRPlugin libovrplatformloader libvrapi
+# (libsteam_api: kl_steam; the vendor-suffixed OpenXR loaders that Metro
+# Awakening's Steam Frame APK ships: kl_openxr's dlopen door claims them).
+GUEST_REPLACED := libOVRPlugin libovrplatformloader libvrapi \
+                  libsteam_api libopenxr_loader_valve libopenxr_loader_meta
 
 # ...and these are not part of the APPLICATION at all.
 GUEST_EXCLUDED := libfrda libscript

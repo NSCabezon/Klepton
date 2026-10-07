@@ -988,6 +988,43 @@ static int klj_same_args(const char *a, const char *b) {
     return la == lb && klj_sig_eq_n(a, b, la);
 }
 
+// One JNI type descriptor starting at *p: advances *p past it and returns its
+// length, 0 at ')' or on garbage.
+static size_t klj_one_type(const char **p) {
+    const char *s = *p, *q = s;
+    while (*q == '[') q++;
+    if (*q == 'L') { q = strchr(q, ';'); if (!q) return 0; q++; }
+    else if (*q && *q != ')') q++;
+    else return 0;
+    *p = q;
+    return (size_t)(q - s);
+}
+
+// The REFLECTION-shaped loose match. Unity's AndroidJavaObject.Call resolves a
+// method through ReflectionHelper.getMethodID with a signature built from the
+// C# arguments, and a C# `null` has no type, so it goes in as
+// `Ljava/lang/Object;` — SUPERHOT's `activity.Call<AndroidJavaObject>(
+// "getExternalFilesDir", null)` asks for `(Ljava/lang/Object;)Ljava/lang/Object;`
+// where the method is `(Ljava/lang/String;)Ljava/io/File;`. Java's own lookup
+// matches it by assignability; here an Object parameter matches any reference
+// parameter in the same position, everything else must be identical, and the
+// return must be a reference on both sides.
+static int klj_reflect_args(const char *asked, const char *table) {
+    if (*asked++ != '(' || *table++ != '(') return 0;
+    for (;;) {
+        if (*asked == ')' || *table == ')') break;
+        const char *a0 = asked, *t0 = table;
+        size_t la = klj_one_type(&asked), lt = klj_one_type(&table);
+        if (!la || !lt) return 0;
+        int a_obj = la == 18 && !strncmp(a0, "Ljava/lang/Object;", 18);
+        int t_ref = *t0 == 'L' || *t0 == '[';
+        if (a_obj ? !t_ref : (la != lt || !klj_sig_eq_n(a0, t0, la))) return 0;
+    }
+    if (*asked != ')' || *table != ')') return 0;
+    return (asked[1] == 'L' || asked[1] == '[' || asked[1] == 'V') &&
+           (table[1] == 'L' || table[1] == '[' || table[1] == asked[1]);
+}
+
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
     // Exact wins outright across EVERY family table, so the answer does not
@@ -1000,6 +1037,12 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
             if (klj_sig_eq(b->sig, sig)) return b;
             if (!loose && klj_same_args(b->sig, sig)) loose = b;
         }
+    if (!loose && strstr(sig, "Ljava/lang/Object;"))
+        for (const klj_binding *const *t = klj_binding_tables; *t && !loose; t++)
+            for (const klj_binding *b = *t; b->cls && !loose; b++)
+                if (!strcmp(b->cls, cls) && !strcmp(b->name, name) &&
+                    klj_reflect_args(sig, b->sig))
+                    loose = b;
     // Named, once per (method, signature). A loose match is the right answer
     // for the generic-return case it exists for and a SILENT wrong answer for
     // anything else — the call succeeds, returns something plausible and lands
