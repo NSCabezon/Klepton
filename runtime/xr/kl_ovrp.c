@@ -1984,6 +1984,18 @@ void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
     if (tangents) memcpy(tangents, klovrp_eye_tan(eye), sizeof g_eye_tan[eye]);
 }
 
+// The eye in HEAD space: the offset and cant kl_ovrp_eye_view composes onto
+// the head, without composing them. A caller wanting eye-to-head must not
+// difference two world-space reads of the head (one inside kl_ovrp_eye_view, one
+// of its own): before the first latch those are two reads of the LIVE head, and
+// any motion between them lands in the answer.
+void kl_ovrp_eye_local(int eye, float p[3], float q[4]) {
+    if ((unsigned)eye > 1) eye = 0;
+    klovrp_eye_offset(eye, &p[0], &p[1], &p[2]);
+    if (klovrp_eye_cant()) memcpy(q, g_eye_rot[eye], 4 * sizeof(float));
+    else { q[0] = q[1] = q[2] = 0.0f; q[3] = 1.0f; }
+}
+
 // The guest's head — the latched one. See the header for why this is a
 // different function from kl_ovrp_get_head_pose rather than a parameter on it.
 void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
@@ -2021,8 +2033,24 @@ void kl_ovrp_set_head_pose_time(double t) {
     g_head_pose_time = t;
 }
 
+// How far ahead of "now" the frontend predicts the head it publishes — the
+// compositor's own lead (its presentation time minus the moment it queried),
+// smoothed. A guest predicting its frame to when it will be SEEN adds this:
+// the compositor frame that first shows it presents this far after it starts.
+static double g_head_lead_s;
+double kl_ovrp_head_lead_s(void) { return g_head_lead_s; }   // one writer; a torn double is not possible on arm64
+
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
+    if (g_head_pose_time > 0) {
+        struct timespec u;
+        clock_gettime(CLOCK_UPTIME_RAW, &u);
+        double lead = g_head_pose_time - ((double)u.tv_sec + (double)u.tv_nsec * 1e-9);
+        if (lead > 0 && lead < 0.2) {
+            double prev = g_head_lead_s;
+            g_head_lead_s = prev > 0 ? prev * 0.95 + lead * 0.05 : lead;
+        }
+    }
     // DeviceAnchor does not report a velocity, so this derives one. The old
     // note here said the head's motion "is not a field the guest reads for
     // node 9 anyway" — true of an OVRPlugin guest, and node 9 is still served
@@ -2999,10 +3027,37 @@ void kl_ovrp_set_head_at(kl_ovrp_head_at_fn fn) {
     __atomic_store_n(&g_head_at, fn, __ATOMIC_RELEASE);
 }
 
+// The tracker's clock. `time_s` arrives in CLOCK_MONOTONIC seconds (every
+// caller's clock: kl_openvr's now_s, kl_openxr's klxr_now) and the frontend's
+// queryDeviceAnchor(atTimestamp:) speaks CACurrentMediaTime, which is
+// mach_absolute_time — CLOCK_UPTIME_RAW. They are NOT the same clock on Darwin:
+// CLOCK_MONOTONIC keeps counting while the device sleeps and the other does
+// not, so on a Vision Pro that has ever been taken off they differ by the total
+// time it slept (measured on a Mac: 10406.8 s). Every timestamped query landed
+// hours in the future, the tracker refused it, the frontend's 50 ms walk-back
+// could not reach the present, and every device log says "head NOT predicted
+// (no tracker answers)": neither the OpenVR nor the OpenXR head prediction has
+// ever run on device. Re-based here, at the one seam both use, as an offset
+// from now on the caller's clock to now on the tracker's.
+static double klovrp_to_tracker_clock(double mono_s) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    clock_gettime(CLOCK_UPTIME_RAW, &b);
+    double mono_now = (double)a.tv_sec + (double)a.tv_nsec * 1e-9;
+    double up_now = (double)b.tv_sec + (double)b.tv_nsec * 1e-9;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [ovrp] head prediction: CLOCK_MONOTONIC is %.3f s ahead of the "
+                        "tracker's clock (CLOCK_UPTIME_RAW = CACurrentMediaTime); instants are "
+                        "re-based before the tracker is asked\n", mono_now - up_now);
+    return mono_s - mono_now + up_now;
+}
+
 int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3) {
     kl_ovrp_head_at_fn fn = __atomic_load_n(&g_head_at, __ATOMIC_ACQUIRE);
     if (!fn) return 0;
     float w[7];
+    if (kl_env_on("KL_OVRP_PREDICT_CLOCK_FIX", 1)) time_s = klovrp_to_tracker_clock(time_s);
     if (!fn(time_s, w)) return 0;
     // delta = predicted o current^-1, so applying it on the left of anything
     // built from the current pose moves it to where the prediction says.
