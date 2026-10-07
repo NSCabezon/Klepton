@@ -285,6 +285,7 @@ final class KleptonCompositor {
     // also how this loop tells a fresh guest frame from a reused one.
     private var guestFrameEvent: MTLSharedEvent!
     private var lastGuestFrame: UInt64 = 0
+    private let sessionStats = KLSessionStats.shared
     private var staleInARow = 0
 
     // Keyed by (eye, stage). Indexed by stage from the start rather than kept
@@ -1461,6 +1462,8 @@ final class KleptonCompositor {
         var iterations = 0
         var nextReport = Date()
         NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
+        // The session's performance summary starts with the loop (KleptonSessionStats.swift).
+        KLSessionStats.shared.begin()
         loop: while true {
             switch layerRenderer.state {
             case .invalidated:
@@ -1507,6 +1510,9 @@ final class KleptonCompositor {
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // Not final: the process may open another immersive space, and the
+        // guest may still be running; backgrounding and exit write the final line.
+        KLSessionStats.shared.checkpoint(reason: "render loop ended")
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
@@ -1848,6 +1854,9 @@ final class KleptonCompositor {
                       + "Further skips silenced.")
             }
         }
+        // New guest frame or a reused one: the session's frame-rate counters
+        // (one locked update, no allocation).
+        sessionStats.noteCompositorFrame(guestSerial: frameValue)
         if frameValue != 0 && frameValue == lastGuestFrame {
             staleInARow += 1
         } else {

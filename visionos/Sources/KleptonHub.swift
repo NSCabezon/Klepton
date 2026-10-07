@@ -200,6 +200,36 @@ enum HubStorage {
     }
 }
 
+// MARK: - Session summaries
+
+/// English or Spanish by the headset's first preferred language. The hub has no
+/// string catalog (its UI is English); the session texts are the first that
+/// speak Spanish too, chosen here rather than through a catalog.
+func klL(_ en: String, _ es: String) -> String {
+    (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
+}
+
+enum HubSessionText {
+    /// "12 min", "45 s", "1 h 05 min".
+    static func duration(_ s: Double) -> String {
+        let t = Int(s.rounded())
+        if t < 60 { return "\(t) s" }
+        let m = t / 60
+        if m < 60 { return "\(m) min" }
+        return String(format: "%d h %02d min", m / 60, m % 60)
+    }
+
+    /// The card's line: "Última sesión: 52 fps (5% peor 38) · 12 min".
+    static func card(_ r: KLSessionRecord) -> String {
+        let head = klL("Last session", "Última sesión")
+        guard let avg = r.fpsAvg else {
+            return "\(head): \(klL("no game frames", "sin imagen del juego")) · \(duration(r.durationS))"
+        }
+        let low = r.fps5Low.map { " (\(klL("5% low", "5% peor")) \(Int($0.rounded())))" } ?? ""
+        return "\(head): \(Int(avg.rounded())) fps\(low) · \(duration(r.durationS))"
+    }
+}
+
 // MARK: - Library model
 
 @MainActor
@@ -222,6 +252,8 @@ final class HubLibraryModel: ObservableObject {
     @Published var preparing: String?
     @Published var checking = false
     @Published var checkError: String?
+    /// Each game's most recent session (KleptonSessionStats.swift), for its card.
+    @Published var lastSession: [String: KLSessionRecord] = [:]
     private var relay: [AnyCancellable] = []
 
     init() {
@@ -241,6 +273,7 @@ final class HubLibraryModel: ObservableObject {
         }
         account = (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load())?.accountName
         #endif
+        reloadSessions()
     }
 
     enum Status: Equatable {
@@ -363,6 +396,13 @@ final class HubLibraryModel: ObservableObject {
         NSLog("[hub] signed out of Steam")
     }
 
+    /// Re-read every game's session history (after the settings sheet cleared one).
+    func reloadSessions() {
+        var m: [String: KLSessionRecord] = [:]
+        for g in games { if let r = KLSessionHistory.load(g.target).last { m[g.target] = r } }
+        lastSession = m
+    }
+
     /// The game's files are gone: re-read its local state for the card.
     func refreshAfterDelete(_ target: String) {
         #if canImport(SteamDepot)
@@ -423,6 +463,7 @@ struct HubGameSettingsView: View {
     let game: KLHubGameRow
     @Environment(\.dismiss) private var dismiss
     @State private var s = KLGameSettings()
+    @State private var sessions: [KLSessionRecord] = []
 
     private var base: KLTune { KleptonTuning.shared.baseline }
 
@@ -497,6 +538,8 @@ struct HubGameSettingsView: View {
                     }
                 }
 
+                sessionsSection
+
                 Section {
                     Button("Reset all settings for this game", role: .destructive) {
                         s = KLGameSettings(); save()
@@ -509,7 +552,54 @@ struct HubGameSettingsView: View {
             }
         }
         .frame(minWidth: 560, minHeight: 640)
-        .onAppear { s = KLGameSettingsStore.load(game.target) }
+        .onAppear {
+            s = KLGameSettingsStore.load(game.target)
+            sessions = Array(KLSessionHistory.load(game.target).suffix(10).reversed())
+        }
+    }
+
+    /// The last ten sessions, newest first, and a way to forget them.
+    @ViewBuilder private var sessionsSection: some View {
+        Section {
+            if sessions.isEmpty {
+                Text(klL("No sessions recorded yet.", "Aún no hay sesiones registradas."))
+                    .foregroundStyle(.secondary)
+            } else {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                    GridRow {
+                        Text(klL("Date", "Fecha"))
+                        Text(klL("Duration", "Duración"))
+                        Text(klL("Avg", "Media"))
+                        Text(klL("5% low", "5% peor"))
+                        Text(klL("Peak mem.", "Memoria máx."))
+                    }
+                    .font(.caption.bold()).foregroundStyle(.secondary)
+                    ForEach(sessions) { r in
+                        GridRow {
+                            Text(r.start.formatted(date: .abbreviated, time: .shortened))
+                                + Text(r.final ? "" : " *").foregroundStyle(.orange)
+                            Text(HubSessionText.duration(r.durationS))
+                            Text(r.fpsAvg.map { String(format: "%.0f fps", $0) } ?? "—")
+                            Text(r.fps5Low.map { String(format: "%.0f", $0) } ?? "—")
+                            Text(r.peakFootprintMB > 0
+                                 ? String(format: "%.1f GB", Double(r.peakFootprintMB) / 1024) : "—")
+                        }
+                        .font(.callout).monospacedDigit()
+                    }
+                }
+                Button(klL("Clear history", "Borrar historial"), role: .destructive) {
+                    KLSessionHistory.clear(game.target)
+                    sessions = []
+                }
+            }
+        } header: { Text(klL("Sessions", "Sesiones")) } footer: {
+            Text(klL("Frame rate the game delivered while playing (loading screens excluded). "
+                     + "5% low: the slowest 5% of frames ran at or below this. "
+                     + "* = the session did not close cleanly; its figures are from up to 30 s before the end.",
+                     "Imágenes por segundo que dio el juego mientras se jugaba (sin pantallas de carga). "
+                     + "5% peor: el 5% más lento de las imágenes fue a esta velocidad o menos. "
+                     + "* = la sesión no se cerró limpiamente; sus datos son de hasta 30 s antes del final."))
+        }
     }
 
     private func save() { KLGameSettingsStore.save(s, for: game.target) }
@@ -690,7 +780,7 @@ struct HubLibraryView: View {
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
         .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
-        .sheet(item: $settingsFor) { g in HubGameSettingsView(game: g) }
+        .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
     }
 
@@ -772,6 +862,10 @@ struct HubLibraryView: View {
             }
             Text(HubGameSettingsView.summary(g.target))
                 .font(.caption).foregroundStyle(.secondary)
+            if let r = model.lastSession[g.target] {
+                Text(HubSessionText.card(r))
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
