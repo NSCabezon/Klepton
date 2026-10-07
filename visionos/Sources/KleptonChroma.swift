@@ -27,8 +27,9 @@ struct KLChromaSettings: Codable, Equatable {
     /// picture. On by default, which is what visionOS does in `.mixed` and what
     /// a person reaching for a real object wants; off is what a guest that
     /// draws its own hands wants, because two pairs of hands in one place is
-    /// worse than either alone.
-    var handMatting = true
+    /// worse than either alone. Off by default for alyx, which draws its own
+    /// hands from the controllers; a setting already saved still wins.
+    var handMatting = klTargetName() != "alyx"
 
     /// SIMD3 is not Codable, so the colour rides as three keyed floats. Spelled
     /// out rather than reached for a wrapper: this is the file format, and a

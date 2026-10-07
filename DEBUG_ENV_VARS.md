@@ -1533,7 +1533,8 @@ The composite/timewarp pass — one file, compiled by both compositors
   fades; a band rather than a threshold is what stops the matte having a hard
   jagged edge.
 - `KL_HAND_MATTING=0` — stop the system drawing the user's own hands and arms
-  over the guest's picture (`.upperLimbVisibility`). On by default, which is what
+  over the guest's picture (`.upperLimbVisibility`). Off by default for alyx
+  (it draws its own hands). Otherwise on by default, which is what
   visionOS does in `.mixed`; off is what a guest that draws its own hands wants,
   because two pairs of hands in one place is worse than either alone.
 
