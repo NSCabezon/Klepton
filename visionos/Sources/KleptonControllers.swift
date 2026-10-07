@@ -720,7 +720,10 @@ final class KleptonControllers {
         // is mirrored for the left hand for the reason KL_SENSE_MIRROR gives.
         let live = KleptonTuning.shared.snapshot()
         let mx: Float = KLSenseTune.mirrorX && hand == 0 ? -1 : 1
-        let rot   = klEulerXYZ(SIMD3<Float>(KLSenseTune.psvr2Tilt + live.sensePitch, 0, 0))
+        // Yaw and roll are mirrored with X for the left hand: reflecting the
+        // X axis negates rotations about Y and Z and leaves pitch alone.
+        let rot   = klEulerXYZ(SIMD3<Float>(KLSenseTune.psvr2Tilt + live.sensePitch,
+                                            mx * live.senseYaw, mx * live.senseRoll))
         let tpos   = SIMD3<Float>(mx * live.sensePos.x, live.sensePos.y, live.sensePos.z)
         let tpivot = SIMD3<Float>(mx * live.sensePivot.x, live.sensePivot.y, live.sensePivot.z)
         _ = t

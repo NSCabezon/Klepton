@@ -492,6 +492,11 @@ The guest's own memory management, and the three seams that used to disable it.
   from the core count, so `KL_CPUS=1` collapses the pak-decompression fan-out.
   It earned its keep by **exonerating** one — RE4's Oodle crash reproduced
   identically at 1 and at 32, which is what moved the search off concurrency.
+  The same count also sets `/sys/devices/system/cpu/cpuN/topology/`
+  (`core_id` = N, `physical_package_id` = 0, sibling lists): one core per CPU,
+  no SMT. Source 2's tier0 counts PHYSICAL cores as distinct (package, core)
+  pairs; without these files it saw 1, and Alyx's VR menu warned "CPU below
+  the minimum requirements" (fires at <= 3 physical cores).
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -504,7 +509,9 @@ The guest's own memory management, and the three seams that used to disable it.
   `passthrough` prints exactly that on every call while `remap` prints the full
   amount. Rate-limited to the first 8 calls, then every 256 MiB.
 - `KL_MEM_TOTAL_MB=<n>` — what `/proc/meminfo` reports as `MemTotal`, capped at
-  the host's real memory. Default **6144**, the Quest 2's RAM: this is part of
+  the host's real memory. **glibc guests (Alyx) default to 16384** (a Vision
+  Pro; `kl_glibc.c`): Alyx's VR menu warns "system memory below the minimum
+  requirements" under ~11.2 GiB of `sysinfo()` total RAM. Android default **6144**, the Quest 2's RAM: this is part of
   the device identity we already present, and a 6 GB title sizes its streaming
   budgets and pool ceilings from it. It used to report the host's — 16 GB on a
   Vision Pro, 32–128 on a development Mac. `MemFree`/`MemAvailable` are now
@@ -1473,6 +1480,12 @@ that reports what came due since the frontend last asked. Platform-independent
 The composite/timewarp pass — one file, compiled by both compositors
 (`KleptonCompositor.swift` on device, `kl_view_mtl.m` in the viewer).
 
+- `KL_CP_MAGENTA_KEY=0` — (`kl_reproject.c`, `kl_reproject_f`) show pure
+  magenta from a guest's eye texture as is. **Default 1**: a texel at
+  (1, 0, 1) is a render target's clear colour (Source 2 clears to it), i.e. a
+  region the guest never drew, and is drawn black like the outside of the
+  frame — so no unrendered band can read as a pink stripe, on either
+  compositor. Read once, when the pass is compiled.
 - `KL_OVRP_TOUCH_FRAME=0` — hand an OVRPlugin guest the grip pose the platform
   publishes, rather than the pose an Oculus Touch's TRACKED origin would have
   had. On by default: the render model is drawn around the tracked origin and
@@ -1697,6 +1710,11 @@ The composite/timewarp pass — one file, compiled by both compositors
   (`KL_OPENVR_OVERSCAN`) keeps its scale and the margin stays off-window. The
   two differ only for such a frame, logged once as `[vmtl] eye N rendered ...
   shown through the display's ...`.
+- `KL_VIEW_YAW=<deg>` / `KL_VIEW_PITCH=<deg>` — the viewer's starting look
+  direction (mouse-look still moves it). For scripted runs that capture the
+  window with no hand on the mouse, e.g. `KL_VIEW_PITCH=-30` to look down.
+  `KL_VIEW_PITCH_AT="<secs>:<deg>"` changes the pitch once, `<secs>` after the
+  window opens (look ahead to get a title going, then down to frame a shot).
 - `KL_VIEW_EYE=0` / `KL_VIEW_EYE=1` — show ONE eye (left / right) at full
   window. **Unset, the Mac viewer shows both eyes side by side** (left | right,
   each letterboxed by its own frustum) for every stereo guest, on every
@@ -2160,6 +2178,20 @@ nothing, and prints the unresolved imports grouped by category.
 - `KL_GLIBC_HEADLESS=1` — (`mains/m_boot.c`) no host window: the SDL seam
   hands the render system kl_vulkan's synthetic surface instead of a
   CAMetalLayer, which is the shape the VR backend takes.
+- `KL_SDL_AUDIO_STATS=0` — silence the SDL audio seam's `[sdl-au]` lines.
+  On by default: every audio subsystem init/quit, every
+  `SDL_OpenAudioDevice` with the spec asked for (and whether a device was
+  already open), every pause/play change, close, refused queue call, and one
+  line per 5 s per open device: `playing`/`PAUSED`, periods fed (and how many
+  were short of queued data), bytes queued, queue depth, clears, and the PCM
+  peak of THAT window (`— SILENT` when it is 0 while playing). The sink's
+  `[au] guest PCM so far` line keeps its cumulative peak and now adds the last
+  1000 writes' peak, so "played in the menu, silent in game" reads as
+  `SILENT NOW`. Alyx opens ONE device at boot (44.1 kHz float stereo,
+  512-frame periods, **callback** mode) and keeps it across map loads. A
+  second open while one is open now replaces it (it used to return 0, mute
+  for the rest of the run), and `SDL_QuitSubSystem(AUDIO)` / `SDL_AudioQuit`
+  close the device as real SDL does.
 - `KL_GLIBC_SDL_SEAM=0` — leave all of SDL to the guest's own libSDL2 (its
   video subsystem then fails: no X11/Wayland). The A/B for the seam.
 - `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface) and pointer capture: SetRelativeMouseMode, SetWindowGrab, ShowCursor, CaptureMouse, the first warp, focus changes and button presses (with the relative/grab state at the time).
@@ -2282,6 +2314,47 @@ nothing, and prints the unresolved imports grouped by category.
   auto-fidelity (`KL_OPENVR_FRAME_TIMING`) answers the heavier frame by
   dropping a level, so on device the two converge; this is the A/B for whether
   the overscan costs frame rate or sharpness.
+- `KL_OPENVR_SYM_PROJ=0` — (`kl_openvr.c`, `eye_tangents`) offer each eye the
+  display's own (canted, asymmetric) frustum again. **Default 1**: each eye is
+  offered l = r = the wider of its two horizontal tangents. Alyx renders a
+  symmetric frustum whatever it is offered (log: `rendered with tangents
+  l=1.94 r=1.94 ... (we offered l=1.12 r=1.94 ...)`), but with an asymmetric
+  offer AND the overscan it leaves part of the right eye's temporal side
+  unrendered — its render target's clear colour, MAGENTA (Mac,
+  `KL_OVRP_EYE_TAN=vision`: everything past tangent ~1.25 of a display that
+  reaches 1.94). It shows worst on a loading screen: Alyx calls
+  `SuspendRendering(1)` and stops submitting, the compositor reprojects that
+  one stale frame, and every head turn swings the band (and the black past
+  the frame) into view. Same image size either way; the compositor places the
+  picture by the tangents it was rendered with, so nothing else changes.
+- `KL_OPENVR_TOUCH_FRAME=0` — (`kl_openvr.c`, `openvr_hand_pose`) hand an
+  OpenVR guest the published controller pose unchanged (the old behaviour).
+  **Default 1**: the controllers are Quest 2 Touch (`oculus_touch`,
+  `oculus_quest2_controller_*`) and Alyx binds `/pose/raw` — the Touch's
+  TRACKED origin, the render model's origin — so the published hilt `P`
+  (`.grip` · T(`KL_SENSE_POS`) · Rx(5.037 + `KL_SENSE_PITCH` -37)) is turned
+  into it: `raw = P · Rx(+37) · T(0.007 mirrored, -0.0342, -0.0961) · Rx(-20.6)`
+  (the OpenXR grip, as `KL_XR_GRIP_PITCH` builds it, then the render model's
+  grip->tracked row, `tools/rendermodel_frames.py`). Net: the reported origin
+  moves 9.7 cm forward along `P`'s -Z and 3 cm up its +Y, turned 16.4 deg
+  nose-up. Without it Alyx hung its hand off an origin ~10 cm too far down the
+  handle and 16 deg too nose-down: the hand sat below and behind the real
+  controller, at the wrong angle. OVRPlugin and OpenXR guests are unaffected
+  (they never call this). Logged once: `[openvr] controller pose: ...`.
+- `KL_OPENVR_HAND_POS="x,y,z"` / `KL_OPENVR_HAND_ROT="x,y,z"` — metres /
+  degrees (X then Y then Z), the OpenVR guest's hand calibration, in the
+  **grip's** frame (+X right, +Y up, -Z along the handle through the fist),
+  applied before the grip->tracked step, so a rotation turns the hand about
+  the palm instead of swinging it on an arc. `_L`/`_R` per hand; the shared
+  form mirrors X (POS) or yaw/roll (ROT) for the left hand. Read once at the
+  first pose. Hand too low: raise `y`; too far back: more negative `z`; tilted
+  nose-down: positive `x` rotation. `KL_SENSE_*` (the hub's controller
+  calibration) still applies underneath, since it moves `P`.
+- `KL_OPENVR_FAKE_HAND="x,y,z[,pitch,yaw,roll]"` — host diagnostic: put each
+  hand's Apple grip at a fixed head-relative pose (right as given, left
+  mirrored), build `P` from it with the frontend's default Sense tune, and run
+  it through the conversion above — where a Mac run draws the hand relative to
+  a known grip. E.g. `0.10,-0.05,-0.35,60,0,0`.
 - `KL_OPENVR_PREDICT=0` — (`kl_openvr.c`, `predict_frame`) render from the
   head as latched at WaitGetPoses instead of the head predicted to when the
   frame is first seen. On by default: once per frame, right after the latch,
@@ -2472,11 +2545,23 @@ except its own control vars (next section).
   (`runtime/kl_env.c`), so `KL_FULL=1` additionally turns on diagnostic
   logging knobs; to get `.full` without that, use the per-game setting.
 - **Per-game settings** (`KleptonChroma.swift`, `KLGameSettings`): UserDefaults
-  key `klepton.game.<target>`, JSON `{fullImmersion, handMatting, language}`,
-  each optional (absent = the game's default). Edited from the gear button on
-  the hub's game card; hand matting also from the boot window's Matting panel.
+  key `klepton.game.<target>`, JSON `{fullImmersion, handMatting, language,
+  calibration, performance}`, each optional (absent = the game's default).
+  Edited from the gear button on the hub's game card; hand matting also from
+  the boot window's Matting panel, and the calibration from its Controller
+  alignment panel (both save to the running game). `calibration` holds only
+  the fields that differ from the baseline (environment, else built-in
+  default): `senseOffset`/`sensePitch`/`senseYaw`/`senseRoll`/`sensePivot`
+  (the Sense path — PSVR2 controllers, every guest incl. Alyx's OpenVR) and
+  `gripPitch`/`aimPitch`/`gripPivot`/`gripPos` (the extra OpenXR-guest grip
+  tune). `performance` (alyx only) sets `KL_OPENVR_RT_SCALE`,
+  `KL_OPENVR_OVERSCAN`, `KL_OPENVR_OVERSCAN_RT` before boot when saved.
   Precedence: environment (`KL_FULL`, `KL_HAND_MATTING`, `KL_LOCALE`,
-  `KL_STEAM_LANG`) > saved > default. The hub loads them when Play picks the
+  `KL_STEAM_LANG`, `KL_SENSE_*`, `KL_XR_GRIP_*`, `KL_XR_AIM_PITCH`,
+  `KL_OPENVR_*`) > saved > default. The hub's Settings button (library header)
+  shows the Steam account (sign out) and each game's downloaded data with
+  "Delete game data" (the Steam download root plus an APK game's derived APK
+  and `<tree>/`; saves are kept). The hub loads them when Play picks the
   game, before the boot window exists, so `.full` and hidden hands are in place
   before the immersive space opens. Language: System (default) sets nothing;
   any other choice sets `KL_LOCALE`, `KL_STEAM_LANG` and `LANG` (only if not
@@ -2526,7 +2611,9 @@ rendering while they move and a candidate costs a drag instead of a two-minute
 relaunch. The panel seeds itself from whatever is actually in force, so the
 variables below still set the starting point; it prints the whole set back as a
 copy-pasteable environment line, because a value found by dragging and not
-written down is a value found twice.
+written down is a value found twice. Offsets range ±30 cm. What is dragged is
+**saved for the running game** (`KLGameSettings.calibration`) and restored on
+its next launch; Reset returns to the environment/defaults and forgets it.
 
 - `KL_SENSE_MIRROR=0` — stop mirroring the shared offsets' X term for the LEFT
   hand. A grip offset is a point on a hand and the two hands are mirror images,
@@ -2549,6 +2636,11 @@ written down is a value found twice.
   estimable the same way — it is a point you can look at your hand and guess
   ("the hilt centre is about six centimetres forward and four down from where
   the controller is tracked" -> `0,-0.04,-0.06`).
+- `KL_SENSE_YAW=<deg>` / `KL_SENSE_ROLL=<deg>` — Y and Z terms on top of the
+  pitch, default 0, mirrored (negated) for the left hand with the offsets' X
+  term. Live-tunable in the panel; saved per game. (The live pose path builds
+  its rotation from `KL_SENSE_PITCH`/`_YAW`/`_ROLL` — `KL_SENSE_ROT` is parsed
+  but not used by it.)
 - `KL_SENSE_PITCH=<deg>` — just the X term of that rotation, which is the one
   that has ever needed changing. Default **-37**: the magnitude is Beat Saber's
   own in-game controller adjustment, the sign is device-measured (the same

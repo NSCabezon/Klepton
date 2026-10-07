@@ -332,23 +332,35 @@ static uint32_t ut_appid(void *s) { (void)s; return APP_ID; }
 static uint32_t ut_time(void *s) { (void)s; return (uint32_t)time(NULL); }
 static const char *ut_country(void *s) { (void)s; return "US"; }
 // The game language: KL_STEAM_LANG (a Steam language API name: english,
-// spanish, latam, french, german, ...) or else the system's first preferred
-// language. Alyx ships English voices only; this picks UI text and subtitles.
+// spanish, latam, french, german, ...), else KL_LOCALE (the per-game language
+// the visionOS hub sets, the same knob the Android Locale answers from) mapped
+// to Steam's name, else the system's first preferred language. Alyx ships
+// English voices only; this picks UI text and subtitles.
 static const char *steam_lang(void) {
     static char lang[32];
     if (lang[0]) return lang;
     const char *e = getenv("KL_STEAM_LANG");
     if (e && *e) { snprintf(lang, sizeof lang, "%s", e); return lang; }
     char code[64] = "en";
-    CFArrayRef pref = CFLocaleCopyPreferredLanguages();
-    if (pref) {
-        if (CFArrayGetCount(pref) > 0)
-            CFStringGetCString(CFArrayGetValueAtIndex(pref, 0), code, sizeof code, kCFStringEncodingUTF8);
-        CFRelease(pref);
+    const char *loc = getenv("KL_LOCALE");
+    if (loc && *loc) {
+        snprintf(code, sizeof code, "%s", loc);
+        for (char *p = code; *p; p++) {
+            if (*p == '_') *p = '-';
+            if (*p == '.' || *p == '@') { *p = 0; break; }
+        }
+    } else {
+        CFArrayRef pref = CFLocaleCopyPreferredLanguages();
+        if (pref) {
+            if (CFArrayGetCount(pref) > 0)
+                CFStringGetCString(CFArrayGetValueAtIndex(pref, 0), code, sizeof code, kCFStringEncodingUTF8);
+            CFRelease(pref);
+        }
     }
     static const struct { const char *pfx, *name; } map[] = {
         {"es-ES", "spanish"}, {"es-", "latam"}, {"es", "spanish"},
-        {"pt-BR", "brazilian"}, {"pt", "portuguese"}, {"zh-Hant", "tchinese"}, {"zh", "schinese"},
+        {"pt-BR", "brazilian"}, {"pt", "portuguese"}, {"zh-Hant", "tchinese"},
+        {"zh-TW", "tchinese"}, {"zh-HK", "tchinese"}, {"zh", "schinese"},
         {"fr", "french"}, {"de", "german"}, {"it", "italian"}, {"ja", "japanese"}, {"ko", "koreana"},
         {"ru", "russian"}, {"pl", "polish"}, {"nl", "dutch"}, {"sv", "swedish"}, {"da", "danish"},
         {"fi", "finnish"}, {"nb", "norwegian"}, {"no", "norwegian"}, {"cs", "czech"}, {"hu", "hungarian"},
@@ -359,7 +371,8 @@ static const char *steam_lang(void) {
     for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
         if (strncmp(code, map[i].pfx, strlen(map[i].pfx)) == 0) { name = map[i].name; break; }
     snprintf(lang, sizeof lang, "%s", name);
-    fprintf(stderr, "  [steam] game language: %s (system %s)\n", lang, code);
+    fprintf(stderr, "  [steam] game language: %s (%s %s)\n", lang,
+            loc && *loc ? "KL_LOCALE" : "system", code);
     return lang;
 }
 static const char *ut_lang(void *s) { (void)s; return steam_lang(); }

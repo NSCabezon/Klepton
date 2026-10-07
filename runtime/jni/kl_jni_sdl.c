@@ -72,7 +72,14 @@ static klj_val klj_SDLA_getManifestEnv(void *env, void *self, const klj_val *a, 
 // "_COUNTRY" when the locale has one.
 static klj_val klj_SDLA_getPreferredLocales(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = kl_jni_new_string("en_US")};
+    // The same locale java.util.Locale and AConfiguration report
+    // (kl_jni_locale_parts: KL_LOCALE, else LANG, else the system), not a
+    // fixed en_US — SDL's SDL_GetPreferredLocales is how an SDL title asks.
+    char lang[16], country[16], out[40];
+    kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(out, sizeof out, "%s_%s", lang, country);
+    else          snprintf(out, sizeof out, "%s", lang);
+    return (klj_val){.l = kl_jni_new_string(out)};
 }
 
 // These two are part of the display panel's GROUP answer, not independent facts:

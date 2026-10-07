@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include "klepton.h"
 #include "kl_mediaplayer.h"
 #include "kl_jni.h"
@@ -529,26 +530,67 @@ static klj_val klj_Class_getName(void *env, void *self, const klj_val *a, int n)
 // reason: the language and country have to describe one locale, and Unity reads
 // them separately to build Application.systemLanguage.
 //
-// The value is taken from the host's LANG rather than hardcoded, because unlike
-// Build.MODEL this is a user preference and not device identity — the same
-// reasoning that makes the synthetic /proc report the host's real core count.
-// The fallback is en/US, which is what an unset LANG means in practice.
+// The value is a user preference, not device identity — the same reasoning
+// that makes the synthetic /proc report the host's real core count — so it is
+// taken from the host, in this order:
+//
+//   1. KL_LOCALE ("es_ES", "pt-BR", "ja", "zh_CN"...) — the per-game language
+//      the visionOS hub picks before boot, or a debugging override. It wins
+//      over LANG because a Mac shell always has a LANG, and a knob that a
+//      shell variable silently beats reads as broken.
+//   2. LANG ("en_US.UTF-8" -> en/US), as before; empty or C* is "unset".
+//   3. The host's first preferred language (CFLocale) — what an app launched
+//      from the visionOS Home View has, since it has no LANG at all. Before
+//      this, the headset reported en/US whatever the system language was,
+//      while the Steam stand-in (kl_steam.c) already followed the system:
+//      two answers to one question.
+//   4. en/US.
+//
+// The parse is the same for all three sources: language subtag, then the
+// first 2-letter or 3-digit region subtag; a script subtag (zh-Hans/zh-Hant)
+// implies CN/TW when no region follows it.
+static int klj_locale_parse(const char *src, char *lang, size_t lang_sz,
+                            char *country, size_t country_sz) {
+    if (!src || !*src || strncmp(src, "C", 1) == 0 || strncmp(src, "POSIX", 5) == 0) return 0;
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", src);
+    char *cut = strpbrk(buf, ".@");
+    if (cut) *cut = 0;
+    char *save = NULL, *tok = strtok_r(buf, "_-", &save);
+    if (!tok || !*tok) return 0;
+    char l[16] = "", c[16] = "", script[8] = "";
+    snprintf(l, sizeof l, "%s", tok);
+    for (char *p = l; *p; p++) *p = (char)tolower((unsigned char)*p);
+    while ((tok = strtok_r(NULL, "_-", &save))) {
+        size_t n = strlen(tok);
+        if (n == 4 && !*script) snprintf(script, sizeof script, "%s", tok);
+        else if ((n == 2 && isalpha((unsigned char)tok[0])) || (n == 3 && isdigit((unsigned char)tok[0]))) {
+            snprintf(c, sizeof c, "%s", tok);
+            for (char *p = c; *p; p++) *p = (char)toupper((unsigned char)*p);
+            break;
+        }
+    }
+    if (!*c && strcmp(l, "zh") == 0)
+        snprintf(c, sizeof c, "%s", strcasecmp(script, "Hant") == 0 ? "TW" : "CN");
+    snprintf(lang, lang_sz, "%s", l);
+    snprintf(country, country_sz, "%s", c);
+    return 1;
+}
+
 static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz) {
     snprintf(lang, lang_sz, "en");
     snprintf(country, country_sz, "US");
-    const char *env = getenv("LANG");
-    if (!env || !*env || strncmp(env, "C", 2) == 0) return;
-    // "en_US.UTF-8" -> "en" + "US"
-    char buf[64];
-    snprintf(buf, sizeof buf, "%s", env);
-    char *dot = strchr(buf, '.');
-    if (dot) *dot = 0;
-    char *us = strchr(buf, '_');
-    if (us) {
-        *us = 0;
-        snprintf(country, country_sz, "%s", us + 1);
+    if (klj_locale_parse(getenv("KL_LOCALE"), lang, lang_sz, country, country_sz)) return;
+    if (klj_locale_parse(getenv("LANG"), lang, lang_sz, country, country_sz)) return;
+    char code[64] = "";
+    CFArrayRef pref = CFLocaleCopyPreferredLanguages();
+    if (pref) {
+        if (CFArrayGetCount(pref) > 0)
+            CFStringGetCString(CFArrayGetValueAtIndex(pref, 0), code, sizeof code,
+                               kCFStringEncodingUTF8);
+        CFRelease(pref);
     }
-    if (*buf) snprintf(lang, lang_sz, "%s", buf);
+    klj_locale_parse(code, lang, lang_sz, country, country_sz);
 }
 
 // ...and the same two strings for the NDK's AConfiguration, which is the OTHER
@@ -578,7 +620,7 @@ static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, in
         // nowhere near a locale, and hundreds of frames after the call that
         // cached it.
         if (locale) klj_as_object(locale)->pinned = 1;
-        KLJ_LOG("Locale.getDefault() -> %s_%s (from the host LANG)", lang, country);
+        KLJ_LOG("Locale.getDefault() -> %s_%s (KL_LOCALE, else LANG, else the system)", lang, country);
     }
     return (klj_val){.l = locale};
 }
