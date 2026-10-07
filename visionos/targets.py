@@ -671,6 +671,46 @@ TARGETS = {
         "product": "KleptonAlyx",
         "display": "Half-Life: Alyx",
     },
+
+    # ---- THE HUB: one app, several games ----
+    #
+    # Not a guest: a BUILD that embeds several of the rows above and lets the
+    # player pick one from an in-app library (Sources/KleptonHub.swift). Each
+    # game's translated frameworks land in their own Frameworks/<game>/ inside
+    # the .app (gen_xcodeproj.py), so same-named libraries from two games
+    # (libunity, libUE4, libc++_shared) never meet; kl_app.c picks the selected
+    # game's folder. The selection is KL_TARGET, set by the library before the
+    # runtime is configured, so everything downstream is the single-game path.
+    # One game per process: when it ends, the app ends.
+    #
+    # The bundle id is FIXED rather than derived: it is the container that
+    # already holds Half-Life: Alyx's 72 GB (the id the alyx device runs used
+    # through KLEPTON_BUNDLE_ID), so the hub adopts that data in place.
+    # KLEPTON_BUNDLE_ID still overrides it.
+    #
+    # Never in the runtime's C table (c_table skips kind "hub"): the runtime only
+    # ever sees the game that was picked.
+    "hub": {
+        "libs":    "",
+        "srcdir":  "",
+        "tree":    "hub",
+        "apk":     "hub.apk",
+        "assets":  "hub/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "",
+        "kind":    "hub",
+        # The games the hub carries, in library order. Adding a game is one more
+        # name here (it must be a row above, with its frameworks built by
+        # mkguest.sh); give it a Steam descriptor in Sources/KleptonGames.swift
+        # if its data can be downloaded in-app.
+        "games":   [
+            "alyx",
+        ],
+        "bundle_id": "com.example.avpgamehub",
+        "product": "KleptonHub",
+        "display": "Klepton",
+    },
 }
 
 DEFAULT = "beatsaber"
@@ -770,6 +810,11 @@ BUNDLE_PREFIX = "dev.klepton.target"
 
 def bundle_for(name):
     import os, re
+    # A row that must keep an EXISTING app's identity (the hub: its container
+    # holds data that cannot be re-staged cheaply) states it outright.
+    fixed = TARGETS.get(name, {}).get("bundle_id")
+    if fixed:
+        return fixed
     scope = os.environ.get("KLEPTON_BUNDLE_SCOPE", os.environ.get("USER", ""))
     scope = re.sub(r"[^A-Za-z0-9-]", "-", scope).strip("-").lower()
     ident = re.sub(r"[^A-Za-z0-9.-]", "-", f"{BUNDLE_PREFIX}.{name}")
@@ -784,9 +829,27 @@ def resolve(name):
     t = dict(TARGETS[name])
     t["name"] = name
     t["bundle"] = bundle_for(name)
+    if t["kind"] == "hub":
+        # Space-separated for the shells (`targets.py hub games`); the generator
+        # reads hub_games() for the list itself.
+        t["games"] = " ".join(t["games"])
+        return t
     if t["libs"] is None:
         t["libs"] = glibc_libs_for(name) if t["kind"] == "glibc" else libs_for(t["srcdir"])
     return t
+
+
+def hub_games(name):
+    """The games a hub row carries, each validated as a real guest row."""
+    games = list(TARGETS[name].get("games", []))
+    for g in games:
+        if g not in TARGETS or TARGETS[g]["kind"] == "hub":
+            print(f"!! hub {name!r}: {g!r} is not a guest target", file=sys.stderr)
+            sys.exit(1)
+    if not games:
+        print(f"!! hub {name!r} lists no games", file=sys.stderr)
+        sys.exit(1)
+    return games
 
 
 # The runtime's copy of the table, as an X-macro list. Only the fields C needs
@@ -814,6 +877,8 @@ def c_table():
     ]
     for name in sorted(TARGETS):
         t = TARGETS[name]
+        if t["kind"] == "hub":
+            continue        # a build of several guests, never a guest itself
         kind = "KL_GUEST_" + t["kind"].upper()
         # `userdata` defaults to the row name — one profile per target is the
         # rule, and a row only states it to KEEP a directory a previous naming

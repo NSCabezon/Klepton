@@ -69,6 +69,55 @@ apps embed *different* guest frameworks, so pointing one at the other's target
 stops at `kl_app_configure` with "missing guest libraries" rather than
 misbehaving.
 
+## The hub: one app, several games
+
+`targets.py`'s `hub` row is a BUILD, not a guest (kind `hub`; it never reaches
+`runtime/kl_target_table.h`). It embeds every game in its `games` list and opens
+on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
+
+- **Frameworks, per game.** Each game's translations go to
+  `KleptonHub.app/Frameworks/<game>/` (one Embed phase per game, `dstPath` =
+  the game), so same-named libraries from two games cannot collide. `kl_app.c`
+  sets `KL_DYLIB_DIR` to `Frameworks/<target>/` when that folder holds the
+  target's entry library, else to `Frameworks/` (every single-target build).
+  ANGLE and MoltenVK stay in `Frameworks/` for all games (`KL_ANGLE_DIR`,
+  `KL_MVK_DIR`).
+- **Selection.** Play sets `KL_TARGET=<game>` (the existing runtime override)
+  and only then creates the boot window, so `kl_app_target_name_or_default()`,
+  `kl_app_configure` and everything after them are the single-game path. The
+  compiled-in `KL_TARGET_DEFAULT` is the first game. `KL_HUB_GAME=<game>` in the
+  launch environment skips the library (scripted runs). **One game per
+  process**: when the game ends or the app is backgrounded, it exits; the next
+  launch shows the library again (visionOS apps cannot relaunch themselves).
+- **Data.** Each game's container root is `Documents/games/<game>/`, laid out
+  as a single-game build lays out `Documents/` (so alyx's game root is
+  `games/alyx/android-files/alyx/game`). The boot log stays at
+  `Documents/klepton-boot.log` (`kl_app_set_log_dir`). On first launch the hub
+  adopts data that predates it with a rename, not a copy — alyx's
+  `Documents/android-files/alyx` becomes `games/alyx/android-files/alyx`, and a
+  relative symlink is left at the old path for a single-game alyx build.
+- **Downloads.** A game with a `SteamGameDescriptor` (`Sources/
+  KleptonSteamContent.swift`, registry `SteamGames.all`: app id, depots or an OS
+  filter to discover them, file filter, data subpath, legacy path, presence
+  probes, size) downloads its data in-app through SteamDepot, with the same
+  Steam sign-in, adopt/verify, free-space check and completion marker as the
+  alyx build. "Update available" compares the markers with Steam's current
+  manifests once signed in.
+- **Bundle id** `com.example.avpgamehub` (the container with Alyx's 72 GB);
+  product `KleptonHub`, display name "Klepton".
+
+Adding a game: build its frameworks (`KLEPTON_TARGET=<game> ./mkguest.sh`, which
+`run.sh` does for every hub game), add its name to the hub row's `games`, and —
+if Steam can supply its data — one `SteamGameDescriptor` in `SteamGames.all`.
+
+```bash
+./build_run_vpro.sh hub --build-only      # build + sign for the device, no headset
+./build_run_vpro.sh hub                   # build, install, launch (library)
+KL_SKIP_GUEST=1 ./build_run_vpro.sh hub   # ...reusing the translated frameworks
+KLEPTON_HUB_NO_GUESTS=1 KL_SKIP_GUEST=1 KLEPTON_TARGET=hub visionos/run.sh sim
+                                          # library-only build for the simulator
+```
+
 ## What lives where, and why
 
 |  | where | why |

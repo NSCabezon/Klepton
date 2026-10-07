@@ -147,7 +147,16 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 # there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
 # mkangle.sh below stops and names the bootstrap command instead.
 if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
-./mkguest.sh | tail -1
+# The hub carries several games: translate each into its own Frameworks/<game>/.
+# KL_SKIP_GUEST=1 reuses the frameworks already there (a glibc guest is ~90
+# translations; the hub's own Swift is what usually changed).
+if [ -n "${KL_SKIP_GUEST:-}" ]; then
+  echo "  guest translations: reused (KL_SKIP_GUEST=1)"
+elif [ "$KLT_KIND" = hub ]; then
+  for G in $KLT_GAMES; do KLEPTON_TARGET="$G" ./mkguest.sh | tail -1; done
+else
+  ./mkguest.sh | tail -1
+fi
 ./mkangle.sh | tail -1
 # ...and the Vulkan renderer, for a guest whose graphics API is not GLES. Unlike
 # ANGLE this needs no source checkout and no build — `make mvk` is a 180 MB
@@ -158,7 +167,9 @@ if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*VR name + monogram icon + Boot button)" || echo "off (normal build; set KL_CUSTOM_LAUNCHER=1 to enable)")"
 # An existing project is kept as-is (hand edits in Xcode — signing, profile,
 # capabilities — survive); KL_REGEN_XCODEPROJ=1 regenerates it from targets.py.
-if [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
+# The hub is always regenerated: its game list (and the Swift manifest generated
+# from it) must match targets.py, and KLEPTON_HUB_NO_GUESTS changes what it embeds.
+if [ "$KLT_KIND" != hub ] && [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
   echo "  keeping existing $PRODUCT.xcodeproj (KL_REGEN_XCODEPROJ=1 to regenerate)"
 else
   python3 gen_xcodeproj.py | head -1
@@ -186,8 +197,13 @@ print(phys[0]["identifier"])
 ' "$json"
     rm -f "$json"
   }
-  DEVID="${KLEPTON_DEVICE:-$(find_device || true)}"
-  [ -n "$DEVID" ] || { echo "!! no physical Vision Pro — pair it in Xcode, or set KLEPTON_DEVICE"; exit 1; }
+  # KL_BUILD_ONLY=1: build (and sign) for the device and stop — no headset needed.
+  if [ -n "${KL_BUILD_ONLY:-}" ]; then
+    DEVID="(build only)"
+  else
+    DEVID="${KLEPTON_DEVICE:-$(find_device || true)}"
+    [ -n "$DEVID" ] || { echo "!! no physical Vision Pro — pair it in Xcode, or set KLEPTON_DEVICE"; exit 1; }
+  fi
 
   echo "[3/5] building for device ${DEVID}…"
   # generic/platform, not id= : the build must not depend on the device being awake
@@ -205,6 +221,10 @@ print(phys[0]["identifier"])
   APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+  if [ -n "${KL_BUILD_ONLY:-}" ]; then
+    echo "    built $APP ($BUNDLE_ID) — KL_BUILD_ONLY=1, not installing"
+    exit 0
+  fi
 
   if [ -n "${KL_SKIP_INSTALL:-}" ]; then
     # Every install observed on this device ROTATES the data container, which
@@ -219,7 +239,10 @@ print(phys[0]["identifier"])
     xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
   fi
   # Installing can rotate the data container, so assets are staged *after*.
-  stage_if_needed "$DEVID" "$DEVID"
+  # The hub has no assets of its own to stage: its games download their data
+  # in-app (or keep what is already in the container, under games/<target>/).
+  if [ "$KLT_KIND" = hub ]; then echo "  assets: none for the hub (games download their own data)"
+  else stage_if_needed "$DEVID" "$DEVID"; fi
 
   echo "[5/5] launching (report also renders on-screen)…"
   # KL_FRAMES carries the app past the initJni gate into the Android lifecycle
@@ -403,12 +426,14 @@ fi
 # ever prints. Cost a "build crash" report that was really a missing `device`
 # argument on a machine with no simulator booted.
 UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)
-[ -n "$UDID" ] || { echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; }
+if [ -n "$UDID" ]; then SIMDEST="platform=visionOS Simulator,id=$UDID"
+elif [ -n "${KL_BUILD_ONLY:-}" ]; then SIMDEST="generic/platform=visionOS Simulator"
+else echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; fi
 
 echo "[3/5] building for the simulator…"
 set +e
 xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" \
-  -destination "platform=visionOS Simulator,id=$UDID" \
+  -destination "$SIMDEST" \
   -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" CODE_SIGNING_ALLOWED=NO build 2>&1 \
   | grep -E 'error:|\*\* BUILD'
 BUILD_RC=${PIPESTATUS[0]}
@@ -422,17 +447,19 @@ APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.
 # nothing and reports the entry as unmappable. Ad-hoc signing (no identity, no
 # team) is all the simulator asks for; frameworks first, then the app around
 # them.
-for F in "$APP"/Frameworks/*.framework; do
+# (the hub's games sit one level down, in Frameworks/<game>/)
+for F in "$APP"/Frameworks/*.framework "$APP"/Frameworks/*/*.framework; do
   [ -d "$F" ] && codesign -f -s - "$F" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $F"
 done
 codesign -f -s - "$APP" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $APP"
+if [ -n "${KL_BUILD_ONLY:-}" ]; then echo "    built $APP — KL_BUILD_ONLY=1, not installing"; exit 0; fi
 
 echo "[4/5] installing + staging…"
 xcrun simctl install "$UDID" "$APP"
 # After install, not before: simctl rotates the data container on reinstall, so
 # assets staged earlier end up in an orphaned one and the app reports them
 # missing. Cost a confusing run once.
-stage_if_needed "sim-$UDID"
+if [ "$KLT_KIND" = hub ]; then echo "  assets: none for the hub"; else stage_if_needed "sim-$UDID"; fi
 
 echo "[5/5] launching…"
 # `env`, not a bare prefix: bash only treats NAME=value as an assignment when it

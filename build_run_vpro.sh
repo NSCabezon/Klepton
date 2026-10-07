@@ -33,6 +33,12 @@
 #   ./build_run_vpro.sh --stage         # re-upload the 2.2 GB of assets (first run only)
 #   ./build_run_vpro.sh --sync          # drive the guest on the compositor thread
 #   ./build_run_vpro.sh --log           # pull + summarise the last run, build nothing
+#   ./build_run_vpro.sh --build-only    # generate + build + sign for the device, stop
+#                                       #   there (no headset needed)
+#   ./build_run_vpro.sh hub             # the HUB: one app (com.example.avpgamehub)
+#                                       #   with every game in targets.py's hub list
+#                                       #   and an in-app library; KL_HUB_GAME=alyx
+#                                       #   boots that game instead of the library
 #
 # Anything already set in the environment wins, so a one-off knob the flags do
 # not cover still works:
@@ -52,6 +58,7 @@ IMMERSIVE=""      # unset => the app's default (on)
 GLFB=""           # unset => the app's default (on)
 STAGE=""          # empty => KL_SKIP_STAGE=1 (assets persist across installs)
 LOG_ONLY=""
+BUILD_ONLY=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +70,7 @@ while [ $# -gt 0 ]; do
     --stage)      STAGE=1; shift ;;
     --sync)       export KL_SYNC_GUEST=1; shift ;;
     --log)        LOG_ONLY=1; shift ;;
+    --build-only) BUILD_ONLY=1; shift ;;
     -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
     -*)           echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
     # A bare word is the TARGET. One only: a second would silently be ignored,
@@ -116,6 +124,12 @@ print(phys[0]["identifier"])
 ' "$json"
   rm -f "$json"
 }
+# --build-only: generate + build + sign for the device, then stop. No headset.
+if [ -n "$BUILD_ONLY" ]; then
+  echo "target    : $KLT_NAME ($BUNDLE_ID, $KLT_PRODUCT.app) — build only"
+  KL_BUILD_ONLY=1 exec visionos/run.sh device
+fi
+
 DEVID="${KLEPTON_DEVICE:-$(find_device || true)}"
 [ -n "$DEVID" ] || { echo "!! no physical Vision Pro — pair it in Xcode, or set KLEPTON_DEVICE"; exit 1; }
 export KLEPTON_DEVICE="$DEVID"
