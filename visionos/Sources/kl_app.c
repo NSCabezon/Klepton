@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -432,27 +433,78 @@ int kl_app_configure(const char *resources, const char *container) {
 // signal — which on the host reads as a much earlier failure than actually
 // happened, and on device would be the only evidence there is.
 //
-// KL_LOG_FILE=0 leaves both streams alone, which is the ONLY way anything
-// outside this process can read them live: `devicectl device process launch
-// --console` bridges the app's stdout and stderr, and a freopen'd stdout is
-// bridged to a file nobody is watching. Polling the file instead costs a
-// `devicectl device copy from` per sample, and that call is ~27 seconds on this
-// hardware whatever the file's SIZE — 150 KB and 15 MB take the same time — so a
-// run watched by copying is minutes of transfer per minute of run. Nothing here
-// is smaller in that mode; the same bytes go somewhere the host can already see.
+// KL_LOG_FILE=0 is the console mode: `devicectl device process launch
+// --console` bridges the app's stdout and stderr, and that is the ONLY way
+// anything outside this process can read them live (`devicectl device copy
+// from` is ~27 s per call on this hardware whatever the file's size). It used to
+// leave both streams alone and write NO file — and that is how a hub session
+// lost its log: build_run_vpro.sh launched the hub over --console, the person
+// picked SUPERHOT in that same process, the bridge delivered nothing (157 bytes
+// of devicectl chatter, not one line of ours), and Documents/klepton-boot.log
+// was never created. So console mode now TEES: one pipe carries fds 1 and 2, and
+// a thread copies it to both the file and the original console. The file is
+// written on every run, whoever launched it, and is what the in-window report,
+// `build_run_vpro.sh --log` and the post-run pull read.
 //
-// The file stays the default because it is what survives the process: an
-// unimplemented JNI call aborts by design, a launch from the Home View has no
-// console at all, and the in-window boot report is read back out of this path.
+// The file stays the primary path: an unimplemented JNI call aborts by design, a
+// launch from the Home View has no console at all, and the in-window boot report
+// is read back out of this path. Tee mode's cost is that the last bytes still in
+// the pipe can be lost if the process dies on a signal — the crash report
+// (klepton-crash.log, written by path and fsync'd) covers that case.
+static int g_tee_file = -1, g_tee_console = -1;
+
+static void tee_write(int fd, const char *b, ssize_t n) {
+    while (fd >= 0 && n > 0) {
+        ssize_t w = write(fd, b, (size_t)n);
+        if (w < 0) { if (errno == EINTR) continue; return; }
+        b += w; n -= w;
+    }
+}
+
+static void *log_tee(void *arg) {
+    int in = (int)(intptr_t)arg;
+    char buf[16384];
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        tee_write(g_tee_file, buf, n);
+        tee_write(g_tee_console, buf, n);
+    }
+    return NULL;
+}
+
 static int open_log(void) {
-    if (!kl_env_on("KL_LOG_FILE", 1)) {
-        // Same buffering discipline either way. The reason is unchanged — a
-        // fully-buffered stream loses the report when the process dies on a
-        // signal — and it applies harder here, because the far end of the bridge
-        // is another process that only ever sees what was actually written.
-        setvbuf(stdout, NULL, _IOLBF, 0);
-        setvbuf(stderr, NULL, _IOLBF, 0);
-        return 0;
+    int tee = !kl_env_on("KL_LOG_FILE", 1);
+    if (tee) {
+        // The console's fds, kept before 1 and 2 are pointed at the pipe.
+        int out = dup(STDOUT_FILENO);
+        int file = open(g_log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        int p[2];
+        if (out < 0 || file < 0 || pipe(p) != 0) {
+            if (out >= 0) close(out);
+            if (file >= 0) close(file);
+            tee = 0;                     // fall back to the plain file below
+        } else {
+            g_tee_console = out;
+            g_tee_file = file;
+            fcntl(p[0], F_SETFD, FD_CLOEXEC);
+            pthread_t t;
+            if (pthread_create(&t, NULL, log_tee, (void *)(intptr_t)p[0]) != 0) {
+                close(p[0]); close(p[1]); close(out); close(file);
+                g_tee_console = g_tee_file = -1;
+                tee = 0;
+            } else {
+                pthread_detach(t);
+                fflush(stdout); fflush(stderr);
+                dup2(p[1], STDOUT_FILENO);
+                dup2(p[1], STDERR_FILENO);   // the guest's own writes(2) land here too
+                close(p[1]);
+                setvbuf(stdout, NULL, _IOLBF, 0);
+                setvbuf(stderr, NULL, _IOLBF, 0);
+                return 0;
+            }
+        }
     }
     if (!freopen(g_log, "w", stdout)) return 1;
     setvbuf(stdout, NULL, _IOLBF, 0);

@@ -301,11 +301,35 @@ static const char *sysprop_value(const char *n) {
         if (t && strcmp(t, "hl2") == 0 && !kl_env_on("KL_HL2_MULTIVIEW", 0))
             return "0";
     }
+    // The locale, the libc door onto what java.util.Locale and AConfiguration
+    // answer (kl_jni_locale_parts: KL_LOCALE, else LANG, else the system). A
+    // native engine that never touches JNI reads these instead: the BCP 47 tag
+    // (persist.sys.locale, ro.product.locale) on Android 5+, and the split
+    // language/region pair on older images.
+    {
+        static char tag[40], lang[16], country[16];
+        int which = !strcmp(n, "persist.sys.locale") || !strcmp(n, "ro.product.locale") ? 1
+                  : !strcmp(n, "persist.sys.language") || !strcmp(n, "ro.product.locale.language") ? 2
+                  : !strcmp(n, "persist.sys.country") || !strcmp(n, "ro.product.locale.region") ? 3 : 0;
+        if (which) {
+            kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+            if (which == 2) return lang;
+            if (which == 3) return country[0] ? country : NULL;
+            if (*country) snprintf(tag, sizeof tag, "%s-%s", lang, country);
+            else          snprintf(tag, sizeof tag, "%s", lang);
+            return tag;
+        }
+    }
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0)
             return kl_jni_build_string(g_sysprops[i].build_field);
     return NULL;
 }
+
+static const char *const g_locale_props[] = {
+    "persist.sys.locale", "ro.product.locale", "persist.sys.language",
+    "ro.product.locale.language", "persist.sys.country", "ro.product.locale.region",
+};
 
 // find/read are the two-step form of the same lookup. The "handle" we hand back
 // is the table entry's own name pointer, which is a stable string constant for
@@ -327,6 +351,9 @@ const void *klb_sysprop_find(const char *n) {
             if (strcmp(n, dns_names[i]) == 0 && sysprop_value(n))
                 return dns_names[i];
     }
+    for (size_t i = 0; i < sizeof g_locale_props / sizeof *g_locale_props; i++)
+        if (strcmp(n, g_locale_props[i]) == 0 && sysprop_value(n))
+            return g_locale_props[i];
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0 && sysprop_value(n))
             return g_sysprops[i].prop;
@@ -1327,6 +1354,31 @@ static void proc_build(void) {
     // loop's upper bound and the nodes that exist agree.
     snprintf(buf, sizeof buf, "%ld\n", nfreq - 1);
     proc_put("/sys/devices/system/cpu/kernel_max", buf);
+
+    // Topology, for every ONLINE core: one package, one core per CPU, no SMT —
+    // what an arm64 kernel publishes and what Apple silicon is. arm64's
+    // /proc/cpuinfo carries no "physical id"/"core id" lines, so a guest that
+    // counts PHYSICAL cores reads these instead. Source 2's tier0
+    // (GetCPUInformation) counts distinct (physical_package_id, core_id) pairs;
+    // with the files missing every CPU was the same (-1, -1) pair, the guest
+    // saw ONE physical core, and Half-Life: Alyx's VR menu raised "your CPU is
+    // below the minimum requirements" (#HLVR_MainMenu_Attention_MinSpec_CPU
+    // fires at <= 3 physical cores). The logical count is unchanged.
+    char sib[32];
+    if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\n", ncpu - 1);
+    else          snprintf(sib, sizeof sib, "0\n");
+    for (long i = 0; i < ncpu; i++) {
+        char rel[256], v[32];
+        snprintf(v, sizeof v, "%ld\n", i);
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+        proc_put(rel, v);
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+        proc_put(rel, "0\n");
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+        proc_put(rel, v);
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
+        proc_put(rel, sib);
+    }
     fprintf(stderr, "[proc] synthetic /proc and /sys at %s (%ld cpus, %llu MB budget)\n",
             g_procroot, ncpu, (unsigned long long)(kl_mem_total() >> 20));
 }

@@ -444,6 +444,21 @@ int kl_view_main(const char *libdir, int hw) {
     // zero, facing −z per the convention block above.
     float px = 0, py = KL_VIEW_EYE_HEIGHT, pz = 0;
     float yaw = 0, pitch = 0;
+    // KL_VIEW_YAW / KL_VIEW_PITCH (degrees): the head's starting look direction,
+    // so a scripted run (no hand on the mouse) can frame what it captures.
+    yaw   = kl_env_float("KL_VIEW_YAW", 0.0f)   * 3.14159265f / 180.0f;
+    pitch = kl_env_float("KL_VIEW_PITCH", 0.0f) * 3.14159265f / 180.0f;
+    if (pitch >  KL_VIEW_PITCH_CLAMP) pitch =  KL_VIEW_PITCH_CLAMP;
+    if (pitch < -KL_VIEW_PITCH_CLAMP) pitch = -KL_VIEW_PITCH_CLAMP;
+    // KL_VIEW_PITCH_AT="<secs>:<deg>": look to <deg> pitch once <secs> have
+    // passed — a scripted run that must look ahead to get going and then down
+    // at what it wants to capture.
+    float pitch_at_s = -1, pitch_at_deg = 0;
+    {
+        const char *pa = getenv("KL_VIEW_PITCH_AT");
+        if (pa && sscanf(pa, "%f:%f", &pitch_at_s, &pitch_at_deg) != 2) pitch_at_s = -1;
+    }
+    uint64_t view_t0 = SDL_GetTicks();
     int mouselook = 0;
     int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
     int32_t mono_buttons = 0;       // the flat path's Android button-state mask
@@ -484,6 +499,12 @@ int kl_view_main(const char *libdir, int hw) {
     if (period_ms < 1) period_ms = 1;
     while (!done) {
         uint64_t t_now = SDL_GetTicks();
+        if (pitch_at_s >= 0 && (float)(t_now - view_t0) / 1000.0f >= pitch_at_s) {
+            pitch = pitch_at_deg * 3.14159265f / 180.0f;
+            if (pitch >  KL_VIEW_PITCH_CLAMP) pitch =  KL_VIEW_PITCH_CLAMP;
+            if (pitch < -KL_VIEW_PITCH_CLAMP) pitch = -KL_VIEW_PITCH_CLAMP;
+            pitch_at_s = -1;
+        }
         float dt = (float)(t_now - t_prev) / 1000.0f;
         if (dt > 0.1f) dt = 0.1f;  // a stall is not a teleport
         t_prev = t_now;
@@ -810,6 +831,13 @@ int kl_view_main(const char *libdir, int hw) {
                              (float)(t_now - hud_last);
             hud_frames = now_frames;
             hud_last = t_now;
+            // The same rate in the title bar, readable at a glance without the
+            // log: on the hardware path it is the guest's own frame rate.
+            {
+                char title[96];
+                snprintf(title, sizeof title, "Klepton — %.0f fps", (double)achieved);
+                SDL_SetWindowTitle(win, title);
+            }
             char frames[128];
             if (hw) snprintf(frames, sizeof frames,
                              "frame %llu, shown %u, %.1f fps vs %.1f advertised",

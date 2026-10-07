@@ -285,13 +285,16 @@ visionos/run.sh device
 # it re-pulls because the run may have written more after the poller gave up.
 #
 # ...unless the run STREAMED it (run.sh's --console path, the default for an
-# open-ended run). There the log in $LOCAL_LOG is the live one and the container
-# holds only whatever a previous file-logging run left behind — so pulling would
-# replace this run's output with an older run's, and the "keep the longest"
-# rule protects the wrong one when the stale log is the longer.
-if [ -f "$LOCAL_LOG.streamed" ]; then
-  echo "    (streamed live over --console; the container's log is not this run's)"
+# open-ended run) and the stream has the boot report: then $LOCAL_LOG is the live
+# copy already. The app writes Documents/klepton-boot.log in console mode too
+# (kl_app.c tees the stream into it), so when the stream carried no boot report —
+# the bridge has delivered nothing at all on some runs (the first hub session:
+# 157 bytes of devicectl chatter) — the container's file is this run's: pull it.
+if [ -f "$LOCAL_LOG.streamed" ] && LC_ALL=C grep -aq '=== Klepton on visionOS ===' "$LOCAL_LOG"; then
+  echo "    (streamed live over --console; Documents/klepton-boot.log on device has the same run)"
 else
+  [ -f "$LOCAL_LOG.streamed" ] && \
+    echo "    (the --console stream carried no boot report; pulling the container's log)"
   pull_log || true
   pull_crash || true
 fi
