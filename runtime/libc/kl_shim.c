@@ -89,6 +89,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_vulkan.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steam.h"
 #include "kl_jni.h"
 #include "kl_tls.h"
 
@@ -2026,6 +2027,10 @@ static const kl_entry g_shim[] = {
 
     // divergent layouts / Android-only
     E("__errno", klb_errno), E("environ", &environ), E("gettid", klb_gettid),
+    // bionic's `long timezone` (seconds west of UTC, set by tzset) is a DATA
+    // import; Darwin's <time.h> global is the same type and tzset fills it the
+    // same way, so the guest reads the host's (libUnreal imports it).
+    E("timezone", &timezone),
     // Xash3D (cs1/hl1) imports: a data global and the POSIX timer trio (stubbed).
     E("in6addr_any", &in6addr_any),
     E("timer_create", klb_timer_create), E("timer_settime", klb_timer_settime),
@@ -2407,5 +2412,18 @@ void *kl_shim_lookup_base(const char *name) {
     // `ovrp_` must not be claimed here.
     if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
         return kl_ovrplat_sym(name);
+
+    // Tier 12: Steamworks (Metro Awakening). The Steam Frame's Android builds
+    // LINK libsteam_api.so — it is in libUnreal's DT_NEEDED and fourteen
+    // SteamAPI_/SteamInternal_/SteamGameServer_ names bind at relocation time.
+    // The guest's own copy is a client for the Frame's Steam service, which is
+    // not here, so it is REPLACED like the platform loaders above: kl_steam is
+    // the stand-in Alyx's glibc door already uses, and the flat entry points
+    // and the C++ interface objects it hands back are the same AAPCS64/Itanium
+    // ABI on both doors. kl_steam_lookup claims only those three prefixes and
+    // returns NULL for a name it does not serve, so an unserved Steam entry
+    // still reaches the unresolved report. KL_STEAM_STUB=0 opts out.
+    if (name[0] == 'S' && !strncmp(name, "Steam", 5))
+        return kl_steam_lookup(name);
     return NULL;
 }

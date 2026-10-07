@@ -114,6 +114,12 @@ reads the OBB out of the guest's userdata directory:
 | `beatsaber` | `obb/` | `main.1716.com.beatgames.beatsaber.obb` |
 | `bonelab` | `obb/` | `main.2974` + `patch.2974`, `.com.StressLevelZero.BONELAB.obb` |
 | `re4` | `Android/obb/com.Armature.VR4/` | `main.203` + `patch.203`, `.com.Armature.VR4.obb` |
+| `metro` | `Android/obb/com.vertigogames.ImpactDevelopment/` | `main.944116` + `chunk.1`..`chunk.12`, `chunk.20`, `.com.vertigogames.ImpactDevelopment.obb` (17 GB; symlinks to the depot download work) |
+
+Metro Awakening (Steam Frame build, Steam app 2669410, depot 2669412) keeps its
+tree OUTSIDE the repo: unpack with `apktool d -o game/metro/apk
+Impact-Android-Shipping-arm64.apk` next to the depot download and point the
+gitignored `metro` and `metro.apk` symlinks at the repo root to it.
 
 ---
 

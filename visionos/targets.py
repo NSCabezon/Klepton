@@ -362,6 +362,52 @@ TARGETS = {
         "product": "KleptonVampire",
         "display": "Vampire: The Masquerade - Justice",
     },
+    "metro": {
+        # Metro Awakening (Vertigo Games), package com.vertigogames.
+        # ImpactDevelopment (project "Impact") — the STEAM FRAME build (Steam app
+        # 2669410, Android depot 2669412), and the first UE5 title here that is
+        # not a Quest build: UE 5.2.1, libUnreal through
+        # com.epicgames.unreal.GameActivity, so it takes the "ue4" kind with the
+        # libUnreal entry that already selects UE5's naming family (kl_ue4.c).
+        #
+        # What is different from the Quest UE titles, all read off the APK:
+        #
+        #   - **XR is OpenXR, picked by vendor.** The engine dlopens
+        #     libopenxr_loader_valve.so or libopenxr_loader_meta.so (UTF-16
+        #     literals in libUnreal), not the Khronos name; both are claimed by
+        #     kl_openxr's dlopen door, so neither ELF is ever mapped.
+        #   - **Steamworks is LINKED.** libsteam_api.so is in libUnreal's
+        #     DT_NEEDED and fourteen SteamAPI_/SteamInternal_ names bind at
+        #     relocation time. The guest's copy is a client for the Frame's Steam
+        #     service; kl_steam (Alyx's stand-in client) answers those names
+        #     instead, owning this app. The user bought it; this stands in for
+        #     the missing Steam client, nothing more.
+        #   - **The data is IoStore in CHUNK OBBs**: main.944116 (pakchunk0 +
+        #     movies) plus chunk.1..12 and chunk.20, one pakchunk each, all
+        #     stored (uncompressed) zips, 17 GB. kl_obbmap indexes every *.obb in
+        #     the directory, so they are staged side by side.
+        #
+        # libovrplatformloader is replaced (kl_ovrplat) as for every UE title;
+        # libbhaptics-native-lib and libpsoservice (UE's out-of-process PSO
+        # compile service, reached through Java we do not run) are translated
+        # but nothing here needs them for the game to start.
+        #
+        # The tree lives OUTSIDE the repo (game/metro/apk, apktool output) and
+        # is reached through the gitignored `metro` / `metro.apk` symlinks at the
+        # repo root, so no game bytes can end up in git.
+        "libs":    None,
+        "srcdir":  "metro/lib/arm64-v8a",
+        "tree":    "metro",
+        "apk":     "metro.apk",
+        "assets":  "metro/assets",
+        "qtplugins": "",
+        # UE builds <external>/Android/obb/<package>/ itself — RE4's layout.
+        "obb":     "Android/obb/com.vertigogames.ImpactDevelopment",
+        "entry":   "libUnreal",
+        "kind":    "ue4",
+        "product": "KleptonMetro",
+        "display": "Metro Awakening",
+    },
     "vicecity": {
         # GTA Vice City VR (GTAVCVR) — a reVC/re3 (open-source re-implementation)
         # VR port. A plain Android NativeActivity + OpenXR native app: the entry is

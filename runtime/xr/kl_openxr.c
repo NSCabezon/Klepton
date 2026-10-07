@@ -6660,17 +6660,29 @@ void *kl_openxr_lookup(const char *name) {
 // nothing to do with XR.
 static const char g_xr_handle[] = "klepton-openxr-loader";
 
+//
+// VENDOR-SUFFIXED LOADERS are the same loader. Unreal 5's OpenXR plugin on a
+// multi-store Android build ships one Khronos loader per vendor and dlopens it
+// by name — Metro Awakening's Steam Frame APK carries
+// libopenxr_loader_valve.so and libopenxr_loader_meta.so and asks for one of
+// them (UTF-16 literals in libUnreal), never "libopenxr_loader.so". Each is the
+// stock loader with the same broker search, so each is claimed the same way:
+// any basename of the form libopenxr_loader[_<vendor>].so.
 int kl_openxr_claims(const char *soname) {
     if (!soname) return 0;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
-    return strcmp(b, "libopenxr_loader.so") == 0;
+    if (strcmp(b, "libopenxr_loader.so") == 0) return 1;
+    size_t n = strlen(b);
+    return strncmp(b, "libopenxr_loader_", 17) == 0 && n > 20 &&
+           strcmp(b + n - 3, ".so") == 0;
 }
 
 void *kl_openxr_dlopen(const char *soname) {
     if (!kl_openxr_claims(soname)) return NULL;
-    fprintf(stderr, "  [xr] guest dlopen(\"libopenxr_loader.so\") -> synthetic OpenXR "
-                    "runtime (the real loader would look for an Android broker)\n");
+    fprintf(stderr, "  [xr] guest dlopen(\"%s\") -> synthetic OpenXR "
+                    "runtime (the real loader would look for an Android broker)\n",
+            soname);
     return (void *)g_xr_handle;
 }
 
