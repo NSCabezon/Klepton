@@ -149,10 +149,13 @@ static float         g_grid_vp[4];
 //
 // Pairs with KL_OVRP_EYE_TAN, which is what gives a host run a canted display
 // to have the problem on in the first place.
-// Side by side (the default for a stereo guest): both eyes, left | right, each
-// letterboxed by its own frustum — the SteamVR mirror window's layout. While one
-// half is being drawn this names its eye, and everything that asks klvm_eye()
-// (uniforms, crop, overlays) answers for that half.
+// Side by side (the default for EVERY stereo guest, on every composite path —
+// per-layer OpenXR projection layers, the reprojected eye and the plain blit):
+// both eyes, left | right, each letterboxed by its own frustum — the SteamVR
+// mirror window's layout. A mono guest, or one with no second eye to show, gets
+// one eye at full window; so does KL_VIEW_EYE=0/1, which pins that eye. While
+// one half is being drawn this names its eye, and everything that asks
+// klvm_eye() (uniforms, crop, overlays) answers for that half.
 static int g_cur_eye = -1;
 static int klvm_sbs(void) {
     static int on = -1;
@@ -405,9 +408,12 @@ static void klvm_hold_frame(int nproj, int eye) {
     double now = (double)clock() / CLOCKS_PER_SEC;
     if (g_holds == 1 || now - last > 1.0) {
         last = now;
+        char which[16];
+        if (eye < 0) snprintf(which, sizeof which, "either eye");
+        else snprintf(which, sizeof which, "eye %d", eye);
         fprintf(stderr, "  [vmtl] %d projection layer(s) submitted and none could be "
-                        "composited for eye %d — holding the previous frame "
-                        "(%lu so far)\n", nproj, eye, g_holds);
+                        "composited for %s — holding the previous frame "
+                        "(%lu so far)\n", nproj, which, g_holds);
     }
 }
 
@@ -1059,37 +1065,33 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // — see klvm_frame_value.
     if (fenced) [cmd encodeWaitForEvent:g_event value:v];
 
-    // Letterbox: the eye is ~1832x1920, the window is not.
-    //
-    // With no eye texture there is no picture to fit, but the overlay pass still
-    // projects through the frustum the guest was given, so the viewport has to
-    // keep THAT aspect or a panel comes out stretched by the window's shape.
-    // The tangents are the frustum, so their ratio is the aspect.
-    double sw = 1832, sh = 1920;
-    if (nproj > 0) {
-        // The per-layer composite has no single source texture to fit: the
-        // picture is several layers of DIFFERENT sizes and the guest changes
-        // which of them it submits while it runs, so a window shaped by "the
-        // texture in hand" changes shape frame to frame — which is the whole
-        // picture jumping, not a letterbox detail. The display's own frustum is
-        // what every layer is placed against, so its aspect is the window's.
-        float et[4] = { 1, 1, 1, 1 };
-        kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
-        if (et[0] + et[1] > 0 && et[2] + et[3] > 0) {
-            sw = et[0] + et[1];
-            sh = et[2] + et[3];
-        }
-    } else if (src) { klvm_eye_aspect(stage, eye, src, &sw, &sh); }
-    else {
-        kl_ovrp_render_pose r;
-        const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
-        if (t && t[0] + t[1] > 0 && t[2] + t[3] > 0) {
-            sw = t[0] + t[1];
-            sh = t[2] + t[3];
+    // Side by side or one eye. SBS is the default for every stereo guest, on
+    // every path below — per-layer, reprojected and plain blit alike — so the
+    // window's shape no longer depends on which way the guest submits its
+    // frame. One eye at full window when KL_VIEW_EYE pins one, or when the
+    // guest has no second eye to show: a half left black is not a picture.
+    int sbs = 0;
+    if (klvm_sbs()) {
+        if (nproj > 0) {
+            int has[2] = { 0, 0 };
+            for (int i = 0; i < nproj; i++) {
+                if (g_list[i].slot[0] >= 0) has[0] = 1;
+                if (g_list[i].slot[1] >= 0) has[1] = 1;
+            }
+            sbs = has[0] && has[1];
+        } else if (src) {
+            int s1 = 0;
+            sbs = kl_glfb_eye_mtl_texture(1, stage, &s1) != NULL;
+        } else {
+            // Panels only (a guest's menu). Stereo if the frame record gives
+            // the second eye a frustum, so the window keeps the same two-half
+            // shape it has when the world comes back.
+            kl_ovrp_render_pose r;
+            sbs = kl_ovrp_stage_render_pose(stage, &r) &&
+                  r.tangents[1][0] + r.tangents[1][1] > 0 &&
+                  r.tangents[1][2] + r.tangents[1][3] > 0;
         }
     }
-    double scale = fmin((double)win_w / sw, (double)win_h / sh);
-    double dw = sw * scale, dh = sh * scale;
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = drawable.texture;
@@ -1098,83 +1100,111 @@ int kl_viewmtl_present(int win_w, int win_h) {
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
     enc.label = @"klepton viewer composite";
-    [enc setViewport:(MTLViewport){ (win_w - dw) * 0.5, (win_h - dh) * 0.5,
-                                    dw, dh, 0.0, 1.0 }];
-    // Slot 1 is the SECOND eye's texture, for a guest whose two eyes are two
-    // unrelated MTLTextures rather than two slices of one (kl_reproject.c,
-    // `src`). This viewer composites ONE eye at a time — KL_VIEW_EYE picks it
-    // — so the same texture goes into both slots and the shader's branch is a
-    // no-op here. It is bound rather than left dangling because a fragment
-    // function that DECLARES a texture and is given none samples undefined
-    // storage, and the blit pipeline that ignores slot 1 costs nothing for it.
-    if (src) {
-        [enc setFragmentTexture:src atIndex:0];
-        [enc setFragmentTexture:src atIndex:1];
-    }
     [enc setFragmentSamplerState:g_samp atIndex:0];
+    // The liveness pass below samples the pinned eye with these.
     kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
-    int sbs_drawn = 0;
-    if (nproj > 0) {
-        // The per-layer composite. The frustum is the DISPLAY's — what this
-        // window is looking through — and every layer is then placed inside it
-        // by its own tangents, never against another layer's. Taking it from
-        // the frame record instead would take it from whichever layer happened
-        // to be submitted last, which is a field of view that changes while the
-        // guest runs and would move the whole picture with it.
+
+    int neyes = sbs ? 2 : 1;
+    double cell_w = sbs ? win_w * 0.5 : (double)win_w;
+    int drew = 0;
+    for (int k = 0; k < neyes; k++) {
+        int e = sbs ? k : eye;
+        // While a half is drawn klvm_eye() names its eye, so the uniforms, the
+        // crop and the overlays answer for that half. Left alone in single-eye
+        // mode, where klvm_eye() already answers KL_VIEW_EYE.
+        if (sbs) g_cur_eye = e;
+        id<MTLTexture> es = src;
+        int eslice = slice, eflip = flip;
+        if (sbs && src) {
+            void *ep = kl_glfb_eye_mtl_texture(e, stage, &eslice);
+            es = ep ? klvm_array_view((__bridge id<MTLTexture>)ep) : nil;
+            eflip = kl_glfb_eye_mtl_origin_top_left(e, stage);
+        }
+
+        // Letterbox: the eye is ~1832x1920, the window (or its half) is not.
+        //
+        // With no eye texture there is no picture to fit, but the overlay pass
+        // still projects through the frustum the guest was given, so the
+        // viewport has to keep THAT aspect or a panel comes out stretched by
+        // the window's shape. The tangents are the frustum, so their ratio is
+        // the aspect.
+        double sw = 1832, sh = 1920;
         float et[4] = { 1, 1, 1, 1 };
-        kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
-        simd_float4x4 pproj = kl_reproject_projection(et[0], et[1], et[2], et[3], 0.03f);
-        int drew = klvm_draw_proj_layers(enc, eye, g_list, nproj, pproj);
-        if (!drew && kl_ovrp_overlay_count() == 0) {
-            // Nothing composed, and no panel to compose either. The drawable is
-            // CLEARED, so presenting it is a black frame between two good ones —
-            // flicker this compositor invents rather than flicker the guest
-            // sent. The eye pass could not produce it: its texture outlives the
-            // frame that filled it, so there was always something to draw. Hold
-            // the previous frame instead, and count the hold.
-            klvm_hold_frame(nproj, eye);
-            [enc endEncoding];
-            [cmd commit];
-            return 0;
-        }
-        klvm_note_delta(stage);
-    } else if (!src) {
-        // Nothing to draw here; the cleared drawable is the background the
-        // overlay pass draws its panel onto.
-    } else if (g_pipe_rp) {
-        if (klvm_sbs()) {
-            // Two halves; each eye's own texture, frustum and letterbox.
-            for (int e = 0; e < 2; e++) {
-                int es = 0;
-                void *ep = kl_glfb_eye_mtl_texture(e, stage, &es);
-                if (!ep) continue;
-                id<MTLTexture> et = klvm_array_view((__bridge id<MTLTexture>)ep);
-                int ef = kl_glfb_eye_mtl_origin_top_left(e, stage);
-                double aw, ah;
-                klvm_eye_aspect(stage, e, et, &aw, &ah);
-                double hw = win_w * 0.5, sc = fmin(hw / aw, (double)win_h / ah);
-                double w2 = aw * sc, h2 = ah * sc;
-                [enc setViewport:(MTLViewport){ e * hw + (hw - w2) * 0.5, (win_h - h2) * 0.5,
-                                                w2, h2, 0.0, 1.0 }];
-                [enc setFragmentTexture:et atIndex:0];
-                [enc setFragmentTexture:et atIndex:1];
-                g_cur_eye = e;
-                kl_blit_uniforms ebu = { (uint32_t)es, (uint32_t)(ef ? 1 : 0) };
-                klvm_draw_eye_rp(enc, stage, e, et, ebu, ef);
-                klvm_draw_overlays(enc, e, stage);
-                g_cur_eye = -1;
+        if (nproj > 0) {
+            // The per-layer composite has no single source texture to fit: the
+            // picture is several layers of DIFFERENT sizes and the guest changes
+            // which of them it submits while it runs, so a window shaped by "the
+            // texture in hand" changes shape frame to frame — which is the whole
+            // picture jumping, not a letterbox detail. The display's own frustum
+            // is what every layer is placed against, so its aspect is the
+            // window's.
+            kl_ovrp_eye_view(e, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
+            if (et[0] + et[1] > 0 && et[2] + et[3] > 0) {
+                sw = et[0] + et[1];
+                sh = et[2] + et[3];
             }
-            sbs_drawn = 1;
-        } else {
-            klvm_draw_eye_rp(enc, stage, eye, src, bu, flip);
+        } else if (es) { klvm_eye_aspect(stage, e, es, &sw, &sh); }
+        else {
+            kl_ovrp_render_pose r;
+            const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[e] : NULL;
+            if (t && t[0] + t[1] > 0 && t[2] + t[3] > 0) {
+                sw = t[0] + t[1];
+                sh = t[2] + t[3];
+            }
         }
-        klvm_note_delta(stage);
-    } else {
-        [enc setRenderPipelineState:g_pipe];
-        [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        double scale = fmin(cell_w / sw, (double)win_h / sh);
+        double dw = sw * scale, dh = sh * scale;
+        [enc setViewport:(MTLViewport){ k * cell_w + (cell_w - dw) * 0.5,
+                                        (win_h - dh) * 0.5, dw, dh, 0.0, 1.0 }];
+        // Slot 1 is the SECOND eye's texture, for a guest whose two eyes are
+        // two unrelated MTLTextures rather than two slices of one
+        // (kl_reproject.c, `src`). Each half composites ONE eye, so the same
+        // texture goes into both slots and the shader's branch is a no-op
+        // here. It is bound rather than left dangling because a fragment
+        // function that DECLARES a texture and is given none samples undefined
+        // storage, and the blit pipeline that ignores slot 1 costs nothing.
+        if (es) {
+            [enc setFragmentTexture:es atIndex:0];
+            [enc setFragmentTexture:es atIndex:1];
+        }
+        kl_blit_uniforms ebu = { (uint32_t)eslice, (uint32_t)(eflip ? 1 : 0) };
+        if (nproj > 0) {
+            // The per-layer composite. The frustum is the DISPLAY's — what this
+            // half is looking through — and every layer is then placed inside
+            // it by its own tangents, never against another layer's. Taking it
+            // from the frame record instead would take it from whichever layer
+            // happened to be submitted last, which is a field of view that
+            // changes while the guest runs and would move the picture with it.
+            simd_float4x4 pproj = kl_reproject_projection(et[0], et[1], et[2], et[3], 0.03f);
+            drew += klvm_draw_proj_layers(enc, e, g_list, nproj, pproj);
+        } else if (!es) {
+            // Nothing to draw here; the cleared drawable is the background the
+            // overlay pass draws its panel onto.
+        } else if (g_pipe_rp) {
+            klvm_draw_eye_rp(enc, stage, e, es, ebu, eflip);
+        } else {
+            [enc setRenderPipelineState:g_pipe];
+            [enc setFragmentBytes:&ebu length:sizeof ebu atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        klvm_draw_overlays(enc, e, stage);
     }
-    if (!sbs_drawn) klvm_draw_overlays(enc, eye, stage);
+    g_cur_eye = -1;
+
+    // Per FRAME, not per half: one frame is one hold, one delta, one fence.
+    if (nproj > 0 && !drew && kl_ovrp_overlay_count() == 0) {
+        // Nothing composed in either half, and no panel to compose either. The
+        // drawable is CLEARED, so presenting it is a black frame between two
+        // good ones — flicker this compositor invents rather than flicker the
+        // guest sent. The eye pass could not produce it: its texture outlives
+        // the frame that filled it, so there was always something to draw.
+        // Hold the previous frame instead, and count the hold.
+        klvm_hold_frame(nproj, sbs ? -1 : eye);
+        [enc endEncoding];
+        [cmd commit];
+        return 0;
+    }
+    if (nproj > 0 || (src && g_pipe_rp)) klvm_note_delta(stage);
     [enc endEncoding];
 
     // The liveness downsample, same source, same shader, 64x64. It is a second
