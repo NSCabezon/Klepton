@@ -160,7 +160,7 @@ struct KleptonApp: App {
     @ObservedObject private var chroma = KleptonChroma.shared
 
     var body: some Scene {
-        WindowGroup { BootView() }
+        WindowGroup { KleptonRootView() }
             .defaultSize(width: 1280, height: 800)
             // On the app's phase, not this window's: closing the boot window
             // while the immersive space is up is not backgrounding, and must
@@ -218,11 +218,51 @@ struct KleptonApp: App {
 /// into Documents afterwards. The 2.3 GB of assets carry no code, so they go
 /// the other way — staged once — because re-uploading them on every install
 /// would make the iterate loop unusable.
+///
+/// The HUB build gives every game its own container root, Documents/games/<target>/,
+/// so two games' android-files/, obb/ and assets never meet; everything inside it
+/// is laid out exactly as a single-game build lays out Documents/. A single-game
+/// build keeps Documents/ itself. The runtime's log stays in Documents/ either
+/// way (kl_app_set_log_dir), where the scripts fetch it.
 enum Paths {
     static var resources: String { Bundle.main.bundlePath }
-    static var container: String {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].path
+    static var documents: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
+    /// The container root a target's data lives under.
+    static func containerURL(for target: String) -> URL {
+        #if KL_HUB
+        return documents.appendingPathComponent("games/\(target)", isDirectory: true)
+        #else
+        return documents
+        #endif
+    }
+    /// The selected (or built-for) target's container root, created on demand.
+    static var container: String {
+        let url = containerURL(for: klTargetName())
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.path
+    }
+}
+
+/// The window's root: the hub's library until a game is picked (KleptonHub.swift),
+/// then the boot window for it. A single-game build goes straight to the boot window.
+struct KleptonRootView: View {
+    #if KL_HUB
+    @State private var picked = HubLaunch.scriptedGame()
+    var body: some View {
+        if picked != nil {
+            BootView()
+        } else {
+            HubLibraryView(onPlay: { target in
+                HubLaunch.select(target)
+                picked = target
+            })
+        }
+    }
+    #else
+    var body: some View { BootView() }
+    #endif
 }
 
 // Coordinates the on-demand keyboard window. It is a separate Scene from BootView
@@ -274,11 +314,13 @@ struct KeyboardEntryView: View {
     }
 }
 
-/// Whether the alyx build must show the Steam content gate before booting.
+/// Whether a single-game build with an in-app download (alyx) must show the Steam
+/// content gate before booting. Never in the hub: its library is the gate, and Play
+/// there already went through it.
 func klSteamGateNeeded() -> Bool {
-    #if canImport(SteamDepot)
-    guard klTargetName() == "alyx" else { return false }
-    let ready = AlyxContent.isReady
+    #if canImport(SteamDepot) && !KL_HUB
+    guard let game = SteamGames.descriptor(for: klTargetName()) else { return false }
+    let ready = game.isReady
     NSLog("[steam] content gate: \(ready ? "content complete, booting" : "content not verified complete, showing gate")")
     return !ready
     #else
@@ -330,7 +372,9 @@ struct BootView: View {
         Group {
             if steamGate {
                 #if canImport(SteamDepot)
-                SteamContentView(onPlay: { steamGate = false })
+                if let game = SteamGames.descriptor(for: klTargetName()) {
+                    SteamContentGate(game: game, onPlay: { steamGate = false })
+                }
                 #endif
             } else if showShell { ShellWindow() } else { bootReport }
         }
@@ -443,8 +487,8 @@ struct BootView: View {
             if isLauncher { LauncherPanel() }
 
             #if canImport(SteamDepot)
-            if klTargetName() == "alyx" {
-                DisclosureGroup("Game files (Steam)") { SteamContentMaintenance() }
+            if let game = SteamGames.descriptor(for: klTargetName()) {
+                DisclosureGroup("Game files (Steam)") { SteamContentMaintenance(game: game) }
                     .font(.callout)
             }
             #endif
@@ -552,8 +596,14 @@ struct BootView: View {
         // futexes, IL2CPP's GC suspends the world — and a blocked main thread
         // is a watchdog kill on this platform, which would present as a crash
         // with no report rather than as the hang it is.
+        // Resolved on the main thread: Paths.container reads the selected target.
+        let container = Paths.container
+        #if KL_HUB
+        // One container per game, one log for the app (where the scripts look).
+        kl_app_set_log_dir(Paths.documents.path)
+        #endif
         Thread.detachNewThread {
-            let rc = kl_app_configure(Paths.resources, Paths.container)
+            let rc = kl_app_configure(Paths.resources, container)
             if rc != 0 {
                 // To the SYSTEM log as well as the window, because this is the
                 // one failure that happens before there is a klepton-boot.log to

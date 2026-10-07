@@ -52,6 +52,8 @@ Quick run scripts:
 ```
 
 Where `[target]` is the name of the target, defaulting to `beatsaber`.
+`./build_run_vpro.sh hub` builds the hub instead: one app with several games and
+an in-app library (see [`visionos/README.md`](visionos/README.md#the-hub-one-app-several-games)).
 
 ## Status
 
