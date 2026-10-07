@@ -77,7 +77,11 @@ on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
 
 - **Frameworks, per game.** Each game's translations go to
   `KleptonHub.app/Frameworks/<game>/` (one Embed phase per game, `dstPath` =
-  the game), so same-named libraries from two games cannot collide. `kl_app.c`
+  the game), so same-named libraries from two games cannot collide. They are
+  referenced as the platform slice's `.framework`, not the `.xcframework`:
+  Xcode flattens every xcframework into one products directory first, and two
+  games' `libphonon` then fail the build ("Multiple commands produce"). Guest
+  framework bundle ids carry the target (`dev.klepton.guest.<target>.<lib>`). `kl_app.c`
   sets `KL_DYLIB_DIR` to `Frameworks/<target>/` when that folder holds the
   target's entry library, else to `Frameworks/` (every single-target build).
   ANGLE and MoltenVK stay in `Frameworks/` for all games (`KL_ANGLE_DIR`,
@@ -103,6 +107,16 @@ on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
   Steam sign-in, adopt/verify, free-space check and completion marker as the
   alyx build. "Update available" compares the markers with Steam's current
   manifests once signed in.
+- **APK games** (descriptor `apk`, e.g. SUPERHOT: depot 617833's `shvr.apk` +
+  `vrpreferences.json` land in `games/superhot/steam/`). Before boot,
+  `Sources/KleptonHubPrep.swift` derives on the headset what `kl_app_configure`
+  reads: `games/superhot/superhot.apk` (a hard link to the downloaded APK, which
+  Unity mounts as a zip), `games/superhot/superhot/assets/` (only the APK's
+  assets/ entries of at most 16 MB, ~24 MB; the bulk stays in the APK) and the
+  `apktool.yml` / `AndroidManifest.xml` beside it, which `gen_xcodeproj.py` bakes
+  into the generated manifest from the Mac's apktool tree (metadata, not game
+  data). Stamped with the APK's size and mtime, so it reruns only after an
+  update. Nothing is staged from the Mac.
 - **Bundle id** `com.example.avpgamehub` (the container with Alyx's 72 GB);
   product `KleptonHub`, display name "Klepton".
 

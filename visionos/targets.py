@@ -752,6 +752,12 @@ TARGETS = {
         # if its data can be downloaded in-app.
         "games":   [
             "alyx",
+            # SUPERHOT VR, the Steam Frame build (app 617830, Android depot
+            # 617833). The headset downloads shvr.apk itself; the hub derives
+            # superhot.apk and superhot/assets from it on device
+            # (Sources/KleptonHubPrep.swift), and apktool.yml / AndroidManifest.xml
+            # ride in the generated manifest (gen_xcodeproj.py) — no staging.
+            "superhot",
         ],
         "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
