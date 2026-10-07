@@ -615,6 +615,7 @@ static void raise_fd_limit(FILE *out) {
                 (unsigned long long)was, (unsigned long long)want);
 }
 
+static void steamaudio_setup(void);
 static void setup_root(void) {
     raise_fd_limit(stderr);
     char tmp[1100], exe_dir[1024];
@@ -646,8 +647,102 @@ static void setup_root(void) {
     int pruned = prune_phantoms(g_wlayer, "");
     if (pruned) fprintf(stderr, "  write layer: pruned %d probe-created path(s) "
                                 "(game/, content/, bin/bin ...) left by earlier runs\n", pruned);
+    steamaudio_setup();
     kl_set_guest_path_hook(content_overlay);
     kl_dl_set_exist_filter(library_location);
+}
+
+// ---- Steam Audio (Half-Life: Alyx's 3D sound) on or off ----
+// KL_GLIBC_STEAMAUDIO=0|1, default 1 (on; 0 is the A/B fallback). In-game audio on the Vision Pro went
+// near-silent after loading a1_intro_world from the menu (the [sdl-au] 5 s
+// peaks fell from ~25000 in the menu to 0-1100 in game), while the same save
+// restored on the Mac plays at 13000-32767; Steam Audio (libsteamaudio ->
+// libphonon: HRTF, baked reverb and pathing) is the in-world path the menu
+// does not use. The engine's switch for it is gameinfo.gi's
+// SoundSystem { "SteamAudioEnabled" "1" }; with "0" libsteamaudio/libphonon
+// are never loaded and every sound plays through the plain panner (measured on
+// the Mac: a1_intro_world peaks 8000-32767, as loud as with it). With
+// KL_GLIBC_STEAMAUDIO=0 the write layer carries a copy of hlvr/gameinfo.gi with that one
+// value flipped — a write-layer FILE shadows the install (content_overlay).
+// The copy is regenerated from the install/content each boot (a game update
+// carries through) and removed again otherwise. On by default: the device
+// silence was not shown to be Steam Audio (the game sat held on its "press to
+// start" screen), so 0 is the A/B, not the default. Side effects
+// with it off: no HRTF/reverb, and the VR options menu logs "Invalid ConVar
+// snd_steamaudio_*" for its three reverb settings.
+#define KL_SA_MARK "// klepton: SoundSystem SteamAudioEnabled forced to 0 (KL_GLIBC_STEAMAUDIO)\n"
+static char *slurp(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = n > 0 ? malloc((size_t)n + 1) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    fclose(f);
+    if (b) { b[n] = 0; *len = (size_t)n; }
+    return b;
+}
+static void steamaudio_setup(void) {
+    static const char rel[] = "/hlvr/gameinfo.gi";
+    char shadow[2048], src[2048];
+    snprintf(shadow, sizeof shadow, "%s%s", g_wlayer, rel);
+    int on = kl_env_on("KL_GLIBC_STEAMAUDIO", 1);
+    // Ours (marked) or nothing: never touch a gameinfo.gi someone put there by hand.
+    size_t sl = 0;
+    char *cur = slurp(shadow, &sl);
+    int ours = cur && !strncmp(cur, KL_SA_MARK, strlen(KL_SA_MARK));
+    if (cur && !ours) {
+        fprintf(stderr, "  [glibc] Steam Audio: %s is not ours — leaving it (KL_GLIBC_STEAMAUDIO ignored)\n", shadow);
+        free(cur);
+        return;
+    }
+    free(cur);
+    if (on) {
+        if (ours) unlink(shadow);
+        fprintf(stderr, "  [glibc] Steam Audio: ON (the game's own gameinfo.gi; KL_GLIBC_STEAMAUDIO=1)\n");
+        return;
+    }
+    // The source: the install's, else the first content root that has it.
+    snprintf(src, sizeof src, "%s%s", g_root, rel);
+    if (access(src, R_OK) != 0) {
+        src[0] = 0;
+        for (int i = 0; i < g_ncontent && !src[0]; i++) {
+            snprintf(src, sizeof src, "%s%s", g_content[i], rel);
+            if (access(src, R_OK) != 0) src[0] = 0;
+        }
+    }
+    if (!src[0]) return;                              // not a Source 2 hlvr tree
+    size_t n = 0;
+    char *gi = slurp(src, &n);
+    if (!gi) return;
+    // The value inside SoundSystem { ... "SteamAudioEnabled" "<v>" } only —
+    // the Hammer block has a key of the same name.
+    char *ss = strstr(gi, "SoundSystem");
+    char *k = ss ? strstr(ss, "\"SteamAudioEnabled\"") : NULL;
+    char *close = ss ? strchr(ss, '}') : NULL;
+    char *v = k && (!close || k < close) ? strchr(k + 19, '"') : NULL;
+    if (!v || v[1] == 0 || v[2] != '"') {
+        fprintf(stderr, "  [glibc] Steam Audio: no SoundSystem/SteamAudioEnabled in %s — left on\n", src);
+        free(gi);
+        return;
+    }
+    v[1] = '0';
+    char tmp[2100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", shadow);
+    char dir[2048];
+    snprintf(dir, sizeof dir, "%s/hlvr", g_wlayer);
+    mkdir_p(dir);
+    FILE *f = fopen(tmp, "wb");
+    int ok = f && fputs(KL_SA_MARK, f) >= 0 && fwrite(gi, 1, n, f) == n;
+    if (f && fclose(f) != 0) ok = 0;
+    if (ok && rename(tmp, shadow) == 0)
+        fprintf(stderr, "  [glibc] Steam Audio: OFF (SteamAudioEnabled 0 via %s; KL_GLIBC_STEAMAUDIO=1 restores it)\n", shadow);
+    else {
+        unlink(tmp);
+        fprintf(stderr, "  [glibc] Steam Audio: could not write %s (%s) — left on\n", shadow, strerror(errno));
+    }
+    free(gi);
 }
 
 // The packaging manifest, written by every --gap run: one line per mapped
