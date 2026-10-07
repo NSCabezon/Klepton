@@ -222,6 +222,171 @@ static void pred_apply(const head_delta *d, float p[3], float q[4]) {
     memcpy(q, rq, sizeof rq);
 }
 
+// ---- the controller pose an OpenVR guest expects: an Oculus Touch's RAW pose ----
+// We present the controllers as Quest 2 Touch (ControllerType oculus_touch,
+// RenderModelName oculus_quest2_controller_*), and Alyx binds its hand to
+// `/user/hand/*/pose/raw` (hlvr/cfg/bindings_touch.json). Under SteamVR's
+// Oculus driver that is the Touch's TRACKED origin — the render model's own
+// origin, the pose the model is drawn around and every title's per-controller
+// hand offset is measured from. It is NOT the grip.
+//
+// What the frontend publishes (kl_ovrp_hand_motion) is neither: it is Apple's
+// `.grip` for the PSVR2 Sense, turned into the hilt frame Beat Saber was tuned
+// against (KleptonControllers.swift, KLSenseTune):
+//
+//     P = G · T(KL_SENSE_POS) · Rx(5.037 PSVR2 tilt + KL_SENSE_PITCH -37)
+//
+// The OpenXR path turns P back into an OpenXR grip with Rx(+37)
+// (KL_XR_GRIP_PITCH, confirmed by eye against the Quest 2 model SteamVR itself
+// draws through Steam Link), and the render model states the Touch's tracked
+// origin in that grip's frame (tools/rendermodel_frames.py on
+// oculus_quest2_controller_*.json, the same numbers kl_ovrp's
+// KLOVRP_TOUCH_TRACKED_* carry): 9.6 cm forward along the grip's -Z, 3.4 cm
+// down its -Y, 0.7 cm out, and pitched 20.6 degrees nose-down. So
+//
+//     raw = P · Rx(+37) · [T(HAND_POS) · R(HAND_ROT)] · T(0.007, -0.0342, -0.0961) · Rx(-20.6)
+//
+// Handing P over as the raw pose (what this bridge did) puts the Touch's origin
+// at the grip — about 10 cm back down the handle, which on a held controller
+// is mostly straight DOWN — and 16.4 degrees nose-down of where it should be,
+// and every hand a title hangs off that origin inherits both.
+//
+// KL_OPENVR_HAND_POS="x,y,z" (metres) and KL_OPENVR_HAND_ROT="x,y,z" (degrees,
+// X then Y then Z) tune it in the GRIP's frame — +X right, +Y up, -Z along the
+// handle through the fist — so a rotation turns the hand about the palm rather
+// than swinging it on an arc about the controller's ring. `_L`/`_R` per hand;
+// the shared form mirrors X (and yaw/roll) for the left hand, as KL_SENSE_POS
+// does. KL_OPENVR_TOUCH_FRAME=0 hands the published pose over unchanged (the
+// old behaviour, the A/B). OVRPlugin and OpenXR guests never come through here.
+#define KLOVR_HILT_UNDO_DEG   37.0f       // = -KLSenseTune.hiltPitch's default
+#define KLOVR_TOUCH_X         0.007000f   // tracked origin in the Touch's OpenXR grip
+#define KLOVR_TOUCH_Y        (-0.034157f)
+#define KLOVR_TOUCH_Z        (-0.096073f)
+#define KLOVR_TOUCH_PITCH_DEG (-20.60f)
+
+static void quat_euler_xyz(const float deg[3], float q[4]) {  // Rx * Ry * Rz
+    float h[3], s[3], c[3];
+    for (int i = 0; i < 3; i++) { h[i] = deg[i] * 0.5f * 3.14159265358979f / 180.0f; s[i] = sinf(h[i]); c[i] = cosf(h[i]); }
+    float qx[4] = { s[0], 0, 0, c[0] }, qy[4] = { 0, s[1], 0, c[1] }, qz[4] = { 0, 0, s[2], c[2] }, t[4];
+    quat_mul(qx, qy, t);
+    quat_mul(t, qz, q);
+}
+// "x,y,z" from <base>_L / <base>_R, else <base> (X term mirrored for the left
+// hand when `mirror_x`, the Y/Z terms too for a rotation via `mirror_yz`).
+static int hand_triple(const char *base, int hand, int mirror_yz, float v[3]) {
+    char k[64];
+    snprintf(k, sizeof k, "%s_%c", base, hand ? 'R' : 'L');
+    const char *e = getenv(k);
+    int shared = 0;
+    if (!e || !*e) { e = getenv(base); shared = 1; }
+    if (!e || !*e) return 0;
+    if (sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) != 3) {
+        fprintf(stderr, "  [openvr] %s=%s is not three comma-separated numbers — ignored\n",
+                shared ? base : k, e);
+        return 0;
+    }
+    if (shared && hand == 0) {
+        if (mirror_yz) { v[1] = -v[1]; v[2] = -v[2]; } else v[0] = -v[0];
+    }
+    fprintf(stderr, "  [openvr] %s: hand %d %.3f %.3f %.3f\n", shared ? base : k, hand,
+            (double)v[0], (double)v[1], (double)v[2]);
+    return 1;
+}
+
+typedef struct { int on; float pre[4], off[3], post[4]; } touch_frame;
+static const touch_frame *touch_frame_for(int hand) {
+    static touch_frame tf[2];
+    static int init;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (!init) {
+        int on = kl_env_on("KL_OPENVR_TOUCH_FRAME", 1);
+        for (int h = 0; h < 2; h++) {
+            touch_frame *t = &tf[h];
+            t->on = on;
+            float mx = h == 0 ? -1.0f : 1.0f;
+            // pre = Rx(+37) * R(HAND_ROT); the HAND_POS offset is applied in
+            // the grip frame after Rx(+37) and before HAND_ROT, so a rotation
+            // turns about the (moved) palm.
+            float undo[3] = { KLOVR_HILT_UNDO_DEG, 0, 0 }, qu[4], rot[3] = { 0, 0, 0 }, qr[4];
+            quat_euler_xyz(undo, qu);
+            hand_triple("KL_OPENVR_HAND_ROT", h, 1, rot);
+            quat_euler_xyz(rot, qr);
+            quat_mul(qu, qr, t->pre);
+            float pos[3] = { 0, 0, 0 }, tr[3] = { mx * KLOVR_TOUCH_X, KLOVR_TOUCH_Y, KLOVR_TOUCH_Z };
+            hand_triple("KL_OPENVR_HAND_POS", h, 0, pos);
+            // offset from P's origin, in P's frame:
+            //   Rx(37)·pos + Rx(37)·R(rot)·tracked
+            float a[3], b[3];
+            quat_rotate(qu, pos, a);
+            quat_rotate(t->pre, tr, b);
+            for (int i = 0; i < 3; i++) t->off[i] = a[i] + b[i];
+            float pitch[3] = { KLOVR_TOUCH_PITCH_DEG, 0, 0 }, qp[4];
+            quat_euler_xyz(pitch, qp);
+            quat_mul(t->pre, qp, t->post);           // P-relative orientation of raw
+        }
+        fprintf(stderr, "  [openvr] controller pose: %s (KL_OPENVR_TOUCH_FRAME); right hand raw = P + "
+                        "(%.4f, %.4f, %.4f) m in P's frame, turned (%.4f, %.4f, %.4f, %.4f)\n",
+                on ? "Oculus Touch raw (tracked origin) from the published hilt" : "published pose unchanged",
+                (double)tf[1].off[0], (double)tf[1].off[1], (double)tf[1].off[2],
+                (double)tf[1].post[0], (double)tf[1].post[1], (double)tf[1].post[2], (double)tf[1].post[3]);
+        init = 1;
+    }
+    pthread_mutex_unlock(&mu);
+    return &tf[hand ? 1 : 0];
+}
+
+// KL_OPENVR_FAKE_HAND="x,y,z[,pitch,yaw,roll]" — diagnostic, host runs: place
+// each hand's APPLE GRIP (G, where the real hand holds the Sense) at a fixed
+// head-relative spot and orientation (right hand as given, left mirrored in
+// X), and build the published pose from it with the frontend's default Sense
+// tune — so a Mac run shows where the guest draws a hand relative to a known
+// grip, the same chain the device runs.
+static int fake_hand(int hand, float p[3], float q[4]) {
+    static int n = -1;
+    static float v[6];
+    if (n < 0) {
+        const char *e = getenv("KL_OPENVR_FAKE_HAND");
+        n = e ? sscanf(e, "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) : 0;
+        if (n < 3) n = 0;
+        if (n) fprintf(stderr, "  [openvr] KL_OPENVR_FAKE_HAND: grip at head + (%.3f, %.3f, %.3f), "
+                               "euler %.1f %.1f %.1f\n", (double)v[0], (double)v[1], (double)v[2],
+                       (double)v[3], (double)v[4], (double)v[5]);
+    }
+    if (!n) return 0;
+    float hp[3], hq[4];
+    kl_ovrp_get_guest_head_pose(&hp[0], &hp[1], &hp[2], &hq[0], &hq[1], &hq[2], &hq[3]);
+    float mx = hand == 0 ? -1.0f : 1.0f;
+    float off[3] = { mx * v[0], v[1], v[2] }, w[3];
+    float e[3] = { v[3], mx * v[4], mx * v[5] }, gq[4], g[4];
+    quat_rotate(hq, off, w);
+    quat_euler_xyz(e, gq);
+    quat_mul(hq, gq, g);
+    // ...and KLSenseTune's defaults: T(-0.005 mirrored, 0.02, -0.02) in G's
+    // frame, then Rx(5.037 - 37).
+    float s[3] = { mx * -0.005f, 0.02f, -0.02f }, sw[3], tilt[3] = { 5.037f - 37.0f, 0, 0 }, tq[4];
+    quat_rotate(g, s, sw);
+    quat_euler_xyz(tilt, tq);
+    quat_mul(g, tq, q);
+    for (int i = 0; i < 3; i++) p[i] = hp[i] + w[i] + sw[i];
+    return 1;
+}
+
+static void openvr_hand_pose(int hand, float p[3], float q[4], float v[3], float a[3]) {
+    const touch_frame *t = touch_frame_for(hand);
+    if (!t->on) return;
+    float d[3], r[4];
+    quat_rotate(q, t->off, d);
+    quat_mul(q, t->post, r);
+    for (int i = 0; i < 3; i++) p[i] += d[i];
+    memcpy(q, r, sizeof r);
+    // A point carried rigidly at offset d moves at v + w x d (velocity and
+    // angular velocity are both in tracking space).
+    v[0] += a[1] * d[2] - a[2] * d[1];
+    v[1] += a[2] * d[0] - a[0] * d[2];
+    v[2] += a[0] * d[1] - a[1] * d[0];
+}
+
 // Device pose in the guest's tracking universe. Seated is the standing frame
 // lowered by the eye height kl_ovrp's floor origin adds. The HMD is the
 // frame's predicted head (above).
@@ -235,8 +400,11 @@ static void device_pose(int dev, TrackedDevicePose_t *o) {
         head_delta d = pred_get();
         pred_apply(&d, p, q);
     } else if (dev == DEV_LEFT || dev == DEV_RIGHT) {
-        known = kl_ovrp_hand_motion(dev == DEV_LEFT ? 0 : 1, p, q, v, a);
+        int hand = dev == DEV_LEFT ? 0 : 1;
+        known = kl_ovrp_hand_motion(hand, p, q, v, a);
         known = 1;                        // the parked default still tracks the head
+        fake_hand(hand, p, q);
+        openvr_hand_pose(hand, p, q, v, a);
     } else {
         return;
     }
@@ -350,12 +518,33 @@ static void eye_size(uint32_t *w, uint32_t *h) {
 static void sys_rt_size(void *s, uint32_t *w, uint32_t *h) { (void)s; eye_size(w, h); }
 // The frustum the game is told to render — the display's, widened by the
 // overscan. Every path that states a frustum reads it here.
+// ---- the magenta band: offer each eye a horizontally SYMMETRIC frustum ----------
+// Alyx renders both eyes into one two-layer image with a symmetric projection
+// whatever it is offered (offered l=1.94/r=1.12 on the canted Vision Pro eye
+// with the 0.12 overscan, rendered l=r=1.94: "rendered with tangents" in the
+// log). With an asymmetric offer AND the overscan, it then leaves part of the
+// RIGHT eye's temporal side unrendered — on the Mac with KL_OVRP_EYE_TAN=vision
+// everything past tangent ~1.25 of a display that reaches 1.94 — and that is
+// the render target's clear colour, MAGENTA, inside the frame the compositor
+// shows. It is plainest on a loading screen: Alyx calls SuspendRendering(1)
+// and stops submitting, so the compositor reprojects that one stale frame for
+// as long as the load takes and every head turn swings the band, then the
+// black past the frame's edge, into view. Without the overscan the same offer
+// renders whole (the band arrived with KL_OPENVR_OVERSCAN), and offering the
+// symmetric frustum it renders anyway renders whole WITH it — same image size,
+// same pixels Alyx was already allocating; the compositor places the picture
+// by the tangents it was rendered with (Submit adopts them), so nothing else
+// changes. KL_OPENVR_SYM_PROJ=0 offers the display's own asymmetric frustum.
 static void eye_tangents(int eye, float t[4]) {      // left, right, top, bottom; positive
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_eye_view(eye, &px, &py, &pz, &qx, &qy, &qz, &qw, t);
     if (t[0] <= 0 || t[1] <= 0 || t[2] <= 0 || t[3] <= 0) t[0] = t[1] = t[2] = t[3] = 1.0f;
     float k = 1.0f + overscan();
     for (int i = 0; i < 4; i++) t[i] *= k;
+    // Symmetric horizontally: see "the magenta band" below.
+    static int sym = -1;
+    if (sym < 0) sym = kl_env_on("KL_OPENVR_SYM_PROJ", 1);
+    if (sym) { float m = fmaxf(t[0], t[1]); t[0] = t[1] = m; }
 }
 static void sys_proj_raw(void *s, int eye, float *l, float *r, float *t, float *b) {
     (void)s;

@@ -5,6 +5,7 @@
 // string, so it builds for the host and the device out of the same source list
 // and can be reasoned about (and, on the host, run) without a headset.
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -359,6 +360,14 @@ static const char kl_msl_reproject[] =
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
 "    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+// Pure magenta is a render target's CLEAR colour, never a picture: Source 2
+// clears to it, and any of its pixels that reach here are a region the guest
+// did not draw (Alyx's unrendered band — kl_openvr.c, "the magenta band").
+// Shown as black, the same as the outside of the frame, so a band the guest
+// leaves can never read as a pink stripe. KL_CP_MAGENTA_KEY=0 shows it as is.
+"#if KL_MAGENTA_KEY\n"
+"    if (c.r > 0.98 && c.g < 0.02 && c.b > 0.98) c = float4(0.0, 0.0, 0.0, 1.0);\n"
+"#endif\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
@@ -582,7 +591,21 @@ static const char kl_msl_equirect[] =
 
 const char *kl_reproject_equirect_msl(void) { return kl_msl_equirect; }
 
-const char *kl_reproject_msl(void)      { return kl_msl_reproject; }
+// The reprojection source with its one build-time switch in front of it
+// (KL_CP_MAGENTA_KEY, read once: the pipeline is compiled once per run).
+static char *g_msl_reproject;
+static void kl_reproject_msl_build(void) {
+    size_t n = strlen(kl_msl_reproject) + 64;
+    char *s = malloc(n);
+    if (!s) return;
+    snprintf(s, n, "#define KL_MAGENTA_KEY %d\n%s", kl_env_on("KL_CP_MAGENTA_KEY", 1), kl_msl_reproject);
+    g_msl_reproject = s;
+}
+const char *kl_reproject_msl(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, kl_reproject_msl_build);
+    return g_msl_reproject ? g_msl_reproject : kl_msl_reproject;
+}
 const char *kl_reproject_blit_msl(void) { return kl_msl_blit; }
 const char *kl_reproject_overlay_msl(void) { return kl_msl_overlay; }
 
