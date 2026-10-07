@@ -93,6 +93,70 @@ void kl_view_pace_wait(void) {
 #define KL_VIEW_HAVE_SDL 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
+
+// ---- KL_VIEW_HEAD_OSC: a scripted head turn, with a neck --------------------
+// "amp_deg,period_s[,up_m,fwd_m]": the head yaws sinusoidally about its start
+// direction, and turns about a NECK PIVOT the given distance below and behind
+// the eye midpoint (default 0.10 m up, 0.08 m forward — the eyes ride a lever,
+// as a real head's do, which is the translation a rotation-only reprojection
+// cannot correct). A pure function of time, so it can also answer "where is
+// the head at instant t" exactly — KL_VIEW_HEAD_AT=1 installs it as the
+// tracker's timestamped query (kl_ovrp_set_head_at), the way the visionOS
+// compositor installs queryDeviceAnchor(atTimestamp:): CACurrentMediaTime
+// seconds (CLOCK_UPTIME_RAW) in, a refusal for an instant more than 100 ms
+// ahead or 1 s behind, as the tracker refuses. With both, a Mac run exercises
+// the head prediction exactly as the device does; KL_VIEW_SWIM=1 measures it.
+static struct { int on; float amp, period, up, fwd, yaw0, pitch0, p0[3]; double t0; } g_osc;
+static double view_uptime(void) {
+    struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static void view_yp_quat(float yaw, float pitch, float q[4]) {
+    float sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f);
+    float syw = sinf(yaw * 0.5f), cyw = cosf(yaw * 0.5f);
+    q[0] = cyw * sp; q[1] = cp * syw; q[2] = -syw * sp; q[3] = cyw * cp;
+}
+static void view_qrot(const float q[4], const float v[3], float o[3]) {
+    float tx = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+    float ty = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+    float tz = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+    o[0] = v[0] + q[3] * tx + (q[1] * tz - q[2] * ty);
+    o[1] = v[1] + q[3] * ty + (q[2] * tx - q[0] * tz);
+    o[2] = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
+}
+static void view_osc_pose(double t, float p[3], float q[4], float *yaw_out) {
+    float yaw = g_osc.yaw0 + g_osc.amp * sinf((float)(2.0 * M_PI * (t - g_osc.t0) / g_osc.period));
+    view_yp_quat(yaw, g_osc.pitch0, q);
+    float q0[4], arm[3] = { 0, g_osc.up, -g_osc.fwd }, a0[3], a[3];
+    view_yp_quat(g_osc.yaw0, g_osc.pitch0, q0);
+    view_qrot(q0, arm, a0);
+    view_qrot(q, arm, a);
+    for (int i = 0; i < 3; i++) p[i] = g_osc.p0[i] - a0[i] + a[i];
+    if (yaw_out) *yaw_out = yaw;
+}
+static int view_osc_head_at(double t, float *pose7) {
+    double now = view_uptime();
+    if (!g_osc.on || !pose7 || t > now + 0.1 || t < now - 1.0) return 0;
+    float p[3], q[4];
+    view_osc_pose(t, p, q, NULL);
+    pose7[0] = q[0]; pose7[1] = q[1]; pose7[2] = q[2]; pose7[3] = q[3];
+    pose7[4] = p[0]; pose7[5] = p[1]; pose7[6] = p[2];
+    return 1;
+}
+static void view_osc_init(float px, float py, float pz, float yaw, float pitch) {
+    const char *e = getenv("KL_VIEW_HEAD_OSC");
+    float v[4] = { 0, 0, 0.10f, 0.08f };
+    if (!e || sscanf(e, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) < 2 || !(v[1] > 0)) return;
+    g_osc.on = 1;
+    g_osc.amp = v[0] * (float)M_PI / 180.0f; g_osc.period = v[1]; g_osc.up = v[2]; g_osc.fwd = v[3];
+    g_osc.yaw0 = yaw; g_osc.pitch0 = pitch;
+    g_osc.p0[0] = px; g_osc.p0[1] = py; g_osc.p0[2] = pz;
+    g_osc.t0 = view_uptime();
+    fprintf(stderr, "view: KL_VIEW_HEAD_OSC yaw +-%.1f deg every %.2f s about a neck %.2f m down, "
+                    "%.2f m back%s\n", (double)v[0], (double)v[1], (double)v[2], (double)v[3],
+            kl_env_on("KL_VIEW_HEAD_AT", 0) ? "; installed as the tracker's timestamped query" : "");
+    if (kl_env_on("KL_VIEW_HEAD_AT", 0)) kl_ovrp_set_head_at(view_osc_head_at);
+}
 #endif
 
 // ---- axis and control conventions -------------------------------------------
@@ -458,6 +522,7 @@ int kl_view_main(const char *libdir, int hw) {
         const char *pa = getenv("KL_VIEW_PITCH_AT");
         if (pa && sscanf(pa, "%f:%f", &pitch_at_s, &pitch_at_deg) != 2) pitch_at_s = -1;
     }
+    view_osc_init(px, py, pz, yaw, pitch);
     uint64_t view_t0 = SDL_GetTicks();
     int mouselook = 0;
     int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
@@ -690,6 +755,12 @@ int kl_view_main(const char *libdir, int hw) {
         // the read side tolerates a torn read (kl_ovrp.c says why), and a
         // constant rewrite keeps the frames honest.
         float hqx, hqy, hqz, hqw;
+        if (g_osc.on) {                 // the scripted turn owns the head
+            float op[3], oq[4];
+            view_osc_pose(view_uptime(), op, oq, &yaw);
+            pitch = g_osc.pitch0;
+            px = op[0]; py = op[1]; pz = op[2];
+        }
         {
             float sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f);
             float syw = sinf(yaw * 0.5f), cyw = cosf(yaw * 0.5f);
@@ -746,6 +817,24 @@ int kl_view_main(const char *libdir, int hw) {
             // is the check that the bits, not the pointer, were the problem.
             uint32_t rb = 0, lb = 0;   // right/left RAW button bits
             float ridx = mouse_l ? 1.0f : 0.0f, rgrip = mouse_r ? 1.0f : 0.0f;
+            // KL_VIEW_TRIGGER_AT="<secs>[,<secs>...]": hold the right trigger for
+            // 0.4 s at each of those times — a scripted run's way past a
+            // "press the trigger to continue" gate with no hand on the mouse.
+            {
+                static float at[8]; static int nat = -1;
+                if (nat < 0) {
+                    nat = 0;
+                    const char *e = getenv("KL_VIEW_TRIGGER_AT");
+                    while (e && *e && nat < 8) {
+                        char *end; float v = strtof(e, &end);
+                        if (end == e) break;
+                        at[nat++] = v;
+                        e = *end == ',' ? end + 1 : end;
+                    }
+                }
+                float ts = (float)(t_now - view_t0) / 1000.0f;
+                for (int i = 0; i < nat; i++) if (ts >= at[i] && ts < at[i] + 0.4f) ridx = 1.0f;
+            }
             float lidx = keys[SDL_SCANCODE_G] ? 1.0f : 0.0f;
             float lgrip = keys[SDL_SCANCODE_H] ? 1.0f : 0.0f;
             float sx = 0, sy2 = 0;

@@ -114,9 +114,11 @@ void kl_ovrp_set_frame_pacer(void (*wait)(void));
 // then, and only the frontend can predict — the platform's tracker does it,
 // and nothing here can.
 //
-// `time_s` is CLOCK_MONOTONIC seconds, which on this platform is the clock
-// CACurrentMediaTime answers from, so the frontend can pass it straight to a
-// timestamped query. `pose7` is {qx,qy,qz,qw,px,py,pz}. Return 0 for "no
+// `time_s` handed to the provider is CACurrentMediaTime seconds
+// (CLOCK_UPTIME_RAW), so the frontend can pass it straight to a timestamped
+// query. Callers of kl_ovrp_head_predict_delta below pass CLOCK_MONOTONIC and
+// it re-bases: the two are NOT one clock on Darwin (CLOCK_MONOTONIC counts
+// sleep), which is why the prediction never ran on device before. `pose7` is {qx,qy,qz,qw,px,py,pz}. Return 0 for "no
 // answer" — a tracker refuses an instant too far ahead, and refusing is the
 // correct answer rather than a reason to invent one.
 typedef int (*kl_ovrp_head_at_fn)(double time_s, float *pose7);
@@ -129,6 +131,11 @@ void kl_ovrp_set_head_at(kl_ovrp_head_at_fn fn);
 // A delta rather than the pose itself so a caller keeps whatever it had
 // composed — eye offsets, cant, a base space — instead of rebuilding it.
 int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3);
+
+// The frontend's prediction lead for the head it publishes, seconds (its
+// presentation time minus the moment it asked the tracker), smoothed; 0 when
+// the frontend dates no poses (the macOS viewer).
+double kl_ovrp_head_lead_s(void);
 
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
@@ -682,6 +689,11 @@ int kl_ovrp_multiview(void);
 void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
                       float *qx, float *qy, float *qz, float *qw,
                       float tangents[4]);
+
+// The eye's pose in HEAD space (metres; quaternion x, y, z, w): the same offset
+// and cant kl_ovrp_eye_view applies, as a constant rather than as a difference
+// of two head reads. What OpenVR's GetEyeToHeadTransform answers.
+void kl_ovrp_eye_local(int eye, float p[3], float q[4]);
 
 // The head pose as the GUEST sees it — pinned for the duration of its frame by
 // kl_ovrp_frame_latch, and therefore NOT the same thing as
