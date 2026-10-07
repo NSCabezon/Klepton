@@ -1,19 +1,27 @@
-// Half-Life: Alyx content from Steam, on the headset (alyx target only).
+// Game content from Steam, on the headset.
 //
-// The game's ~72 GB of content (depot 546561) used to be copied Mac -> headset
-// with devicectl (stage_alyx.sh). This gate lets the app fetch it itself, from
-// the player's own Steam account (ownership is proved by Steam: no depot key
-// without a licence), through the SteamDepot package (../../../SteamDepot).
+// Half-Life: Alyx's ~72 GB of content (depot 546561) used to be copied Mac ->
+// headset with devicectl (stage_alyx.sh). This gate lets the app fetch a game's
+// data itself, from the player's own Steam account (ownership is proved by Steam:
+// no depot key without a licence), through the SteamDepot package
+// (../../../SteamDepot).
 //
-// Shape: before the boot window does anything, the alyx build checks — offline,
-// stat only — whether the content is COMPLETE: a completion marker written by
-// SteamDepot after a successful download/verify, and every file of the last
-// manifest present at its exact size. If so, the window is the boot window as
-// always. If not, this view takes the window: Steam QR login, then verify /
-// adopt whatever is already there (e.g. a partial devicectl copy, which has no
-// SteamDepot resume state — every chunk is checked by SHA-1 and kept if it
-// matches), then download only what is missing. Play enters the existing boot
-// path. Compiled only where the SteamDepot module is linked (the alyx target).
+// What a game needs is a DESCRIPTOR (SteamGameDescriptor, registry in
+// SteamGames below): the Steam app id, the depots (or an OS filter to discover
+// them), a file filter, where the depot root lands, and what counts as
+// installed (SteamDepot's completion marker for every depot, plus every file of
+// the last manifest present at its exact size). Half-Life: Alyx's descriptor is
+// today's behaviour exactly.
+//
+// Shape (single-game alyx build): before the boot window does anything, the
+// build checks — offline, stat only — whether the content is COMPLETE. If so, the
+// window is the boot window as always. If not, this view takes the window: Steam
+// sign-in, then verify / adopt whatever is already there (e.g. a partial devicectl
+// copy, which has no SteamDepot resume state — every chunk is checked by SHA-1
+// and kept if it matches), then download only what is missing. Play enters the
+// existing boot path. In the HUB build (KleptonHub.swift) the same model and
+// view run per game from the library instead. Compiled only where the SteamDepot
+// module is linked (the alyx and hub builds).
 #if canImport(SteamDepot)
 import SwiftUI
 import UIKit
@@ -21,22 +29,116 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import SteamDepot
 
-enum AlyxContent {
-    static let app: UInt32 = 546560
-    static let depot: UInt32 = 546561
+/// Everything the in-app download needs to know about one game.
+struct SteamGameDescriptor: Sendable {
+    /// The Klepton target (visionos/targets.py row).
+    let target: String
+    let title: String
+    let appID: UInt32
+    /// Depots to download, in order. Empty = discover them from Steam: every depot
+    /// of the app whose `oslist` contains `osFilter` (remembered once found).
+    let depots: [UInt32]
+    let osFilter: String?
+    let branch: String
+    /// Where the depot root lands, relative to the game's container
+    /// (Paths.containerURL(for:)). Depot paths are relative to this root.
+    let dataSubpath: String
+    /// The same data's location before the hub existed, relative to Documents/.
+    /// The hub adopts it with a rename (HubStorage); nil = nothing to adopt.
+    let legacyDataSubpath: String?
+    /// Depot-relative path filter (true = download the file).
+    let include: @Sendable (String) -> Bool
+    /// Depot-relative files whose presence means "a (maybe partial) copy is here".
+    let presenceProbes: [String]
+    /// Roughly what the filtered depots occupy, for the free-space hint and text.
+    let approxBytes: UInt64
+    /// UserDefaults key: "verify every file on the next launch".
+    let verifyNextLaunchKey: String
+    var maxConcurrentDownloads = 12
+    var verifyConcurrency = 4
 
-    /// <Documents>/android-files/alyx — the depot's own paths start with "game/",
-    /// so the content lands in android-files/alyx/game exactly where kl_app.c
-    /// (stage_files "alyx") makes the game root.
-    static var root: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("android-files/alyx", isDirectory: true)
+    /// <container>/<dataSubpath>.
+    var root: URL { Paths.containerURL(for: target).appendingPathComponent(dataSubpath, isDirectory: true) }
+
+    /// The Steam store header image (the library's cover art).
+    var headerImageURL: URL { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(appID)/header.jpg")! }
+
+    private var depotsKey: String { "kl.steam.depots.\(target)" }
+    /// The depots this game is made of: the descriptor's, or the ones discovered and
+    /// remembered by a previous download. Empty = not known yet (never downloaded).
+    var knownDepots: [UInt32] {
+        if !depots.isEmpty { return depots }
+        return (UserDefaults.standard.array(forKey: depotsKey) as? [Int] ?? []).map(UInt32.init)
     }
+    func rememberDepots(_ ids: [UInt32]) { UserDefaults.standard.set(ids.map(Int.init), forKey: depotsKey) }
+
+    /// Offline (stat only): completion markers and file sizes for every known depot.
+    func status() -> GameContentStatus {
+        let ids = knownDepots
+        var st = GameContentStatus()
+        st.depotCount = ids.count
+        for id in ids {
+            let l = SteamDepotDownloader.localStatus(directory: root, depot: id)
+            st.markers[id] = l.markerManifestID
+            st.totalFiles += l.totalFiles; st.presentFiles += l.presentFiles
+            st.totalBytes += l.totalBytes; st.presentBytes += l.presentBytes
+            if !l.isComplete { st.allDepotsComplete = false }
+        }
+        if ids.isEmpty { st.allDepotsComplete = false }
+        return st
+    }
+
+    /// Strict: every depot's marker + every listed file at the right size, and no
+    /// verify scheduled. Anything else goes through the download gate.
+    var isReady: Bool { status().isComplete && !UserDefaults.standard.bool(forKey: verifyNextLaunchKey) }
+
+    /// Content that looks like a (possibly partial) copy — offered "Play anyway".
+    var looksPresent: Bool {
+        !presenceProbes.isEmpty && presenceProbes.allSatisfy {
+            FileManager.default.fileExists(atPath: root.appendingPathComponent($0).path)
+        }
+    }
+
+    /// Only one depot-wide test hook: KL_STEAM_FILTER=prefix[,prefix…] limits the download (sim tests).
+    static var debugFilters: [String] {
+        (ProcessInfo.processInfo.environment["KL_STEAM_FILTER"] ?? "")
+            .split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+}
+
+/// What is installed for a game, over all its depots (offline).
+struct GameContentStatus {
+    var depotCount = 0
+    var allDepotsComplete = true
+    var markers: [UInt32: UInt64?] = [:]
+    var totalFiles = 0, presentFiles = 0
+    var totalBytes: UInt64 = 0, presentBytes: UInt64 = 0
+    var isComplete: Bool { depotCount > 0 && allDepotsComplete }
+}
+
+/// The games that can be downloaded in-app, by Klepton target.
+enum SteamGames {
+    /// Half-Life: Alyx — the linuxsteamrtarm64 build's CONTENT depot. The code is in
+    /// the bundle (translated frameworks), so only data is fetched.
+    static let alyx = SteamGameDescriptor(
+        target: "alyx", title: "Half-Life: Alyx", appID: 546560,
+        depots: [546561], osFilter: nil, branch: "public",
+        /// <container>/android-files/alyx — the depot's own paths start with "game/",
+        /// so the content lands in android-files/alyx/game exactly where kl_app.c
+        /// (stage_files "alyx") makes the game root.
+        dataSubpath: "android-files/alyx",
+        legacyDataSubpath: "android-files/alyx",
+        include: { alyxInclude($0) },
+        presenceProbes: ["game/hlvr/gameinfo.gi", "game/core/pak01_dir.vpk"],
+        approxBytes: 70_000_000_000,
+        // The key the single-game build has always used, so a scheduled verify carries over.
+        verifyNextLaunchKey: "kl.steam.verifyNextLaunch",
+        maxConcurrentDownloads: 16, verifyConcurrency: 6)
 
     /// The same exclusions as visionos/stage_alyx.sh (default, without --include-extras):
     /// code (bundle frameworks), other-platform dirs, binaries/debug files, host junk,
     /// editor tools, workshop sample maps. `path` is depot-relative ("game/hlvr/…").
-    static func include(_ path: String) -> Bool {
+    static func alyxInclude(_ path: String) -> Bool {
         let p = path.lowercased()
         guard p.hasPrefix("game/") else { return false }
         let rel = String(p.dropFirst(5))
@@ -52,25 +154,12 @@ enum AlyxContent {
         return true
     }
 
-    static func status() -> LocalContentStatus { SteamDepotDownloader.localStatus(directory: root, depot: depot) }
+    /// One line per downloadable game.
+    static let all: [String: SteamGameDescriptor] = [
+        "alyx": alyx,
+    ]
 
-    /// Strict: marker + every listed file at the right size. Anything else goes through the gate.
-    static var isReady: Bool { status().isComplete && !UserDefaults.standard.bool(forKey: verifyNextLaunchKey) }
-
-    /// Content that looks like a (possibly partial) copy — offered "Play anyway".
-    static var looksPresent: Bool {
-        let g = root.appendingPathComponent("game")
-        return FileManager.default.fileExists(atPath: g.appendingPathComponent("hlvr/gameinfo.gi").path)
-            && FileManager.default.fileExists(atPath: g.appendingPathComponent("core/pak01_dir.vpk").path)
-    }
-
-    static let verifyNextLaunchKey = "kl.steam.verifyNextLaunch"
-
-    /// Only one depot-wide test hook: KL_STEAM_FILTER=prefix[,prefix…] limits the download (sim tests).
-    static var debugFilters: [String] {
-        (ProcessInfo.processInfo.environment["KL_STEAM_FILTER"] ?? "")
-            .split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
+    static func descriptor(for target: String) -> SteamGameDescriptor? { all[target] }
 }
 
 @MainActor
@@ -96,7 +185,11 @@ final class SteamContentModel: ObservableObject {
     @Published var stage: Stage = .idle
     @Published var progress = DownloadProgress()
     @Published var account: String?
-    @Published var local = AlyxContent.status()
+    @Published var local: GameContentStatus
+    /// Which of several depots is downloading (1-based) — 0 when only one.
+    @Published var depotIndex = 0
+    @Published var depotCount = 0
+    let game: SteamGameDescriptor
     @Published var freeBytes: UInt64?
     @Published var speed: Double = 0          // uncompressed bytes/s, smoothed
     @Published var networkSpeed: Double = 0
@@ -110,9 +203,24 @@ final class SteamContentModel: ObservableObject {
     private let store = KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam")
     var interruptedByBackground = false
 
-    init() {
+    init(game: SteamGameDescriptor) {
+        self.game = game
+        local = game.status()
         account = (try? store.load())?.accountName
         refreshLocal()
+    }
+
+    /// Fraction of the game's bytes on disk while downloading/verifying, for the
+    /// library's "Downloading x%" — nil when nothing is running.
+    var activeFraction: Double? {
+        guard isBusy else { return nil }
+        let p = progress
+        switch p.phase {
+        case .verifying: return p.verifyBytesTotal > 0 ? Double(p.verifyBytesDone) / Double(p.verifyBytesTotal) : 0
+        case .downloading, .finished:
+            return p.depotBytes > 0 ? Double(p.depotBytes - p.bytesToDownload + p.bytesDownloaded) / Double(p.depotBytes) : 0
+        case .preparing: return 0
+        }
     }
 
     var isBusy: Bool {
@@ -120,8 +228,8 @@ final class SteamContentModel: ObservableObject {
     }
 
     func refreshLocal() {
-        local = AlyxContent.status()
-        let root = AlyxContent.root
+        local = game.status()
+        let root = game.root
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         if let v = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage { freeBytes = UInt64(v) }
@@ -130,7 +238,7 @@ final class SteamContentModel: ObservableObject {
     /// Main button: use the saved sign-in if there is one, otherwise show the sign-in form.
     func start(forceVerify: Bool = false) {
         self.forceVerify = forceVerify
-        UserDefaults.standard.set(false, forKey: AlyxContent.verifyNextLaunchKey)
+        UserDefaults.standard.set(false, forKey: game.verifyNextLaunchKey)
         launch(.saved)
     }
 
@@ -264,16 +372,38 @@ final class SteamContentModel: ObservableObject {
             account = creds.accountName
             stage = .working
             let downloader = SteamDepotDownloader(session: session, log: { NSLog("[steam] %@", $0) })
-            let opts = DepotDownloadOptions(appID: AlyxContent.app, depotID: AlyxContent.depot, branch: "public",
-                                            directory: AlyxContent.root, filters: AlyxContent.debugFilters,
-                                            include: { AlyxContent.include($0) },
-                                            maxConcurrentDownloads: 16, verifyConcurrency: 6,
-                                            forceVerify: forceVerify)
-            let summary = try await downloader.download(opts) { p in
-                Task { @MainActor in self.update(p) }
+            let game = self.game
+            var depots = game.depots
+            if depots.isEmpty {
+                // Discovery: every depot of the app whose oslist matches the filter.
+                stage = .connecting("Finding \(game.title)'s files on Steam…")
+                let os = game.osFilter?.lowercased()
+                depots = try await downloader.depots(app: game.appID, branch: game.branch)
+                    .filter { d in os.map { o in d.osList.contains { $0.lowercased() == o } } ?? true }
+                    .filter { $0.manifestID != nil }
+                    .map(\.depotID)
+                guard !depots.isEmpty else {
+                    stage = .failed("Steam lists no \(game.osFilter ?? "") depot for \(game.title) on this account.")
+                    return
+                }
+                game.rememberDepots(depots)
+                stage = .working
             }
-            log("done: \(summary.files) files, \(summary.skippedFiles) already there, "
-                + "\(summary.bytesDownloaded) bytes fetched, verified \(summary.verifiedBytes) in \(summary.verifyElapsed)s")
+            depotCount = depots.count
+            for (i, depot) in depots.enumerated() {
+                depotIndex = depots.count > 1 ? i + 1 : 0
+                let opts = DepotDownloadOptions(appID: game.appID, depotID: depot, branch: game.branch,
+                                                directory: game.root, filters: SteamGameDescriptor.debugFilters,
+                                                include: game.include,
+                                                maxConcurrentDownloads: game.maxConcurrentDownloads,
+                                                verifyConcurrency: game.verifyConcurrency,
+                                                forceVerify: forceVerify)
+                let summary = try await downloader.download(opts) { p in
+                    Task { @MainActor in self.update(p) }
+                }
+                log("\(game.target) depot \(depot) done: \(summary.files) files, \(summary.skippedFiles) already there, "
+                    + "\(summary.bytesDownloaded) bytes fetched, verified \(summary.verifiedBytes) in \(summary.verifyElapsed)s")
+            }
             stage = .complete
         } catch is CancellationError {
             if case .signIn = stage { return }
@@ -328,16 +458,32 @@ func qrImage(_ string: String) -> UIImage? {
     return UIImage(cgImage: cg)
 }
 
-/// The window shown instead of the boot window while the content is not complete.
-struct SteamContentView: View {
+/// The single-game build's gate: the window shown instead of the boot window while
+/// the content is not complete. Owns its model; the hub keeps one per game instead.
+struct SteamContentGate: View {
     let onPlay: () -> Void
-    @StateObject private var model = SteamContentModel()
+    @StateObject private var model: SteamContentModel
+    init(game: SteamGameDescriptor, onPlay: @escaping () -> Void) {
+        self.onPlay = onPlay
+        _model = StateObject(wrappedValue: SteamContentModel(game: game))
+    }
+    var body: some View { SteamContentView(model: model, onPlay: onPlay) }
+}
+
+/// Sign-in + download/verify for one game. `onBack` (hub) adds a way back to the library.
+struct SteamContentView: View {
+    @ObservedObject var model: SteamContentModel
+    let onPlay: () -> Void
+    var onBack: (() -> Void)? = nil
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Half-Life: Alyx").font(.largeTitle.bold())
+                if let onBack {
+                    Button { onBack() } label: { Label("Library", systemImage: "chevron.left") }
+                }
+                Text(model.game.title).font(.largeTitle.bold())
                 Spacer()
                 if let a = model.account {
                     Text("Steam: \(a)").font(.footnote).foregroundStyle(.secondary)
@@ -357,11 +503,13 @@ struct SteamContentView: View {
         .onAppear {
             Lifecycle.keepAlive = true
             // "Check for updates / Verify files on next launch" from the boot window.
-            if UserDefaults.standard.bool(forKey: AlyxContent.verifyNextLaunchKey) { model.start(forceVerify: true) }
+            if UserDefaults.standard.bool(forKey: model.game.verifyNextLaunchKey) { model.start(forceVerify: true) }
             // Scripted runs (simulator tests): KL_STEAM_AUTOSTART=1 presses the main button.
             else if klEnvOn("KL_STEAM_AUTOSTART", default: false) { model.start() }
         }
-        .onDisappear { Lifecycle.keepAlive = false }
+        // The hub's library keeps the app alive itself (downloads go on while the
+        // player looks at another game), so only the single-game gate lets go here.
+        .onDisappear { if onBack == nil { Lifecycle.keepAlive = false } }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background, model.isBusy { model.interruptedByBackground = true }
             if phase == .active, model.interruptedByBackground {
@@ -407,12 +555,12 @@ struct SteamContentView: View {
                 progressSummary
                 HStack {
                     Button("Resume") { model.start() }.buttonStyle(.borderedProminent)
-                    if AlyxContent.looksPresent { Button("Play anyway") { onPlay() } }
+                    if model.game.looksPresent { Button("Play anyway") { onPlay() } }
                 }
             }
         case .complete:
             VStack(alignment: .leading, spacing: 12) {
-                Label("Half-Life: Alyx is installed and verified.", systemImage: "checkmark.circle.fill")
+                Label("\(model.game.title) is installed and verified.", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green).font(.title3)
                 Text("\(model.local.totalFiles) files, \(gb(model.local.totalBytes)).").foregroundStyle(.secondary)
                 HStack(spacing: 16) {
@@ -425,33 +573,33 @@ struct SteamContentView: View {
                 Label(msg, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
                 HStack {
                     Button("Retry") { model.start() }.buttonStyle(.borderedProminent)
-                    if AlyxContent.looksPresent { Button("Play anyway") { onPlay() } }
+                    if model.game.looksPresent { Button("Play anyway") { onPlay() } }
                 }
             }
         }
     }
 
     @ViewBuilder private var idle: some View {
-        let present = AlyxContent.looksPresent
+        let present = model.game.looksPresent
         VStack(alignment: .leading, spacing: 12) {
             if present {
                 Text("Game files were found on this device, but they have not been verified as complete.")
                 Text("SteamDepot can check them against Steam (keeping every file that matches) and download only what is missing.")
                     .foregroundStyle(.secondary)
             } else {
-                Text("The game content (about 70 GB) is not on this device yet.")
-                Text("Download it from Steam with the account that owns Half-Life: Alyx.").foregroundStyle(.secondary)
+                Text("The game content (about \(Int((Double(model.game.approxBytes) / 1e9).rounded())) GB) is not on this device yet.")
+                Text("Download it from Steam with the account that owns \(model.game.title).").foregroundStyle(.secondary)
             }
             if let free = model.freeBytes {
-                Text("Free space: \(gb(free))").font(.footnote).foregroundStyle(free < 75_000_000_000 && !present ? .orange : .secondary)
+                Text("Free space: \(gb(free))").font(.footnote).foregroundStyle(free < model.game.approxBytes + 5_000_000_000 && !present ? .orange : .secondary)
             }
             HStack(spacing: 16) {
-                Button(present ? "Complete download from Steam" : "Download Half-Life: Alyx from Steam") { model.start() }
+                Button(present ? "Complete download from Steam" : "Download \(model.game.title) from Steam") { model.start() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                 if present { Button("Play anyway") { onPlay() } }
             }
-            if !AlyxContent.debugFilters.isEmpty {
-                Text("KL_STEAM_FILTER: \(AlyxContent.debugFilters.joined(separator: ", "))").font(.caption).foregroundStyle(.orange)
+            if !SteamGameDescriptor.debugFilters.isEmpty {
+                Text("KL_STEAM_FILTER: \(SteamGameDescriptor.debugFilters.joined(separator: ", "))").font(.caption).foregroundStyle(.orange)
             }
         }
     }
@@ -468,7 +616,8 @@ struct SteamContentView: View {
                 Text("\(gb(p.verifyBytesDone)) of \(gb(p.verifyBytesTotal)) checked · \(p.verifyFilesDone)/\(p.verifyFilesTotal) files · \(mbps(model.verifySpeed))")
                     .monospacedDigit().foregroundStyle(.secondary)
             case .downloading, .finished:
-                Text(p.chunksTotal == 0 ? "Finishing…" : "Downloading from Steam…").font(.title3)
+                Text((p.chunksTotal == 0 ? "Finishing…" : "Downloading from Steam…")
+                     + (model.depotIndex > 0 ? " (depot \(model.depotIndex) of \(model.depotCount))" : "")).font(.title3)
                 let have = Double(p.depotBytes - p.bytesToDownload + p.bytesDownloaded)
                 ProgressView(value: have, total: Double(max(1, p.depotBytes)))
                 Text("\(gbD(have)) of \(gb(p.depotBytes)) · \(mbps(model.speed)) (network \(mbps(model.networkSpeed))) · ETA \(eta(Double(p.bytesToDownload - p.bytesDownloaded) / max(1, model.speed)))")
@@ -489,18 +638,20 @@ struct SteamContentView: View {
     }
 }
 
-/// Small panel in the boot window (alyx only): schedule a full verify / update check.
+/// Small panel in the boot window (games with a descriptor): schedule a full verify / update check.
 struct SteamContentMaintenance: View {
-    @State private var scheduled = UserDefaults.standard.bool(forKey: AlyxContent.verifyNextLaunchKey)
+    let game: SteamGameDescriptor
+    @State private var scheduled = false
     var body: some View {
         HStack {
             Button(scheduled ? "Verify scheduled for next launch" : "Check for updates / Verify files on next launch") {
                 scheduled.toggle()
-                UserDefaults.standard.set(scheduled, forKey: AlyxContent.verifyNextLaunchKey)
+                UserDefaults.standard.set(scheduled, forKey: game.verifyNextLaunchKey)
             }
             Spacer()
         }
         .font(.callout)
+        .onAppear { scheduled = UserDefaults.standard.bool(forKey: game.verifyNextLaunchKey) }
     }
 }
 #endif
@@ -521,7 +672,7 @@ struct SteamSignInForm: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Sign in to Steam").font(.title2.bold())
-            Text("Use the Steam account that owns Half-Life: Alyx.").foregroundStyle(.secondary)
+            Text("Use the Steam account that owns \(model.game.title).").foregroundStyle(.secondary)
             if let message { Label(message, systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
             TextField("Steam account name", text: $user)
                 .textContentType(.username)
