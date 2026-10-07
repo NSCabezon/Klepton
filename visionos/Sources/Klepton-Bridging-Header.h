@@ -38,3 +38,7 @@
 // where it reads the fence value. The eye TEXTURE still arrives through
 // kl_glfb's own table, so nothing else about this seam widens.
 #import "kl_vulkan.h"
+// ...and by one for Steam: the guest's Steamworks stand-in (kl_steam.c) asks
+// the user's real Steam account through a backend the app registers
+// (KleptonSteamBridge.swift), and the app says "playing off" on teardown.
+#import "kl_steam_bridge.h"

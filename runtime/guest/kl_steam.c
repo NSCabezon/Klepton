@@ -19,9 +19,16 @@
 // "no", "none" or k_uAPICallInvalid. An interface version the SDK does not
 // describe (SteamAudio001, Valve-private) gets 128 such slots.
 //
-// WHO WE ARE: user 76561197960287930 (KL_STEAM_ID), logged on, owning the
-// target's app (546560 Half-Life: Alyx, 2669410 Metro Awakening, 617830
-// SUPERHOT VR; see steam_app_id) and nothing else, language english, universe public, no overlay.
+// WHO WE ARE: the user's REAL Steam account when the Steam bridge answers
+// (kl_steam_bridge.h: SteamDepot's SteamBridgeService, through the app on
+// visionOS or `steamdepot serve`'s Unix socket on the Mac). SteamAPI_Init asks
+// it `hello` for the target's app (546560 Half-Life: Alyx, 2669410 Metro
+// Awakening, 617830 SUPERHOT VR; see steam_app_id): the real SteamID and
+// persona name are reported everywhere, an app the account does not own fails
+// init, stats and achievements are loaded from Steam and StoreStats sends what
+// changed, and Steam shows the game as being played until shutdown. With no
+// bridge, the old stub: user 76561197960287930 (KL_STEAM_ID), owning the
+// target's app and nothing else. Either way: universe public, no overlay.
 //
 // NETWORKING: Source 2 runs even single player as a client connected to a
 // listen server in the same process, over ISteamNetworkingSockets. So that
@@ -42,12 +49,16 @@
 #include <unistd.h>
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
+#include <stdatomic.h>
 
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_driver.h"
 #include "kl_jni.h"
 #include "kl_steam.h"
+#include "kl_steam_bridge.h"
+#include "kl_json.h"
 
 // WHICH APP, WHICH USER. Both used to be constants, because Alyx was the only
 // guest; the Steam Frame's Android builds (Metro Awakening, UE5; SUPERHOT VR,
@@ -59,12 +70,13 @@
 // says "you own 546560" to Metro answers BIsSubscribedApp(2669410) with no.
 //
 //   KL_STEAM_APPID  override the app id (default: the target's, below)
-//   KL_STEAM_ID     the 64-bit SteamID to report (default: a fixed fake one)
-//   KL_STEAM_NAME   the persona name (default "Gordon")
+//   KL_STEAM_ID     OVERRIDE the 64-bit SteamID reported (default: the real
+//                   account's from the bridge; with no bridge, a fixed fake one)
+//   KL_STEAM_NAME   OVERRIDE the persona name (default: the real one; with no
+//                   bridge, "Gordon")
 //
-// The SteamID default is deliberately fake rather than read from anywhere: the
-// account that owns the game is the user's, and saying so in a log or a save
-// is the user's call (KL_STEAM_ID), not the stub's.
+// The stub's SteamID is deliberately fake rather than read from anywhere: with
+// no bridge there is no account to read it from.
 static const struct { const char *target; uint32_t app; } g_apps[] = {
     { "alyx",  546560u  },     // Half-Life: Alyx (Linux arm64 depot 546564)
     { "metro", 2669410u },     // Metro Awakening (Android depot 2669412)
@@ -80,12 +92,32 @@ static uint32_t steam_app_id(void) {
         if (t && !strcmp(t, g_apps[i].target)) return app = g_apps[i].app;
     return app = 546560u;
 }
+// The account the bridge answered `hello` for. `real` is set once, inside
+// SteamAPI_Init, before the guest can ask who it is.
+static struct {
+    int real;                 // the bridge answered: everything below is the account's
+    int owned, offline;       // offline: the service answered from its cache
+    uint64_t steamid;
+    char name[128];
+} g_acct;
+
 static uint64_t steam_user_id(void) {
-    static uint64_t id;
-    if (id) return id;
-    const char *e = getenv("KL_STEAM_ID");
-    id = (e && *e) ? strtoull(e, NULL, 10) : 0;
-    return id ? id : (id = 76561197960287930ull);
+    static uint64_t env_id;
+    static int env_read;
+    if (!env_read) {
+        const char *e = getenv("KL_STEAM_ID");
+        env_id = (e && *e) ? strtoull(e, NULL, 10) : 0;
+        env_read = 1;
+    }
+    if (env_id) return env_id;
+    if (g_acct.real && g_acct.steamid) return g_acct.steamid;
+    return 76561197960287930ull;
+}
+static const char *steam_persona(void) {
+    const char *e = getenv("KL_STEAM_NAME");
+    if (e && *e) return e;
+    if (g_acct.real && g_acct.name[0]) return g_acct.name;
+    return "Gordon";
 }
 #define APP_ID      steam_app_id()
 #define USER_ID     steam_user_id()
@@ -113,21 +145,44 @@ static sobj *iface(const char *ver);
 
 // ---- the flat entry points -------------------------------------------------------------
 static void stats_received(void);
+static int  account_init(char *err, size_t n);
+// SteamAPI_Init's verdict, reached once: 0 = not yet, 1 = OK, -rc = failed with
+// that ESteamAPIInitResult (1 FailedGeneric: not owned; 2 NoSteamClient: the
+// bridge is required and did not answer).
+static int g_init_state;
+static char g_init_err[256];
+static pthread_mutex_t g_initmu = PTHREAD_MUTEX_INITIALIZER;
 static int  st_init(const char *versions, void *err) {
     (void)versions;
-    if (err) memset(err, 0, 1024);
-    fprintf(stderr, "  [steam] SteamAPI_Init -> OK (stub client: user %llu, app %u)\n",
-            (unsigned long long)USER_ID, APP_ID);
+    if (err) memset(err, 0, 1024);                // SteamErrMsg
+    pthread_mutex_lock(&g_initmu);
+    if (!g_init_state) {
+        int rc = account_init(g_init_err, sizeof g_init_err);
+        g_init_state = rc ? -rc : 1;
+    }
+    int state = g_init_state;
+    pthread_mutex_unlock(&g_initmu);
+    if (state < 0) {
+        if (err) snprintf(err, 1024, "%s", g_init_err);
+        fprintf(stderr, "  [steam] SteamAPI_Init -> FAILED (result %d): %s\n", -state, g_init_err);
+        return -state;
+    }
+    fprintf(stderr, "  [steam] SteamAPI_Init -> OK (%s: user %llu \"%s\", app %u)\n",
+            g_acct.real ? (g_acct.offline ? "real Steam account, offline (cached answers)"
+                                          : "real Steam account")
+                        : "stub client",
+            (unsigned long long)USER_ID, steam_persona(), APP_ID);
     // SDK 1.61 dropped RequestCurrentStats: the client loads the user's stats
     // itself at init and announces them with UserStatsReceived_t, and a game
     // that waits for that before touching achievements (Steamworks.NET's
-    // samples do) waits forever without it. Queued once; the first pump
-    // delivers it, whichever dispatch style the game uses.
+    // samples do) waits forever without it. Queued once (account_init has
+    // already loaded the real ones); the first pump delivers it, whichever
+    // dispatch style the game uses.
     static int stats_once;
     if (!stats_once) { stats_once = 1; stats_received(); }
     return 0;                                     // k_ESteamAPIInitResult_OK
 }
-static int  st_init_bool(void) { st_init(NULL, NULL); return 1; }
+static int  st_init_bool(void) { return st_init(NULL, NULL) == 0; }
 static int  st_gs_init(uint32_t ip, uint16_t gport, uint16_t qport, int mode,
                        const char *ver, const char *versions, void *err) {
     (void)ip; (void)qport; (void)versions;
@@ -139,8 +194,13 @@ static int  st_gs_init(uint32_t ip, uint16_t gport, uint16_t qport, int mode,
 static int  st_hsteamuser(void) { return 1; }
 static int  st_hsteampipe(void) { return 1; }
 static int  st_gs_hsteamuser(void) { return 2; }
-static int  st_true(void) { return 1; }
 static int  st_false(void) { return 0; }
+// "Is Steam running": not after an init that found no Steam to talk to.
+static int  st_is_running(void) { return g_init_state != -2; }
+static void st_shutdown(void) {
+    fprintf(stderr, "  [steam] SteamAPI_Shutdown\n");
+    kl_steam_shutdown();
+}
 static void st_void(void) {}
 static const char *st_install_path(void) { return "/steam"; }
 static void *st_find_user(int hUser, const char *ver) { (void)hUser; return iface(ver); }
@@ -352,9 +412,9 @@ static int ap_build(void *s) { (void)s; return 1; }
 static int ap_cmdline(void *s, char *buf, int n) { (void)s; if (buf && n) buf[0] = 0; return 0; }
 
 // ---- ISteamFriends ------------------------------------------------------------------------------------
-static const char *fr_name(void *s) { (void)s; return kl_env_str("KL_STEAM_NAME", "Gordon"); }
+static const char *fr_name(void *s) { (void)s; return steam_persona(); }
 static int fr_state(void *s) { (void)s; return 1; }                       // online
-static const char *fr_friend_name(void *s, uint64_t id) { (void)s; (void)id; return kl_env_str("KL_STEAM_NAME", "Gordon"); }
+static const char *fr_friend_name(void *s, uint64_t id) { (void)s; (void)id; return steam_persona(); }
 static int fr_zero(void *s) { (void)s; return 0; }
 
 // ---- ISteamNetworking (the old P2P API): only its packet size is asked ----
@@ -823,15 +883,112 @@ static int nu_id_parse(void *s, uint8_t *id, const char *str) {
     return 0;
 }
 
-// ---- ISteamUserStats: answered locally, and every call NAMED -----------------------------
+// ---- the real account: SteamAPI_Init through the bridge ---------------------------------
 //
-// Achievements and stats are out of scope for now — nothing is forwarded to a
-// real Steam — but they must not FAIL: a game that sees SetAchievement or
-// StoreStats return false may retry every frame, show an error, or stop saving
-// progress. So the writes succeed, the reads report "nothing yet", and every
-// distinct call is logged once with its arguments under "[steam-stats]". That
-// log is the input for the later feature that forwards them to the user's real
-// Steam account: it lists exactly which stats and achievements each game uses.
+// account_init runs once, inside SteamAPI_Init (and the flat / SteamInternal_
+// spellings of it): `hello` for the target's app, then — owned — `stats`, then
+// `playing` on. What happens when the bridge does not answer is
+// KL_STEAM_REQUIRE_REAL's call:
+//   1  init fails (k_ESteamAPIInitResult_NoSteamClient) and the game shows its
+//      own "Steam is not running" behaviour;
+//   0  today's stub, with one loud warning.
+// Default: 0 on the Mac (a run with no `steamdepot serve` is a normal
+// development run); on device 1 when the app registered a backend, i.e. this
+// build carries the Steam service and ownership must come from it. A device
+// build with NO backend (no SteamDepot linked) cannot ask, and keeps the stub.
+//
+// SAFETY KNOB: KL_STEAM_STATS_DRYRUN=1 marks every `store` "dry_run":true — the
+// service then changes nothing on the account. Use it for any test run.
+#define BRIDGE_RESP_CAP (256 * 1024)
+
+static int bridge_timeout(void) { return kl_env_int("KL_STEAM_BRIDGE_TIMEOUT", 30000); }
+static int require_real(void) {
+#if TARGET_OS_OSX
+    int dflt = 0;
+#else
+    int dflt = kl_steam_has_backend();
+#endif
+    return kl_env_on("KL_STEAM_REQUIRE_REAL", dflt);
+}
+static int stats_dry_run(void) { return kl_env_on("KL_STEAM_STATS_DRYRUN", 0); }
+static const char *bridge_where(void) {
+#if TARGET_OS_OSX
+    extern const char *kl_steam_bridge_socket_path(void);
+    if (!kl_steam_has_backend()) return kl_steam_bridge_socket_path();
+#endif
+    return kl_steam_has_backend() ? "the app's Steam service" : "no Steam service in this build";
+}
+
+// One round trip, parsed. NULL if the bridge did not answer or the answer is
+// not JSON; *why says which. The caller checks "ok".
+static kj *bridge(const char *req, int timeout_ms, const char **why) {
+    char *resp = malloc(BRIDGE_RESP_CAP);
+    if (!resp) { if (why) *why = "out of memory"; return NULL; }
+    int n = kl_steam_backend_call(req, resp, BRIDGE_RESP_CAP, timeout_ms);
+    kj *j = n >= 0 ? kj_parse(resp) : NULL;
+    if (why) *why = n < 0 ? "no answer" : !j ? "an answer that is not JSON" : NULL;
+    if (n >= 0 && !j && kl_env_on("KL_TRACE_STEAM", 0))
+        fprintf(stderr, "  [steam] bridge answered: %.200s\n", resp);
+    free(resp);
+    return j;
+}
+static const char *bridge_error(const kj *j) {
+    const char *e = kj_str(kj_get(j, "error"), NULL);
+    return e ? e : "ok:false";
+}
+
+// ---- playing ----
+// Steam's "In-game: <app>" for the run. On at a successful real init; off at
+// SteamAPI_Shutdown, at exit, and on the app's own teardown (kl_steam_shutdown).
+// A run that dies without any of those (a crash, a kill) is covered by the
+// service: on the Mac the bridge connection is the run (kl_steam_bridge.c), and
+// `steamdepot serve` clears "playing" when it closes.
+static atomic_int g_playing;
+static char g_off_req[96];
+static void playing_on(void) {
+    char req[96];
+    snprintf(req, sizeof req, "{\"op\":\"playing\",\"app\":%u,\"on\":true}", APP_ID);
+    snprintf(g_off_req, sizeof g_off_req, "{\"op\":\"playing\",\"app\":%u,\"on\":false}", APP_ID);
+    const char *why;
+    kj *j = bridge(req, 5000, &why);
+    if (j && kj_is_true(kj_get(j, "ok"))) {
+        atomic_store(&g_playing, 1);
+        fprintf(stderr, "  [steam] playing on: Steam shows app %u as in-game\n", APP_ID);
+        static int hooked;
+        if (!hooked) { hooked = 1; atexit(kl_steam_shutdown); }
+    } else {
+        fprintf(stderr, "  [steam] playing on: not announced (%s)\n", j ? bridge_error(j) : why);
+    }
+    kj_free(j);
+}
+void kl_steam_shutdown(void) {
+    if (!atomic_exchange(&g_playing, 0)) return;
+    const char *why;
+    kj *j = bridge(g_off_req, 2000, &why);
+    fprintf(stderr, "  [steam] playing off: %s\n",
+            j && kj_is_true(kj_get(j, "ok")) ? "Steam no longer shows the game" : j ? bridge_error(j) : why);
+    kj_free(j);
+}
+
+// ---- ISteamUserStats: a cache of the real values, and every call NAMED --------------------
+//
+// With the bridge: SteamAPI_Init loads the account's stats and achievements
+// (`stats`) BEFORE it queues UserStatsReceived_t, so every Get* answers from
+// real values. Set* changes the cache. StoreStats sends ONE `store` with only
+// what changed since the last one, off the game thread, and then posts
+// UserStatsStored_t and a UserAchievementStored_t per achievement sent.
+// ClearAchievement, ResetAllStats and UpdateAvgRateStat stay local: the
+// contract has no way to say them, and nothing a test run does should take an
+// achievement away from the account.
+//
+// Without it (the stub): the same cache, empty at start and never sent.
+//
+// Either way every distinct call is logged once with its arguments under
+// "[steam-stats]" — the list of stats and achievements each game uses.
+//
+// Display attributes (name, desc, hidden) are not in the contract and still
+// answer "": a game that shows its own achievement list from Steam's text
+// shows blanks.
 //
 // Callback structs are pack(4) on Linux/Android (VALVE_CALLBACK_PACK_SMALL).
 #pragma pack(push, 4)
@@ -841,64 +998,389 @@ typedef struct { uint64_t game; uint8_t group; char name[128];
                  uint32_t cur, max; } st_ach_stored;                                 // 1103
 typedef struct { uint64_t call; int32_t id; uint32_t n; } st_call_completed;          // 703
 #pragma pack(pop)
+#define EResultOK   1
+#define EResultFail 2
 
-static void stats_note(const char *what, const char *name, const char *val) {
-    static char seen[256][160];
+typedef struct { char *name; int is_float, from_steam; double v, sent; } kstat;
+typedef struct { char *name; int from_steam, unlocked, sent; uint32_t time; } kach;
+static kstat *g_st;
+static kach *g_ach;
+static int g_nst, g_nach, g_capst, g_capach;
+static int g_nach_steam;              // g_ach[0..n) came from Steam, in its order
+static int g_stats_result = EResultOK;
+static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
+
+static kstat *stat_find(const char *n, int create, int is_float) {    // g_smu held
+    if (!n) return NULL;
+    for (int i = 0; i < g_nst; i++) if (!strcmp(g_st[i].name, n)) return &g_st[i];
+    if (!create) return NULL;
+    if (g_nst == g_capst) {
+        int cap = g_capst ? g_capst * 2 : 32;
+        kstat *p = realloc(g_st, (size_t)cap * sizeof *p);
+        if (!p) return NULL;
+        g_st = p; g_capst = cap;
+    }
+    kstat *s = &g_st[g_nst++];
+    *s = (kstat){ strdup(n), is_float, 0, 0, 0 };
+    return s;
+}
+static kach *ach_find(const char *n, int create) {                     // g_smu held
+    if (!n) return NULL;
+    for (int i = 0; i < g_nach; i++) if (!strcmp(g_ach[i].name, n)) return &g_ach[i];
+    if (!create) return NULL;
+    if (g_nach == g_capach) {
+        int cap = g_capach ? g_capach * 2 : 64;
+        kach *p = realloc(g_ach, (size_t)cap * sizeof *p);
+        if (!p) return NULL;
+        g_ach = p; g_capach = cap;
+    }
+    kach *a = &g_ach[g_nach++];
+    *a = (kach){ strdup(n), 0, 0, 0, 0 };
+    return a;
+}
+
+// Logged once per distinct call + arguments; `result` is how it was answered.
+static void stats_note(const char *what, const char *name, const char *val, const char *result) {
+    static char seen[512][160];
     static int nseen;
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     char key[160];
     snprintf(key, sizeof key, "%s(%s%s%s)", what, name ? name : "", val ? ", " : "", val ? val : "");
     pthread_mutex_lock(&mu);
     for (int i = 0; i < nseen; i++) if (!strcmp(seen[i], key)) { pthread_mutex_unlock(&mu); return; }
-    if (nseen < 256) snprintf(seen[nseen++], sizeof seen[0], "%s", key);
+    if (nseen < 512) snprintf(seen[nseen++], sizeof seen[0], "%s", key);
     pthread_mutex_unlock(&mu);
-    fprintf(stderr, "  [steam-stats] %s -> ok (local only, not sent to Steam)\n", key);
+    fprintf(stderr, "  [steam-stats] %s -> %s\n", key, result);
 }
+#define LOCAL_ONLY "ok (local only, not sent to Steam)"
+#define CACHED     "ok (cached; goes to Steam with the next StoreStats)"
+
+static void stats_load(void) {
+    char req[64];
+    snprintf(req, sizeof req, "{\"op\":\"stats\",\"app\":%u}", APP_ID);
+    const char *why;
+    kj *j = bridge(req, bridge_timeout(), &why);
+    if (!j || !kj_is_true(kj_get(j, "ok"))) {
+        g_stats_result = EResultFail;
+        fprintf(stderr, "  [steam-stats] could not load stats from Steam (%s): UserStatsReceived_t will say "
+                "k_EResultFail; writes are still cached and sent\n", j ? bridge_error(j) : why);
+        kj_free(j);
+        return;
+    }
+    int offline = kj_is_true(kj_get(j, "offline")), unlocked = 0;
+    pthread_mutex_lock(&g_smu);
+    kj *st = kj_get(j, "stats");
+    for (kj *c = st && st->t == KJ_OBJ ? st->child : NULL; c; c = c->next) {
+        int isf = !strcmp(kj_str(kj_get(c, "type"), "int"), "float");
+        kstat *s = stat_find(c->key, 1, isf);
+        if (!s) continue;
+        s->is_float = isf;
+        s->from_steam = 1;
+        s->v = s->sent = kj_num(kj_get(c, "value"), 0);
+    }
+    kj *ac = kj_get(j, "achievements");
+    for (kj *c = ac && ac->t == KJ_OBJ ? ac->child : NULL; c; c = c->next) {
+        kach *a = ach_find(c->key, 1);
+        if (!a) continue;
+        a->from_steam = 1;
+        a->unlocked = a->sent = kj_is_true(kj_get(c, "unlocked"));
+        a->time = (uint32_t)kj_num(kj_get(c, "time"), 0);
+        unlocked += a->unlocked;
+    }
+    g_nach_steam = g_nach;
+    fprintf(stderr, "  [steam-stats] loaded from Steam%s: %d stat(s), %d achievement(s), %d unlocked\n",
+            offline ? " (offline: the service's cache)" : "", g_nst, g_nach, unlocked);
+    for (int i = 0; i < g_nach; i++) {
+        char when[32] = "";
+        if (g_ach[i].unlocked && g_ach[i].time) {
+            time_t t = (time_t)g_ach[i].time;
+            struct tm tm;
+            gmtime_r(&t, &tm);
+            strftime(when, sizeof when, " %Y-%m-%d %H:%M UTC", &tm);
+        }
+        fprintf(stderr, "  [steam-stats]   %-32s %s%s\n", g_ach[i].name,
+                g_ach[i].unlocked ? "unlocked" : "locked", when);
+    }
+    if (kl_env_on("KL_TRACE_STEAM", 0))
+        for (int i = 0; i < g_nst; i++)
+            fprintf(stderr, "  [steam-stats]   stat %-27s %g%s\n", g_st[i].name, g_st[i].v,
+                    g_st[i].is_float ? " (float)" : "");
+    pthread_mutex_unlock(&g_smu);
+    kj_free(j);
+}
+
+static int account_init(char *err, size_t n) {
+    char req[64];
+    snprintf(req, sizeof req, "{\"op\":\"hello\",\"app\":%u}", APP_ID);
+    const char *why;
+    kj *j = bridge(req, bridge_timeout(), &why);
+    uint64_t sid = j ? kj_u64(kj_get(j, "steamid"), 0) : 0;
+    if (!j || !kj_is_true(kj_get(j, "ok")) || !sid) {
+        const char *what = !j ? why : !kj_is_true(kj_get(j, "ok")) ? bridge_error(j) : "no steamid in the answer";
+        if (require_real()) {
+            snprintf(err, n, "no Steam: the Steam bridge (%s) did not answer hello (%s), and "
+                     "KL_STEAM_REQUIRE_REAL is on", bridge_where(), what);
+            kj_free(j);
+            return 2;                                     // k_ESteamAPIInitResult_NoSteamClient
+        }
+        fprintf(stderr,
+                "  [steam] !!! ============================================================\n"
+                "  [steam] !!! NO REAL STEAM: the bridge (%s) did not answer hello (%s).\n"
+                "  [steam] !!! Falling back to the STUB: fake user %llu, app %u owned,\n"
+                "  [steam] !!! stats and achievements local only. Run `steamdepot serve`\n"
+                "  [steam] !!! for the real account; KL_STEAM_REQUIRE_REAL=1 makes this fatal.\n"
+                "  [steam] !!! ============================================================\n",
+                bridge_where(), what, (unsigned long long)USER_ID, APP_ID);
+        kj_free(j);
+        return 0;
+    }
+    g_acct.steamid = sid;
+    snprintf(g_acct.name, sizeof g_acct.name, "%s", kj_str(kj_get(j, "name"), ""));
+    g_acct.owned = kj_is_true(kj_get(j, "owned"));
+    g_acct.offline = kj_is_true(kj_get(j, "offline"));
+    g_acct.real = 1;
+    kj_free(j);
+    fprintf(stderr, "  [steam] bridge (%s): hello -> steamid %llu, name \"%s\", app %u %s%s\n",
+            bridge_where(), (unsigned long long)g_acct.steamid, g_acct.name, APP_ID,
+            g_acct.owned ? "OWNED" : "NOT OWNED", g_acct.offline ? " (offline: cached answer)" : "");
+    if (getenv("KL_STEAM_ID") || getenv("KL_STEAM_NAME"))
+        fprintf(stderr, "  [steam] KL_STEAM_ID/KL_STEAM_NAME override the account's: reporting user %llu \"%s\"\n",
+                (unsigned long long)USER_ID, steam_persona());
+    if (!g_acct.owned) {
+        snprintf(err, n, "app %u is not owned by this Steam account (%s, %llu)", APP_ID, g_acct.name,
+                 (unsigned long long)g_acct.steamid);
+        return 1;                                         // k_ESteamAPIInitResult_FailedGeneric
+    }
+    stats_load();
+    playing_on();
+    return 0;
+}
+
 static void stats_received(void) {
-    st_stats_received r = { APP_ID, 1 /* k_EResultOK */, USER_ID };
+    st_stats_received r = { APP_ID, g_stats_result, USER_ID };
     post(1101, &r, sizeof r, 0);
 }
-static int  ss_get_i(void *s, const char *n, int32_t *v) { (void)s; if (v) *v = 0; stats_note("GetStat", n, NULL); return 1; }
-static int  ss_get_f(void *s, const char *n, float *v)   { (void)s; if (v) *v = 0; stats_note("GetStat", n, NULL); return 1; }
-static int  ss_set_i(void *s, const char *n, int32_t v) {
-    (void)s; char b[32]; snprintf(b, sizeof b, "%d", v); stats_note("SetStat", n, b); return 1;
+
+static int ss_get_i(void *s, const char *n, int32_t *v) {
+    (void)s;
+    pthread_mutex_lock(&g_smu);
+    kstat *st = stat_find(n, 0, 0);
+    int32_t x = st ? (int32_t)st->v : 0;
+    int steam = st && st->from_steam;
+    pthread_mutex_unlock(&g_smu);
+    if (v) *v = x;
+    char r[96];
+    snprintf(r, sizeof r, "%d (%s)", x, steam ? "from Steam" : g_acct.real ? "not in Steam's list: 0" : "stub");
+    stats_note("GetStat", n, NULL, r);
+    return 1;
 }
-static int  ss_set_f(void *s, const char *n, float v) {
-    (void)s; char b[32]; snprintf(b, sizeof b, "%g", v); stats_note("SetStat", n, b); return 1;
+static int ss_get_f(void *s, const char *n, float *v) {
+    (void)s;
+    pthread_mutex_lock(&g_smu);
+    kstat *st = stat_find(n, 0, 1);
+    float x = st ? (float)st->v : 0;
+    int steam = st && st->from_steam;
+    pthread_mutex_unlock(&g_smu);
+    if (v) *v = x;
+    char r[96];
+    snprintf(r, sizeof r, "%g (%s)", x, steam ? "from Steam" : g_acct.real ? "not in Steam's list: 0" : "stub");
+    stats_note("GetStat", n, NULL, r);
+    return 1;
 }
+static void stat_set(const char *n, double v, int is_float) {
+    pthread_mutex_lock(&g_smu);
+    kstat *st = stat_find(n, 1, is_float);
+    int known = st && st->from_steam;
+    if (st) st->v = v;
+    pthread_mutex_unlock(&g_smu);
+    char b[32];
+    snprintf(b, sizeof b, "%g", v);
+    stats_note("SetStat", n, b, !g_acct.real ? LOCAL_ONLY : known ? CACHED : CACHED " — not in Steam's list");
+}
+static int  ss_set_i(void *s, const char *n, int32_t v) { (void)s; stat_set(n, v, 0); return 1; }
+static int  ss_set_f(void *s, const char *n, float v)   { (void)s; stat_set(n, v, 1); return 1; }
 static int  ss_avg(void *s, const char *n, float v, double len) {
-    (void)s; char b[48]; snprintf(b, sizeof b, "%g over %g", v, len); stats_note("UpdateAvgRateStat", n, b); return 1;
+    (void)s; char b[48]; snprintf(b, sizeof b, "%g over %g", v, len);
+    stats_note("UpdateAvgRateStat", n, b, LOCAL_ONLY);
+    return 1;
 }
-static int  ss_get_ach(void *s, const char *n, uint8_t *got) { (void)s; if (got) *got = 0; stats_note("GetAchievement", n, NULL); return 1; }
+static int  ach_get(const char *what, const char *n, uint8_t *got, uint32_t *t) {
+    pthread_mutex_lock(&g_smu);
+    kach *a = ach_find(n, 0);
+    int u = a && a->unlocked, steam = a && a->from_steam;
+    uint32_t when = a ? a->time : 0;
+    pthread_mutex_unlock(&g_smu);
+    if (got) *got = (uint8_t)u;
+    if (t) *t = u ? when : 0;
+    stats_note(what, n, NULL, u ? (steam ? "unlocked (from Steam)" : "unlocked (this run)")
+                                : (steam ? "locked (from Steam)" : g_acct.real ? "locked (not in Steam's list)" : "locked (stub)"));
+    return 1;
+}
+static int  ss_get_ach(void *s, const char *n, uint8_t *got) { (void)s; return ach_get("GetAchievement", n, got, NULL); }
 static int  ss_get_ach_t(void *s, const char *n, uint8_t *got, uint32_t *t) {
-    (void)s; if (got) *got = 0; if (t) *t = 0; stats_note("GetAchievementAndUnlockTime", n, NULL); return 1;
+    (void)s; return ach_get("GetAchievementAndUnlockTime", n, got, t);
 }
-static int  ss_set_ach(void *s, const char *n) { (void)s; stats_note("SetAchievement", n, NULL); return 1; }
-static int  ss_clear_ach(void *s, const char *n) { (void)s; stats_note("ClearAchievement", n, NULL); return 1; }
+static int  ss_set_ach(void *s, const char *n) {
+    (void)s;
+    pthread_mutex_lock(&g_smu);
+    kach *a = ach_find(n, 1);
+    int already = a && a->unlocked, known = a && a->from_steam;
+    if (a && !a->unlocked) { a->unlocked = 1; a->time = (uint32_t)time(NULL); }
+    pthread_mutex_unlock(&g_smu);
+    stats_note("SetAchievement", n, NULL, already ? "ok (already unlocked)" : !g_acct.real ? LOCAL_ONLY
+               : known ? CACHED : CACHED " — not in Steam's list");
+    return 1;
+}
+static int  ss_clear_ach(void *s, const char *n) {
+    (void)s;
+    pthread_mutex_lock(&g_smu);
+    kach *a = ach_find(n, 0);
+    if (a) a->unlocked = 0;          // `sent` stays: setting it again sends nothing
+    pthread_mutex_unlock(&g_smu);
+    stats_note("ClearAchievement", n, NULL, LOCAL_ONLY);
+    return 1;
+}
 static int  ss_progress(void *s, const char *n, uint32_t cur, uint32_t max) {
-    (void)s; char b[32]; snprintf(b, sizeof b, "%u/%u", cur, max); stats_note("IndicateAchievementProgress", n, b);
+    (void)s; char b[32]; snprintf(b, sizeof b, "%u/%u", cur, max);
+    stats_note("IndicateAchievementProgress", n, b, "ok (progress toast only)");
     st_ach_stored r = { APP_ID, 0, {0}, cur, max };
     snprintf(r.name, sizeof r.name, "%s", n ? n : "");
     post(1103, &r, sizeof r, 0);
     return 1;
 }
+
+// One StoreStats, as sent: the request, what went into it (for the log and the
+// callbacks), and how to put the cache back if it does not get through.
+typedef struct { int idx; double was, now; } st_rev;
+typedef struct {
+    char *req, *summary;
+    int nst; st_rev *st;
+    int nach; int *ach;
+} store_job;
+static pthread_mutex_t g_store_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *store_worker(void *arg) {
+    store_job *jb = arg;
+    pthread_mutex_lock(&g_store_mu);             // one at a time, in the game's order
+    const char *why;
+    kj *j = bridge(jb->req, bridge_timeout(), &why);
+    int ok = j && kj_is_true(kj_get(j, "ok"));
+    int stored = ok && kj_is_true(kj_get(j, "stored")), queued = ok && kj_is_true(kj_get(j, "queued"));
+    const char *how = !ok ? NULL : stats_dry_run() ? "dry run (the account was not changed)"
+                    : stored ? "sent to Steam" : queued ? "queued (offline)" : "accepted, neither stored nor queued";
+    fprintf(stderr, "  [steam-stats] StoreStats: %s -> %s%s\n", jb->summary, how ? how : "FAILED: ",
+            how ? "" : (j ? bridge_error(j) : why));
+    if (ok) {
+        st_stats_stored r = { APP_ID, EResultOK };
+        post(1102, &r, sizeof r, 0);
+        pthread_mutex_lock(&g_smu);
+        for (int i = 0; i < jb->nach; i++) {
+            st_ach_stored a = { APP_ID, 0, {0}, 0, 0 };
+            snprintf(a.name, sizeof a.name, "%s", g_ach[jb->ach[i]].name);
+            post(1103, &a, sizeof a, 0);
+        }
+        pthread_mutex_unlock(&g_smu);
+    } else {
+        // Not through: what this store carried is "changed" again, unless the
+        // game has changed it since (then it is changed anyway).
+        pthread_mutex_lock(&g_smu);
+        for (int i = 0; i < jb->nst; i++)
+            if (g_st[jb->st[i].idx].sent == jb->st[i].now) g_st[jb->st[i].idx].sent = jb->st[i].was;
+        for (int i = 0; i < jb->nach; i++) g_ach[jb->ach[i]].sent = 0;
+        pthread_mutex_unlock(&g_smu);
+        st_stats_stored r = { APP_ID, EResultFail };
+        post(1102, &r, sizeof r, 0);
+    }
+    pthread_mutex_unlock(&g_store_mu);
+    kj_free(j);
+    free(jb->req); free(jb->summary); free(jb->st); free(jb->ach); free(jb);
+    return NULL;
+}
+
 static int  ss_store(void *s) {
-    (void)s; stats_note("StoreStats", NULL, NULL);
-    st_stats_stored r = { APP_ID, 1 };
-    post(1102, &r, sizeof r, 0);
+    (void)s;
+    if (!g_acct.real) {
+        stats_note("StoreStats", NULL, NULL, LOCAL_ONLY);
+        st_stats_stored r = { APP_ID, EResultOK };
+        post(1102, &r, sizeof r, 0);
+        return 1;
+    }
+    kjb req = {0}, sum = {0};
+    store_job *jb = calloc(1, sizeof *jb);
+    pthread_mutex_lock(&g_smu);
+    jb->st = calloc((size_t)g_nst + 1, sizeof *jb->st);
+    jb->ach = calloc((size_t)g_nach + 1, sizeof *jb->ach);
+    kjb_fmt(&req, "{\"op\":\"store\",\"app\":%u,\"stats\":{", APP_ID);
+    for (int i = 0; i < g_nst; i++) {
+        kstat *st = &g_st[i];
+        if (st->v == st->sent) continue;
+        if (jb->nst) kjb_add(&req, ",");
+        kjb_str(&req, st->name);
+        if (st->is_float) kjb_fmt(&req, ":%.9g", st->v);
+        else kjb_fmt(&req, ":%d", (int32_t)st->v);
+        kjb_fmt(&sum, "%s%s=%g", sum.n ? ", " : "", st->name, st->v);
+        jb->st[jb->nst++] = (st_rev){ i, st->sent, st->v };
+        st->sent = st->v;
+    }
+    kjb_add(&req, "},\"achievements\":{");
+    for (int i = 0; i < g_nach; i++) {
+        kach *a = &g_ach[i];
+        if (!a->unlocked || a->sent) continue;
+        if (jb->nach) kjb_add(&req, ",");
+        kjb_str(&req, a->name);
+        kjb_add(&req, ":true");
+        kjb_fmt(&sum, "%s%s unlocked", sum.n ? ", " : "", a->name);
+        jb->ach[jb->nach++] = i;
+        a->sent = 1;
+    }
+    pthread_mutex_unlock(&g_smu);
+    kjb_fmt(&req, "},\"dry_run\":%s}", stats_dry_run() ? "true" : "false");
+    if (!jb->nst && !jb->nach) {
+        stats_note("StoreStats", NULL, NULL, "ok (nothing changed since the last store: nothing sent)");
+        st_stats_stored r = { APP_ID, EResultOK };
+        post(1102, &r, sizeof r, 0);
+        kjb_free(&req); kjb_free(&sum);
+        free(jb->st); free(jb->ach); free(jb);
+        return 1;
+    }
+    jb->req = req.p;
+    jb->summary = sum.p;
+    if (kl_env_on("KL_TRACE_STEAM", 0)) fprintf(stderr, "  [steam-stats] store request: %s\n", jb->req);
+    // Off the game thread: Steam's StoreStats is asynchronous, and the round
+    // trip can take as long as the service's logon.
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &at, store_worker, jb) != 0) store_worker(jb);
+    pthread_attr_destroy(&at);
     return 1;
 }
 static int  ss_reset(void *s, uint8_t ach) {
-    (void)s; stats_note("ResetAllStats", NULL, ach ? "and achievements" : "stats only"); return 1;
+    (void)s;
+    stats_note("ResetAllStats", NULL, ach ? "and achievements" : "stats only",
+               "ok (NOT done: never sent to Steam, cached values kept)");
+    return 1;
 }
-static uint32_t ss_num_ach(void *s) { (void)s; return 0; }
+static uint32_t ss_num_ach(void *s) {
+    (void)s;
+    pthread_mutex_lock(&g_smu); uint32_t n = (uint32_t)g_nach_steam; pthread_mutex_unlock(&g_smu);
+    return n;
+}
+static const char *ss_ach_name(void *s, uint32_t i) {
+    (void)s;
+    pthread_mutex_lock(&g_smu);
+    const char *n = i < (uint32_t)g_nach_steam ? g_ach[i].name : "";
+    pthread_mutex_unlock(&g_smu);
+    return n;
+}
 static const char *ss_ach_attr(void *s, const char *n, const char *k) {
-    (void)s; (void)n; (void)k; return "";
+    (void)s; (void)n; (void)k; return "";       // names/descriptions: not in the bridge contract
 }
 // RequestUserStats / RequestCurrentStats (pre-1.61): answer with the same
 // UserStatsReceived_t init already queued, as a call result for the former.
 static uint64_t ss_request_user(void *s, uint64_t user) {
-    (void)s; st_stats_received r = { APP_ID, 1, user };
+    (void)s; st_stats_received r = { APP_ID, user == USER_ID ? g_stats_result : EResultFail, user };
     return post(1101, &r, sizeof r, 1);
 }
 static int  ss_request_current(void *s) { (void)s; stats_received(); return 1; }
@@ -986,6 +1468,7 @@ static const impl g_impl[] = {
     I(SSV, "GetAchievementAndUnlockTime", ss_get_ach_t), I(SSV, "StoreStats", ss_store),
     I(SSV, "GetAchievementDisplayAttribute", ss_ach_attr),
     I(SSV, "IndicateAchievementProgress", ss_progress), I(SSV, "GetNumAchievements", ss_num_ach),
+    I(SSV, "GetAchievementName", ss_ach_name),
     I(SSV, "RequestUserStats", ss_request_user), I(SSV, "ResetAllStats", ss_reset),
     I(SSV, "RequestCurrentStats", ss_request_current),
 
@@ -1208,7 +1691,7 @@ static const flat g_flat[] = {
     { "SteamAPI_InitSafe", (void *)st_init_bool }, { "SteamAPI_Init", (void *)st_init_bool },
     { "SteamAPI_InitAnonymousUser", (void *)st_init_bool },
     { "SteamInternal_GameServer_Init_V2", (void *)st_gs_init },
-    { "SteamAPI_Shutdown", (void *)st_void }, { "SteamGameServer_Shutdown", (void *)st_void },
+    { "SteamAPI_Shutdown", (void *)st_shutdown }, { "SteamGameServer_Shutdown", (void *)st_void },
     { "SteamAPI_RunCallbacks", (void *)st_run_callbacks },
     { "SteamGameServer_RunCallbacks", (void *)st_run_callbacks },
     { "SteamAPI_RegisterCallback", (void *)st_register_cb },
@@ -1222,7 +1705,7 @@ static const flat g_flat[] = {
     { "SteamInternal_FindOrCreateUserInterface", (void *)st_find_user },
     { "SteamInternal_FindOrCreateGameServerInterface", (void *)st_find_user },
     { "SteamInternal_CreateInterface", (void *)st_create_iface },
-    { "SteamAPI_IsSteamRunning", (void *)st_true }, { "SteamAPI_RestartAppIfNecessary", (void *)st_false },
+    { "SteamAPI_IsSteamRunning", (void *)st_is_running }, { "SteamAPI_RestartAppIfNecessary", (void *)st_false },
     { "SteamAPI_SetMiniDumpComment", (void *)st_void }, { "SteamAPI_SetBreakpadAppID", (void *)st_void },
     { "SteamAPI_UseBreakpadCrashHandler", (void *)st_void },
     { "SteamAPI_SetTryCatchCallbacks", (void *)st_void },

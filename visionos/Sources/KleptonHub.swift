@@ -58,6 +58,11 @@ enum HubLaunch {
     static func select(_ target: String) {
         setenv("KL_TARGET", target, 1)
         UserDefaults.standard.set(target, forKey: lastGameKey)
+        // Before boot: the guest's Steamworks stand-in asks the real account from
+        // SteamAPI_Init on (KleptonSteamBridge.swift).
+        #if canImport(SteamDepot)
+        KleptonSteamBridge.register()
+        #endif
         // A game is about to boot: from here on, backgrounding ends the process
         // as in a single-game build.
         Lifecycle.keepAlive = false
@@ -132,6 +137,9 @@ final class HubLibraryModel: ObservableObject {
     @Published var owned: [LibraryEntry]?
     #endif
     @Published var account: String?
+    /// Per game: why Play was refused (not owned), or the check in progress.
+    @Published var playBlock: [String: String] = [:]
+    @Published var verifying: String?
     @Published var checking = false
     @Published var checkError: String?
     private var relay: [AnyCancellable] = []
@@ -217,6 +225,33 @@ final class HubLibraryModel: ObservableObject {
         #endif
     }
 
+    /// Play only what the signed-in account owns. Asks the Steam bridge (`hello`;
+    /// offline it answers from its cache). An answer of "not owned" refuses; no
+    /// answer at all lets the game boot, and the runtime decides (with the bridge
+    /// required on device, SteamAPI_Init then fails and the game shows its own
+    /// "no Steam" behaviour).
+    func checkOwnership(_ target: String, then play: @escaping () -> Void) {
+        #if canImport(SteamDepot)
+        guard let app = SteamGames.descriptor(for: target)?.appID else { play(); return }
+        guard verifying == nil else { return }
+        verifying = target
+        playBlock[target] = nil
+        Task {
+            defer { verifying = nil }
+            do {
+                let r = try await KleptonSteamBridge.owns(app: app)
+                NSLog("[hub] \(target): app \(app) \(r.owned ? "owned" : "NOT owned") by \(r.name)\(r.offline ? " (offline, cached)" : "")")
+                if r.owned { play() } else { playBlock[target] = "Not owned on this Steam account" }
+            } catch {
+                NSLog("[hub] \(target): ownership not verified (\(error)); booting, the runtime decides")
+                play()
+            }
+        }
+        #else
+        play()
+        #endif
+    }
+
     /// With a saved Steam sign-in: compare each game's installed manifests with
     /// Steam's latest, and fetch the account's library for the info section.
     func checkUpdates() {
@@ -282,7 +317,10 @@ struct HubLibraryView: View {
         .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
     }
 
-    private func play(_ target: String) { onPlay(target) }
+    private func play(_ target: String) {
+        detail = nil          // back to the card, where a refusal is shown
+        model.checkOwnership(target) { onPlay(target) }
+    }
 
     private var library: some View {
         ScrollView {
@@ -329,13 +367,18 @@ struct HubLibraryView: View {
                     .monospacedDigit()
             }
             if case .working(_, let f?) = st { ProgressView(value: f) }
+            if let why = model.playBlock[g.target] {
+                Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
+            } else if model.verifying == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking your Steam license…").font(.callout) }
+            }
             if !g.bundled {
                 Text("This build carries no game code (library-only build).").font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 12) {
                 Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!st.canPlay || !g.bundled)
+                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil)
                 #if canImport(SteamDepot)
                 if model.content[g.target] != nil {
                     Button(manageTitle(st)) { detail = g.target }
