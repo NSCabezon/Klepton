@@ -2567,6 +2567,36 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
 // the timeline-semaphore version would have.
 static uint64_t g_frame_serial;
 
+// ---- [perf-audit 2026-10-07] KL_PERF_FRAME (default on): the frame seam's ----
+// serialisation, measured where every guest vkQueueSubmit and the frame end
+// pass. kl_vulkan_frame_done runs after the eye copy's fence wait AND a
+// vkQueueWaitIdle, so at its return the guest's queue is EMPTY: the GPU has
+// nothing of this game's to do until the next frame's first vkQueueSubmit
+// returns (MoltenVK encodes synchronously inside it). That interval is a GPU
+// idle bubble caused by the CPU-side frame chain; with Submit not waiting for
+// the GPU it would overlap the previous frame's GPU work instead. Every 5 s:
+//   bubble   = frame_done return -> first BIG vkQueueSubmit of the next frame returned
+//   encode   = time inside vkQueueSubmit (MoltenVK's synchronous Metal encode) / frame
+//   waitidle = time inside the frame-end vkQueueWaitIdle / frame
+//   seam     = time from the frame's LAST BIG guest vkQueueSubmit returning to
+//              frame_done entry: the eye copies + their fence waits, i.e. the
+//              render thread blocked on the GPU finishing the frame.
+//   ("big" = encode >= KL_PERF_BIG_MS, default 0.25 ms; see klvk_QueueSubmit.)
+static struct {
+    double t_done, t_last_submit, win_start;
+    double bubble, encode, waitidle, seam, period;
+    unsigned frames, submits, open;
+} g_pf;
+static double pf_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec * 1e-6;     // ms
+}
+static int pf_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_PERF_FRAME", 1);
+    return on;
+}
+
 unsigned long long kl_vulkan_frame_serial(void) {
     return __atomic_load_n(&g_frame_serial, __ATOMIC_ACQUIRE);
 }
@@ -2689,6 +2719,7 @@ void kl_vulkan_frame_done(int stage) {
     // was originally built for.
     if (eye_shadow < 0) eye_shadow = kl_env_on("KL_EYE_SHADOW", 0);
     if (eye_shadow) klvk_eye_shadow_copy(d, stage);
+    double pf_in = pf_on() ? pf_now() : 0;          // [perf-audit] KL_PERF_FRAME
     if (kl_env_on("KL_VK_FRAME_SYNC", 1) && d && d->queue) {
         VkResult r = d->QueueWaitIdle ? d->QueueWaitIdle(d->queue)
                    : d->DeviceWaitIdle ? d->DeviceWaitIdle(d->dev)
@@ -2701,6 +2732,27 @@ void kl_vulkan_frame_done(int stage) {
         }
     }
     __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
+    if (pf_in > 0) {                                 // [perf-audit] KL_PERF_FRAME
+        double t = pf_now();
+        g_pf.waitidle += t - pf_in;
+        if (g_pf.t_last_submit > 0 && pf_in > g_pf.t_last_submit) g_pf.seam += pf_in - g_pf.t_last_submit;
+        if (g_pf.t_done > 0) g_pf.period += t - g_pf.t_done;
+        g_pf.frames++;
+        g_pf.t_done = t; g_pf.open = 0;
+        if (!g_pf.win_start) g_pf.win_start = t;
+        if (t - g_pf.win_start >= 5000.0 && g_pf.frames > 1) {
+            double n = g_pf.frames;
+            VKI("[perf] frame seam over %u frames: period %.2f ms; GPU-idle bubble (frame end -> next "
+                "frame's first submit committed) %.2f ms; vkQueueSubmit encode %.2f ms in %.1f submits; "
+                "render thread blocked on GPU at Submit (last guest submit -> frame end) %.2f ms; "
+                "frame-end vkQueueWaitIdle %.2f ms (per frame)\n",
+                g_pf.frames, g_pf.period / n, g_pf.bubble / n, g_pf.encode / n,
+                g_pf.submits / n, g_pf.seam / n, g_pf.waitidle / n);
+            g_pf.win_start = t;
+            g_pf.bubble = g_pf.encode = g_pf.waitidle = g_pf.seam = g_pf.period = 0;
+            g_pf.frames = g_pf.submits = 0;
+        }
+    }
 }
 
 static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
@@ -3100,6 +3152,31 @@ static int klvk_format_backed(VkFormat fmt) {
     known[fmt] = (fp.optimalTilingFeatures || fp.linearTilingFeatures) ? 1 : -1;
     return known[fmt] > 0;
 }
+// [perf-audit 2026-10-07] image -> (samples, w, h, fmt, usage) for the
+// render-target census in klvk_CmdBeginRendering (KL_PERF_PASS_LOG).
+#define KLVK_PERF_RT_MAX 1024
+static struct { VkImage img; uint32_t samples, w, h, usage; int fmt; } g_perf_rt[KLVK_PERF_RT_MAX];
+static int g_perf_rt_n;
+static pthread_mutex_t g_perf_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+static void perf_rt_note(VkImage img, const VkImageCreateInfo *ci) {
+    pthread_mutex_lock(&g_perf_rt_lock);
+    int i = 0;
+    while (i < g_perf_rt_n && g_perf_rt[i].img != img) i++;
+    if (i == g_perf_rt_n && g_perf_rt_n < KLVK_PERF_RT_MAX) g_perf_rt_n++;
+    if (i < KLVK_PERF_RT_MAX) {
+        g_perf_rt[i].img = img; g_perf_rt[i].samples = ci->samples; g_perf_rt[i].w = ci->extent.width;
+        g_perf_rt[i].h = ci->extent.height; g_perf_rt[i].usage = ci->usage; g_perf_rt[i].fmt = (int)ci->format;
+    }
+    pthread_mutex_unlock(&g_perf_rt_lock);
+}
+static int perf_rt_find(VkImage img, uint32_t *samples, uint32_t *w, uint32_t *h, int *fmt) {
+    int ok = 0;
+    pthread_mutex_lock(&g_perf_rt_lock);
+    for (int i = 0; i < g_perf_rt_n; i++) if (g_perf_rt[i].img == img) {
+        *samples = g_perf_rt[i].samples; *w = g_perf_rt[i].w; *h = g_perf_rt[i].h; *fmt = g_perf_rt[i].fmt; ok = 1; break; }
+    pthread_mutex_unlock(&g_perf_rt_lock);
+    return ok;
+}
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
     static PFN_vkCreateImage real;
@@ -3225,6 +3302,24 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
         fprintf(stderr, "[TRACE] [thr] createRT %#llx %ux%u fmt %d usage %#x tid=%u\n",
             (unsigned long long)(uintptr_t)(out?*out:0), ci->extent.width, ci->extent.height,
             (int)ci->format, ci->usage, klvk_tid());
+    // [perf-audit 2026-10-07] KL_PERF_RT_LOG (default on, first 128): every
+    // large render target the guest creates, with its SAMPLE COUNT and whether it
+    // asked for TRANSIENT usage (0x40) — the evidence for "is Alyx's 4x MSAA
+    // backed by real memory (stored/loaded every pass) or memoryless tile
+    // storage". Pairs with the [perf] vkAllocateMemory lines below.
+    if (r == VK_SUCCESS && ci && out && *out && (ci->usage & 0x30u) && ci->extent.width >= 256)
+        perf_rt_note(*out, ci);
+    if (r == VK_SUCCESS && ci && (ci->usage & 0x30u) && ci->extent.width >= 1024
+        && kl_env_on("KL_PERF_RT_LOG", 1)) {
+        static int rt_said;
+        if (rt_said < 128) {
+            rt_said++;
+            VKI("[perf] RT %#llx %ux%u fmt %d samples %u layers %u mips %u usage %#x%s\n",
+                (unsigned long long)(uintptr_t)(out ? *out : 0), ci->extent.width,
+                ci->extent.height, (int)ci->format, (unsigned)ci->samples, ci->arrayLayers,
+                ci->mipLevels, ci->usage, (ci->usage & 0x40u) ? " TRANSIENT" : "");
+        }
+    }
     static int logged;
     if (logged < 4096 && (r != VK_SUCCESS || (ci && ci->mipLevels > 1) || logged < 64)) {
         logged++;
@@ -3815,6 +3910,67 @@ static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
                 (unsigned long long)(uintptr_t)im, klvk_img_tag(im), klvk_layer_image_key(im));
         }
     }
+    // [perf-audit 2026-10-07] KL_PERF_PASS_LOG=<n>: log n vkCmdBeginRendering
+    // calls after skipping KL_PERF_PASS_SKIP (default 20000, i.e. in game): the
+    // flags (1 = CONTENTS_SECONDARY, 2 = SUSPENDING, 4 = RESUMING), area, layers,
+    // viewMask, and every attachment's load/store op, resolve mode and sample
+    // count — what MoltenVK has to turn into Metal load/store actions on a tiler.
+    {
+        static int n_log = -1, skip; static long seen;
+        if (n_log < 0) { n_log = kl_env_int("KL_PERF_PASS_LOG", 0); skip = kl_env_int("KL_PERF_PASS_SKIP", 20000); }
+        if (n_log > 0 && ri && __atomic_add_fetch(&seen, 1, __ATOMIC_RELAXED) > skip) {
+            n_log--;
+            static const char *lo[] = { "LOAD", "CLEAR", "DONTCARE" };
+            char buf[1024]; int k = 0;
+            k += snprintf(buf + k, sizeof buf - k, "[perf] pass cb %p flags %#x area %ux%u layers %u viewMask %#x",
+                          (void *)cb, ri->flags, ri->renderArea.extent.width, ri->renderArea.extent.height,
+                          ri->layerCount, ri->viewMask);
+            for (uint32_t i = 0; i < ri->colorAttachmentCount && ri->pColorAttachments && k < 900; i++) {
+                const VkRenderingAttachmentInfo *a = &ri->pColorAttachments[i];
+                uint32_t sm = 0, w = 0, h = 0; int fmt = 0;
+                perf_rt_find(klvk_view_image(a->imageView), &sm, &w, &h, &fmt);
+                k += snprintf(buf + k, sizeof buf - k, " | C%u %s/%s %ux%u fmt %d x%u%s", i,
+                              a->loadOp <= 2 ? lo[a->loadOp] : "?", a->storeOp == 0 ? "STORE" : a->storeOp == 1 ? "DONTCARE" : "NONE",
+                              w, h, fmt, sm, a->resolveMode ? " +resolve" : "");
+            }
+            const VkRenderingAttachmentInfo *dep[2] = { ri->pDepthAttachment, ri->pStencilAttachment };
+            for (int i = 0; i < 2 && k < 900; i++) if (dep[i] && dep[i]->imageView) {
+                uint32_t sm = 0, w = 0, h = 0; int fmt = 0;
+                perf_rt_find(klvk_view_image(dep[i]->imageView), &sm, &w, &h, &fmt);
+                k += snprintf(buf + k, sizeof buf - k, " | %s %s/%s %ux%u fmt %d x%u%s", i ? "S" : "D",
+                              dep[i]->loadOp <= 2 ? lo[dep[i]->loadOp] : "?",
+                              dep[i]->storeOp == 0 ? "STORE" : dep[i]->storeOp == 1 ? "DONTCARE" : "NONE",
+                              w, h, fmt, sm, dep[i]->resolveMode ? " +resolve" : "");
+            }
+            VKI("%s\n", buf);
+        }
+    }
+    // [perf-audit 2026-10-07] KL_PERF_NO_SUSPEND_AB=<s>: a MEASUREMENT, not a
+    // fix — the picture is WRONG while it is on. Every <s> seconds, alternately,
+    // strip SUSPENDING/RESUMING from the guest's dynamic-rendering segments, so
+    // MoltenVK no longer stores every (4x MSAA) attachment at each segment end and
+    // loads it back at the next segment start (it clears/resolves per the
+    // Vulkan ops instead; only the last segment's draws survive). The GPU time
+    // difference between the two phases (Metal System Trace, per frame) is the
+    // cost of the store/load round trips. Phase changes are logged.
+    {
+        static double period = -1;
+        if (period < 0) { const char *e = getenv("KL_PERF_NO_SUSPEND_AB"); period = e ? atof(e) : 0; }
+        if (period > 0 && ri && (ri->flags & 0x6u)) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double t = ts.tv_sec + ts.tv_nsec * 1e-9;
+            int phase = ((long)(t / period)) & 1;
+            static int last = -1;
+            if (phase != last) { last = phase;
+                VKI("[perf] NO_SUSPEND_AB phase %s at %.3f\n", phase ? "STRIPPED" : "normal", t); }
+            if (phase) {
+                VkRenderingInfo m = *ri;
+                m.flags &= ~0x6u;
+                if (real) real(cb, &m);
+                return;
+            }
+        }
+    }
     if (real) real(cb, ri);
 }
 // KL_TRACE: catch a temp-RT allocation that FAILS at bind time — the step Unity
@@ -4008,6 +4164,27 @@ static VkResult VKAPI_CALL klvk_AllocateMemory(VkDevice dev,
     static PFN_vkAllocateMemory real;
     if (!real && real_gdpa) real = (PFN_vkAllocateMemory)real_gdpa(dev, "vkAllocateMemory");
     VkResult r = real ? real(dev, ai, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    // [perf-audit 2026-10-07] KL_PERF_RT_LOG: big allocations (>= 16 MB) with
+    // the memory type's property flags — 0x10 = LAZILY_ALLOCATED, which MoltenVK
+    // backs with MTLStorageModeMemoryless (no DRAM, no load/store traffic).
+    if (r == VK_SUCCESS && ai && ai->allocationSize >= (16ull << 20) && g_devs[0]
+        && kl_env_on("KL_PERF_RT_LOG", 1)) {
+        static int mem_said;
+        static VkPhysicalDeviceMemoryProperties mp;
+        static int have_mp;
+        if (!have_mp && real_gipa) {
+            PFN_vkGetPhysicalDeviceMemoryProperties gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)
+                real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+            if (gmp) { gmp(g_devs[0]->phys, &mp); have_mp = 1; }
+        }
+        if (mem_said < 128) {
+            mem_said++;
+            VKI("[perf] vkAllocateMemory %.1f MB type %u flags %#x\n",
+                (double)ai->allocationSize / (1 << 20), ai->memoryTypeIndex,
+                have_mp && ai->memoryTypeIndex < mp.memoryTypeCount
+                    ? mp.memoryTypes[ai->memoryTypeIndex].propertyFlags : 0u);
+        }
+    }
     if (r != VK_SUCCESS)
         VKI("vkAllocateMemory FAILED result %d size %llu typeIndex %u\n", (int)r,
             ai ? (unsigned long long)ai->allocationSize : 0, ai ? ai->memoryTypeIndex : 0);
@@ -4326,7 +4503,22 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
                 klvk_tid(), n, cb, fence != VK_NULL_HANDLE);
         }
     }
+    double pf_t0 = pf_on() ? pf_now() : 0;           // [perf-audit] KL_PERF_FRAME
     VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
+    if (pf_t0 > 0) {
+        double t = pf_now();
+        g_pf.encode += t - pf_t0; g_pf.submits++;
+        unsigned ncb = 0; for (uint32_t i = 0; i < n && si; i++) ncb += si[i].commandBufferCount;
+        // "Big" = a submit whose synchronous encode took >= KL_PERF_BIG_MS
+        // (default 0.25 ms): the game's frame command buffers, not the empty /
+        // timestamp submits it makes right after Submit, nor our eye copies.
+        static double big = -1;
+        if (big < 0) { const char *e = getenv("KL_PERF_BIG_MS"); big = e ? atof(e) : 0.25; }
+        if (ncb && t - pf_t0 >= big) {
+            g_pf.t_last_submit = t;
+            if (!g_pf.open && g_pf.t_done > 0) { g_pf.bubble += t - g_pf.t_done; g_pf.open = 1; }
+        }
+    }
     // Same thread, same queue, right after the guest's work: copy every wanted
     // overlay texture into its persistent shadow (see klvk_shadow_pump).
     if (r == VK_SUCCESS) klvk_shadow_pump();

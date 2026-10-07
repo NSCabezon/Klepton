@@ -2192,6 +2192,23 @@ nothing, and prints the unresolved imports grouped by category.
   second open while one is open now replaces it (it used to return 0, mute
   for the rest of the run), and `SDL_QuitSubSystem(AUDIO)` / `SDL_AudioQuit`
   close the device as real SDL does.
+- `KL_GLIBC_STEAMAUDIO=0|1` — Half-Life: Alyx's Steam Audio (libsteamaudio →
+  libphonon: HRTF, baked reverb, pathing). **Default 1 (on)**; `=0` is the
+  A/B fallback: the door writes `<write layer>/hlvr/gameinfo.gi`, a copy of the game's with
+  `SoundSystem { "SteamAudioEnabled" "0" }` and a `// klepton:` marker on its
+  first line, which shadows the install's (a write-layer file wins in
+  `content_overlay`); regenerated every boot, deleted again when on. A
+  hand-made gameinfo.gi there (no marker) is left alone and the knob ignored.
+  Why: on the Vision Pro in-game audio went near-silent (`[sdl-au]` 5 s peaks
+  0–1100 after loading a1_intro_world's 0:46 autosave from the menu, vs
+  ~25000 in the menu), while on the Mac the same map and the same 0:46 save
+  play at 13000–32767 — with ELF libraries and with libsoundsystem/libsteamaudio/
+  libphonon translated by klepton-ld alike, so neither the audio code's
+  translation nor Steam Audio's maths reproduce here. With Steam Audio off the
+  engine never loads libsteamaudio/libphonon and plays every sound through its
+  plain panner, as loud (Mac: peaks 8000–32767). Costs: no HRTF/reverb, and
+  the options menu logs `Invalid ConVar snd_steamaudio_*` for its three reverb
+  settings. `=1` is the device A/B for whether Steam Audio is the silence.
 - `KL_GLIBC_SDL_SEAM=0` — leave all of SDL to the guest's own libSDL2 (its
   video subsystem then fails: no X11/Wayland). The A/B for the seam.
 - `KL_TRACE_SDL=1` — the SDL seam's Vulkan calls (extensions, surface) and pointer capture: SetRelativeMouseMode, SetWindowGrab, ShowCursor, CaptureMouse, the first warp, focus changes and button presses (with the relative/grab state at the time).
