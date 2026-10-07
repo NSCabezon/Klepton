@@ -3197,9 +3197,15 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
     g_eye_mtl[eye][stage].h = h;
     // Vulkan's framebuffer origin is the top left, like Metal's and unlike GL's.
     g_eye_mtl[eye][stage].top_left = 1;
-    fprintf(stderr, "  [glfb] eye %d stage %d is MTLTexture %p slice %d (%dx%d), "
-                    "from Vulkan — top-left origin, the compositor can sample it\n",
-            eye, stage, texture, slice, w, h);
+    // Bounded: a slot re-pointed every frame (the OpenVR bridge's zero-copy
+    // and native-stage paths) would otherwise print at the frame rate.
+    static int said;
+    if (said < 24) {
+        said++;
+        fprintf(stderr, "  [glfb] eye %d stage %d is MTLTexture %p slice %d (%dx%d), "
+                        "from Vulkan — top-left origin, the compositor can sample it%s\n",
+                eye, stage, texture, slice, w, h, said == 24 ? " (further changes not logged)" : "");
+    }
 }
 
 int kl_glfb_eye_mtl_origin_top_left(int eye, int stage) {
