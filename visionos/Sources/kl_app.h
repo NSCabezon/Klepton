@@ -170,6 +170,11 @@ const char *kl_app_assets_dir(void);
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.
 const char *kl_app_log_path(void);
+// Where kl_app_configure puts klepton-boot.log and klepton-crash.log. Call
+// before it; NULL or "" (the default) means the container. The hub passes
+// Documents/ so each game's container can differ while the log stays where
+// visionos/run.sh and build_run_vpro.sh fetch it.
+void        kl_app_set_log_dir(const char *dir);
 
 // Human-readable status of the last call, for the UI. Never NULL.
 const char *kl_app_status(void);

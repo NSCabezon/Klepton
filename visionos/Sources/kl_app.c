@@ -96,7 +96,9 @@ static char g_assets[1024];
 static char g_files[1024];
 static char g_apk[1024];
 static char g_dylibs[1024];
+static char g_fwroot[1024];   // the bundle's Frameworks/ itself: ANGLE, MoltenVK
 static char g_log[1024];
+static char g_logdir[1024];   // kl_app_set_log_dir; empty = the container
 static char g_status[512] = "not configured";
 const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 
@@ -105,6 +107,9 @@ const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 static void app_phase(const char *p);
 
 const char *kl_app_log_path(void) { return g_log; }
+void kl_app_set_log_dir(const char *dir) {
+    snprintf(g_logdir, sizeof g_logdir, "%s", dir ? dir : "");
+}
 const char *kl_app_status(void)   { return g_status; }
 
 static int have(const char *p) { struct stat st; return p && *p && stat(p, &st) == 0; }
@@ -160,11 +165,27 @@ int kl_app_configure(const char *resources, const char *container) {
     // Frameworks/, not a directory of our own: that is where Xcode code-signs
     // what it embeds, and a loose Mach-O elsewhere in the bundle is only
     // sealed. kl_load_auto knows both layouts.
-    snprintf(g_dylibs, sizeof g_dylibs, "%s/Frameworks", resources);
+    //
+    // A HUB build (several games in one app, visionos/targets.py kind "hub")
+    // embeds each game's translations in its own Frameworks/<target>/, because
+    // two games may ship libraries of the same name (libunity, libUE4,
+    // libc++_shared) and one flat directory can hold only one of each. So the
+    // selected target's subfolder wins when it carries this target's entry
+    // library; a single-target build has no such folder and keeps the flat
+    // layout. ANGLE and MoltenVK are shared by every game and stay in
+    // Frameworks/ itself (g_fwroot).
+    snprintf(g_fwroot, sizeof g_fwroot, "%s/Frameworks", resources);
+    snprintf(g_dylibs, sizeof g_dylibs, "%s/Frameworks/%s", resources, g_target->name);
+    if (!have_translations())
+        snprintf(g_dylibs, sizeof g_dylibs, "%s", g_fwroot);
     snprintf(g_assets, sizeof g_assets, "%s/%s/assets", container, g_target->tree);
     snprintf(g_apk,    sizeof g_apk,    "%s/%s", container, g_target->apk);
     snprintf(g_files,  sizeof g_files,  "%s/android-files", container);
-    snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", container);
+    // The log (and crash report) go to the container unless the app named
+    // another directory: the hub gives each game its own container but keeps
+    // the log where every script looks for it, Documents/klepton-boot.log.
+    const char *logdir = g_logdir[0] ? g_logdir : container;
+    snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", logdir);
 
     // A crash report of its own, beside the log. The boot log is stdout with
     // stderr duped onto it, and neither survives a fault reliably — a guest may
@@ -172,7 +193,7 @@ int kl_app_configure(const char *resources, const char *container) {
     // thread never releases. This path is opened at fault time and fsync'd, so
     // "it crashed and the log stops just before" stops being the whole story.
     static char crash[1024];
-    snprintf(crash, sizeof crash, "%s/klepton-crash.log", container);
+    snprintf(crash, sizeof crash, "%s/klepton-crash.log", logdir);
     kl_fault_set_crash_path(crash);
 
     // Check before running, not after failing. A missing asset tree otherwise
@@ -304,7 +325,7 @@ int kl_app_configure(const char *resources, const char *container) {
     // "where is ANGLE" itself rather than have the launcher guess at a path
     // that only exists on the device. Not forced: an explicit KL_ANGLE_DIR
     // still wins, which is how a run points at a different build.
-    setenv("KL_ANGLE_DIR", g_dylibs, 0);
+    setenv("KL_ANGLE_DIR", g_fwroot, 0);
 
     // ...and so does MoltenVK, for a guest whose graphics API is Vulkan
     // (BONELAB). Same rule, same reason: the app knows where its own Frameworks
@@ -317,7 +338,7 @@ int kl_app_configure(const char *resources, const char *container) {
     // HOST's vendored path, so a run where MoltenVK is genuinely missing from
     // the bundle reports `vendor-moltenvk/out/macos/...: no such file`, which
     // names a directory that has never existed on a headset.
-    setenv("KL_MVK_DIR", g_dylibs, 0);
+    setenv("KL_MVK_DIR", g_fwroot, 0);
 
     // The capture knobs, resolved against the CONTAINER when they are relative.
     //
