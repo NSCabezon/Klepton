@@ -1541,17 +1541,21 @@ The composite/timewarp pass — one file, compiled by both compositors
   Below `min` a pixel is fully keyed out, above `max` fully kept, between them it
   fades; a band rather than a threshold is what stops the matte having a hard
   jagged edge.
-- `KL_HAND_MATTING=0` — stop the system drawing the user's own hands and arms
-  over the guest's picture (`.upperLimbVisibility`). Off by default for alyx
-  (it draws its own hands). Otherwise on by default, which is what
-  visionOS does in `.mixed`; off is what a guest that draws its own hands wants,
-  because two pairs of hands in one place is worse than either alone.
+- `KL_HAND_MATTING=0|1` — whether the system draws the user's own hands and
+  arms over the guest's picture (`.upperLimbVisibility`). **A per-game setting**
+  (see "Per-game settings" in the visionOS app section): default **off for every
+  hub game** and for a single-game alyx build (they draw their own hands), on
+  for other single-game builds. This variable overrides the saved/default value
+  for the run.
 
-  All four are seeded into the **Matting** panel in the boot window and are
-  PERSISTED from there (UserDefaults, JSON, key `klepton.chroma`) — unlike the
-  controller dials beside them, because a key colour is a property of the room
-  rather than of a debugging session. Precedence at launch: an explicitly set
-  environment variable wins, then the saved settings, then these defaults.
+  The three chroma knobs are seeded into the **Matting** panel in the boot
+  window and are PERSISTED from there (UserDefaults, JSON, key `klepton.chroma`)
+  — unlike the controller dials beside them, because a key colour is a property
+  of the room rather than of a debugging session. Precedence at launch: an
+  explicitly set environment variable wins, then the saved settings, then these
+  defaults. The panel's hand-matting toggle saves to the running game's
+  per-game settings instead; a `handMatting` key in an old `klepton.chroma`
+  blob is ignored (and dropped on the next save).
 
 
 - `KL_SENSE_PREDICT_MS=<ms>` — how far into the future a Sense-controller pose
@@ -2223,9 +2227,13 @@ nothing, and prints the unresolved imports grouped by category.
   contract and still answer "". Without the bridge everything is local, as
   before.
 - `KL_STEAM_LANG=<steam language>` — the game language the Steam stub reports
-  (`english`, `spanish`, `latam`, `french`, …). Default: the system's first
-  preferred language, mapped to Steam's name. Alyx has English voices only;
-  this picks UI text and subtitles.
+  (`GetCurrentGameLanguage`, `GetSteamUILanguage`, `GetAvailableGameLanguages`;
+  glibc and Android stand-ins alike): `english`, `spanish`, `latam`, `french`,
+  `german`, `italian`, `brazilian`, `japanese`, `koreana`, `schinese`,
+  `russian`, …. Default: `KL_LOCALE` mapped to Steam's name if set, else the
+  system's first preferred language mapped the same way. Alyx has English
+  voices only; this picks UI text and subtitles. The hub sets it from the
+  game's Language setting.
 - `KL_OPENVR=0` — (`runtime/guest/kl_openvr.c`) leave libopenvr_api's VR_*
   entry points to the guest's own library (which looks for a SteamVR install
   and fails). With it on (default), `-vr` boots against Klepton's runtime: HMD
@@ -2265,9 +2273,11 @@ nothing, and prints the unresolved imports grouped by category.
   with tangents ... (we offered ...)" line shows the game honouring it; 0.12 is
   ~3 degrees per side on the Vision Pro (60 -> 62.7 deg out, 45 -> 48.2 up,
   50 -> 53.2 down). Mac menu: 46-48 fps off, 36-41 fps at 0.12, same picture.
-- `KL_OPENVR_OVERSCAN_RT=0` — keep the recommended render-target size under
-  the overscan (same pixels spread over the wider field: density -1/(1+f)).
-  Default 1 scales it by (1+f) so the centre's pixel density is unchanged —
+- `KL_OPENVR_OVERSCAN_RT=1` — scale the recommended render target by (1+f)
+  under the overscan. Default 0 (2026-10-07: the device is GPU-bound and the
+  extra pixels cost too much frame rate) keeps the size, spreading the same
+  pixels over the wider field (density -1/(1+f)). With 1 the centre's pixel
+  density is unchanged —
   (1+f)^2 pixels, ~25% more at 0.12 (Mac: 44-45 fps with `=0`). Alyx's
   auto-fidelity (`KL_OPENVR_FRAME_TIMING`) answers the heavier frame by
   dropping a level, so on device the two converge; this is the A/B for whether
@@ -2452,10 +2462,25 @@ except its own control vars (next section).
   P5b's shape before the guest moved to its own thread. The clock P5.4's device numbers were taken
   against, and the A/B for anything that looks like a pacing regression.
   Default is the guest on its own thread, one frame per published pose.
-- `KL_FULL=1` — `.full` immersion. `.mixed` is the default — the guest's world
-  is opaque so passthrough shows through nowhere it matters, and seeing the
-  room makes scale and IPD easier to judge. The scene manifest declares
-  `UIImmersionStyleMixed` to match; keep the two in step.
+- `KL_FULL=0|1` — `.full` vs `.mixed` immersion, overriding the game's saved
+  or default setting for the run. **Hub: every game defaults to `.full`**
+  (no passthrough, whatever the guest kind). Single-game builds: `.mixed` is the
+  default — the guest's world is opaque so passthrough shows through nowhere it
+  matters, and seeing the room makes scale and IPD easier to judge — except the
+  kinds `kl_app_target_wants_full` names (native VR, GLES3JNI, SDL2, glibc).
+  **Caveat:** the runtime also reads `KL_FULL` as an alias of `KL_VERBOSE_ALL`
+  (`runtime/kl_env.c`), so `KL_FULL=1` additionally turns on diagnostic
+  logging knobs; to get `.full` without that, use the per-game setting.
+- **Per-game settings** (`KleptonChroma.swift`, `KLGameSettings`): UserDefaults
+  key `klepton.game.<target>`, JSON `{fullImmersion, handMatting, language}`,
+  each optional (absent = the game's default). Edited from the gear button on
+  the hub's game card; hand matting also from the boot window's Matting panel.
+  Precedence: environment (`KL_FULL`, `KL_HAND_MATTING`, `KL_LOCALE`,
+  `KL_STEAM_LANG`) > saved > default. The hub loads them when Play picks the
+  game, before the boot window exists, so `.full` and hidden hands are in place
+  before the immersive space opens. Language: System (default) sets nothing;
+  any other choice sets `KL_LOCALE`, `KL_STEAM_LANG` and `LANG` (only if not
+  already set) before `kl_app_configure`.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
   **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
   two are one word apart and were briefly one name, which would have made each
@@ -2709,11 +2734,14 @@ Read by the scripts themselves, never forwarded to the app.
   are forwarded to the app, so tearing the bridge down would quit the thing you
   are looking at the moment the script stops watching it. The next run's
   `--terminate-existing` ends both, so at most one bridge is ever outstanding.
-- `KL_LOG_FILE=0` — the app does **not** redirect stdout/stderr into
-  `Documents/klepton-boot.log` (visionOS, `kl_app.c`). The only way anything
-  outside the process can read them live; the in-window boot report and the
-  after-the-fact pull both go empty in exchange, so this is set by the console
-  path rather than by hand.
+- `KL_LOG_FILE=0` — console mode (visionOS, `kl_app.c`): stdout/stderr still
+  reach the original console, which `devicectl --console` bridges live, AND are
+  written to `Documents/klepton-boot.log` — a pipe and a thread tee them. (It
+  used to write no file at all; a hub session launched over `--console` whose
+  bridge delivered nothing then had no log anywhere.) The log is overwritten
+  per run in both modes; `Documents/klepton-crash.log` is written only when a
+  run faults. `build_run_vpro.sh` pulls the container's log after a streamed
+  run whose stream has no boot report. Set by the console path, not by hand.
 
 ## Host environment pass-through
 
@@ -2721,6 +2749,16 @@ Not knobs — the shim reads these to answer the guest with host truth.
 
 - `TMPDIR` — `kl_libc.c` builds the synthetic `/proc` tree under
   `$TMPDIR/klepton-proc.XXXXXX`, falling back to `/tmp/`.
-- `LANG` — `kl_jni.c` derives `Locale.getDefault()`'s language and country
-  from it (`en_US.UTF-8` becomes en/US). Empty, unset, or `C*` falls back to
-  en/US.
+- `KL_LOCALE=<ll[_CC]>` — the Android locale the guest is told (`es_ES`,
+  `pt-BR`, `ja`, `zh_CN`…), on every door onto it: `Locale.getDefault()` /
+  `getLanguage` / `getCountry` / `toLanguageTag`, `Configuration.getLocales()`,
+  NDK `AConfiguration_getLanguage/Country`, SDL `getPreferredLocales`, and the
+  system properties `persist.sys.locale`, `ro.product.locale`,
+  `persist.sys.language|country`, `ro.product.locale.language|region`. Also
+  feeds the Steam language when `KL_STEAM_LANG` is unset. Set per game by the
+  hub's Language setting.
+- `LANG` — the next source after `KL_LOCALE` for the same answers
+  (`en_US.UTF-8` becomes en/US). Empty, unset, or `C*`/`POSIX` falls through to
+  the host's first preferred language (CFLocale — what a visionOS app launched
+  from the Home View has, since it has no `LANG`; before, the headset reported
+  en/US there), then en/US.

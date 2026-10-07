@@ -315,12 +315,13 @@ static float overscan(void) {
 // view is unchanged: the same tangent span per pixel, more pixels. That costs
 // GPU — (1 + f)^2, about 25% more pixels at 0.12 — and Alyx's auto-fidelity
 // (frame timing, below) answers a heavier frame by dropping a level, which
-// lands near the old pixel count anyway. KL_OPENVR_OVERSCAN_RT=0 keeps the
-// size: the same pixels spread over the wider field (density -1/(1+f)), which
-// is the A/B for "is the overscan's cost in GPU or in sharpness".
+// lands near the old pixel count anyway. OFF by default since the first device
+// runs (GPU-bound, the extra pixels cost frame rate): the size is kept and the
+// same pixels spread over the wider field (density -1/(1+f)).
+// KL_OPENVR_OVERSCAN_RT=1 turns the scaling back on.
 static float overscan_rt(void) {
     static float s = -1.0f;
-    if (s < 0.0f) s = overscan() > 0 && kl_env_on("KL_OPENVR_OVERSCAN_RT", 1) ? 1.0f + overscan() : 1.0f;
+    if (s < 0.0f) s = overscan() > 0 && kl_env_on("KL_OPENVR_OVERSCAN_RT", 0) ? 1.0f + overscan() : 1.0f;
     return s;
 }
 
