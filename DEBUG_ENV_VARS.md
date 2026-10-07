@@ -474,9 +474,15 @@ every time they fire, with the address and the instruction each replaces.
 
 A row is skipped, loudly and by name, when the word at its address is not the
 word it was measured against — that is a build fingerprint, so these cannot
-corrupt an APK they were not measured on. **Not yet wired for device**: a
-klepton-ld dylib's text is signed and cannot be written at run time, so a device
-run currently behaves as `KL_GUEST_PATCH=0`.
+corrupt an APK they were not measured on. On device a klepton-ld dylib's text is
+signed, so the table is applied OFFLINE by `build/klepton-ld` when
+`visionos/mkguest.sh` translates the guest: a change to the table reaches the
+headset only through a re-translation (a build without `KL_SKIP_GUEST=1`), and
+`KL_GUEST_PATCH_OFF` there is read at translate time, not at launch.
+
+Half-Life: Alyx's `alyx-startup-no-pause` row (libclient's level-start pause
+countdown) is **disabled** since 2026-10-07: it kept every level after the menu
+behind its "press trigger to start" gate (see `KL_OPENVR_GATE_TRACE`).
 
 ## Memory: decommit, budget and pressure (`runtime/libc/kl_libc.c`)
 
@@ -2403,6 +2409,27 @@ nothing, and prints the unresolved imports grouped by category.
   is the game drawing from a head other than the one the compositor corrects
   from — swim this runtime caused. Mac menu: all zeros, `submitted` on every
   frame.
+- `KL_OPENVR_GATE_TRACE=1` — (`kl_openvr.c`, `alyx_gate_trace`) Alyx build 10919
+  only (checked by an instruction word, so another build reads nothing): print
+  libclient's "press trigger to start" gate whenever it changes — the menu
+  controller's mode (+0xa0), state (+0xa4: 3 = held behind the gate, paused;
+  4 = playing; 7 = game menu), pause countdown (+0x78; the gate holds while it
+  is >= 0 or the state is 0/3), and the loading state machine (1 shown, 2
+  waiting, 3 -> `end_loading`). A level that starts reads `state 3 countdown -1`
+  -> `unpaused the game` -> `gate open`. Before 2026-10-07 every level after the
+  menu sat at `state 4 countdown 3 ... GATE HELD`: the `alyx-startup-no-pause`
+  patch stopped the countdown, so no hands, no world sound, until the pause menu.
+- `KL_OPENVR_CMD_AT="<secs>:<cmd>[;<secs>:<cmd>...]"` — (`alyx_cmd_at`) run each
+  console command on the game's thread (libclient's engine client, the call its
+  menu makes for `setpause`) that many seconds after the first
+  UpdateActionState. Scripted Mac runs take the menu's route with it
+  (`40:load autosave`); on the headset it is a console without a keyboard, e.g.
+  `300:snd_soundmixer_list_mix_layers` dumps the mixer into the log. Up to 8.
+- `KL_OPENVR_RENDER_MODELS=0` — (`rm_load_model`) answer IVRRenderModels'
+  loads with NotSupported (200), the old answer. Default: every name gets one
+  zero-area triangle and a 4x4 grey texture (pack(4) layouts, verified against
+  libvr), which libvr accepts once — with 200 it retries and logs "VR failure
+  loading render model ..." every frame of play (17661 lines in two minutes).
 - `KL_GLIBC_MANIFEST=<path>` — where a `--gap` run writes the packaging
   manifest ("<framework stem>\t<source path>" per mapped image; default
   `build/<target>_images.txt`), which `visionos/mkguest.sh` and `targets.py`

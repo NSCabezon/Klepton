@@ -1883,7 +1883,10 @@ static uint32_t co_focus_process(void *s) { (void)s; return (uint32_t)getpid(); 
 // the file was at hand, and differed where it mattered: MenuDismiss — the
 // action behind Alyx's "Pulsa <origin> para empezar" gate after a load — was on
 // B/Y, so the trigger the prompt (and every player) reaches for did nothing, the
-// level never started, and the hands stayed dead until the pause menu.
+// level never started, and the hands stayed dead until the pause menu. (The
+// trigger alone was not enough: the guest patch alyx-startup-no-pause also kept
+// the level from pausing behind its gate, the state MenuDismiss is read in —
+// disabled 2026-10-07, see kl_guestpatch.c and KL_OPENVR_GATE_TRACE below.)
 // KL_OPENVR_LEGACY_BINDINGS=1 is not offered: the old table has no basis.
 //
 // A handle carries what it was bound to, so the per-frame reads are a switch.
@@ -2019,9 +2022,11 @@ static int in_source_handle(void *s, const char *path, uint64_t *h) {
     return 0;
 }
 static void skel_advance(float now);
+static void alyx_gate_trace(void);
 static int in_update(void *s, const VRActiveActionSet_t *sets, uint32_t size, uint32_t n) {
     (void)s;
     g_update_n++;
+    alyx_gate_trace();
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     g_input_time = (float)t.tv_sec + (float)t.tv_nsec * 1e-9f;
     skel_advance(g_input_time);
@@ -2646,24 +2651,213 @@ static int mb_read(void *s, uint64_t h, char *buf, uint32_t size, uint32_t *need
     return 0;
 }
 
-// ---- IVRRenderModels: none to offer -------------------------------------------
-// Alyx asks for the controllers' render models once a level has STARTED (it
-// never got that far before the "press to start" gate worked): GetComponentCount,
-// then LoadRenderModel_Async. As a logging stub that answered 0 —
-// VRRenderModelError_None, "loaded" — and left the RenderModel_t * NULL, and
-// libvr read its triangle count at +0x18: SIGSEGV in libvr.so+0xb53bc on the
-// first frame of play (measured on the Mac). NotSupported (200) is an honest
-// "there is no model": the game draws its own hands and controllers.
+// ---- KL_OPENVR_GATE_TRACE: Alyx's "press to start" gate, read from libclient ----
+// After every load Alyx holds the level behind an interstitial ("Pulsa <origin>
+// para empezar") and only ends it — mailbox "end_loading", hands in, world
+// sound up — when its menu controller says the level is live. Measured in
+// hlvr/bin/linuxsteamrtarm64/libclient.so (build 10919):
+//
+//   menu controller   static object at 0x25872b0 + 0x60 (fn 0xf83200 returns it)
+//     +0xa0  u32     a mode (2 = the per-frame input handler 0xf95ae8 is off)
+//     +0xa4  u32     menu state (3 = loading gate, 7 = game menu)
+//     +0x78  s32     "pause after N frames" countdown; -1 once pause/unpause ran
+//   gate test 0xf83210: still loading while state is 0 or 3, or countdown >= 0
+//   loading state     0x25e1bb0 + 0x610 (1 shown, 2 waiting, 3 ending -> end_loading)
+//
+// This prints those words whenever they change, so a run says which half of
+// the test holds the gate shut. Read-only; the code word at 0xf83210 is checked
+// first, so another build reads nothing.
+static const uint8_t *alyx_client(void);
+// KL_OPENVR_CMD_AT="<secs>:<command>[;<secs>:<command>...]" — a test harness:
+// runs each console command on the game's own thread (through libclient's
+// engine client, the call its menu makes for "setpause") once that many
+// seconds have passed since the first UpdateActionState. For scripted Mac runs
+// that need the menu's route (startup map, then "load <save>") with no hand on
+// a laser pointer. Build 10919 only, like the trace.
+static void alyx_cmd_at(void) {
+    static int n = -1;
+    static struct { float at; char cmd[96]; int done; } c[8];
+    static double t0;
+    if (n == 0) return;
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("KL_OPENVR_CMD_AT");
+        while (e && *e && n < 8) {
+            char *end; float v = strtof(e, &end);
+            if (end == e || *end != ':') break;
+            const char *s = end + 1, *t = strchr(s, ';');
+            size_t l = t ? (size_t)(t - s) : strlen(s);
+            if (l >= sizeof c[0].cmd) l = sizeof c[0].cmd - 1;
+            c[n].at = v; memcpy(c[n].cmd, s, l); c[n].cmd[l] = 0; c[n].done = 0; n++;
+            e = t ? t + 1 : s + l;
+        }
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0 = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (!n) return;
+    }
+    const uint8_t *cl = alyx_client();
+    if (!cl) return;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9 - t0;
+    for (int i = 0; i < n; i++) {
+        if (c[i].done || now < c[i].at) continue;
+        c[i].done = 1;
+        void *eng; memcpy(&eng, cl + 0x26b94a8, sizeof eng);     // IVEngineClient * (0xf81c44)
+        if (!eng) continue;
+        void **vt = *(void ***)eng;
+        void (*cmd)(void *, int, const char *, int, int) = (void (*)(void *, int, const char *, int, int))vt[0xd0 / 8];
+        fprintf(stderr, "  [openvr] console at %.0f s: \"%s\" (KL_OPENVR_CMD_AT)\n", now, c[i].cmd);
+        cmd(eng, 0, c[i].cmd, 0, 0);
+    }
+}
+
+static const uint8_t *alyx_client(void) {
+    static const uint8_t *cl;
+    static int bad;
+    if (cl || bad) return cl;
+    kl_image *img = kl_find_image("libclient.so");
+    const uint8_t *b = img ? (const uint8_t *)kl_base(img) : NULL;
+    if (!b) return NULL;
+    uint32_t w = 0;
+    memcpy(&w, b + 0xf83210, 4);
+    if (w != 0xaa0003e1u) {
+        fprintf(stderr, "  [openvr] libclient.so is not build 10919 (0x%08x at 0xf83210): gate trace / console knobs off\n", w);
+        bad = 1;
+        return NULL;
+    }
+    return cl = b;
+}
+
+static void alyx_gate_trace(void) {
+    static int on = -1;
+    static const uint8_t *cl;
+    static int32_t last[8];
+    static int have;
+    alyx_cmd_at();
+    if (on < 0) on = kl_env_on("KL_OPENVR_GATE_TRACE", 0);
+    if (!on) return;
+    if (!cl) {
+        if (!(cl = alyx_client())) return;
+        fprintf(stderr, "  [openvr] gate trace: libclient.so at %p (KL_OPENVR_GATE_TRACE)\n", (void *)cl);
+    }
+    const uint8_t *mc = cl + 0x25872b0 + 0x60, *ld = cl + 0x25e1bb0;
+    int32_t v[8];
+    memcpy(&v[0], mc + 0xa0, 4); memcpy(&v[1], mc + 0xa4, 4); memcpy(&v[2], mc + 0x78, 4);
+    memcpy(&v[3], mc + 0x7c, 4); v[4] = mc[0x98]; memcpy(&v[5], ld + 0x610, 4);
+    v[6] = mc[0x6f] | mc[0x70] << 8; v[7] = ld[0x608];
+    if (have && !memcmp(v, last, sizeof v)) return;
+    have = 1; memcpy(last, v, sizeof v);
+    fprintf(stderr, "  [openvr] gate: mode(a0) %d state(a4) %d countdown(78) %d frames(7c) %d paused-by-countdown(98) %d"
+                    " | loading %d sleeping %d | dismiss last L%d R%d -> %s\n",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[7], v[6] & 1, (v[6] >> 8) & 1,
+            (v[1] == 0 || v[1] == 3 || v[2] >= 0) ? "GATE HELD" : "gate open");
+}
+
+// ---- IVRRenderModels: one invisible model for every name -----------------------
+// Alyx asks for the controllers' render models once a level has STARTED:
+// libvr's loader (0xb5080) reads Prop_RenderModelName_String (1003), asks
+// GetComponentCount, and with no components loads the model itself —
+// LoadRenderModel_Async, then LoadTexture_Async on the model's
+// diffuseTextureId — and builds an engine mesh from the two (0xb4164). An
+// answer of 0 with a NULL RenderModel_t * crashed it (libvr.so+0xb53bc reads
+// +0x18 of the model); NotSupported (200) is survived, but the loader treats
+// any error other than Loading (100) as a failure to retry, and logs "VR
+// failure loading render model <name>: 200" every frame of play — 17661 lines
+// in a two-minute Mac run, each a write to the log from the render loop.
+//
+// The game draws the hands itself (the controller is never shown in play), so
+// what it is handed is the smallest thing the loader accepts: one triangle with
+// all three corners at the origin (nothing to rasterize) and a 4x4 grey
+// texture. Layouts are OpenVR's under `#pragma pack(push, 4)` (Linux), which
+// libvr confirms: diffuseTextureId at +0x18 of RenderModel_t (natural alignment
+// would put it at +0x1c), the texture's pixels at +4 of RenderModel_TextureMap_t
+// (`ldur x3, [x21, #4]`, 0xb45c0), and a texture id <= 0 skips the texture.
+// KL_OPENVR_RENDER_MODELS=0 restores the NotSupported answer — the A/B.
 #define RM_NOT_SUPPORTED 200
+#pragma pack(push, 4)
+typedef struct { float pos[3], normal[3], uv[2]; } RenderModel_Vertex_t;
+typedef struct {
+    const RenderModel_Vertex_t *rVertexData; uint32_t unVertexCount;
+    const uint16_t *rIndexData; uint32_t unTriangleCount; int32_t diffuseTextureId;
+} RenderModel_t;
+typedef struct {
+    uint16_t unWidth, unHeight; const uint8_t *rubTextureMapData; int32_t format; uint16_t unMipLevels;
+} RenderModel_TextureMap_t;
+#pragma pack(pop)
+_Static_assert(sizeof(RenderModel_Vertex_t) == 32, "RenderModel_Vertex_t");
+_Static_assert(__builtin_offsetof(RenderModel_t, rIndexData) == 12, "RenderModel_t pack(4)");
+_Static_assert(__builtin_offsetof(RenderModel_t, diffuseTextureId) == 24, "RenderModel_t pack(4)");
+_Static_assert(sizeof(RenderModel_t) == 28, "RenderModel_t pack(4)");
+_Static_assert(__builtin_offsetof(RenderModel_TextureMap_t, rubTextureMapData) == 4, "TextureMap pack(4)");
+_Static_assert(__builtin_offsetof(RenderModel_TextureMap_t, format) == 12, "TextureMap pack(4)");
+_Static_assert(sizeof(RenderModel_TextureMap_t) == 20, "TextureMap pack(4)");
+#define RM_TEXTURE_ID 1
+static const RenderModel_Vertex_t k_rm_verts[3] = {
+    { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 0 } }, { { 0, 0, 0 }, { 0, 0, 1 }, { 1, 0 } },
+    { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1 } },
+};
+static const uint16_t k_rm_index[3] = { 0, 1, 2 };
+// Filled at run time, not by an initializer: pack(4) puts a pointer at +12 /
+// +4, and the linker refuses an unaligned pointer in static data ("pointer not
+// aligned"), so the structs are written through memcpy'd fields instead.
+static RenderModel_t g_rm_model;
+static RenderModel_TextureMap_t g_rm_texture;
+
+static const uint8_t k_rm_pixels[4 * 4 * 4] = {
+#define RM_PX 0x80, 0x80, 0x80, 0xff
+    RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX,
+    RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX, RM_PX,
+#undef RM_PX
+};
+static void rm_fill(void) {
+    const RenderModel_Vertex_t *v = k_rm_verts; const uint16_t *ix = k_rm_index; const uint8_t *px = k_rm_pixels;
+    uint32_t nv = 3, nt = 1; int32_t tid = RM_TEXTURE_ID, fmt = 0;   // EVRRenderModelTextureFormat RGBA8_SRGB
+    uint16_t w = 4, h = 4, mips = 1;
+    memcpy(&g_rm_model.rVertexData, &v, sizeof v);   memcpy(&g_rm_model.unVertexCount, &nv, 4);
+    memcpy(&g_rm_model.rIndexData, &ix, sizeof ix);  memcpy(&g_rm_model.unTriangleCount, &nt, 4);
+    memcpy(&g_rm_model.diffuseTextureId, &tid, 4);
+    memcpy(&g_rm_texture.unWidth, &w, 2); memcpy(&g_rm_texture.unHeight, &h, 2);
+    memcpy(&g_rm_texture.rubTextureMapData, &px, sizeof px);
+    memcpy(&g_rm_texture.format, &fmt, 4); memcpy(&g_rm_texture.unMipLevels, &mips, 2);
+}
+static int rm_on(void) {
+    static int on = -1;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, rm_fill);
+    if (on < 0) on = kl_env_on("KL_OPENVR_RENDER_MODELS", 1);
+    return on;
+}
 static int rm_load_model(void *s, const char *name, void **out) {
     (void)s;
-    if (out) *out = NULL;
-    static int said;
-    if (said < 4) { said++; fprintf(stderr, "  [openvr] LoadRenderModel_Async(\"%s\") -> NotSupported "
-                                            "(no render models here)\n", name ? name : ""); }
-    return RM_NOT_SUPPORTED;
+    static _Atomic int said;
+    int on = rm_on();
+    if (out) *out = on ? (void *)&g_rm_model : NULL;
+    if (atomic_fetch_add(&said, 1) < 4)
+        fprintf(stderr, "  [openvr] LoadRenderModel_Async(\"%s\") -> %s\n", name ? name : "",
+                on ? "None: an empty model (one zero-area triangle; KL_OPENVR_RENDER_MODELS)"
+                   : "NotSupported (KL_OPENVR_RENDER_MODELS=0)");
+    return on ? 0 : RM_NOT_SUPPORTED;
 }
-static int rm_load_texture(void *s, int32_t id, void **out) { (void)s; (void)id; if (out) *out = NULL; return RM_NOT_SUPPORTED; }
+static int rm_load_texture(void *s, int32_t id, void **out) {
+    (void)s;
+    int ok = rm_on() && id == RM_TEXTURE_ID;
+    if (out) *out = ok ? (void *)&g_rm_texture : NULL;
+    return ok ? 0 : RM_NOT_SUPPORTED;
+}
+// No components: the loader then takes the model whole (0xb51a8 -> 0xb5444).
+static uint32_t rm_component_count(void *s, const char *name) { (void)s; (void)name; return 0; }
+static uint32_t rm_component_name(void *s, const char *name, uint32_t i, char *buf, uint32_t n) {
+    (void)s; (void)name; (void)i; if (buf && n) buf[0] = 0; return 0;
+}
+static uint64_t rm_component_mask(void *s, const char *name, const char *comp) { (void)s; (void)name; (void)comp; return 0; }
+static uint32_t rm_component_model(void *s, const char *name, const char *comp, char *buf, uint32_t n) {
+    (void)s; (void)name; (void)comp; if (buf && n) buf[0] = 0; return 0;
+}
+static int rm_component_state(void *s, const char *name, const char *comp, const void *a, const void *b, void *st) {
+    (void)s; (void)name; (void)comp; (void)a; (void)b; (void)st; return 0;
+}
+static int rm_has_component(void *s, const char *name, const char *comp) { (void)s; (void)name; (void)comp; return 0; }
+static uint32_t rm_model_name(void *s, uint32_t i, char *buf, uint32_t n) { (void)s; (void)i; if (buf && n) buf[0] = 0; return 0; }
 static int rm_load_d3d(void *s, int32_t id, void *dev, void **out) { (void)s; (void)id; (void)dev; if (out) *out = NULL; return RM_NOT_SUPPORTED; }
 static int rm_load_into_d3d(void *s, int32_t id, void *tex) { (void)s; (void)id; (void)tex; return RM_NOT_SUPPORTED; }
 static void rm_free(void *s, void *p) { (void)s; (void)p; }
@@ -2767,7 +2961,15 @@ static const impl g_impl[] = {
     { "IVRRenderModels_006", "LoadTextureD3D11_Async", (void *)rm_load_d3d },
     { "IVRRenderModels_006", "LoadIntoTextureD3D11_Async", (void *)rm_load_into_d3d },
     { "IVRRenderModels_006", "FreeTextureD3D11", (void *)rm_free },
+    { "IVRRenderModels_006", "GetRenderModelName", (void *)rm_model_name },
     { "IVRRenderModels_006", "GetRenderModelCount", (void *)rm_zero_u32 },
+    { "IVRRenderModels_006", "GetComponentCount", (void *)rm_component_count },
+    { "IVRRenderModels_006", "GetComponentName", (void *)rm_component_name },
+    { "IVRRenderModels_006", "GetComponentButtonMask", (void *)rm_component_mask },
+    { "IVRRenderModels_006", "GetComponentRenderModelName", (void *)rm_component_model },
+    { "IVRRenderModels_006", "GetComponentStateForDevicePath", (void *)rm_component_state },
+    { "IVRRenderModels_006", "GetComponentState", (void *)rm_component_state },
+    { "IVRRenderModels_006", "RenderModelHasComponent", (void *)rm_has_component },
     { "IVRRenderModels_006", "GetRenderModelThumbnailURL", (void *)rm_name_err },
     { "IVRRenderModels_006", "GetRenderModelOriginalPath", (void *)rm_name_err },
     { "IVRRenderModels_006", "GetRenderModelErrorNameFromEnum", (void *)rm_err_name },
