@@ -152,6 +152,9 @@ enum Lifecycle {
         // Steam stops showing the game as played. The runtime's atexit would
         // too, but only if every guest atexit before it returns; say it first.
         kl_steam_shutdown()
+        // The session's final performance line (KleptonSessionStats.swift),
+        // before exit rather than from its atexit hook, for the reason above.
+        KLSessionStats.shared.finish(reason: "background")
         fflush(nil)
         exit(0)
     }
