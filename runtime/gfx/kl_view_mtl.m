@@ -26,6 +26,9 @@
 #include "kl_view_mtl.h"
 #include "kl_vulkan.h"
 #include "kl_env.h"
+#include <math.h>
+
+static const float *klvm_display_tan(int eye, const float *rendered, float out[4]);
 
 // The liveness downsample. 64x64 is 16 KB read back in a completion handler —
 // off the critical path and small enough not to matter, but enough resolution
@@ -429,7 +432,8 @@ static kl_overlay_uniforms klvm_overlay_uniforms(const kl_ovrp_overlay *ov, int 
     if (stage < 0) stage = 0;
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
-    const float *t = have ? r.tangents[eye] : (const float[]){1, 1, 1, 1};
+    float shown[4];
+    const float *t = have ? klvm_display_tan(eye, r.tangents[eye], shown) : (const float[]){1, 1, 1, 1};
     simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
     return kl_overlay_build(ov, eye, device, matrix_identity_float4x4, proj);
 }
@@ -522,6 +526,40 @@ static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int sta
     }
 }
 
+// The frustum this window SHOWS, which is the display's — kl_ovrp_eye_view, the
+// frustum the frontend published — and not necessarily the one the frame was
+// rendered with (the record's tangents). Those differ when a guest renders
+// PAST the display: an OpenVR overscan (KL_OPENVR_OVERSCAN) renders each eye
+// wider so the device compositor has a margin to reproject into, and Alyx
+// symmetrises an asymmetric frustum. The device compositor projects through
+// the drawable's own projection, so the margin is clipped there until the head
+// turns into it; projecting through the record's tangents here instead showed
+// the whole margin and shrank the picture by the overscan. With the two equal —
+// every other guest — this is exactly what it was. KL_VIEW_FRUSTUM=rendered
+// restores the record's.
+static const float *klvm_display_tan(int eye, const float *rendered, float out[4]) {
+    static int rend = -1;
+    if (rend < 0) {
+        const char *v = getenv("KL_VIEW_FRUSTUM");
+        rend = v && !strcmp(v, "rendered");
+    }
+    if (rend || !rendered) return rendered;
+    float t[4] = { 0, 0, 0, 0 };
+    kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, t);
+    if (!(t[0] > 0 && t[1] > 0 && t[2] > 0 && t[3] > 0)) return rendered;
+    static int said;
+    if (!said && (fabsf(t[0] - rendered[0]) > 1e-3f || fabsf(t[1] - rendered[1]) > 1e-3f ||
+                  fabsf(t[2] - rendered[2]) > 1e-3f || fabsf(t[3] - rendered[3]) > 1e-3f)) {
+        said = 1;
+        fprintf(stderr, "  [vmtl] eye %d rendered l=%.3f r=%.3f t=%.3f b=%.3f, shown through the "
+                        "display's l=%.3f r=%.3f t=%.3f b=%.3f — the margin is the reprojection's "
+                        "(KL_VIEW_FRUSTUM=rendered shows it all)\n", eye,
+                rendered[0], rendered[1], rendered[2], rendered[3], t[0], t[1], t[2], t[3]);
+    }
+    memcpy(out, t, sizeof t);
+    return out;
+}
+
 static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
@@ -535,7 +573,8 @@ static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y
     }
 
     int eye = klvm_eye();
-    const float *t = have ? r.tangents[eye] : (const float[]){1, 1, 1, 1};
+    float shown[4];
+    const float *t = have ? klvm_display_tan(eye, r.tangents[eye], shown) : (const float[]){1, 1, 1, 1};
     simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
     // grid_per_eye = 0: this window draws ONE eye, so the grid it binds has one
     // block and that block was built with this eye's viewport.
@@ -841,7 +880,8 @@ static int klvm_present_flat(int win_w, int win_h) {
 // which is how the viewer showed a too-tall picture.
 static void klvm_eye_aspect(int stage, int eye, id<MTLTexture> src, double *w, double *h) {
     kl_ovrp_render_pose r;
-    const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
+    float shown[4];
+    const float *t = kl_ovrp_stage_render_pose(stage, &r) ? klvm_display_tan(eye, r.tangents[eye], shown) : NULL;
     if (t && t[0] + t[1] > 0 && t[2] + t[3] > 0) { *w = t[0] + t[1]; *h = t[2] + t[3]; return; }
     *w = src ? (double)src.width : 1832; *h = src ? (double)src.height : 1920;
 }

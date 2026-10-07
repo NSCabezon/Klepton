@@ -126,10 +126,105 @@ static void quat_rotate_inv(const float q[4], const float v[3], float o[3]) {  /
     o[2] = vz + c[3] * tz + (c[0] * ty - c[1] * tx);
 }
 
+static void quat_mul(const float a[4], const float b[4], float o[4]) {        // a * b
+    float x = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    float y = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    float z = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    float w = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+    o[0] = x; o[1] = y; o[2] = z; o[3] = w;
+}
+static void quat_rotate(const float q[4], const float v[3], float o[3]) {      // q v conj(q)
+    float c[4] = { -q[0], -q[1], -q[2], q[3] };
+    quat_rotate_inv(c, v, o);
+}
+// The rotation of a 3x4 pose matrix as a quaternion (Shepperd: branch on the
+// largest diagonal term so the square root never sees a near-zero argument).
+static void m34_to_quat(const HmdMatrix34_t *m, float q[4]) {
+    float m00 = m->m[0][0], m11 = m->m[1][1], m22 = m->m[2][2], tr = m00 + m11 + m22;
+    if (tr > 0) {
+        float s = sqrtf(tr + 1.0f) * 2;
+        q[3] = 0.25f * s; q[0] = (m->m[2][1] - m->m[1][2]) / s;
+        q[1] = (m->m[0][2] - m->m[2][0]) / s; q[2] = (m->m[1][0] - m->m[0][1]) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1.0f + m00 - m11 - m22) * 2;
+        q[3] = (m->m[2][1] - m->m[1][2]) / s; q[0] = 0.25f * s;
+        q[1] = (m->m[0][1] + m->m[1][0]) / s; q[2] = (m->m[0][2] + m->m[2][0]) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1.0f + m11 - m00 - m22) * 2;
+        q[3] = (m->m[0][2] - m->m[2][0]) / s; q[0] = (m->m[0][1] + m->m[1][0]) / s;
+        q[1] = 0.25f * s; q[2] = (m->m[1][2] + m->m[2][1]) / s;
+    } else {
+        float s = sqrtf(1.0f + m22 - m00 - m11) * 2;
+        q[3] = (m->m[1][0] - m->m[0][1]) / s; q[0] = (m->m[0][2] + m->m[2][0]) / s;
+        q[1] = (m->m[1][2] + m->m[2][1]) / s; q[2] = 0.25f * s;
+    }
+}
+// The angle between two orientations, by atan2 of the relative quaternion's
+// vector part against its scalar — NOT 2*acos(dot), whose float32 floor is
+// 0.056 deg exactly where a consistency trace lives (see klxr_quat_deg).
+static float quat_deg(const float a[4], const float b[4]) {
+    float r[4];
+    quat_conj_mul(b, a, r);                                   // conj(b) * a
+    float v = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]), w = fabsf(r[3]);
+    return 2.0f * atan2f(v, w) * 57.29577951308232f;
+}
+
 static int g_origin = 1;                 // TrackingUniverseStanding
 
+// ---- head prediction: the head as it will be when the frame is SEEN -------------
+// kl_ovrp_frame_latch pins the head as the tracker last published it — the
+// head of the moment WaitGetPoses returns. The picture drawn from it reaches
+// the eye a whole frame of work later (WaitGetPoses -> Submit is 30-40 ms on
+// device) plus the compositor's own refresh, and for all of that the
+// compositor must reproject by however far the head moved: on a turn that is
+// the black edge (see overscan) and, since the correction is a rotation about
+// a fixed depth, the translation and parallax it cannot correct — the swim.
+// Rendering from the head PREDICTED to the frame's display time leaves the
+// compositor only the prediction's error to correct.
+//
+// The predicting is the frontend's (kl_ovrp_head_predict_delta: a timestamped
+// queryDeviceAnchor on device, capped like OpenXR's at 50 ms), exactly as the
+// OpenXR path asks it (klxr_frame_head_delta) — the same seam, not a second
+// extrapolator. It answers a delta against the latched head, applied on the
+// left: pose' = delta o pose, so eye offsets composed onto the head survive.
+//
+// Computed ONCE per frame, in WaitGetPoses, and every pose this bridge answers
+// for the HMD until the next WaitGetPoses reads that one delta: the render and
+// game poses, GetLastPoses, GetDeviceToAbsoluteTrackingPose, the frame-timing
+// pose AND the pose the frame is declared with (g_frame_pose). The declared
+// pose has to be the rendered one — a compositor correcting from a pose the
+// game did not draw from corrects a difference that was never there, which is
+// a swim of its own (KL_XR_POSE_TRACE's argument).
+//
+// A host run has no tracker (kl_ovrp_set_head_at is the visionOS
+// compositor's): the delta comes back invalid and every pose is the latched
+// head, which is exactly what this bridge answered before. KL_OPENVR_PREDICT=0
+// is the A/B on device. The controllers are NOT moved by it: the frontend
+// already predicts each PSVR2 Sense controller on its own measured motion
+// (AccessoryTrackingProvider.predictAnchor, to the compositor's presentation
+// time — KleptonControllers.sensePose), and the head's delta applied to a hand
+// would be wrong, a hand does not hang off the head.
+typedef struct { int valid; float q[4], p[3]; double ahead_ms; } head_delta;
+static head_delta g_pred;                // this frame's; guarded by g_pred_mu
+static pthread_mutex_t g_pred_mu = PTHREAD_MUTEX_INITIALIZER;
+static head_delta pred_get(void) {
+    pthread_mutex_lock(&g_pred_mu);
+    head_delta d = g_pred;
+    pthread_mutex_unlock(&g_pred_mu);
+    return d;
+}
+static void pred_apply(const head_delta *d, float p[3], float q[4]) {
+    if (!d || !d->valid) return;
+    float rp[3], rq[4];
+    quat_rotate(d->q, p, rp);
+    quat_mul(d->q, q, rq);
+    for (int i = 0; i < 3; i++) p[i] = rp[i] + d->p[i];
+    memcpy(q, rq, sizeof rq);
+}
+
 // Device pose in the guest's tracking universe. Seated is the standing frame
-// lowered by the eye height kl_ovrp's floor origin adds.
+// lowered by the eye height kl_ovrp's floor origin adds. The HMD is the
+// frame's predicted head (above).
 static void device_pose(int dev, TrackedDevicePose_t *o) {
     memset(o, 0, sizeof *o);
     float p[3], q[4], v[3] = {0}, a[3] = {0};
@@ -137,6 +232,8 @@ static void device_pose(int dev, TrackedDevicePose_t *o) {
     if (dev == DEV_HMD) {
         kl_ovrp_get_guest_head_pose(&p[0], &p[1], &p[2], &q[0], &q[1], &q[2], &q[3]);
         kl_ovrp_head_motion(v, a);
+        head_delta d = pred_get();
+        pred_apply(&d, p, q);
     } else if (dev == DEV_LEFT || dev == DEV_RIGHT) {
         known = kl_ovrp_hand_motion(dev == DEV_LEFT ? 0 : 1, p, q, v, a);
         known = 1;                        // the parked default still tracks the head
@@ -168,24 +265,96 @@ static long ovr_unimpl(const char *name) {
 }
 
 // ---- IVRSystem ------------------------------------------------------------------------------------
+// ---- overscan: render past the display's edge ----------------------------------
+// Alyx runs at 25-30 fps on device against a 90-100 Hz display, so the
+// compositor shows each picture for three or four refreshes, reprojected every
+// time to where the head is NOW. A picture that covers exactly the display's
+// frustum has nothing past its edge, so on any head turn the leading edge of
+// the view is outside the picture: black (clamp-to-zero in the compositor's
+// sampler; magenta before the hidden-area fix). The margin has to be RENDERED.
+//
+// KL_OPENVR_OVERSCAN=<f> widens every eye's frustum by f per side — each of the
+// four tangents x (1 + f) — and says so everywhere the frustum is stated:
+// GetProjectionRaw, GetProjectionMatrix (built from it) and the tangents the
+// frame is declared with (g_frame_tan, from the same eye_tangents()). Submit
+// then reads back the projection the game actually rendered with and adopts it
+// (see "rendered with tangents" below), so the declared frustum is the wider
+// one in fact and not only in intent. Nothing else derives from the frustum:
+// GetEyeToHeadTransform is a pose, the hidden-area mesh hides nothing.
+//
+// The compositor handles a declared frustum WIDER than the display without
+// being told: kl_reproject places the picture as a quad sized by its declared
+// tangents, at the declared pose, and draws it through the DISPLAY's own
+// projection from the current head (KleptonCompositor: drawable.
+// computeProjection). The margin falls outside the display's clip volume and is
+// clipped while the head is still, and swings in when it turns; nothing is
+// scaled to fit. That is the same mechanism that already carries Alyx's own
+// horizontally widened render (it symmetrises the canted Vision Pro frustum:
+// l=r=1.73 for an offered l=1.73/r=1.00).
+//
+// Default 0.12 for `alyx` (about 3 degrees of extra field on each side at the
+// Vision Pro's tangents: 60 -> 62.7 deg out, 45 -> 48.2 up, 50 -> 53.2 down),
+// 0 for anything else. Clamped to [0, 0.5].
+extern const char *kl_driver_target_name(void);
+static float overscan(void) {
+    static float f = -1.0f;
+    if (f < 0.0f) {
+        const char *tg = kl_driver_target_name();
+        float def = tg && !strcmp(tg, "alyx") ? 0.12f : 0.0f;
+        float v = kl_env_float("KL_OPENVR_OVERSCAN", def);
+        if (!(v > 0.0f)) v = 0.0f;
+        if (v > 0.5f) v = 0.5f;
+        f = v;
+        fprintf(stderr, "  [openvr] overscan %.3f: every eye frustum %s (KL_OPENVR_OVERSCAN)\n",
+                (double)f, f > 0 ? "widened by that much per side — GetProjectionRaw/Matrix and the "
+                                   "frame declared to the compositor" : "exactly the display's");
+    }
+    return f;
+}
+// ...and the render target with it, so the pixel density at the centre of the
+// view is unchanged: the same tangent span per pixel, more pixels. That costs
+// GPU — (1 + f)^2, about 25% more pixels at 0.12 — and Alyx's auto-fidelity
+// (frame timing, below) answers a heavier frame by dropping a level, which
+// lands near the old pixel count anyway. KL_OPENVR_OVERSCAN_RT=0 keeps the
+// size: the same pixels spread over the wider field (density -1/(1+f)), which
+// is the A/B for "is the overscan's cost in GPU or in sharpness".
+static float overscan_rt(void) {
+    static float s = -1.0f;
+    if (s < 0.0f) s = overscan() > 0 && kl_env_on("KL_OPENVR_OVERSCAN_RT", 1) ? 1.0f + overscan() : 1.0f;
+    return s;
+}
+
 // KL_OPENVR_RT_SCALE scales the recommended render target size, and with it
 // every fidelity level Alyx derives from it (its levels are 0.78x..1.5x of this
-// size) and our stage images. 1 by default; 0.7 halves the pixels.
+// size) and our stage images. 1 by default; 0.7 halves the pixels. The
+// overscan's own factor multiplies it.
 static void eye_size(uint32_t *w, uint32_t *h) {
     int ew = 0, eh = 0;
     kl_ovrp_eye_texture_size(&ew, &eh);
     if (ew <= 0 || eh <= 0) { ew = kl_env_int("KL_OPENVR_EYE_W", 1832); eh = kl_env_int("KL_OPENVR_EYE_H", 1920); }
     float sc = kl_env_float("KL_OPENVR_RT_SCALE", 1.0f);
-    if (sc > 0.2f && sc < 2.0f && sc != 1.0f) {
+    if (!(sc > 0.2f && sc < 2.0f)) sc = 1.0f;
+    sc *= overscan_rt();
+    if (sc != 1.0f) {
         ew = (int)(ew * sc + 0.5f) & ~7; eh = (int)(eh * sc + 0.5f) & ~7;
     }
+    static int said;
+    if (!said++ && overscan() > 0)
+        fprintf(stderr, "  [openvr] recommended render target %dx%d per eye (%s; KL_OPENVR_OVERSCAN_RT=%d)\n",
+                ew, eh, overscan_rt() > 1.0f ? "scaled with the overscan: same density, more pixels"
+                                             : "NOT scaled with the overscan: same pixels, lower density",
+                overscan_rt() > 1.0f);
     *w = (uint32_t)ew; *h = (uint32_t)eh;
 }
 static void sys_rt_size(void *s, uint32_t *w, uint32_t *h) { (void)s; eye_size(w, h); }
+// The frustum the game is told to render — the display's, widened by the
+// overscan. Every path that states a frustum reads it here.
 static void eye_tangents(int eye, float t[4]) {      // left, right, top, bottom; positive
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_eye_view(eye, &px, &py, &pz, &qx, &qy, &qz, &qw, t);
     if (t[0] <= 0 || t[1] <= 0 || t[2] <= 0 || t[3] <= 0) t[0] = t[1] = t[2] = t[3] = 1.0f;
+    float k = 1.0f + overscan();
+    for (int i = 0; i < 4; i++) t[i] *= k;
 }
 static void sys_proj_raw(void *s, int eye, float *l, float *r, float *t, float *b) {
     (void)s;
@@ -238,9 +407,32 @@ static void sys_output_device(void *s, uint64_t *dev, int type, void *instance) 
 }
 static int sys_false(void *s) { (void)s; return 0; }
 static int sys_true(void *s) { (void)s; return 1; }
+// GetDeviceToAbsoluteTrackingPose(origin, fPredictedSecondsToPhotonsFromNow, ...).
+// OpenVR defines `predict` as an interval from now to the photons the caller
+// cares about. It is answered here with the FRAME's head — the one predicted
+// once in WaitGetPoses — whatever interval is named, and deliberately:
+//   * a caller works its interval out of GetTimeSinceLastVsync and
+//     Prop_SecondsFromVsyncToPhotons, and this runtime has no vsync to time
+//     against (GetTimeSinceLastVsync answers 0), so the number it names is not
+//     a measurement of anything here;
+//   * a second, independently predicted head inside one frame is the "draws
+//     from one head, declares another" fault if the game renders anything
+//     from it (KL_XR_POSE_TRACE's argument), and the declared pose is the
+//     WaitGetPoses one.
+// Before the first WaitGetPoses (no delta yet) it is the latched head, as
+// before. The interval asked is logged once, and KL_OPENVR_POSE_TRACE counts
+// the frames this is asked on and differences its head against the declared one.
+enum { PT_WAIT, PT_ABS, PT_LAST, PT_SUBMIT, PT_N };        // KL_OPENVR_POSE_TRACE sources
+static void pose_trace_note(int src, const TrackedDevicePose_t *hmd);
 static void sys_poses(void *s, int origin, float predict, TrackedDevicePose_t *out, uint32_t n) {
-    (void)s; (void)predict; (void)origin;
+    (void)s; (void)origin;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [openvr] GetDeviceToAbsoluteTrackingPose(predict %.1f ms) — answered with "
+                        "the frame's head (predicted once at WaitGetPoses), not a second prediction\n",
+                (double)predict * 1000.0);
     for (uint32_t i = 0; i < n; i++) device_pose((int)i, &out[i]);
+    if (n > 0) pose_trace_note(PT_ABS, &out[0]);
 }
 static HmdMatrix34_t sys_seated_to_standing(void *s) {
     (void)s;
@@ -432,18 +624,36 @@ static void ft_wait(void) {
     f->interval_ms = prev->t_wait > 0 ? (t - prev->t_wait) * 1000.0 : 0.0;
     __atomic_store_n(&g_ft_index, f->index, __ATOMIC_RELEASE);
 }
+// The frame's work, smoothed: what the head prediction reads to say how far
+// ahead this frame will be seen. Written by the submitting thread, read at the
+// next WaitGetPoses; a torn double is not possible on arm64.
+static double g_work_ema_ms;
+// The prediction's own numbers, for the 5-second line: how far ahead it asked
+// and how far it moved the head, so an A/B on device is a number in the log.
+static double g_pred_win_ahead, g_pred_win_deg, g_pred_win_worst;
+static unsigned g_pred_win_n, g_pred_win_valid;
 static void ft_submitted(void) {
     frame_time *f = &g_ft[g_ft_index % FT_RING];
     f->t_submit = now_s();
     f->work_ms = (f->t_submit - f->t_wait) * 1000.0;
+    if (f->work_ms > 0 && f->work_ms < 1000.0)
+        g_work_ema_ms = g_work_ema_ms > 0 ? g_work_ema_ms * 0.9 + f->work_ms * 0.1 : f->work_ms;
     static double win_start; static unsigned win_n; static double win_work;
     if (!win_start) win_start = f->t_submit;
     win_n++; win_work += f->work_ms;
     if (f->t_submit - win_start >= 5.0) {
         fprintf(stderr, "  [openvr] guest %.1f fps, frame work %.1f ms (WaitGetPoses -> Submit), "
-                        "display %.0f Hz\n", win_n / (f->t_submit - win_start), win_work / win_n,
+                        "display %.0f Hz", win_n / (f->t_submit - win_start), win_work / win_n,
                 (double)kl_ovrp_display_frequency());
+        if (g_pred_win_valid)
+            fprintf(stderr, "; head predicted %.1f ms ahead on %u/%u frames, moved %.2f deg avg / "
+                            "%.2f worst\n", g_pred_win_ahead / g_pred_win_valid, g_pred_win_valid,
+                    g_pred_win_n, g_pred_win_deg / g_pred_win_valid, g_pred_win_worst);
+        else
+            fprintf(stderr, "; head NOT predicted (%s)\n",
+                    kl_env_on("KL_OPENVR_PREDICT", 1) ? "no tracker answers — latched head" : "KL_OPENVR_PREDICT=0");
         win_start = f->t_submit; win_n = 0; win_work = 0;
+        g_pred_win_ahead = g_pred_win_deg = g_pred_win_worst = 0; g_pred_win_n = g_pred_win_valid = 0;
     }
 }
 // Compositor_FrameTiming, packed 4 on Linux: six uint32, a double at +24,
@@ -490,14 +700,140 @@ static uint32_t co_frame_timings(void *s, uint8_t *t, uint32_t n) {
     return got;
 }
 
+// ---- KL_OPENVR_POSE_TRACE: is the rendered head the declared head? -----------
+// The KL_XR_POSE_TRACE instrument for this bridge (on with either knob). Per
+// frame, the HMD pose each entry point handed the game — WaitGetPoses,
+// GetDeviceToAbsoluteTrackingPose, GetLastPoses — and the pose the game SAYS it
+// rendered with (Alyx submits VRTextureWithPose_t, flag 0x08: the matrix at +16
+// is OpenVR's "actual pose used to render scene textures"), each differenced
+// against the pose the frame is DECLARED to the compositor with (g_frame_pose,
+// in the same tracking universe). Reported once a second as worst degrees /
+// metres with the count of frames each source was asked on. A row of zeros is
+// a consistent runtime; a non-zero "submitted" row with prediction on is the
+// game rendering from a head other than the one declared — the swim this
+// bridge must not cause. The first answer of each source per frame is the one
+// recorded (the one the game built the frame on).
+static const char *const k_pt_name[PT_N] = {
+    "WaitGetPoses", "GetDeviceToAbsoluteTrackingPose", "GetLastPoses", "submitted (TextureWithPose)"
+};
+static int pose_trace_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OPENVR_POSE_TRACE", kl_env_on("KL_XR_POSE_TRACE", 0));
+    return on;
+}
+static struct { uint32_t frame; uint8_t have[PT_N]; float p[PT_N][3], q[PT_N][4]; } g_pt;
+static pthread_mutex_t g_pt_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pose_trace_note(int src, const TrackedDevicePose_t *hmd) {
+    if (!pose_trace_on() || !hmd || src < 0 || src >= PT_N) return;
+    pthread_mutex_lock(&g_pt_mu);
+    uint32_t fr = __atomic_load_n(&g_ft_index, __ATOMIC_ACQUIRE);
+    if (g_pt.frame != fr) { g_pt.frame = fr; memset(g_pt.have, 0, sizeof g_pt.have); }
+    if (!g_pt.have[src]) {
+        g_pt.have[src] = 1;
+        const HmdMatrix34_t *m = &hmd->mDeviceToAbsoluteTracking;
+        g_pt.p[src][0] = m->m[0][3]; g_pt.p[src][1] = m->m[1][3]; g_pt.p[src][2] = m->m[2][3];
+        m34_to_quat(m, g_pt.q[src]);
+    }
+    pthread_mutex_unlock(&g_pt_mu);
+}
+// Once per filed frame, against the pose it was filed with.
+static void pose_trace_report(const float pose7[7]) {
+    if (!pose_trace_on()) return;
+    static double t0;
+    static unsigned frames, seen[PT_N];
+    static float worst_deg[PT_N], worst_m[PT_N];
+    float dp[3] = { pose7[0], pose7[1] - (g_origin == 0 ? kl_ovrp_eye_height() : 0.0f), pose7[2] };
+    float dq[4] = { pose7[3], pose7[4], pose7[5], pose7[6] };
+    pthread_mutex_lock(&g_pt_mu);
+    frames++;
+    for (int i = 0; i < PT_N; i++) {
+        if (!g_pt.have[i]) continue;
+        seen[i]++;
+        float deg = quat_deg(g_pt.q[i], dq);
+        float dx = g_pt.p[i][0] - dp[0], dy = g_pt.p[i][1] - dp[1], dz = g_pt.p[i][2] - dp[2];
+        float m = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (deg > worst_deg[i]) worst_deg[i] = deg;
+        if (m > worst_m[i]) worst_m[i] = m;
+    }
+    memset(g_pt.have, 0, sizeof g_pt.have);
+    pthread_mutex_unlock(&g_pt_mu);
+    double now = now_s();
+    if (!t0) t0 = now;
+    if (now - t0 < 1.0) return;
+    fprintf(stderr, "  [openvr] pose agreement over %u frame(s), each HMD pose vs the DECLARED one:\n", frames);
+    for (int i = 0; i < PT_N; i++)
+        fprintf(stderr, "  [openvr]   %-32s asked on %3u, worst %.3f deg / %.4f m\n", k_pt_name[i],
+                seen[i], (double)worst_deg[i], (double)worst_m[i]);
+    t0 = now; frames = 0;
+    memset(seen, 0, sizeof seen); memset(worst_deg, 0, sizeof worst_deg); memset(worst_m, 0, sizeof worst_m);
+}
+
+// The frame's head prediction (see "head prediction" above), once, right after
+// the latch it is a delta against.
+//
+// How far ahead: to when this frame is first SEEN. It is drawn for the frame's
+// work — WaitGetPoses to the second Submit returning, which on device includes
+// the GPU (Submit waits on the eye copy queued behind the game's own work) —
+// smoothed over recent frames, and then waits for the compositor's next
+// refresh and its scanout: one display period stands in for that. On device
+// that is ~35 ms + ~10 ms. Capped at 50 ms for OpenXR's reason (past that a
+// tracker's extrapolation overshoots and is worse than late), and the cap is
+// what a slow frame gets. KL_OPENVR_PREDICT_MS=<ms> fixes the interval instead
+// (still capped) — the knob for tuning it by eye.
+#define OVR_PREDICT_MAX_MS 50.0
+static void predict_frame(void) {
+    head_delta d = { 0, { 0, 0, 0, 1 }, { 0, 0, 0 }, 0 };
+    static int on = -1;
+    static float fixed_ms;
+    if (on < 0) {
+        on = kl_env_on("KL_OPENVR_PREDICT", 1);
+        fixed_ms = kl_env_float("KL_OPENVR_PREDICT_MS", 0.0f);
+    }
+    if (on) {
+        float hz = kl_ovrp_display_frequency();
+        double period = 1000.0 / (hz > 0 ? hz : 90.0);
+        double ahead = fixed_ms > 0 ? (double)fixed_ms : g_work_ema_ms + period;
+        if (ahead < 0) ahead = 0;
+        if (ahead > OVR_PREDICT_MAX_MS) ahead = OVR_PREDICT_MAX_MS;
+        d.ahead_ms = ahead;
+        d.valid = kl_ovrp_head_predict_delta(now_s() + ahead / 1000.0, d.q, d.p);
+        if (!d.valid) { d.q[0] = d.q[1] = d.q[2] = 0; d.q[3] = 1; d.p[0] = d.p[1] = d.p[2] = 0; }
+    }
+    pthread_mutex_lock(&g_pred_mu);
+    g_pred = d;
+    pthread_mutex_unlock(&g_pred_mu);
+    g_pred_win_n++;
+    static int said_on, said_off;
+    if (d.valid) {
+        static const float ident[4] = { 0, 0, 0, 1 };
+        double deg = quat_deg(d.q, ident);
+        g_pred_win_valid++; g_pred_win_ahead += d.ahead_ms; g_pred_win_deg += deg;
+        if (deg > g_pred_win_worst) g_pred_win_worst = deg;
+        if (!said_on++)
+            fprintf(stderr, "  [openvr] head prediction ON: the frame's head predicted %.1f ms ahead "
+                            "(%s), capped %.0f ms, applied to every HMD pose AND the declared pose "
+                            "(KL_OPENVR_PREDICT=0 for the latched head). From here the [ovrp] \"guest "
+                            "submitted a pose ... from the one it was handed\" line measures this "
+                            "prediction, not the game\n", d.ahead_ms,
+                    fixed_ms > 0 ? "KL_OPENVR_PREDICT_MS" : "frame work, smoothed, + one display period",
+                    OVR_PREDICT_MAX_MS);
+    } else if (!said_off++) {
+        fprintf(stderr, "  [openvr] head prediction %s: every pose is the latched head, as before\n",
+                on ? "asked, but no tracker answers (host run: no frontend predicts)" : "off (KL_OPENVR_PREDICT=0)");
+    }
+}
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
     ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
-    // the poses this frame will be drawn with.
+    // the poses this frame will be drawn with...
     kl_ovrp_frame_latch();
     kl_ovrp_frame_begin_external();
+    // ...and move the head to when the frame will be seen, once, for every
+    // pose below and every pose asked until the next WaitGetPoses.
+    predict_frame();
     for (int d = 0; d < NDEV; d++) device_pose(d, &g_last[d]);
     for (uint32_t i = 0; render && i < n; i++) {
         if (i < NDEV) render[i] = g_last[i]; else memset(&render[i], 0, sizeof *render);
@@ -505,8 +841,16 @@ static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
     for (uint32_t i = 0; game && i < gn; i++) {
         if (i < NDEV) game[i] = g_last[i]; else memset(&game[i], 0, sizeof *game);
     }
+    pose_trace_note(PT_WAIT, &g_last[DEV_HMD]);
+    // The pose the frame is declared with: the same latched head, moved by the
+    // same delta, so it is the head the game was handed — in kl_ovrp's space
+    // (the seated offset is the guest's view of it, not the compositor's).
     kl_ovrp_get_guest_head_pose(&g_frame_pose[0], &g_frame_pose[1], &g_frame_pose[2],
                                 &g_frame_pose[3], &g_frame_pose[4], &g_frame_pose[5], &g_frame_pose[6]);
+    {
+        head_delta d = pred_get();
+        pred_apply(&d, g_frame_pose, g_frame_pose + 3);
+    }
     eye_tangents(0, g_frame_tan);
     eye_tangents(1, g_frame_tan + 4);
     return 0;
@@ -516,6 +860,7 @@ static int co_last_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
     (void)s;
     for (uint32_t i = 0; render && i < n; i++) { if (i < NDEV) render[i] = g_last[i]; else memset(&render[i], 0, sizeof *render); }
     for (uint32_t i = 0; game && i < gn; i++) { if (i < NDEV) game[i] = g_last[i]; else memset(&game[i], 0, sizeof *game); }
+    if ((render && n) || (game && gn)) pose_trace_note(PT_LAST, &g_last[DEV_HMD]);
     return 0;
 }
 static int co_last_pose_idx(void *s, uint32_t i, TrackedDevicePose_t *r, TrackedDevicePose_t *g) {
@@ -523,6 +868,7 @@ static int co_last_pose_idx(void *s, uint32_t i, TrackedDevicePose_t *r, Tracked
     if (i >= NDEV) return 1;
     if (r) *r = g_last[i];
     if (g) *g = g_last[i];
+    if (i == DEV_HMD) pose_trace_note(PT_LAST, &g_last[DEV_HMD]);
     return 0;
 }
 
@@ -930,6 +1276,16 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         if (!said++) fprintf(stderr, "  [openvr] Submit with texture type %d — only Vulkan (2) is served\n", tex->eType);
         return 101;
     }
+    // Submit_TextureWithPose (0x08): the Texture_t is a VRTextureWithPose_t and
+    // the HmdMatrix34_t at +16 is the pose the game says it rendered this eye's
+    // picture with — the ground truth KL_OPENVR_POSE_TRACE holds the declared
+    // pose against. Eye 0's is the frame's (both eyes are one head).
+    if ((flags & SUBMIT_TEXTURE_WITH_POSE) && eye == 0 && pose_trace_on()) {
+        TrackedDevicePose_t sp;
+        memset(&sp, 0, sizeof sp);
+        memcpy(&sp.mDeviceToAbsoluteTracking, (const uint8_t *)tex + 16, sizeof sp.mDeviceToAbsoluteTracking);
+        pose_trace_note(PT_SUBMIT, &sp);
+    }
 #ifdef KLOVR_VULKAN
     // Submit_TextureWithDepth (0x10, part of Alyx's 0x258 = TextureWithMotion):
     // the Texture_t is a VRTextureWithPoseAndDepth_t, whose depth info carries
@@ -1000,6 +1356,7 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         // Both eyes in: file the frame through the same seams an OpenXR frame
         // uses, with the pose and frusta it was drawn with.
         kl_ovrp_frame_end_external(g_stage, g_frame_pose, g_frame_tan);
+        pose_trace_report(g_frame_pose);
         ft_submitted();
 #ifdef KLOVR_VULKAN
         g_frames_for_dump++;
