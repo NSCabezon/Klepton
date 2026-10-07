@@ -482,4 +482,8 @@ float kl_reproject_delta_degrees(const kl_ovrp_render_pose *rendered,
 // towards 0; anything in [0,1] is inside the clip range.
 float kl_reproject_ndc_depth(const kl_reproject_uniforms *u);
 
+// KL_REPROJECT_OFF (default: KL_OPENVR_MINIMAL): 1 = kl_reproject_build
+// applies no correction from the render pose toward the display pose.
+int kl_reproject_off(void);
+
 #endif

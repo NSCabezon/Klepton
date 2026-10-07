@@ -82,6 +82,23 @@ int kl_reproject_chroma(float rgb[3], float *dmin, float *dmax) {
     return __atomic_load_n(&s_chroma_on, __ATOMIC_ACQUIRE);
 }
 
+// KL_REPROJECT_OFF=1: no timewarp at all. The picture is placed with the
+// DISPLAY's own pose as if it had been rendered from it — no correction from
+// the render pose toward the current head, rotation or translation. Between
+// guest frames it moves with the head (judders at the guest's frame rate) but
+// nothing of ours bends it: if a fault persists with this on, the reprojection
+// math is exonerated. Defaults to on under KL_OPENVR_MINIMAL=1 (the OpenVR
+// bridge's bisection switch), off otherwise.
+int kl_reproject_off(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_REPROJECT_OFF", kl_env_on("KL_OPENVR_MINIMAL", 0));
+        if (on) fprintf(stderr, "  [reproject] timewarp OFF (KL_REPROJECT_OFF): the picture "
+                                "is shown at the display pose, uncorrected\n");
+    }
+    return on;
+}
+
 static int klr_translate(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_REPROJECT_TRANSLATE", 1);
@@ -828,7 +845,7 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // around the room — which is what happens for every frame before the guest
     // first reaches ovrp_BeginFrame.
     simd_float4x4 device_rot = klr_rotation_of(origin_from_device);
-    simd_float4x4 render_rot = rendered && rendered->serial
+    simd_float4x4 render_rot = rendered && rendered->serial && !kl_reproject_off()
         ? klr_rotation_of_quat(rendered->qx, rendered->qy, rendered->qz, rendered->qw)
         : device_rot;
     // device_from_view loses its translation too, and that is a correction of a
@@ -871,7 +888,7 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // between the guest's tracking space and the display's world origin (a
     // floor height, a recentre) cancels and neither space has to be the other.
     simd_float4x4 render_m = render_rot, device_m = device_rot;
-    if (klr_translate() && rendered && rendered->serial) {
+    if (klr_translate() && rendered && rendered->serial && !kl_reproject_off()) {
         render_m.columns[3] = simd_make_float4(rendered->px, rendered->py,
                                                rendered->pz, 1.0f);
         device_m.columns[3] = origin_from_device.columns[3];
