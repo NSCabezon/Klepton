@@ -543,6 +543,8 @@ static struct {
     VkFence sync;                         // the zero-copy path's "the game's frame is done"
     uint64_t dst[2][OVR_STAGES];
     uint32_t w[2], h[2], fmt[2];
+    void *mtl[2][OVR_STAGES];             // the MTLTexture behind dst, as the compositor knows it
+    uint8_t in_place[2][OVR_STAGES];      // the compositor slot points at the GAME's image instead
     PFN_vkCreateCommandPool CreateCommandPool;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
@@ -681,45 +683,109 @@ static void vk_dump(const VRVulkanTextureData_t *t, VkImage img, uint32_t layer,
 // compositor has no per-frame sub-rect for an external frame) and no vertical
 // flip. Anything else falls back to the copy, per submit.
 //
+// **It is only correct for a game that ROTATES its eye images, and Alyx does
+// not.** The compositor does not sample a frame once: it re-reads the last
+// complete stage on every display refresh (timewarp, 90-120 Hz) until the next
+// frame is filed. Sampled in place, the image the compositor is reading is the
+// image the game is RENDERING its next frame into. Measured on the Mac
+// (KL_OPENVR_ZEROCOPY=2, forced): 7 of 20 back-to-back window captures of the
+// VR menu showed the world pass with the hands and the Panorama panels missing
+// — a half-rendered frame, which on screen is the menu FLICKERING. The vertical
+// stripes seen earlier did not reproduce on the Mac; they are most likely the
+// same race caught at another point of the game's frame. Nothing about the
+// sampling itself is wrong: MoltenVK's texture for the game's image is a
+// 2-layer MTLTextureType2DArray, RGBA8 sRGB (fmt 43) like our stage images, and
+// the layer as the slice gives the right eye (left != right, measured).
+//
+// What Alyx does (logged by the "eye images" line below): ONE 2-layer image
+// per render size, rewritten every frame. Its dynamic resolution flips between
+// 2688x2880 and 1728x1824, each size its own image, so a run sees "2 distinct"
+// images — which read as a two-image rotation and is not one: between size
+// changes, every frame is the same image. The "same image" detector that
+// tripped "after a few hundred frames" was therefore right, not a false trip —
+// it tripped at the first stretch without a size change. Real zero copy for
+// Alyx needs the game to render into OUR rotating images, i.e. answering
+// IVRIPCResourceManagerClient (refused today, see the interface table).
+//
+// So the decision is per FRAME, from evidence: in place only once the image
+// has changed on every one of the last ZC_STREAK frames (a rotation of two or
+// more), and back to the copy on the first repeat. Per frame and not per eye,
+// because both eyes of one frame have to come from the same place — Alyx's two
+// eyes are two layers of one image, so they repeat together anyway. A frame's
+// first eye decides; its second follows. Under Alyx this is the copy, always,
+// with one line saying why.
+//
+// Leaving in place has a second half that used to be missing: the compositor's
+// per-(eye, stage) table still points at the game's image, and the copy only
+// re-exports its own images when their SIZE changes — so after a fallback the
+// slots the zero-copy frames had touched kept sampling the game's live image
+// while the copy wrote elsewhere (a stage table of mixed sources, measured).
+// in_place[][] remembers which slots those are and the copy points them back.
+//
 // Ordering: the game submitted its rendering before Submit, on the queue it
 // handed us. One empty submission with a fence on that queue, waited on once
-// per frame (after the second eye), is "the picture is complete" — the same
-// point the copy's fence used to mark, minus the copy. Reuse: the game rotates
-// two eye images (measured — "2 distinct"), so the image a frame was filed with
-// is not rewritten until the frame after next, by which time the compositor has
-// moved on to the newer one. A game that renders into ONE image would race the
-// compositor; that case is detected and sends this back to the copy.
-// EXPERIMENTAL, OFF by default (KL_OPENVR_ZEROCOPY=1 turns it on). Not yet
-// solid: on the Mac the in-place source showed full-height vertical stripes
-// (a slice/array-view or texcoord mismatch in the compositor's sampling of the
-// game's 2-layer image, not found yet), and the same-image detector tripped
-// after a few hundred frames although the game rotates two images.
-static int vk_zero_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t,
-                            const VRTextureBounds_t *b, uint32_t layer) {
+// per frame (after its last eye), is "the picture is complete" — the same
+// point the copy's fence used to mark, minus the copy. Reuse is then the
+// rotation's: the image of frame N is not rewritten before frame N+1 is filed.
+// A game that stops rotating exactly after an in-place frame races for that
+// one frame; that cannot be seen coming from here.
+//
+// KL_OPENVR_ZEROCOPY: 0 (default) the copy; 1 in place when the game rotates
+// (the copy for Alyx); 2 in place ALWAYS — a diagnostic that reproduces the
+// race, never a setting.
+#define ZC_STREAK 8
+static int zc_mode(void) {
     static int on = -1;
-    if (on < 0) on = kl_env_on("KL_OPENVR_ZEROCOPY", 0);
-    if (!on) return -1;
-    if (b && (b->uMin != 0.0f || b->uMax != 1.0f || b->vMin != 0.0f || b->vMax != 1.0f)) return -1;
-    // One image rewritten every frame: not safe to sample in place.
-    static uint64_t prev[2]; static int same[2];
-    same[eye & 1] = t->m_nImage == prev[eye & 1] ? same[eye & 1] + 1 : 0;
-    prev[eye & 1] = t->m_nImage;
-    if (same[eye & 1] >= 2) {
+    if (on < 0) on = kl_env_int("KL_OPENVR_ZEROCOPY", 0);
+    return on;
+}
+
+// Called once per submit, BEFORE either path, so the streak sees every frame
+// whichever path the frame then takes. Returns whether this frame may be
+// sampled in place. `first`: no eye of this frame has been submitted yet.
+static int zc_frame_ok(int first, uint64_t image) {
+    static uint64_t prev;
+    static int streak, ok;
+    if (!first) return ok;                // a frame's second eye follows its first
+    streak = image != prev ? (streak < 1000000 ? streak + 1 : streak) : 0;
+    prev = image;
+    int was = ok;
+    ok = zc_mode() == 2 || streak >= ZC_STREAK;
+    if (zc_mode() && was != ok) {
         static int said;
-        if (!said) { said = 1;
-            fprintf(stderr, "  [openvr] the game submits the SAME eye image every frame — "
-                            "zero-copy off, copying (it would race the compositor)\n"); }
-        return -1;
+        if (said < 6) { said++;
+            if (ok)
+                fprintf(stderr, "  [openvr] zero-copy: the game rotates its eye images (a new "
+                                "one on each of the last %d frames) — sampling them in place\n",
+                        ZC_STREAK);
+            else
+                fprintf(stderr, "  [openvr] zero-copy: the game submitted the image it submitted "
+                                "last frame — it renders into ONE image, which the compositor "
+                                "would be reading while the game redraws it; copying\n"); }
     }
+    if (zc_mode() == 1 && !ok && !was) {
+        static unsigned long long n;
+        if (++n == 600) fprintf(stderr, "  [openvr] zero-copy: never taken in 600 frames — "
+                                        "the game renders every frame into the same image "
+                                        "(Alyx does; see vk_zero_copy_eye)\n");
+    }
+    return ok;
+}
+
+static int vk_zero_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t,
+                            const VRTextureBounds_t *b, uint32_t layer, int frame_ok, int last) {
+    if (!zc_mode() || !frame_ok) return -1;
+    if (b && (b->uMin != 0.0f || b->uMax != 1.0f || b->vMin != 0.0f || b->vMax != 1.0f)) return -1;
     if (vk_setup(t) != 0) return -1;
     void *mtl = kl_vulkan_xr_image_mtl(t->m_nImage);
     if (!mtl) return -1;
     kl_glfb_note_eye_mtl_texture(eye, stage, mtl, (int)layer, (int)t->m_nWidth, (int)t->m_nHeight);
+    V.in_place[eye][stage] = 1;
     static int said;
     if (!said) { said = 1;
         fprintf(stderr, "  [openvr] zero-copy: the compositor samples the game's %ux%u eye "
                         "image in place (no per-eye blit)\n", t->m_nWidth, t->m_nHeight); }
-    if (eye == 1) {                       // both eyes in: wait for the game's frame
+    if (last) {                           // both eyes in: wait for the game's frame
         if (!V.sync) {
             VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
             if (V.CreateFence(V.dev, &fci, NULL, &V.sync) != VK_SUCCESS) return -1;
@@ -757,11 +823,19 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
         for (int k = 0; k < OVR_STAGES; k++) {
             V.dst[eye][k] = kl_vulkan_xr_image(w, h, 1, 1, (long long)t->m_nFormat, 0);
             void *mtl = kl_vulkan_xr_image_mtl(V.dst[eye][k]);
+            V.mtl[eye][k] = mtl;
+            V.in_place[eye][k] = 0;
             if (mtl) kl_glfb_note_eye_mtl_texture(eye, k, mtl, 0, (int)w, (int)h);
         }
         V.w[eye] = w; V.h[eye] = h; V.fmt[eye] = t->m_nFormat;
         fprintf(stderr, "  [openvr] eye %d: %ux%u fmt %u — %d stage image(s) exported to the compositor\n",
                 eye, w, h, t->m_nFormat, OVR_STAGES);
+    }
+    // A slot the zero-copy path last pointed at the game's image: point it back
+    // at ours, or the compositor keeps sampling the game's (see above).
+    if (V.in_place[eye][stage]) {
+        V.in_place[eye][stage] = 0;
+        if (V.mtl[eye][stage]) kl_glfb_note_eye_mtl_texture(eye, stage, V.mtl[eye][stage], 0, (int)w, (int)h);
     }
     VkImage src = (VkImage)(uintptr_t)t->m_nImage, dst = (VkImage)(uintptr_t)V.dst[eye][stage];
     if (!dst) return -1;
@@ -896,17 +970,26 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
             fprintf(stderr, "  [openvr] eye %d <- array layer %u\n", eye, layer); }
         // How many distinct images the game rotates its eyes through — whether
         // the compositor could sample them in place (see the zero-copy path).
-        static uint64_t seen[8]; static int nseen, reported;
+        // Distinct is not enough on its own: Alyx shows 2, one per render size,
+        // and still repeats the same image on almost every frame. The count of
+        // frames whose image differs from the previous frame's is the rotation.
+        static uint64_t seen[8], last; static int nseen, reported, changed;
         uint64_t im = ((const VRVulkanTextureData_t *)tex->handle)->m_nImage;
         int k = 0;
         while (k < nseen && seen[k] != im) k++;
         if (k == nseen && nseen < 8) seen[nseen++] = im;
+        if (g_submitted_mask == 0) { changed += im != last; last = im; }
         if (!reported && g_frames >= 600) {
             reported = 1;
-            fprintf(stderr, "  [openvr] the game's eye images: %d distinct over 600 frames\n", nseen);
+            fprintf(stderr, "  [openvr] the game's eye images: %d distinct over 600 frames, a "
+                            "different one from the frame before on %d of them%s\n", nseen, changed,
+                    changed < 540 ? " — it renders into one image, not a rotation" : "");
         }
     }
-    if (vk_zero_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0 &&
+    const VRVulkanTextureData_t *vtd = (const VRVulkanTextureData_t *)tex->handle;
+    int zc_ok = zc_frame_ok(g_submitted_mask == 0, vtd->m_nImage);
+    if (vk_zero_copy_eye(eye, g_stage, vtd, b, layer, zc_ok,
+                         (g_submitted_mask | (1u << eye)) == 3) != 0 &&
         vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
 #else
     (void)b;
