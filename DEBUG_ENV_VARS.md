@@ -2157,6 +2157,23 @@ nothing, and prints the unresolved imports grouped by category.
   the first read of each digital action and every change after it, the
   start-of-session events PollNextEvent hands out, and SuspendRendering;
   `KL_OPENVR_EYE_W` / `_H` set the render-target size when no frontend has.
+- `KL_OPENVR_ZEROCOPY` — (`kl_openvr.c`, `vk_zero_copy_eye`) **default 0**:
+  Submit blits each eye into our own stage images. `1`: let the compositor
+  sample the game's own eye image in place (no blit) — but only once the game
+  has submitted a DIFFERENT image on each of the last 8 frames, i.e. it
+  rotates; the first repeat goes back to the copy (and points the compositor's
+  slots back at our images). **Alyx never qualifies**: it renders every frame
+  into ONE 2-layer image per render size (its "2 distinct" images are the two
+  dynamic-resolution sizes, not a rotation — see the `eye images: N distinct
+  ... different one from the frame before on M` line), so `1` is the copy for
+  Alyx and says so once. `2`: in place ALWAYS — a diagnostic only. The
+  compositor re-reads the latest frame on every display refresh, so in place it
+  reads the image the game is redrawing: measured on the Mac menu, 7 of 20
+  window captures were half-rendered frames (no hands, no Panorama panels) —
+  the menu FLICKERS. The vertical stripes reported earlier did not reproduce
+  on the Mac and are most likely the same race.
+  Real zero copy for Alyx needs it to render into our rotating images
+  (IVRIPCResourceManagerClient, refused today).
 - `KL_GLIBC_MANIFEST=<path>` — where a `--gap` run writes the packaging
   manifest ("<framework stem>\t<source path>" per mapped image; default
   `build/<target>_images.txt`), which `visionos/mkguest.sh` and `targets.py`
