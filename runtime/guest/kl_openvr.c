@@ -55,6 +55,7 @@
 #include "kl_glfb.h"
 #include "kl_vulkan.h"
 #include "kl_openvr.h"
+#include "kl_reproject.h"
 
 #if __has_include(<vulkan/vulkan.h>)
 #define VK_NO_PROTOTYPES
@@ -63,6 +64,43 @@
 #endif
 
 #define TRACE(...) do { if (kl_env_on("KL_TRACE_OPENVR", 0)) fprintf(stderr, "  [openvr] " __VA_ARGS__); } while (0)
+
+// ---- KL_OPENVR_MINIMAL: the whole pipeline with every stage of ours OFF ----------
+// A bisection switch. Each stage this bridge (and the compositor) adds between
+// the game's picture and the display has its own knob; MINIMAL=1 flips every
+// one of those knobs' DEFAULTS to "off", and a knob set explicitly still wins —
+// so a run list is MINIMAL=1, then MINIMAL=1 plus one stage turned back on:
+//
+//   stage                       knob (normal default -> minimal default)
+//   head prediction             KL_OPENVR_PREDICT         1 -> 0
+//   overscan                    KL_OPENVR_OVERSCAN        0.12 -> 0
+//   symmetric frustum           KL_OPENVR_SYM_PROJ        1 -> 0
+//   adopted "rendered with"     KL_OPENVR_SUBMIT_PROJ     1 -> 0  (0 = show the
+//     tangents                                                    frustum OFFERED)
+//   stage rescale               KL_OPENVR_STAGE_SCALE     1 -> 0  (0 = the stage
+//                                                                 image is the
+//                                                                 rendered rect, 1:1)
+//   Touch raw-frame hands       KL_OPENVR_TOUCH_FRAME     1 -> 0
+//   hand velocities             KL_OPENVR_HAND_VEL        1 -> 0  (0 = zeros)
+//   frame timing (auto-fid.)    KL_OPENVR_FRAME_TIMING    1 -> 0
+//   compositor timewarp         KL_REPROJECT_OFF          0 -> 1  (kl_reproject.c:
+//                                                                 1 = the picture
+//                                                                 is shown with no
+//                                                                 correction toward
+//                                                                 the current head)
+//
+// Alyx's auto-fidelity is the game's: fix the level with KL_GLIBC_ARGS
+// (+vr_fidelity_level_auto 0 +vr_fidelity_level N). The state of every stage is
+// printed once, so a device log says exactly which pipeline ran.
+static int ovr_minimal(void) {
+    static int m = -1;
+    if (m < 0) m = kl_env_on("KL_OPENVR_MINIMAL", 0);
+    return m;
+}
+static int ovr_stage(const char *knob, int normal) {
+    return kl_env_on(knob, ovr_minimal() ? 0 : normal);
+}
+static void ovr_pipeline_report(void);
 
 // ---- openvr.h types, the ones crossing the ABI (layouts measured: arm64) -------------
 typedef struct { float m[3][4]; } HmdMatrix34_t;
@@ -300,7 +338,7 @@ static const touch_frame *touch_frame_for(int hand) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     if (!init) {
-        int on = kl_env_on("KL_OPENVR_TOUCH_FRAME", 1);
+        int on = ovr_stage("KL_OPENVR_TOUCH_FRAME", 1);
         for (int h = 0; h < 2; h++) {
             touch_frame *t = &tf[h];
             t->on = on;
@@ -405,6 +443,13 @@ static void device_pose(int dev, TrackedDevicePose_t *o) {
         known = 1;                        // the parked default still tracks the head
         fake_hand(hand, p, q);
         openvr_hand_pose(hand, p, q, v, a);
+        // KL_OPENVR_HAND_VEL=0: report the controller as moving at zero, so a
+        // guest that extrapolates the pose by its velocity (or reads the ω×r
+        // term above, which amplifies a noisy ω by the lever arm) cannot add
+        // motion of its own. The A/B for "the hands tremble".
+        static int vel = -1;
+        if (vel < 0) vel = ovr_stage("KL_OPENVR_HAND_VEL", 1);
+        if (!vel) { memset(v, 0, sizeof v); memset(a, 0, sizeof a); }
     } else {
         return;
     }
@@ -468,7 +513,7 @@ static float overscan(void) {
     static float f = -1.0f;
     if (f < 0.0f) {
         const char *tg = kl_driver_target_name();
-        float def = tg && !strcmp(tg, "alyx") ? 0.12f : 0.0f;
+        float def = tg && !strcmp(tg, "alyx") && !ovr_minimal() ? 0.12f : 0.0f;
         float v = kl_env_float("KL_OPENVR_OVERSCAN", def);
         if (!(v > 0.0f)) v = 0.0f;
         if (v > 0.5f) v = 0.5f;
@@ -543,7 +588,7 @@ static void eye_tangents(int eye, float t[4]) {      // left, right, top, bottom
     for (int i = 0; i < 4; i++) t[i] *= k;
     // Symmetric horizontally: see "the magenta band" below.
     static int sym = -1;
-    if (sym < 0) sym = kl_env_on("KL_OPENVR_SYM_PROJ", 1);
+    if (sym < 0) sym = ovr_stage("KL_OPENVR_SYM_PROJ", 1);
     if (sym) { float m = fmaxf(t[0], t[1]); t[0] = t[1] = m; }
 }
 static void sys_proj_raw(void *s, int eye, float *l, float *r, float *t, float *b) {
@@ -870,7 +915,7 @@ static void ft_submitted(void) {
                     g_pred_win_n, g_pred_win_deg / g_pred_win_valid, g_pred_win_worst);
         else
             fprintf(stderr, "; head NOT predicted (%s)\n",
-                    kl_env_on("KL_OPENVR_PREDICT", 1) ? "no tracker answers — latched head" : "KL_OPENVR_PREDICT=0");
+                    ovr_stage("KL_OPENVR_PREDICT", 1) ? "no tracker answers — latched head" : "KL_OPENVR_PREDICT=0");
         win_start = f->t_submit; win_n = 0; win_work = 0;
         g_pred_win_ahead = g_pred_win_deg = g_pred_win_worst = 0; g_pred_win_n = g_pred_win_valid = 0;
     }
@@ -881,7 +926,7 @@ static void ft_submitted(void) {
 // ClientFrameInterval, ...), the HMD pose at +96.
 static int co_frame_timing(void *s, uint8_t *t, uint32_t frames_ago) {
     (void)s;
-    if (!t || !kl_env_on("KL_OPENVR_FRAME_TIMING", 1)) return 0;
+    if (!t || !ovr_stage("KL_OPENVR_FRAME_TIMING", 1)) return 0;
     uint32_t idx = __atomic_load_n(&g_ft_index, __ATOMIC_ACQUIRE);
     if (frames_ago + 1 >= FT_RING || idx <= frames_ago + 1) return 0;
     // The newest COMPLETE frame is the one before the frame in flight.
@@ -1005,7 +1050,7 @@ static void predict_frame(void) {
     static int on = -1;
     static float fixed_ms;
     if (on < 0) {
-        on = kl_env_on("KL_OPENVR_PREDICT", 1);
+        on = ovr_stage("KL_OPENVR_PREDICT", 1);
         fixed_ms = kl_env_float("KL_OPENVR_PREDICT_MS", 0.0f);
     }
     if (on) {
@@ -1050,9 +1095,122 @@ static void predict_frame(void) {
     }
 }
 
+// Once, at the first WaitGetPoses: which stages of the pipeline this run has.
+static void ovr_pipeline_report(void) {
+    static int said;
+    if (said++) return;
+    fprintf(stderr, "  [openvr] PIPELINE%s: predict %d, overscan %.3f, sym_proj %d, submit_proj "
+                    "(adopted tangents) %d, stage_scale %d, touch_frame %d, hand_vel %d, "
+                    "frame_timing %d, reproject_off %d (KL_OPENVR_MINIMAL turns every stage off; "
+                    "a knob set explicitly wins)\n",
+            ovr_minimal() ? " MINIMAL" : "",
+            ovr_stage("KL_OPENVR_PREDICT", 1), (double)overscan(),
+            ovr_stage("KL_OPENVR_SYM_PROJ", 1), ovr_stage("KL_OPENVR_SUBMIT_PROJ", 1),
+            ovr_stage("KL_OPENVR_STAGE_SCALE", 1), ovr_stage("KL_OPENVR_TOUCH_FRAME", 1),
+            ovr_stage("KL_OPENVR_HAND_VEL", 1), ovr_stage("KL_OPENVR_FRAME_TIMING", 1),
+            kl_reproject_off());
+}
+
+// ---- KL_OPENVR_HAND_TRACE: is the hand the game is handed smooth? --------------
+// Once per frame (at WaitGetPoses, the poses the frame is built on), per hand:
+// the step from the previous frame and the SECOND difference (p[n] - 2p[n-1] +
+// p[n-2]: zero for steady motion, large for a pose that jitters or jumps back
+// and forth — a tremor is this number, not the step), how many frames the
+// published sample did not change at all (a source that stops and restarts:
+// ARKit hand tracking of a hand gripping a controller does exactly that), the
+// largest velocity and angular velocity reported to the game, and the head
+// prediction's translation (the part of the head the compositor's rotational
+// timewarp cannot correct). One line per hand every 5 s by default
+// (=1), every second with =2, off with =0.
+static void hand_trace_frame(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_int("KL_OPENVR_HAND_TRACE", 1);
+    if (!on) return;
+    typedef struct {
+        int have; float p1[3], p2[3], q1[4], q2[4], raw[7];
+        unsigned frames, repeats;
+        double step_m, step_deg, jit_m, jit_deg;
+        float step_m_max, step_deg_max, jit_m_max, jit_deg_max, v_max, w_max;
+    } ht;
+    static ht h[2];
+    static double t0, pred_max_m, pred_sum_m;
+    static unsigned pred_n;
+    head_delta d = pred_get();
+    if (d.valid) {
+        double m = sqrt((double)d.p[0] * d.p[0] + (double)d.p[1] * d.p[1] + (double)d.p[2] * d.p[2]);
+        pred_sum_m += m; pred_n++;
+        if (m > pred_max_m) pred_max_m = m;
+    }
+    for (int k = 0; k < 2; k++) {
+        ht *s = &h[k];
+        const HmdMatrix34_t *M = &g_last[k ? DEV_RIGHT : DEV_LEFT].mDeviceToAbsoluteTracking;
+        float p[3] = { M->m[0][3], M->m[1][3], M->m[2][3] }, q[4];
+        m34_to_quat(M, q);
+        float raw[7], rv[3], ra[3];
+        kl_ovrp_hand_motion(k, raw, raw + 3, rv, ra);
+        if (s->have && !memcmp(raw, s->raw, sizeof raw)) s->repeats++;
+        memcpy(s->raw, raw, sizeof raw);
+        const float *vv = g_last[k ? DEV_RIGHT : DEV_LEFT].vVelocity;
+        const float *aa = g_last[k ? DEV_RIGHT : DEV_LEFT].vAngularVelocity;
+        float vm = sqrtf(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
+        float wm = sqrtf(aa[0] * aa[0] + aa[1] * aa[1] + aa[2] * aa[2]);
+        if (vm > s->v_max) s->v_max = vm;
+        if (wm > s->w_max) s->w_max = wm;
+        if (s->have >= 1) {
+            float dx = p[0] - s->p1[0], dy = p[1] - s->p1[1], dz = p[2] - s->p1[2];
+            float st = sqrtf(dx * dx + dy * dy + dz * dz), sd = quat_deg(q, s->q1);
+            s->step_m += st; s->step_deg += sd;
+            if (st > s->step_m_max) s->step_m_max = st;
+            if (sd > s->step_deg_max) s->step_deg_max = sd;
+        }
+        if (s->have >= 2) {
+            float j[3];
+            for (int i = 0; i < 3; i++) j[i] = p[i] - 2 * s->p1[i] + s->p2[i];
+            float jm = sqrtf(j[0] * j[0] + j[1] * j[1] + j[2] * j[2]);
+            // Rotational second difference: the turn this frame minus the turn
+            // last frame, as an angle (r1 = q1 q2^-1, r0 = q q1^-1; |r0 r1^-1|).
+            float r0[4], r1[4];
+            float iq1[4] = { -s->q1[0], -s->q1[1], -s->q1[2], s->q1[3] };
+            float iq2[4] = { -s->q2[0], -s->q2[1], -s->q2[2], s->q2[3] };
+            quat_mul(q, iq1, r0); quat_mul(s->q1, iq2, r1);
+            float jd = quat_deg(r0, r1);
+            s->jit_m += jm; s->jit_deg += jd;
+            if (jm > s->jit_m_max) s->jit_m_max = jm;
+            if (jd > s->jit_deg_max) s->jit_deg_max = jd;
+        }
+        memcpy(s->p2, s->p1, sizeof s->p2); memcpy(s->q2, s->q1, sizeof s->q2);
+        memcpy(s->p1, p, sizeof s->p1); memcpy(s->q1, q, sizeof s->q1);
+        if (s->have < 2) s->have++;
+        s->frames++;
+    }
+    double now = now_s();
+    if (!t0) t0 = now;
+    if (now - t0 < (on >= 2 ? 1.0 : 5.0)) return;
+    for (int k = 0; k < 2; k++) {
+        ht *s = &h[k];
+        unsigned n1 = s->frames > 1 ? s->frames - 1 : 1, n2 = s->frames > 2 ? s->frames - 2 : 1;
+        fprintf(stderr, "  [openvr] hand %c over %u frames: step %.1f/%.1f mm %.2f/%.2f deg (mean/max), "
+                        "JITTER %.1f/%.1f mm %.2f/%.2f deg, published sample repeated on %u, "
+                        "|v| max %.2f m/s |w| max %.1f rad/s\n", k ? 'R' : 'L', s->frames,
+                s->step_m / n1 * 1000, (double)s->step_m_max * 1000, s->step_deg / n1, (double)s->step_deg_max,
+                s->jit_m / n2 * 1000, (double)s->jit_m_max * 1000, s->jit_deg / n2, (double)s->jit_deg_max,
+                s->repeats, (double)s->v_max, (double)s->w_max);
+        s->frames = s->repeats = 0;
+        s->step_m = s->step_deg = s->jit_m = s->jit_deg = 0;
+        s->step_m_max = s->step_deg_max = s->jit_m_max = s->jit_deg_max = s->v_max = s->w_max = 0;
+    }
+    if (pred_n)
+        fprintf(stderr, "  [openvr] head prediction moved the head %.1f mm avg / %.1f mm worst "
+                        "(translation: the compositor's timewarp does not correct it)\n",
+                pred_sum_m / pred_n * 1000, pred_max_m * 1000);
+    pred_sum_m = pred_max_m = 0; pred_n = 0;
+    t0 = now;
+}
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
+    ovr_pipeline_report();
     ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
     // the poses this frame will be drawn with...
@@ -1062,6 +1220,7 @@ static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
     // pose below and every pose asked until the next WaitGetPoses.
     predict_frame();
     for (int d = 0; d < NDEV; d++) device_pose(d, &g_last[d]);
+    hand_trace_frame();
     for (uint32_t i = 0; render && i < n; i++) {
         if (i < NDEV) render[i] = g_last[i]; else memset(&render[i], 0, sizeof *render);
     }
@@ -1118,6 +1277,10 @@ static struct {
     uint32_t w[2], h[2], fmt[2];
     void *mtl[2][OVR_STAGES];             // the MTLTexture behind dst, as the compositor knows it
     uint8_t in_place[2][OVR_STAGES];      // the compositor slot points at the GAME's image instead
+    // KL_OPENVR_STAGE_SCALE=0: per (eye, stage) images sized exactly to the
+    // rendered rect, one per size seen (Alyx's dynamic resolution alternates
+    // a few), never freed — a diagnostic's memory, not a setting's.
+    struct { uint32_t w, h, fmt; uint64_t img; void *mtl; } native[2][OVR_STAGES][4];
     PFN_vkCreateCommandPool CreateCommandPool;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
@@ -1392,7 +1555,47 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     uint32_t w, h;
     eye_size(&w, &h);
     if (!w || !h || x1 <= x0 || y1 <= y0) return -1;
-    if (V.w[eye] != w || V.h[eye] != h || V.fmt[eye] != t->m_nFormat) {
+    // KL_OPENVR_STAGE_SCALE=0 (KL_OPENVR_MINIMAL): no rescale. The stage image
+    // is exactly the rendered rect, copied 1:1, and the compositor slot is
+    // pointed at it for this frame — the picture reaches the compositor with
+    // the game's own pixel grid. Falls back to the scaled stage (said once) if
+    // the game cycles through more sizes than the cache holds.
+    static int scale = -1;
+    if (scale < 0) scale = ovr_stage("KL_OPENVR_STAGE_SCALE", 1);
+    VkImage native_dst = VK_NULL_HANDLE;
+    if (!scale) {
+        uint32_t rw = (uint32_t)(x1 - x0), rh = (uint32_t)(y1 - y0);
+        int k = 0;
+        for (; k < 4; k++) {
+            if (!V.native[eye][stage][k].img) break;
+            if (V.native[eye][stage][k].w == rw && V.native[eye][stage][k].h == rh &&
+                V.native[eye][stage][k].fmt == t->m_nFormat) break;
+        }
+        if (k < 4 && !V.native[eye][stage][k].img) {
+            uint64_t im = kl_vulkan_xr_image(rw, rh, 1, 1, (long long)t->m_nFormat, 0);
+            void *mtl = im ? kl_vulkan_xr_image_mtl(im) : NULL;
+            if (im && mtl) {
+                V.native[eye][stage][k].w = rw; V.native[eye][stage][k].h = rh;
+                V.native[eye][stage][k].fmt = t->m_nFormat;
+                V.native[eye][stage][k].img = im; V.native[eye][stage][k].mtl = mtl;
+                static int said;
+                if (said < 12) { said++;
+                    fprintf(stderr, "  [openvr] eye %d stage %d: native %ux%u stage image (no rescale, "
+                                    "KL_OPENVR_STAGE_SCALE=0), size %d of 4\n", eye, stage, rw, rh, k + 1); }
+            } else k = 4;
+        }
+        if (k < 4) {
+            native_dst = (VkImage)(uintptr_t)V.native[eye][stage][k].img;
+            kl_glfb_note_eye_mtl_texture(eye, stage, V.native[eye][stage][k].mtl, 0, (int)rw, (int)rh);
+            V.in_place[eye][stage] = 1;   // the slot is not V.dst's: re-point it if scaling resumes
+            w = rw; h = rh;
+        } else {
+            static int said;
+            if (!said++) fprintf(stderr, "  [openvr] native stage: more than 4 render sizes — "
+                                         "falling back to the scaled stage\n");
+        }
+    }
+    if (!native_dst && (V.w[eye] != w || V.h[eye] != h || V.fmt[eye] != t->m_nFormat)) {
         for (int k = 0; k < OVR_STAGES; k++) {
             V.dst[eye][k] = kl_vulkan_xr_image(w, h, 1, 1, (long long)t->m_nFormat, 0);
             void *mtl = kl_vulkan_xr_image_mtl(V.dst[eye][k]);
@@ -1406,11 +1609,12 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     }
     // A slot the zero-copy path last pointed at the game's image: point it back
     // at ours, or the compositor keeps sampling the game's (see above).
-    if (V.in_place[eye][stage]) {
+    if (!native_dst && V.in_place[eye][stage]) {
         V.in_place[eye][stage] = 0;
         if (V.mtl[eye][stage]) kl_glfb_note_eye_mtl_texture(eye, stage, V.mtl[eye][stage], 0, (int)w, (int)h);
     }
     VkImage src = (VkImage)(uintptr_t)t->m_nImage, dst = (VkImage)(uintptr_t)V.dst[eye][stage];
+    if (native_dst) dst = native_dst;
     if (!dst) return -1;
     V.WaitForFences(V.dev, 1, &V.fence[eye][stage], VK_TRUE, UINT64_MAX);
     V.ResetFences(V.dev, 1, &V.fence[eye][stage]);
@@ -1548,7 +1752,7 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
                     (double)pm[12], (double)pm[13], (double)pm[14], (double)pm[15]);
         }
     }
-    if ((flags & 0x10) && kl_env_on("KL_OPENVR_SUBMIT_PROJ", 1)) {
+    if ((flags & 0x10) && ovr_stage("KL_OPENVR_SUBMIT_PROJ", 1)) {
         const float *m = (const float *)((const uint8_t *)tex + 72);     // row-major 4x4
         float m00 = m[0], m02 = m[2], m11 = m[5], m12 = m[6];
         if (m00 != 0.0f && m11 != 0.0f) {
