@@ -2166,7 +2166,8 @@ nothing, and prints the unresolved imports grouped by category.
 - `KL_STEAM_STUB=0` — (`runtime/guest/kl_steam.c`) leave libsteam_api's entry
   points to the guest's own library (which then looks for a running Steam and
   fails). `KL_TRACE_STEAM=1` logs callback registration and every loopback
-  connection state change; `KL_STEAM_NAME` is the persona name (Gordon).
+  connection state change, bridge answers that do not parse and each store
+  request; `KL_STEAM_NAME` overrides the persona name (below).
   The same stand-in serves the Steam Frame's ANDROID builds (Metro Awakening,
   SUPERHOT VR): their imports bind through kl_shim.c's Steamworks tier and
   their `dlopen("libsteam_api.so")` gets a stand-in handle (kl_dl.c); there
@@ -2175,13 +2176,52 @@ nothing, and prints the unresolved imports grouped by category.
   callback it hands out.
 - `KL_STEAM_APPID=<id>` — the app id the stand-in owns. Default: the target's
   (`alyx` 546560, `metro` 2669410, `superhot` 617830; table in kl_steam.c).
-- `KL_STEAM_ID=<steamid64>` — the SteamID the stand-in reports for the user.
-  Default: a fixed fake one (76561197960287930); set it to your own if a game
-  keys saves or cloud paths on it.
-- Stats and achievements (ISteamUserStats) are answered locally and never sent
-  anywhere: writes succeed, reads say "not yet", and every distinct call is
-  logged once as `[steam-stats] <Method>(<name>[, value])` — the list of stats
-  and achievements a game uses, for a later forwarder to real Steam.
+- **The real Steam account (the bridge).** At `SteamAPI_Init` the stand-in asks
+  SteamDepot's `SteamBridgeService` (`runtime/guest/kl_steam_bridge.{c,h}`;
+  newline-delimited JSON: `hello`, `stats`, `store`, `playing`) who the user is
+  and whether the account owns the target's app. Answered: the real SteamID
+  and persona name everywhere (`GetSteamID`, `GetPersonaName`, `GetAppOwner`,
+  `UserHasLicenseForApp`, `BIsSubscribedApp`…); `owned:false` makes init FAIL
+  (`[steam] SteamAPI_Init -> FAILED (result 1): app N is not owned…`) and the
+  game shows its own "no Steam" behaviour; stats and achievements are loaded
+  from Steam before `UserStatsReceived_t` and `StoreStats` sends what changed;
+  Steam shows the game as being played until `SteamAPI_Shutdown`/exit. On the
+  Mac the transport is a Unix socket (`steamdepot serve`); on visionOS the app
+  registers a backend (`kl_steam_set_backend`, KleptonSteamBridge.swift)
+  before the guest boots.
+- `KL_STEAM_BRIDGE=<path>` — (Mac) the bridge's Unix socket. Default
+  `~/.steamdepot/bridge.sock` (`steamdepot serve`'s default). One connection
+  per run: the service clears "playing" when it closes, so a killed run does
+  not stay "in-game". Ignored when the app registered a backend.
+- `KL_STEAM_REQUIRE_REAL=1|0` — what happens when the bridge does not answer
+  `hello`. `1`: init fails (`k_ESteamAPIInitResult_NoSteamClient`). `0`: the
+  old stub (fake user, app owned, stats local only) after a loud
+  `[steam] !!! NO REAL STEAM` warning. **Default: 0 on the Mac; on device 1
+  when the app registered a backend** (the hub and the alyx build, which link
+  SteamDepot), and 0 in a device build without one (no Steam service to ask).
+  The service answers from its own cache when Steam is offline, so "no
+  answer" means no sign-in or no cache, not just no network.
+- `KL_STEAM_STATS_DRYRUN=1` — every `store` carries `"dry_run":true`: the
+  service builds the Steam message but changes nothing on the account, and
+  the log says `-> dry run`. **Use it for every test run**: games set stats on
+  their own (SUPERHOT stores `Stat_*` counters from the menu).
+- `KL_STEAM_BRIDGE_TIMEOUT=<ms>` — per-request timeout for `hello`, `stats`
+  and `store` (default 30000; the first request may include the service's
+  Steam logon). `playing` uses 5 s on, 2 s off.
+- `KL_STEAM_ID=<steamid64>` / `KL_STEAM_NAME=<name>` — now OVERRIDES only:
+  they replace what is reported to the game (the bridge's answers are still
+  used for ownership and stats). With no bridge they are the stub's identity
+  (default 76561197960287930 / "Gordon").
+- `[steam-stats]` — every distinct ISteamUserStats call is logged once with
+  how it was answered: `GetStat(X) -> 3 (from Steam)`, `SetStat(X, 4) -> ok
+  (cached; goes to Steam with the next StoreStats)`, and each store as
+  `StoreStats: X=4, Y unlocked -> sent to Steam` / `-> queued (offline)` /
+  `-> dry run`. Init lists every achievement with its real state and unlock
+  time. `ClearAchievement`, `ResetAllStats` and `UpdateAvgRateStat` are never
+  sent (local only). `GetNumAchievements` / `GetAchievementName` answer from
+  Steam's list; display attributes (name, desc) are not in the bridge
+  contract and still answer "". Without the bridge everything is local, as
+  before.
 - `KL_STEAM_LANG=<steam language>` — the game language the Steam stub reports
   (`english`, `spanish`, `latam`, `french`, …). Default: the system's first
   preferred language, mapped to Steam's name. Alyx has English voices only;

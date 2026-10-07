@@ -277,6 +277,9 @@ if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package
 PKG_REF, PKG_PROD, B_PKG = _fixed("SDPKGREF"), _fixed("SDPKGPROD"), _fixed("SDPKGBLD")
 if STEAMDEPOT:
     swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
+    # ...and the guest's Steamworks stand-in answered from the real account
+    # (kl_steam_bridge.h's backend, over SteamDepot's SteamBridgeService).
+    swift.append({"name": "KleptonSteamBridge.swift", "ref": _fixed("SDBRIDGEF"), "bld": _fixed("SDBRIDGEB")})
 # The hub's library UI, plus a Swift file GENERATED here from targets.py naming the
 # games this build carries (so the app's list and the embedded frameworks are the
 # same list). The library works without SteamDepot (no download, no cover check),
