@@ -1693,8 +1693,12 @@ The composite/timewarp pass — one file, compiled by both compositors
   (`KL_OPENVR_OVERSCAN`) keeps its scale and the margin stays off-window. The
   two differ only for such a frame, logged once as `[vmtl] eye N rendered ...
   shown through the display's ...`.
-- `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
-  shows one eye, and which one is not a detail: a guest under Oculus symmetric
+- `KL_VIEW_EYE=0` / `KL_VIEW_EYE=1` — show ONE eye (left / right) at full
+  window. **Unset, the Mac viewer shows both eyes side by side** (left | right,
+  each letterboxed by its own frustum) for every stereo guest, on every
+  composite path — OpenXR projection layers, the reprojected eye and the plain
+  blit alike; a mono guest or a missing second eye falls back to one eye at full
+  window. Pinning one eye matters because which one is not a detail: a guest under Oculus symmetric
   projection renders the two eyes into different sub-rects of one texture, so
   eye 1 is the one whose crop and whose quad can be wrong
   while eye 0 looks perfect. With `KL_OVRP_EYE_TAN=vision` this is the whole
