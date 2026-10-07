@@ -1675,6 +1675,14 @@ The composite/timewarp pass — one file, compiled by both compositors
   (`kl_glfb_request_flat_surface`; the run says `flat guest — IOSurface
   composite, no readback`). `KL_VIEW_CPU=1` is the one switch that brings
   `glReadPixels` back for either shape.
+- `KL_VIEW_FRUSTUM=rendered` — (`kl_view_mtl.m`, `klvm_display_tan`) project
+  and letterbox the eye picture through the frustum the frame was RENDERED with
+  (the frame record's tangents) instead of the display's (`kl_ovrp_eye_view`).
+  The default matches the device compositor, which projects through the
+  drawable's own projection: a frame rendered past the display
+  (`KL_OPENVR_OVERSCAN`) keeps its scale and the margin stays off-window. The
+  two differ only for such a frame, logged once as `[vmtl] eye N rendered ...
+  shown through the display's ...`.
 - `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
   shows one eye, and which one is not a detail: a guest under Oculus symmetric
   projection renders the two eyes into different sub-rects of one texture, so
@@ -2174,6 +2182,56 @@ nothing, and prints the unresolved imports grouped by category.
   on the Mac and are most likely the same race.
   Real zero copy for Alyx needs it to render into our rotating images
   (IVRIPCResourceManagerClient, refused today).
+- `KL_OPENVR_OVERSCAN=<f>` — (`kl_openvr.c`, `overscan`) **default 0.12 for
+  `alyx`, 0 otherwise**, clamped to [0, 0.5]: widen every eye's frustum by `f`
+  per side (each tangent x (1+f)) in GetProjectionRaw, GetProjectionMatrix and
+  the tangents the frame is declared to the compositor with. At ~25-30 fps
+  against a 90-100 Hz display the compositor reprojects each picture for 3-4
+  refreshes; a picture that covers exactly the display has nothing past its
+  edge, so a head turn shows black there. The margin is rendered instead. The
+  compositor needs no change: kl_reproject places the picture as a quad sized
+  by its declared tangents and draws it through the DISPLAY's projection, so
+  the margin is clipped until the head turns into it (the same path that
+  already carries Alyx's horizontally symmetrised render). Submit's "rendered
+  with tangents ... (we offered ...)" line shows the game honouring it; 0.12 is
+  ~3 degrees per side on the Vision Pro (60 -> 62.7 deg out, 45 -> 48.2 up,
+  50 -> 53.2 down). Mac menu: 46-48 fps off, 36-41 fps at 0.12, same picture.
+- `KL_OPENVR_OVERSCAN_RT=0` — keep the recommended render-target size under
+  the overscan (same pixels spread over the wider field: density -1/(1+f)).
+  Default 1 scales it by (1+f) so the centre's pixel density is unchanged —
+  (1+f)^2 pixels, ~25% more at 0.12 (Mac: 44-45 fps with `=0`). Alyx's
+  auto-fidelity (`KL_OPENVR_FRAME_TIMING`) answers the heavier frame by
+  dropping a level, so on device the two converge; this is the A/B for whether
+  the overscan costs frame rate or sharpness.
+- `KL_OPENVR_PREDICT=0` — (`kl_openvr.c`, `predict_frame`) render from the
+  head as latched at WaitGetPoses instead of the head predicted to when the
+  frame is first seen. On by default: once per frame, right after the latch,
+  the frontend's tracker (`kl_ovrp_head_predict_delta`, the seam OpenXR's
+  `KL_XR_PREDICT` uses — timestamped `queryDeviceAnchor`) is asked for the head
+  `frame work (WaitGetPoses -> Submit, smoothed) + one display period` ahead,
+  capped 50 ms, and that ONE delta moves every HMD pose the bridge answers until
+  the next WaitGetPoses — render/game poses, GetLastPoses,
+  GetDeviceToAbsoluteTrackingPose (its `predict` argument is logged and NOT
+  used: there is no vsync here for the game to have timed it against, and a
+  second prediction inside one frame is a second head) — and the pose the
+  frame is DECLARED with, so the compositor corrects only the prediction's
+  error. Controllers are not moved by it: the frontend already predicts each
+  Sense controller on its own motion. No host frontend predicts, so on the Mac
+  this does nothing ("head prediction asked, but no tracker answers"). The
+  5-second `guest N fps` line carries the interval and how far it moved the
+  head. With it on, the `[ovrp] the guest submitted a pose ... from the one it
+  was handed` line measures the prediction, not the game.
+- `KL_OPENVR_PREDICT_MS=<ms>` — predict a fixed interval instead of the
+  measured one (still capped at 50 ms); for tuning by eye.
+- `KL_OPENVR_POSE_TRACE=1` — (also on with `KL_XR_POSE_TRACE=1`) once a second,
+  each HMD pose the game was handed this frame (WaitGetPoses,
+  GetDeviceToAbsoluteTrackingPose, GetLastPoses) and the pose it says it
+  rendered with (VRTextureWithPose_t, Submit flag 0x08), each differenced
+  against the DECLARED pose: worst degrees / metres and the frames each was
+  asked on. A row of zeros is a consistent bridge; a non-zero `submitted` row
+  is the game drawing from a head other than the one the compositor corrects
+  from — swim this runtime caused. Mac menu: all zeros, `submitted` on every
+  frame.
 - `KL_GLIBC_MANIFEST=<path>` — where a `--gap` run writes the packaging
   manifest ("<framework stem>\t<source path>" per mapped image; default
   `build/<target>_images.txt`), which `visionos/mkguest.sh` and `targets.py`
