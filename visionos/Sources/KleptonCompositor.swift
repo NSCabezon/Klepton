@@ -332,6 +332,9 @@ final class KleptonCompositor {
     private let handTracking = HandTrackingProvider()
     private let controllers = KleptonControllers()
     private var arRunning = false
+    /// Ghost controllers and the achievement toast (KleptonHUD.swift), drawn
+    /// last in every composite encoder. nil until the pipelines are built.
+    private var hud: KleptonHUD?
 
     // How much work reprojection is doing, sampled for the log.
     private var reprojectFrames = 0
@@ -711,6 +714,16 @@ final class KleptonCompositor {
             if let a = hands.rightHand, a.isTracked { right = a }
         }
         controllers.update(leftHand: left, rightHand: right, at: presentationTime)
+        // The ghost controllers' in-hand decision, on the same instant and the
+        // same hand anchors.
+        if let hud, hud.ghostsEnabled {
+            hud.updateGhosts(samples: [controllers.ghostSample(hand: 0, at: presentationTime),
+                                       controllers.ghostSample(hand: 1, at: presentationTime)],
+                             lastInput: controllers.lastInputActivity(),
+                             left: left, right: right,
+                             handTrackingRunning: HandTrackingProvider.isSupported
+                                                  && handTracking.state == .running)
+        }
         // ...and the same seam in the other direction: whatever the guest
         // queued for the controllers to play. Here rather than inside `update`
         // because it has nothing to do with the anchors that call takes — it is
@@ -944,6 +957,7 @@ final class KleptonCompositor {
             NSLog("[cp] composite pipeline failed: \(error)")
             return
         }
+        hud = KleptonHUD(device: device, colorFormat: color, amplification: amplification)
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear; sd.magFilter = .linear
         // Clamp to ZERO, not to edge: when the reprojection turns the quad
@@ -2010,6 +2024,10 @@ final class KleptonCompositor {
         // The guest's stereo separation, refreshed from the display itself.
         pushEyeOffsets(main)
 
+        // The toast queue and its lazy follow, once per frame against the head
+        // the composite is about to draw with.
+        hud?.prepare(originFromHead: originFromHead)
+
         var encoded = 0
         for drawable in drawables {
             // Per drawable, not once: each one is presented separately and each
@@ -2205,6 +2223,8 @@ final class KleptonCompositor {
             // the menu shows through instead of only the loading environment.
             _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
                                originFromHead: originFromHead, writeDepth: true)
+            encodeHUD(enc, viewIndices: viewIndices, drawable: drawable, layered: layered,
+                      originFromHead: originFromHead)
             enc.endEncoding()
             return viewIndices.count
         }
@@ -2472,6 +2492,8 @@ final class KleptonCompositor {
         let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
                                     originFromHead: originFromHead,
                                     writeDepth: visible == 0)
+        encodeHUD(enc, viewIndices: viewIndices, drawable: drawable, layered: layered,
+                  originFromHead: originFromHead)
         enc.endEncoding()
         // "How many eyes got a picture", which is what the caller counts black
         // frames with — and a panel IS a picture. Without this a guest that
@@ -2479,6 +2501,31 @@ final class KleptonCompositor {
         // its menu correctly, which is an instrument contradicting the display.
         if visible > 0 { return visible }
         return panels > 0 ? viewIndices.count : 0
+    }
+
+    /// Klepton's own layer (KleptonHUD): ghost controllers and the achievement
+    /// toast, last in the encoder so they sit over the game. Same views,
+    /// viewports and amplification as the eye pass — restated here because the
+    /// loading-skybox path reaches this without the eye pass having set them.
+    private func encodeHUD(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
+                           drawable: LayerRenderer.Drawable, layered: Bool,
+                           originFromHead: simd_float4x4) {
+        guard let hud, hud.hasContent else { return }
+        enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
+        if layered && viewIndices.count > 1 {
+            var mappings = viewIndices.enumerated().map { (n, vi) in
+                MTLVertexAmplificationViewMapping(
+                    viewportArrayIndexOffset: UInt32(n),
+                    renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+            }
+            enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
+        }
+        let views = viewIndices.map { vi -> KLHUDView in
+            let originFromView = originFromHead
+                * Self.headFromView(drawable.views[vi].transform, midpoint: eyeMidpointInDevice)
+            return KLHUDView(viewProj: drawable.computeProjection(viewIndex: vi) * originFromView.inverse)
+        }
+        hud.encode(enc, views: views, recenter: recenterXform)
     }
 
     /// The guest's PROJECTION layers, each as its own quad with its own frustum,

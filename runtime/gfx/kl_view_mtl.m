@@ -16,6 +16,10 @@
 // as head motion is corrected on device.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <CoreText/CoreText.h>
+#import <ImageIO/ImageIO.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +30,7 @@
 #include "kl_view_mtl.h"
 #include "kl_vulkan.h"
 #include "kl_env.h"
+#include "kl_steam_bridge.h"
 #include <math.h>
 
 static const float *klvm_display_tan(int eye, const float *rendered, float out[4]);
@@ -625,6 +630,254 @@ static void *klvm_first_layer_texture(void) {
     return NULL;
 }
 
+// ---- The achievement toast (host twin of KleptonHUD.swift's) -----------------
+//
+// kl_steam.c hands every achievement a StoreStats confirmed as unlocked to the
+// unlock handler (kl_steam_bridge.h). On device the app registers one and
+// draws the panel in the immersive layer; on the Mac THIS registers itself
+// when nothing else has, and draws the same panel, rasterised by the same
+// CoreText layout, flat at the top of the window — the verification surface
+// for the panel's content and timing. KL_TOAST_TEST=1 queues a fake one 5 s
+// after the viewer starts.
+#define KLVM_TOAST_W 1024
+#define KLVM_TOAST_H 288
+#define KLVM_TOAST_QMAX 16
+typedef struct { char *name, *desc, *icon; } klvm_toast;
+static klvm_toast g_tq[KLVM_TOAST_QMAX];
+static int g_tq_n;
+static pthread_mutex_t g_tq_mu = PTHREAD_MUTEX_INITIALIZER;
+static klvm_toast g_tcur;               // the one on screen (render thread only)
+static double g_tcur_t0 = -1;
+static id<MTLTexture> g_ttex;
+static id<MTLRenderPipelineState> g_tpipe;
+static double g_tstart = -1;            // viewer start, for KL_TOAST_TEST
+static int g_ttest_fired;
+
+static double klvm_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void klvm_toast_push(const char *api, const char *name, const char *desc, const char *icon) {
+    (void)api;
+    pthread_mutex_lock(&g_tq_mu);
+    if (g_tq_n < KLVM_TOAST_QMAX) {
+        g_tq[g_tq_n++] = (klvm_toast){ strdup(name ? name : ""), strdup(desc ? desc : ""),
+                                       strdup(icon ? icon : "") };
+    }
+    pthread_mutex_unlock(&g_tq_mu);
+}
+
+// "spanish"/"latam" -> Spanish, everything else English.
+static int klvm_toast_es(void) {
+    const char *l = kl_steam_game_language();
+    return l && (!strncmp(l, "spanish", 7) || !strncmp(l, "latam", 5));
+}
+static const char *klvm_toast_header(void) {
+    return klvm_toast_es() ? "\xF0\x9F\x8F\x86 Logro desbloqueado"
+                           : "\xF0\x9F\x8F\x86 Achievement unlocked";
+}
+
+static CTLineRef klvm_line(const char *text, CTFontRef font, CGColorRef color, double max_w) {
+    CFStringRef s = CFStringCreateWithCString(NULL, text ? text : "", kCFStringEncodingUTF8);
+    if (!s) s = CFSTR("");
+    const void *k[] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+    const void *v[] = { font, color };
+    CFDictionaryRef at = CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks,
+                                            &kCFTypeDictionaryValueCallBacks);
+    CFAttributedStringRef as = CFAttributedStringCreate(NULL, s, at);
+    CTLineRef line = CTLineCreateWithAttributedString(as);
+    CFAttributedStringRef es = CFAttributedStringCreate(NULL, CFSTR("…"), at);
+    CTLineRef ell = CTLineCreateWithAttributedString(es);
+    CTLineRef t = CTLineCreateTruncatedLine(line, max_w, kCTLineTruncationEnd, ell);
+    if (t) { CFRelease(line); line = t; }
+    CFRelease(ell); CFRelease(es); CFRelease(as); CFRelease(at); CFRelease(s);
+    return line;
+}
+
+// The panel, 1024x288, premultiplied RGBA8 (sRGB), row 0 at the top. The
+// layout is KleptonHUD.swift's ToastRaster, number for number.
+static id<MTLTexture> klvm_toast_raster(const klvm_toast *t) {
+    const int W = KLVM_TOAST_W, H = KLVM_TOAST_H;
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef c = CGBitmapContextCreate(NULL, W, H, 8, W * 4, cs,
+                                           kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    if (!c) { CGColorSpaceRelease(cs); return nil; }
+    CGContextClearRect(c, CGRectMake(0, 0, W, H));
+    // Card: dark, slightly translucent, with a hairline gold edge.
+    CGPathRef card = CGPathCreateWithRoundedRect(CGRectMake(4, 4, W - 8, H - 8), 56, 56, NULL);
+    CGContextAddPath(c, card);
+    CGContextSetRGBFillColor(c, 0.07, 0.08, 0.10, 0.92);
+    CGContextFillPath(c);
+    CGContextAddPath(c, card);
+    CGContextSetRGBStrokeColor(c, 1.0, 0.80, 0.35, 0.55);
+    CGContextSetLineWidth(c, 4);
+    CGContextStrokePath(c);
+    CGPathRelease(card);
+    // Icon, 192 px, rounded, vertically centred; a gold placeholder without one.
+    CGRect ir = CGRectMake(48, (H - 192) / 2.0, 192, 192);
+    CGPathRef ip = CGPathCreateWithRoundedRect(ir, 28, 28, NULL);
+    CGImageRef img = NULL;
+    if (t->icon && *t->icon) {
+        CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)t->icon,
+                                                             (CFIndex)strlen(t->icon), false);
+        CGImageSourceRef src = u ? CGImageSourceCreateWithURL(u, NULL) : NULL;
+        if (src) { img = CGImageSourceCreateImageAtIndex(src, 0, NULL); CFRelease(src); }
+        if (u) CFRelease(u);
+    }
+    CGContextSaveGState(c);
+    CGContextAddPath(c, ip);
+    CGContextClip(c);
+    if (img) CGContextDrawImage(c, ir, img);
+    else { CGContextSetRGBFillColor(c, 0.85, 0.66, 0.22, 1); CGContextFillRect(c, ir); }
+    CGContextRestoreGState(c);
+    CGPathRelease(ip);
+    if (img) CGImageRelease(img);
+    // Text column.
+    double x = 48 + 192 + 40, maxw = W - x - 48;
+    CTFontRef fh = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 34, NULL);
+    CTFontRef fn = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 50, NULL);
+    CTFontRef fd = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 32, NULL);
+    CGColorRef gold = CGColorCreateSRGB(1.0, 0.80, 0.35, 1);
+    CGColorRef white = CGColorCreateSRGB(1, 1, 1, 1);
+    CGColorRef grey = CGColorCreateSRGB(0.78, 0.80, 0.84, 1);
+    CTLineRef lh = klvm_line(klvm_toast_header(), fh, gold, maxw);
+    CTLineRef ln = klvm_line(t->name, fn, white, maxw);
+    // Baselines from the top: header 78, name 146, description lines 198 / 240.
+    CGContextSetTextPosition(c, x, H - 78);  CTLineDraw(lh, c);
+    CGContextSetTextPosition(c, x, H - 146); CTLineDraw(ln, c);
+    if (t->desc && *t->desc) {
+        // Two lines at most: wrap with a typesetter, truncate the second.
+        CFStringRef s = CFStringCreateWithCString(NULL, t->desc, kCFStringEncodingUTF8);
+        if (s) {
+            const void *k[] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+            const void *v[] = { fd, grey };
+            CFDictionaryRef at = CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks,
+                                                    &kCFTypeDictionaryValueCallBacks);
+            CFAttributedStringRef as = CFAttributedStringCreate(NULL, s, at);
+            CTTypesetterRef ts = CTTypesetterCreateWithAttributedString(as);
+            CFIndex len = CFStringGetLength(s);
+            CFIndex n1 = CTTypesetterSuggestLineBreak(ts, 0, maxw);
+            CTLineRef l1 = CTTypesetterCreateLine(ts, CFRangeMake(0, n1));
+            CGContextSetTextPosition(c, x, H - 198); CTLineDraw(l1, c);
+            CFRelease(l1);
+            if (n1 < len) {
+                CFStringRef rest = CFStringCreateWithSubstring(NULL, s, CFRangeMake(n1, len - n1));
+                char buf[1024];
+                if (rest && CFStringGetCString(rest, buf, sizeof buf, kCFStringEncodingUTF8)) {
+                    CTLineRef l2 = klvm_line(buf, fd, grey, maxw);
+                    CGContextSetTextPosition(c, x, H - 240); CTLineDraw(l2, c);
+                    CFRelease(l2);
+                }
+                if (rest) CFRelease(rest);
+            }
+            CFRelease(ts); CFRelease(as); CFRelease(at); CFRelease(s);
+        }
+    }
+    CFRelease(lh); CFRelease(ln);
+    CFRelease(fh); CFRelease(fn); CFRelease(fd);
+    CGColorRelease(gold); CGColorRelease(white); CGColorRelease(grey);
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                     width:W height:H mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> tex = [g_dev newTextureWithDescriptor:td];
+    [tex replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0
+             withBytes:CGBitmapContextGetData(c) bytesPerRow:(NSUInteger)W * 4];
+    CGContextRelease(c);
+    CGColorSpaceRelease(cs);
+    return tex;
+}
+
+static const char *klvm_toast_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VO { float4 p [[position]]; float2 uv; };\n"
+    "vertex VO klvm_toast_v(uint vid [[vertex_id]]) {\n"
+    "  float2 c = float2((vid & 1) ? 1.0 : 0.0, (vid & 2) ? 1.0 : 0.0);\n"
+    "  VO o; o.p = float4(c.x * 2 - 1, 1 - c.y * 2, 0, 1); o.uv = c; return o; }\n"
+    "fragment float4 klvm_toast_f(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                             sampler s [[sampler(0)]], constant float &a [[buffer(0)]]) {\n"
+    "  return t.sample(s, i.uv) * a; }\n";
+
+static void klvm_toast_start(void) {
+    g_tstart = klvm_now();
+    if (!kl_steam_unlock_handler()) kl_steam_set_unlock_handler(klvm_toast_push);
+    NSError *err = nil;
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:klvm_toast_msl]
+                                             options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"klvm_toast_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"klvm_toast_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;          // premultiplied
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    g_tpipe = pd.vertexFunction && pd.fragmentFunction
+        ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+    if (!g_tpipe)
+        fprintf(stderr, "  [toast] viewer toast pipeline failed: %s — unlocks are only logged\n",
+                err.localizedDescription.UTF8String ?: "?");
+}
+
+// Drawn last, over whatever the frame is. Fade 0.3 s in and out, 5 s on
+// screen (KL_TOAST_SECS), then the next queued one.
+static void klvm_toast_draw(id<MTLCommandBuffer> cmd, id<MTLTexture> target) {
+    if (!g_tpipe || !target) return;
+    double now = klvm_now();
+    if (!g_ttest_fired && g_tstart > 0 && now - g_tstart >= 5.0 && kl_env_on("KL_TOAST_TEST", 0)) {
+        g_ttest_fired = 1;
+        int es = klvm_toast_es();
+        klvm_toast_push("KL_TOAST_TEST", es ? "Prueba de logro" : "Test achievement",
+                        es ? "KL_TOAST_TEST: un aviso falso para comprobar el panel."
+                           : "KL_TOAST_TEST: a fake toast to check the panel.", "");
+        fprintf(stderr, "  [toast] KL_TOAST_TEST: fake toast queued\n");
+    }
+    double secs = kl_env_float("KL_TOAST_SECS", 5.0);
+    if (g_tcur_t0 >= 0 && now - g_tcur_t0 > secs) {
+        free(g_tcur.name); free(g_tcur.desc); free(g_tcur.icon);
+        memset(&g_tcur, 0, sizeof g_tcur);
+        g_tcur_t0 = -1; g_ttex = nil;
+    }
+    if (g_tcur_t0 < 0) {
+        pthread_mutex_lock(&g_tq_mu);
+        int have = g_tq_n > 0;
+        if (have) {
+            g_tcur = g_tq[0];
+            memmove(g_tq, g_tq + 1, (size_t)(g_tq_n - 1) * sizeof g_tq[0]);
+            g_tq_n--;
+        }
+        pthread_mutex_unlock(&g_tq_mu);
+        if (!have) return;
+        g_ttex = klvm_toast_raster(&g_tcur);
+        g_tcur_t0 = now;
+        fprintf(stderr, "  [toast] showing \"%s\" (%s)\n", g_tcur.name, klvm_toast_header());
+    }
+    if (!g_ttex) return;
+    double e = now - g_tcur_t0;
+    float a = (float)fmin(1.0, fmin(e / 0.3, (secs - e) / 0.3));
+    if (a <= 0) return;
+    double tw = target.width, th = target.height;
+    double w = fmin(tw * 0.6, KLVM_TOAST_W * fmax(th / 1400.0, 0.5));
+    double h = w * KLVM_TOAST_H / KLVM_TOAST_W;
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = target;
+    p.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:p];
+    enc.label = @"klepton viewer toast";
+    [enc setViewport:(MTLViewport){ (tw - w) * 0.5, th * 0.06, w, h, 0.0, 1.0 }];
+    [enc setRenderPipelineState:g_tpipe];
+    [enc setFragmentTexture:g_ttex atIndex:0];
+    [enc setFragmentSamplerState:g_samp atIndex:0];
+    [enc setFragmentBytes:&a length:sizeof a atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [enc endEncoding];
+}
+
 int kl_viewmtl_start(void *metal_layer) {
     if (g_started) return 1;
     if (!metal_layer) return 0;
@@ -753,6 +1006,7 @@ int kl_viewmtl_start(void *metal_layer) {
     int gl = kl_glfb_mtl_device() != NULL;
     if (gl) kl_glfb_set_gpu_fence((__bridge void *)g_event);
 
+    klvm_toast_start();
     g_started = 1;
     fprintf(stderr, "  [vmtl] hardware compositor on %s — no readback, "
                     "no CPU copies%s%s\n", g_dev.name.UTF8String,
@@ -872,6 +1126,7 @@ static int klvm_present_flat(int win_w, int win_h) {
         }];
     }
 
+    klvm_toast_draw(cmd, drawable.texture);
     [cmd presentDrawable:drawable];
     [cmd commit];
     g_last_value = v;
@@ -1251,6 +1506,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         }];
     }
 
+    klvm_toast_draw(cmd, drawable.texture);
     [cmd presentDrawable:drawable];
     [cmd commit];
     g_last_value = v;

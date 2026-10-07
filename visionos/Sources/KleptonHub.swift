@@ -452,8 +452,13 @@ struct HubGameSettingsView: View {
                     Toggle("Real hands visible", isOn: Binding(
                         get: { s.handMatting ?? KLGameSettingsStore.defaultMatting(game.target) },
                         set: { s.handMatting = $0; save() }))
+                    Toggle("Show controllers when not held", isOn: Binding(
+                        get: { s.ghostControllers ?? KLGameSettingsStore.defaultGhostControllers },
+                        set: { s.ghostControllers = $0; save() }))
                 } header: { Text("Display") } footer: {
-                    Text("The game draws its own hands, so your real ones are hidden by default.")
+                    Text("The game draws its own hands, so your real ones are hidden by default. "
+                         + "A controller you put down is shown as a grey outline where it rests, "
+                         + "and disappears again when you pick it up.")
                 }
 
                 Section {

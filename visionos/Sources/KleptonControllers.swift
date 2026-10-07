@@ -444,6 +444,41 @@ final class KleptonControllers {
     private(set) var senseConnected = false
     private var tracked: [GCController] = []
 
+    // MARK: - Ghost controllers (KleptonHUD)
+
+    /// When each controller last showed input (CACurrentMediaTime), under `lock`.
+    private var lastActive: [TimeInterval] = [-100, -100]
+    func lastInputActivity() -> [TimeInterval] {
+        lock.lock(); defer { lock.unlock() }
+        return lastActive
+    }
+
+    /// The physical controller for the ghost model: the `.grip` frame with the
+    /// platform's RENDERED correction (the one meant for drawing content
+    /// aligned with the device) and none of the game's calibration, predicted
+    /// to the frame like sensePose. nil when there is no anchor for that hand.
+    func ghostSample(hand: Int, at time: TimeInterval) -> KLGhostSample? {
+        lock.lock()
+        let stored = accessoryAnchor[hand]
+        let provider = accessoryProvider
+        lock.unlock()
+        guard let stored else { return nil }
+        let now = CACurrentMediaTime()
+        let a = provider?.predictAnchor(for: stored, at: now + min(max(time - now, 0), 0.05)) ?? stored
+        let m = a.accessory.locations.contains(.grip)
+            ? a.coordinateSpace(for: .grip, correction: .rendered).ancestorFromSpaceTransformFloat().matrix
+            : a.originFromAnchorTransform
+        let positioned: Bool
+        switch a.trackingState {
+        case .positionOrientationTracked, .positionOrientationTrackedLowAccuracy: positioned = true
+        case .untracked, .orientationTracked: positioned = false
+        @unknown default: positioned = a.isTracked
+        }
+        return KLGhostSample(originFromGrip: m, positionTracked: positioned && a.isTracked,
+                             heldByPlatform: a.heldChirality != nil,
+                             speed: simd_length(a.velocity), angularSpeed: simd_length(a.angularVelocity))
+    }
+
     // MARK: - Discovery
 
     /// The spatial controllers paired right now.
@@ -1703,6 +1738,15 @@ final class KleptonControllers {
         for hand in 0...1 {
             lock.lock()
             var st = state[hand]
+            // Any sign of a hand ON this controller — a button, a capacitive
+            // touch, the trigger or grip, the stick off-centre — for the ghost
+            // controllers (KleptonHUD): input means held. From the latched
+            // sample, so a button held down keeps counting while no new input
+            // state arrives.
+            if st.fromController && (st.buttons != 0 || st.touches != 0 || st.indexTrigger > 0.05
+                                     || st.handTrigger > 0.05 || simd_length(st.stick) > 0.2) {
+                lastActive[hand] = CACurrentMediaTime()
+            }
             lock.unlock()
 
             let accPose = sensePose(hand: hand, at: presentationTime)
