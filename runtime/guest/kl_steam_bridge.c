@@ -24,6 +24,13 @@ void kl_steam_set_backend(kl_steam_backend_fn fn) {
 }
 int kl_steam_has_backend(void) { return atomic_load(&g_backend) != NULL; }
 
+static _Atomic(kl_steam_unlock_fn) g_unlock;
+void kl_steam_set_unlock_handler(kl_steam_unlock_fn fn) {
+    atomic_store(&g_unlock, fn);
+    fprintf(stderr, "  [steam] achievement-unlock handler %s\n", fn ? "registered" : "removed");
+}
+kl_steam_unlock_fn kl_steam_unlock_handler(void) { return atomic_load(&g_unlock); }
+
 // $KL_STEAM_BRIDGE, else ~/.steamdepot/bridge.sock.
 const char *kl_steam_bridge_socket_path(void) {
     static char path[sizeof(((struct sockaddr_un *)0)->sun_path)];

@@ -405,6 +405,7 @@ build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_vi
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
 	  runtime/gfx/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
+	  -framework CoreText -framework CoreGraphics -framework ImageIO \
 	  $(shell pkg-config --libs sdl3)
 
 boot: build/m_boot

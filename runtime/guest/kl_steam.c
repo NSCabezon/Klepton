@@ -376,6 +376,7 @@ static const char *steam_lang(void) {
     return lang;
 }
 static const char *ut_lang(void *s) { (void)s; return steam_lang(); }
+const char *kl_steam_game_language(void) { return steam_lang(); }
 static int ut_universe(void *s) { (void)s; return 1; }
 static uint8_t ut_battery(void *s) { (void)s; return 255; }
 static int ut_call_done(void *s, uint64_t call, int *failed) {
@@ -999,9 +1000,8 @@ void kl_steam_shutdown(void) {
 // Either way every distinct call is logged once with its arguments under
 // "[steam-stats]" — the list of stats and achievements each game uses.
 //
-// Display attributes (name, desc, hidden) are not in the contract and still
-// answer "": a game that shows its own achievement list from Steam's text
-// shows blanks.
+// Display attributes (name, desc, hidden) come from Steam's schema in the game
+// language (`stats` with "lang"); without a bridge they answer "".
 //
 // Callback structs are pack(4) on Linux/Android (VALVE_CALLBACK_PACK_SMALL).
 #pragma pack(push, 4)
@@ -1015,7 +1015,8 @@ typedef struct { uint64_t call; int32_t id; uint32_t n; } st_call_completed;    
 #define EResultFail 2
 
 typedef struct { char *name; int is_float, from_steam; double v, sent; } kstat;
-typedef struct { char *name; int from_steam, unlocked, sent; uint32_t time; } kach;
+typedef struct { char *name; int from_steam, unlocked, sent; uint32_t time;
+                 char *dname, *ddesc; int hidden; } kach;   // display: Steam's schema, in the game language
 static kstat *g_st;
 static kach *g_ach;
 static int g_nst, g_nach, g_capst, g_capach;
@@ -1069,8 +1070,11 @@ static void stats_note(const char *what, const char *name, const char *val, cons
 #define CACHED     "ok (cached; goes to Steam with the next StoreStats)"
 
 static void stats_load(void) {
-    char req[64];
-    snprintf(req, sizeof req, "{\"op\":\"stats\",\"app\":%u}", APP_ID);
+    char req[128];
+    // "lang": the achievement texts ("display") come back in the game's
+    // language, which is what GetAchievementDisplayAttribute and the unlock
+    // toast show.
+    snprintf(req, sizeof req, "{\"op\":\"stats\",\"app\":%u,\"lang\":\"%s\"}", APP_ID, steam_lang());
     const char *why;
     kj *j = bridge(req, bridge_timeout(), &why);
     if (!j || !kj_is_true(kj_get(j, "ok"))) {
@@ -1098,6 +1102,13 @@ static void stats_load(void) {
         a->from_steam = 1;
         a->unlocked = a->sent = kj_is_true(kj_get(c, "unlocked"));
         a->time = (uint32_t)kj_num(kj_get(c, "time"), 0);
+        kj *d = kj_get(c, "display");
+        if (d && d->t == KJ_OBJ) {
+            const char *dn = kj_str(kj_get(d, "name"), NULL), *dd = kj_str(kj_get(d, "desc"), NULL);
+            if (dn && !a->dname) a->dname = strdup(dn);
+            if (dd && !a->ddesc) a->ddesc = strdup(dd);
+            a->hidden = kj_is_true(kj_get(d, "hidden"));
+        }
         unlocked += a->unlocked;
     }
     g_nach_steam = g_nach;
@@ -1272,6 +1283,42 @@ typedef struct {
 } store_job;
 static pthread_mutex_t g_store_mu = PTHREAD_MUTEX_INITIALIZER;
 
+// The store's "unlocked" list -> the app's toast (kl_steam_set_unlock_handler).
+// Each icon is fetched through the bridge's `icon` op first, so the handler is
+// handed a local file. Without a handler the unlock is only logged; KL_TOAST=0
+// skips the whole thing (no icon fetches either).
+static void notify_unlocks(const kj *j) {
+    kj *ul = kj_get(j, "unlocked");
+    if (!ul || ul->t != KJ_ARR || !ul->child || !kl_env_on("KL_TOAST", 1)) return;
+    kl_steam_unlock_fn fn = kl_steam_unlock_handler();
+    for (kj *e = ul->child; e; e = e->next) {
+        const char *api = kj_str(kj_get(e, "api"), "");
+        const char *name = kj_str(kj_get(e, "name"), api);
+        const char *desc = kj_str(kj_get(e, "desc"), "");
+        const char *url = kj_str(kj_get(e, "icon"), NULL);
+        char path[1024] = "";
+        if (url && *url && fn) {
+            kjb req = {0};
+            kjb_add(&req, "{\"op\":\"icon\",\"url\":");
+            kjb_str(&req, url);
+            kjb_add(&req, "}");
+            const char *why = NULL;
+            kj *ij = req.p ? bridge(req.p, kl_env_int("KL_STEAM_ICON_TIMEOUT", 10000), &why) : NULL;
+            if (ij && kj_is_true(kj_get(ij, "ok")))
+                snprintf(path, sizeof path, "%s", kj_str(kj_get(ij, "path"), ""));
+            else
+                fprintf(stderr, "  [toast] icon for %s not fetched (%s)\n", api,
+                        ij ? bridge_error(ij) : why ? why : "?");
+            kj_free(ij);
+            kjb_free(&req);
+        }
+        fprintf(stderr, "  [toast] achievement unlocked%s: %s \"%s\" — %s%s%s\n",
+                stats_dry_run() ? " (dry run)" : "", api, name, desc,
+                path[0] ? " | icon " : "", path);
+        if (fn) fn(api, name, desc, path);
+    }
+}
+
 static void *store_worker(void *arg) {
     store_job *jb = arg;
     pthread_mutex_lock(&g_store_mu);             // one at a time, in the game's order
@@ -1286,6 +1333,7 @@ static void *store_worker(void *arg) {
     if (ok) {
         st_stats_stored r = { APP_ID, EResultOK };
         post(1102, &r, sizeof r, 0);
+        notify_unlocks(j);
         pthread_mutex_lock(&g_smu);
         for (int i = 0; i < jb->nach; i++) {
             st_ach_stored a = { APP_ID, 0, {0}, 0, 0 };
@@ -1347,7 +1395,9 @@ static int  ss_store(void *s) {
         a->sent = 1;
     }
     pthread_mutex_unlock(&g_smu);
-    kjb_fmt(&req, "},\"dry_run\":%s}", stats_dry_run() ? "true" : "false");
+    kjb_fmt(&req, "},\"dry_run\":%s,\"lang\":", stats_dry_run() ? "true" : "false");
+    kjb_str(&req, steam_lang());
+    kjb_add(&req, "}");
     if (!jb->nst && !jb->nach) {
         stats_note("StoreStats", NULL, NULL, "ok (nothing changed since the last store: nothing sent)");
         st_stats_stored r = { APP_ID, EResultOK };
@@ -1387,8 +1437,22 @@ static const char *ss_ach_name(void *s, uint32_t i) {
     pthread_mutex_unlock(&g_smu);
     return n;
 }
+// "name", "desc" and "hidden" from Steam's schema in the game language (the
+// `stats` load asks with "lang"); "" for anything else, or with no bridge. The
+// strings are owned by the cache and never freed, so the pointer stays valid.
 static const char *ss_ach_attr(void *s, const char *n, const char *k) {
-    (void)s; (void)n; (void)k; return "";       // names/descriptions: not in the bridge contract
+    (void)s;
+    const char *r = "";
+    pthread_mutex_lock(&g_smu);
+    kach *a = ach_find(n, 0);
+    if (a && k) {
+        if (!strcmp(k, "name") && a->dname) r = a->dname;
+        else if (!strcmp(k, "desc") && a->ddesc) r = a->ddesc;
+        else if (!strcmp(k, "hidden")) r = a->hidden ? "1" : "0";
+    }
+    pthread_mutex_unlock(&g_smu);
+    stats_note("GetAchievementDisplayAttribute", n, k, *r ? "from Steam's schema" : "\"\" (no display data)");
+    return r;
 }
 // RequestUserStats / RequestCurrentStats (pre-1.61): answer with the same
 // UserStatsReceived_t init already queued, as a call result for the former.
