@@ -34,6 +34,7 @@
 #include "kl_glibc_sdl.h"
 #include "kl_audio.h"
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 
 static const kl_flatwin_backend *g_be;
@@ -289,7 +290,10 @@ static int  sdl_GL_SetAttribute(int a, int v) { (void)a; (void)v; return 0; }
 static int g_audio_inited;
 static int sdl_InitSubSystem(uint32_t flags) {
     if (flags & SDL_INIT_VIDEO) g_video_inited = 1;
-    if (flags & SDL_INIT_AUDIO) g_audio_inited = 1;
+    if (flags & SDL_INIT_AUDIO) {
+        fprintf(stderr, "  [sdl-au] SDL_InitSubSystem(AUDIO) (was %s)\n", g_audio_inited ? "up" : "down");
+        g_audio_inited = 1;
+    }
     uint32_t rest = flags & ~(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     if (flags & SDL_INIT_VIDEO) rest |= SDL_INIT_EVENTS;
     if (!rest) return 0;
@@ -297,9 +301,10 @@ static int sdl_InitSubSystem(uint32_t flags) {
     return r ? r(rest) : 0;
 }
 static int sdl_Init(uint32_t flags) { return sdl_InitSubSystem(flags); }
+static void sdl_audio_quit(const char *who);
 static void sdl_QuitSubSystem(uint32_t flags) {
     if (flags & SDL_INIT_VIDEO) g_video_inited = 0;
-    if (flags & SDL_INIT_AUDIO) g_audio_inited = 0;
+    if (flags & SDL_INIT_AUDIO) sdl_audio_quit("SDL_QuitSubSystem(AUDIO)");
     uint32_t rest = flags & ~(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     void (*r)(uint32_t) = REAL(void (*)(uint32_t), "SDL_QuitSubSystem");
     if (r && rest) r(rest);
@@ -333,16 +338,26 @@ _Static_assert(sizeof(sdl_audiospec) == 32, "SDL2 SDL_AudioSpec");
 #define AUDIO_S16LSB 0x8010u
 #define AUDIO_S32LSB 0x8020u
 #define AUDIO_F32LSB 0x8120u
-#define AUDIO_DEV_ID 2u
+// Device ids: every successful open gets a NEW id (2, 3, ...), as SDL does,
+// and only the current one is honoured. A stale id (a device the engine closed,
+// or one we replaced) is a no-op rather than an alias of whatever is open now.
+#define AUDIO_DEV_FIRST 2u
 
 static struct {
     int open, paused, quit;
+    uint32_t id;                      // the open device's id
     sdl_audiospec spec;
     pthread_t th;
     pthread_mutex_t mu;               // the queue, and SDL_LockAudioDevice
     uint8_t *q; size_t qcap, qhead, qlen;
     unsigned long long periods, starved;
+    // The 5-second window the feeder reports (KL_SDL_AUDIO_STATS, default on):
+    // bytes the guest queued (under mu), and what the feeder played.
+    unsigned long long w_in, w_periods, w_starved, w_queues, w_clears;
+    int w_peak;
 } g_au = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static uint32_t g_au_next_id = AUDIO_DEV_FIRST;
+static int au_dev(uint32_t dev) { return g_au.open && dev == g_au.id; }
 
 static int au_frame_bytes(void) { return (g_au.spec.format & 0xff) / 8 * g_au.spec.channels; }
 static float au_sample(const uint8_t *p, int i) {
@@ -378,13 +393,42 @@ static void au_convert(const uint8_t *in, int n, int16_t *out) {
         out[2 * f + 1] = (int16_t)lrintf(r * 32767.0f);
     }
 }
+static double au_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+// One line per 5 s while a device is open: is the guest still feeding us, and
+// is what it feeds silent? The sink's own "guest PCM so far" peak is cumulative
+// over the process, so a menu that played audio hides a game that went silent;
+// this one is per window.
+static void au_stats_maybe(double *t0) {
+    double t = au_now();
+    if (t - *t0 < 5.0) return;
+    *t0 = t;
+    pthread_mutex_lock(&g_au.mu);
+    unsigned long long in = g_au.w_in, nq = g_au.w_queues, ncl = g_au.w_clears;
+    size_t qlen = g_au.qlen;
+    g_au.w_in = g_au.w_queues = g_au.w_clears = 0;
+    pthread_mutex_unlock(&g_au.mu);
+    fprintf(stderr, "  [sdl-au] dev %u 5s: %s, %llu periods (%llu short), %s %llu KB in %llu calls, "
+                    "queue now %zu B, %llu clears, PCM peak %d/32767%s\n",
+            g_au.id, g_au.paused ? "PAUSED" : "playing", g_au.w_periods, g_au.w_starved,
+            g_au.spec.callback ? "callback" : "queued", in >> 10, nq, qlen, ncl, g_au.w_peak,
+            g_au.paused ? "" : g_au.w_peak ? "" : " — SILENT");
+    g_au.w_periods = g_au.w_starved = 0;
+    g_au.w_peak = 0;
+}
 static void *au_feeder(void *arg) {
     (void)arg;
     if (g_au.spec.callback) kl_thread_init();         // the guest's callback runs here
     size_t period = (size_t)g_au.spec.samples * au_frame_bytes();
     uint8_t *buf = malloc(period);
     int16_t *out = malloc((size_t)g_au.spec.samples * 4);
+    int stats = kl_env_on("KL_SDL_AUDIO_STATS", 1);
+    double t0 = au_now();
     while (!g_au.quit) {
+        if (stats) au_stats_maybe(&t0);
         if (g_au.paused) { usleep(5000); continue; }
         if (g_au.spec.callback) {
             memset(buf, g_au.spec.silence, period);
@@ -398,23 +442,58 @@ static void *au_feeder(void *arg) {
             g_au.qhead = g_au.qcap ? (g_au.qhead + take) % g_au.qcap : 0;
             g_au.qlen -= take;
             pthread_mutex_unlock(&g_au.mu);
-            if (take < period) { memset(buf + take, g_au.spec.silence, period - take); g_au.starved++; }
+            if (take < period) {
+                memset(buf + take, g_au.spec.silence, period - take);
+                g_au.starved++; g_au.w_starved++;
+            }
         }
         au_convert(buf, g_au.spec.samples, out);
-        g_au.periods++;
+        for (int i = 0; i < g_au.spec.samples * 2; i++) {
+            int v = out[i] < 0 ? -out[i] : out[i];
+            if (v > g_au.w_peak) g_au.w_peak = v;
+        }
+        g_au.periods++; g_au.w_periods++;
         if (kl_audio_write(out, (size_t)g_au.spec.samples * 4) == 0) usleep(5000);
     }
     free(buf); free(out);
     return NULL;
 }
+static void au_close(const char *who) {
+    if (!g_au.open) return;
+    g_au.quit = 1;
+    pthread_join(g_au.th, NULL);
+    kl_audio_close();
+    g_au.open = 0;
+    pthread_mutex_lock(&g_au.mu);
+    g_au.qhead = g_au.qlen = 0;
+    pthread_mutex_unlock(&g_au.mu);
+    fprintf(stderr, "  [sdl-au] %s: device %u closed, %llu periods played, %llu of them short\n",
+            who, g_au.id, g_au.periods, g_au.starved);
+}
+static void sdl_audio_quit(const char *who) {
+    // SDL_QuitSubSystem(AUDIO) / SDL_AudioQuit close every open device in real
+    // SDL. Leaving ours open made the NEXT open (after SDL_InitSubSystem(AUDIO))
+    // refuse with "one device", and the engine would have run mute from there.
+    fprintf(stderr, "  [sdl-au] %s (device %s)\n", who, g_au.open ? "open: closing it" : "none open");
+    au_close(who);
+    g_audio_inited = 0;
+}
 static uint32_t sdl_OpenAudioDevice(const char *name, int capture, const sdl_audiospec *want,
                                     sdl_audiospec *have, int allowed) {
-    (void)allowed;
     if (capture || !want) {
         fprintf(stderr, "  [sdl] SDL_OpenAudioDevice(capture %d): no capture device\n", capture);
         return 0;
     }
-    if (g_au.open) return 0;                          // one device, as most backends
+    fprintf(stderr, "  [sdl-au] SDL_OpenAudioDevice(\"%s\", want %d Hz, format %#x, %u ch, %u frames, "
+                    "%s, allowed %#x)%s\n",
+            name ? name : "default", want->freq, want->format, want->channels, want->samples,
+            want->callback ? "callback" : "queue", allowed,
+            g_au.open ? " — a device is ALREADY open" : "");
+    // One sink, so one device. A second open with the first still open used to
+    // be refused (0) — silently, and for the rest of the run if the engine
+    // reopens on a map change without closing. The newest open wins instead:
+    // the old one is closed (its id goes stale) and this one plays.
+    if (g_au.open) au_close("replaced by a new SDL_OpenAudioDevice");
     sdl_audiospec s = *want;
     if (s.format != AUDIO_S16LSB && s.format != AUDIO_S32LSB && s.format != AUDIO_F32LSB)
         s.format = AUDIO_F32LSB;
@@ -429,22 +508,42 @@ static uint32_t sdl_OpenAudioDevice(const char *name, int capture, const sdl_aud
         return 0;
     }
     g_au.spec = s;
-    g_au.paused = 1; g_au.quit = 0; g_au.qhead = g_au.qlen = 0;
+    g_au.id = g_au_next_id++;
+    g_au.paused = 1; g_au.quit = 0;
+    pthread_mutex_lock(&g_au.mu);
+    g_au.qhead = g_au.qlen = 0;
+    g_au.w_in = g_au.w_queues = g_au.w_clears = 0;
+    pthread_mutex_unlock(&g_au.mu);
+    g_au.periods = g_au.starved = g_au.w_periods = g_au.w_starved = 0;
+    g_au.w_peak = 0;
     g_au.open = 1;
     pthread_create(&g_au.th, NULL, au_feeder, NULL);
     fprintf(stderr, "  [sdl] SDL_OpenAudioDevice(\"%s\") -> %u: %d Hz, format %#x, %u channel(s), "
                     "%u-frame periods, %s mode -> s16 stereo into the host sink\n",
-            name ? name : "default", AUDIO_DEV_ID, s.freq, s.format, s.channels, s.samples,
+            name ? name : "default", g_au.id, s.freq, s.format, s.channels, s.samples,
             s.callback ? "callback" : "queue");
-    return AUDIO_DEV_ID;
+    return g_au.id;
 }
 static void sdl_PauseAudioDevice(uint32_t dev, int pause) {
-    if (dev != AUDIO_DEV_ID || !g_au.open) return;
+    if (!au_dev(dev)) {
+        fprintf(stderr, "  [sdl-au] SDL_PauseAudioDevice(%u, %d) on a device that is not open "
+                        "(open: %u) — ignored\n", dev, pause, g_au.open ? g_au.id : 0);
+        return;
+    }
+    if ((pause != 0) != g_au.paused)
+        fprintf(stderr, "  [sdl-au] device %u %s\n", dev, pause ? "PAUSED" : "playing");
     g_au.paused = pause != 0;
     if (pause) kl_audio_pause(); else kl_audio_play();
 }
 static int sdl_QueueAudio(uint32_t dev, const void *data, uint32_t len) {
-    if (dev != AUDIO_DEV_ID || !g_au.open || g_au.spec.callback) return -1;
+    if (!au_dev(dev) || g_au.spec.callback) {
+        static int said;
+        if (said++ < 5)
+            fprintf(stderr, "  [sdl-au] SDL_QueueAudio(%u, %u B) refused: %s\n", dev, len,
+                    !g_au.open ? "no device open" : dev != g_au.id ? "stale device id"
+                                                                    : "device is in callback mode");
+        return -1;
+    }
     pthread_mutex_lock(&g_au.mu);
     if (g_au.qlen + len > g_au.qcap) {                // grow, unrolling the ring
         size_t ncap = (g_au.qlen + len) * 2;
@@ -456,44 +555,46 @@ static int sdl_QueueAudio(uint32_t dev, const void *data, uint32_t len) {
     for (uint32_t i = 0; i < len; i++)
         g_au.q[(g_au.qhead + g_au.qlen + i) % g_au.qcap] = ((const uint8_t *)data)[i];
     g_au.qlen += len;
+    g_au.w_in += len; g_au.w_queues++;
     pthread_mutex_unlock(&g_au.mu);
     return 0;
 }
 static uint32_t sdl_GetQueuedAudioSize(uint32_t dev) {
-    if (dev != AUDIO_DEV_ID || !g_au.open) return 0;
+    if (!au_dev(dev)) return 0;
     pthread_mutex_lock(&g_au.mu);
     uint32_t n = (uint32_t)g_au.qlen;
     pthread_mutex_unlock(&g_au.mu);
     return n;
 }
 static void sdl_ClearQueuedAudio(uint32_t dev) {
-    if (dev != AUDIO_DEV_ID || !g_au.open) return;
+    if (!au_dev(dev)) return;
     pthread_mutex_lock(&g_au.mu);
     g_au.qhead = g_au.qlen = 0;
+    g_au.w_clears++;
     pthread_mutex_unlock(&g_au.mu);
 }
 static void sdl_CloseAudioDevice(uint32_t dev) {
-    if (dev != AUDIO_DEV_ID || !g_au.open) return;
-    g_au.quit = 1;
-    pthread_join(g_au.th, NULL);
-    kl_audio_close();
-    g_au.open = 0;
-    fprintf(stderr, "  [sdl] SDL_CloseAudioDevice: %llu periods played, %llu of them short\n",
-            g_au.periods, g_au.starved);
+    if (!au_dev(dev)) {
+        fprintf(stderr, "  [sdl-au] SDL_CloseAudioDevice(%u): not the open device (%u) — ignored\n",
+                dev, g_au.open ? g_au.id : 0);
+        return;
+    }
+    au_close("SDL_CloseAudioDevice");
 }
-static void sdl_LockAudioDevice(uint32_t dev)   { if (dev == AUDIO_DEV_ID) pthread_mutex_lock(&g_au.mu); }
-static void sdl_UnlockAudioDevice(uint32_t dev) { if (dev == AUDIO_DEV_ID) pthread_mutex_unlock(&g_au.mu); }
+static void sdl_LockAudioDevice(uint32_t dev)   { if (au_dev(dev)) pthread_mutex_lock(&g_au.mu); }
+static void sdl_UnlockAudioDevice(uint32_t dev) { if (au_dev(dev)) pthread_mutex_unlock(&g_au.mu); }
 static int  sdl_GetAudioDeviceStatus(uint32_t dev) {   // 0 stopped, 1 playing, 2 paused
-    return dev == AUDIO_DEV_ID && g_au.open ? (g_au.paused ? 2 : 1) : 0;
+    return au_dev(dev) ? (g_au.paused ? 2 : 1) : 0;
 }
+// The legacy (SDL 1.2-style) entry points address "the" device: whichever is open.
 static int  sdl_OpenAudio(const sdl_audiospec *want, sdl_audiospec *have) {
     sdl_audiospec tmp;
-    return sdl_OpenAudioDevice(NULL, 0, want, have ? have : &tmp, 0) == AUDIO_DEV_ID ? 0 : -1;
+    return sdl_OpenAudioDevice(NULL, 0, want, have ? have : &tmp, 0) ? 0 : -1;
 }
-static void sdl_PauseAudio(int pause) { sdl_PauseAudioDevice(AUDIO_DEV_ID, pause); }
-static void sdl_CloseAudio(void)      { sdl_CloseAudioDevice(AUDIO_DEV_ID); }
-static void sdl_LockAudio(void)       { sdl_LockAudioDevice(AUDIO_DEV_ID); }
-static void sdl_UnlockAudio(void)     { sdl_UnlockAudioDevice(AUDIO_DEV_ID); }
+static void sdl_PauseAudio(int pause) { if (g_au.open) sdl_PauseAudioDevice(g_au.id, pause); }
+static void sdl_CloseAudio(void)      { if (g_au.open) sdl_CloseAudioDevice(g_au.id); }
+static void sdl_LockAudio(void)       { if (g_au.open) sdl_LockAudioDevice(g_au.id); }
+static void sdl_UnlockAudio(void)     { if (g_au.open) sdl_UnlockAudioDevice(g_au.id); }
 static int  sdl_GetNumAudioDevices(int capture) { return capture ? 0 : 1; }
 static const char *sdl_GetAudioDeviceName(int i, int capture) {
     return !capture && i == 0 ? "Klepton audio" : NULL;
@@ -501,8 +602,12 @@ static const char *sdl_GetAudioDeviceName(int i, int capture) {
 static int  sdl_GetNumAudioDrivers(void) { return 1; }
 static const char *sdl_GetAudioDriver(int i) { return i == 0 ? "klepton" : NULL; }
 static const char *sdl_GetCurrentAudioDriver(void) { return g_audio_inited ? "klepton" : NULL; }
-static int  sdl_AudioInit(const char *d) { (void)d; g_audio_inited = 1; return 0; }
-static void sdl_AudioQuit(void) { g_audio_inited = 0; }
+static int  sdl_AudioInit(const char *d) {
+    fprintf(stderr, "  [sdl-au] SDL_AudioInit(%s)\n", d ? d : "NULL");
+    g_audio_inited = 1;
+    return 0;
+}
+static void sdl_AudioQuit(void) { sdl_audio_quit("SDL_AudioQuit"); }
 
 // ---- Vulkan ------------------------------------------------------------------------------
 typedef struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pLayer; } metal_surface_ci;

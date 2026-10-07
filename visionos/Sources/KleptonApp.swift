@@ -64,9 +64,12 @@ enum Immersive {
     // which is what shipping a VR title eventually wants.
     // The native OpenXR VR kind (GTA Vice City) is an in-world title and defaults
     // to FULLY immersive — .mixed leaves its menu a window floating in passthrough.
-    // Every other target keeps .mixed as the development default. KL_FULL in the
+    // Every other target keeps .mixed as the development default in a single-game
+    // build. In the HUB every game defaults to .full, whatever its kind (unity,
+    // ue4, glibc...). Both are per-game settings now (KLGameSettingsStore: saved
+    // per target, editable from the hub's game card), and KL_FULL in the
     // environment overrides either way (KL_FULL=0 forces .mixed back).
-    static var mixed: Bool { !klEnvOn("KL_FULL", default: kl_app_target_wants_full() != 0) }
+    static var mixed: Bool { !KLGameSettingsStore.fullImmersion(for: klTargetName()) }
 
     // How many times the CompositorLayer closure has been entered. SwiftUI may
     // re-evaluate a scene, and a second layer would mean the render loop the log
@@ -200,12 +203,14 @@ struct KleptonApp: App {
                 KleptonCompositor(layerRenderer).startRenderLoop()
             }
         }
-        // .mixed vs .full is read from the observed chroma object (set by boot
-        // once the target is known — see KleptonChroma.immersionFull and
-        // Immersive.mixed), NOT from a static read here: the scene graph is built
-        // before kl_app_configure, so a static read always saw the pre-target
-        // default. Observing the object means .full takes hold reactively before
-        // the space opens, for the native VR kind (GTA Vice City). KL_FULL wins.
+        // .mixed vs .full is read from the observed chroma object (set by the
+        // hub's Play, or by boot once the target is known — see
+        // KleptonChroma.immersionFull and Immersive.mixed), NOT from a static
+        // read here: the scene graph is built before a game is picked and before
+        // kl_app_configure, so a static read always saw the pre-target default.
+        // Observing the object means .full takes hold reactively before the
+        // space opens — it opens only after kl_app_boot returns, long after
+        // either publish — for every guest kind. KL_FULL wins.
         .immersionStyle(selection: .constant(chroma.immersionFull ? .full : .mixed),
                         in: .mixed, .full)
         // See Immersive.systemOverlays. On the scene, not on a view inside it:
@@ -609,6 +614,10 @@ struct BootView: View {
         // with no report rather than as the hang it is.
         // Resolved on the main thread: Paths.container reads the selected target.
         let container = Paths.container
+        // The game's saved settings that the runtime reads from the
+        // environment, before configure: language (KL_LOCALE / KL_STEAM_LANG /
+        // LANG; nothing for "System") and Alyx's render knobs.
+        KLGameSettingsStore.applyBeforeBoot(for: klTargetName())
         #if KL_HUB
         // One container per game, one log for the app (where the scripts look).
         kl_app_set_log_dir(Paths.documents.path)

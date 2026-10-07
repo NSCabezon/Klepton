@@ -102,6 +102,7 @@ static int              g_trace;
 // for the opus roundtrip, and the one that would have caught "3,238 buffers
 // consumed, nothing heard" years earlier.
 static int              g_peak;
+static int              g_peak_win;       // since the last periodic line
 static unsigned long    g_silent_buffers;
 
 // ---- microphone capture state ----
@@ -758,6 +759,7 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
         if (v > peak) peak = v;
     }
     if (peak > g_peak) g_peak = peak;
+    if (peak > g_peak_win) g_peak_win = peak;
     if (!peak) g_silent_buffers++;
 
     // The convert()/scratch state and the mix cursors are shared, so the whole
@@ -878,10 +880,16 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     // of buffers means the guest's mixer is running but producing silence (banks
     // not loaded, no events) — a different bug from an output that never opened.
     if ((g_writes % 1000) == 1) {
-        fprintf(stderr, "  [au] guest PCM so far: peak %d/32767, %lu of %lu "
+        // The cumulative peak alone hides a guest that went silent AFTER it
+        // played something (menu audio, then a mute level), so the last
+        // 1000 buffers' own peak rides along.
+        fprintf(stderr, "  [au] guest PCM so far: peak %d/32767 (last %s: %d), %lu of %lu "
                         "buffers all-zero — %s\n",
-                g_peak, g_silent_buffers, g_writes,
-                g_peak ? "producing audio" : "ONLY SILENCE so far");
+                g_peak, g_writes > 1 ? "1000 writes" : "write", g_peak_win,
+                g_silent_buffers, g_writes,
+                !g_peak ? "ONLY SILENCE so far" : g_peak_win ? "producing audio"
+                        : "producing audio before, SILENT NOW");
+        g_peak_win = 0;
     }
     pthread_mutex_unlock(&g_wlock);
     return written == frames ? bytes : written * in_frame;

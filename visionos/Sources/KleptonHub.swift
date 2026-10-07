@@ -68,6 +68,12 @@ enum HubLaunch {
     static func select(_ target: String) {
         setenv("KL_TARGET", target, 1)
         UserDefaults.standard.set(target, forKey: lastGameKey)
+        // The game's own presentation settings (full immersion, hand matting),
+        // published now — before the boot window exists — so the immersive
+        // scene is already .full with the real hands hidden when it opens.
+        KleptonChroma.shared.loadGame(target)
+        // ...and its controller calibration (the live tune the pose path reads).
+        KleptonTuning.shared.loadGame(target)
         // Before boot: the guest's Steamworks stand-in asks the real account from
         // SteamAPI_Init on (KleptonSteamBridge.swift).
         #if canImport(SteamDepot)
@@ -99,6 +105,68 @@ enum HubStorage {
             guard let game = SteamGames.descriptor(for: row.target), let legacy = game.legacyDataSubpath else { continue }
             adopt(target: row.target, legacy: legacy, into: game.dataSubpath)
         }
+        #endif
+    }
+
+    /// What "Delete game data" removes for a game: the Steam download root
+    /// and, for an APK game, what HubPrep derived from it (the hard-linked APK
+    /// and <tree>/). NOT android-files/ (an APK game's saves) nor
+    /// Library/Application Support (a glibc game's saves and config).
+    static func dataURLs(_ row: KLHubGameRow) -> [URL] {
+        var urls: [URL] = []
+        #if canImport(SteamDepot)
+        if let game = SteamGames.descriptor(for: row.target) {
+            urls.append(game.root)
+            if game.apk != nil {
+                let c = Paths.containerURL(for: row.target)
+                urls.append(c.appendingPathComponent(row.apk))
+                urls.append(c.appendingPathComponent(row.tree, isDirectory: true))
+            }
+        }
+        #endif
+        return urls
+    }
+
+    /// Bytes allocated under `url` (0 if absent). Hard links count once per
+    /// path, so an APK game's derived APK shows twice its real cost — the
+    /// number is what deleting frees at most, not exactly.
+    static func size(of url: URL) -> UInt64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .isRegularFileKey]
+        if !isDir.boolValue {
+            return UInt64((try? url.resourceValues(forKeys: Set(keys)))?.totalFileAllocatedSize ?? 0)
+        }
+        var total: UInt64 = 0
+        if let e = fm.enumerator(at: url, includingPropertiesForKeys: keys) {
+            for case let f as URL in e {
+                if let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true {
+                    total += UInt64(v.totalFileAllocatedSize ?? 0)
+                }
+            }
+        }
+        return total
+    }
+
+    /// Remove dataURLs(row). nil on success, else the first error.
+    static func deleteData(_ row: KLHubGameRow) -> String? {
+        var firstError: String?
+        for u in dataURLs(row) where FileManager.default.fileExists(atPath: u.path) {
+            do { try FileManager.default.removeItem(at: u) } catch {
+                if firstError == nil { firstError = "\(error)" }
+            }
+        }
+        NSLog("[hub] \(row.target): deleted its game data\(firstError.map { " (with an error: \($0))" } ?? "")")
+        return firstError
+    }
+
+    /// A download or verify is running for the game.
+    @MainActor static func isBusy(_ model: HubLibraryModel, _ target: String) -> Bool {
+        #if canImport(SteamDepot)
+        return model.content[target]?.isBusy ?? false
+        #else
+        return false
         #endif
     }
 
@@ -283,6 +351,26 @@ final class HubLibraryModel: ObservableObject {
         }
     }
 
+    /// Forget the saved Steam sign-in (Keychain refresh token).
+    func signOut() {
+        #if canImport(SteamDepot)
+        for m in content.values { m.signOut() }
+        try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").clear()
+        owned = nil
+        latest = [:]
+        #endif
+        account = nil
+        NSLog("[hub] signed out of Steam")
+    }
+
+    /// The game's files are gone: re-read its local state for the card.
+    func refreshAfterDelete(_ target: String) {
+        #if canImport(SteamDepot)
+        content[target]?.refreshLocal()
+        #endif
+        objectWillChange.send()
+    }
+
     /// With a saved Steam sign-in: compare each game's installed manifests with
     /// Steam's latest, and fetch the account's library for the info section.
     func checkUpdates() {
@@ -324,12 +412,263 @@ final class HubLibraryModel: ObservableObject {
     }
 }
 
+// MARK: - Per-game settings
+
+/// One game's settings (KLGameSettings, saved per target under
+/// `klepton.game.<target>`): the language it boots in, how it is presented, the
+/// controller calibration and (Alyx) render performance. Read when Play is
+/// pressed, so a change applies to the next launch. Environment variables set
+/// on a scripted launch still win over everything here.
+struct HubGameSettingsView: View {
+    let game: KLHubGameRow
+    @Environment(\.dismiss) private var dismiss
+    @State private var s = KLGameSettings()
+
+    private var base: KLTune { KleptonTuning.shared.baseline }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Language", selection: Binding(
+                        get: { KLGameLanguage(rawValue: s.language ?? "system") ?? .system },
+                        set: { s.language = $0 == .system ? nil : $0.rawValue; save() })) {
+                        ForEach(KLGameSettingsStore.languages(for: game.target)) { l in
+                            Text(l.label).tag(l)
+                        }
+                    }
+                } header: { Text("Language") } footer: {
+                    Text("Menus, text and subtitles. System follows the headset's language. "
+                         + "Spoken audio depends on what the game ships.")
+                }
+
+                Section {
+                    Picker("Immersion", selection: Binding(
+                        get: { s.fullImmersion ?? KLGameSettingsStore.defaultFull(game.target) },
+                        set: { s.fullImmersion = $0; save() })) {
+                        Text("Full VR").tag(true)
+                        Text("Mixed (see the room)").tag(false)
+                    }
+                    Toggle("Real hands visible", isOn: Binding(
+                        get: { s.handMatting ?? KLGameSettingsStore.defaultMatting(game.target) },
+                        set: { s.handMatting = $0; save() }))
+                } header: { Text("Display") } footer: {
+                    Text("The game draws its own hands, so your real ones are hidden by default.")
+                }
+
+                Section {
+                    cm("Offset X (right)", 0)
+                    cm("Offset Y (up)", 1)
+                    cm("Offset Z (back)", 2)
+                    deg("Pitch", \.sensePitch, \.sensePitch, -90 ... 90)
+                    deg("Yaw", \.senseYaw, \.senseYaw, -180 ... 180)
+                    deg("Roll", \.senseRoll, \.senseRoll, -180 ... 180)
+                    Button("Reset calibration") { s.calibration = nil; save() }
+                } header: { Text("Controller calibration") } footer: {
+                    Text("Where the game puts your hands relative to the PlayStation VR2 Sense "
+                         + "controllers, in the controller's own frame (−Z points forward); X, yaw "
+                         + "and roll are mirrored for the left hand. The same values as Controller "
+                         + "alignment in the game's window — tuning there is saved here.")
+                }
+
+                if KLGameSettingsStore.hasPerformance(game.target) {
+                    Section {
+                        slider("Render scale", value: s.performance?.renderScale ?? KLGameSettingsStore.defaultRenderScale,
+                               range: 0.6 ... 1.2, step: 0.05, format: "%.2f×") { v in
+                            perf { $0.renderScale = v }
+                        }
+                        slider("Overscan margin", value: s.performance?.overscan ?? KLGameSettingsStore.defaultOverscan,
+                               range: 0 ... 0.2, step: 0.01, format: "%.2f") { v in
+                            perf { $0.overscan = v }
+                        }
+                        Toggle("Extra pixels for the margin", isOn: Binding(
+                            get: { s.performance?.overscanRT ?? KLGameSettingsStore.defaultOverscanRT },
+                            set: { v in perf { $0.overscanRT = v } }))
+                        Button("Reset performance") { s.performance = nil; save() }
+                    } header: { Text("Performance") } footer: {
+                        Text("Lower render scale = faster and blurrier. The overscan margin renders "
+                             + "past the edge of the view so fast head turns show picture instead of "
+                             + "black; extra pixels keep the centre sharp at a GPU cost.")
+                    }
+                }
+
+                Section {
+                    Button("Reset all settings for this game", role: .destructive) {
+                        s = KLGameSettings(); save()
+                    }
+                }
+            }
+            .navigationTitle(game.display)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .frame(minWidth: 560, minHeight: 640)
+        .onAppear { s = KLGameSettingsStore.load(game.target) }
+    }
+
+    private func save() { KLGameSettingsStore.save(s, for: game.target) }
+
+    private func perf(_ f: (inout KLPerformance) -> Void) {
+        var p = s.performance ?? KLPerformance()
+        f(&p)
+        s.performance = p
+        save()
+    }
+
+    private func cal(_ f: (inout KLCalibration) -> Void) {
+        var c = s.calibration ?? KLCalibration()
+        f(&c)
+        s.calibration = c == KLCalibration() ? nil : c
+        save()
+    }
+
+    /// One axis of the Sense offset, shown in centimetres, ±30 cm.
+    private func cm(_ label: String, _ i: Int) -> some View {
+        let b = [base.sensePos.x, base.sensePos.y, base.sensePos.z]
+        let cur = s.calibration?.senseOffset ?? b
+        return slider(label, value: cur[i] * 100, range: -30 ... 30, step: 0.5, format: "%+.1f cm") { v in
+            cal { c in
+                var o = c.senseOffset ?? b
+                o[i] = v / 100
+                c.senseOffset = o
+            }
+        }
+    }
+
+    private func deg(_ label: String, _ kc: WritableKeyPath<KLCalibration, Float?>,
+                     _ kt: KeyPath<KLTune, Float>, _ range: ClosedRange<Float>) -> some View {
+        slider(label, value: s.calibration?[keyPath: kc] ?? base[keyPath: kt],
+               range: range, step: 0.5, format: "%+.1f°") { v in
+            cal { $0[keyPath: kc] = v }
+        }
+    }
+
+    private func slider(_ label: String, value: Float, range: ClosedRange<Float>, step: Float,
+                        format: String, set: @escaping (Float) -> Void) -> some View {
+        HStack {
+            Text(label).frame(width: 160, alignment: .leading)
+            Slider(value: Binding(get: { value }, set: set), in: range, step: step)
+            Text(String(format: format, value))
+                .font(.system(.body, design: .monospaced)).frame(width: 96, alignment: .trailing)
+        }
+    }
+
+    /// The one-line summary on the game's card.
+    static func summary(_ target: String) -> String {
+        let lang = KLGameSettingsStore.language(for: target)
+        let full = KLGameSettingsStore.fullImmersion(for: target)
+        let hands = KLGameSettingsStore.handMatting(for: target)
+        let cal = KLGameSettingsStore.load(target).calibration != nil ? " · Calibrated" : ""
+        return "\(lang.label) · \(full ? "Full VR" : "Mixed") · "
+            + "\(hands ? "Real hands shown" : "Real hands hidden")\(cal)"
+    }
+}
+
+// MARK: - App settings
+
+/// The hub's own settings: the Steam account, and each game's storage with a
+/// way to delete the downloaded data.
+struct HubAppSettingsView: View {
+    @ObservedObject var model: HubLibraryModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var sizes: [String: UInt64] = [:]
+    @State private var confirmDelete: KLHubGameRow?
+    @State private var confirmSignOut = false
+    @State private var error: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    if let a = model.account {
+                        LabeledContent("Signed in as", value: a)
+                        Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
+                    } else {
+                        Text("Not signed in. Signing in happens from a game's Download button.")
+                            .foregroundStyle(.secondary)
+                    }
+                } header: { Text("Steam account") }
+
+                Section {
+                    ForEach(model.games) { g in
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(g.display)
+                                Text(sizes[g.target].map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
+                                     ?? "Measuring…")
+                                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                            }
+                            Spacer()
+                            Button("Delete game data", role: .destructive) { confirmDelete = g }
+                                .disabled((sizes[g.target] ?? 0) == 0 || HubStorage.isBusy(model, g.target))
+                        }
+                    }
+                    if let error { Text(error).font(.caption).foregroundStyle(.red) }
+                } header: { Text("Storage") } footer: {
+                    Text("Deletes the files downloaded from Steam and those derived from them. "
+                         + "Saved games and settings are kept. Download again from the game's card.")
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .frame(minWidth: 560, minHeight: 480)
+        .task { await measure() }
+        .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+            Button("Sign out", role: .destructive) { model.signOut() }
+        } message: {
+            Text("Downloads and ownership checks will need you to sign in again.")
+        }
+        .alert(confirmDelete.map { "Delete \($0.display) data?" } ?? "",
+               isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
+               presenting: confirmDelete) { g in
+            Button("Delete \(sizeText(g))", role: .destructive) { delete(g) }
+            Button("Cancel", role: .cancel) {}
+        } message: { g in
+            Text("This permanently deletes \(sizeText(g)) of \(g.display) from this headset. "
+                 + "Playing it again means downloading it all again"
+                 + (g.target == "alyx" ? " — about 72 GB." : "."))
+        }
+    }
+
+    private func sizeText(_ g: KLHubGameRow) -> String {
+        sizes[g.target].map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? "the data"
+    }
+
+    private func measure() async {
+        let rows = model.games
+        let r = await Task.detached(priority: .utility) { () -> [String: UInt64] in
+            var out: [String: UInt64] = [:]
+            for g in rows { out[g.target] = HubStorage.dataURLs(g).reduce(0) { $0 + HubStorage.size(of: $1) } }
+            return out
+        }.value
+        sizes = r
+    }
+
+    private func delete(_ g: KLHubGameRow) {
+        error = nil
+        sizes[g.target] = nil
+        Task {
+            let err = await Task.detached(priority: .userInitiated) { HubStorage.deleteData(g) }.value
+            if let err { error = "Could not delete all of \(g.display): \(err)" }
+            model.refreshAfterDelete(g.target)
+            await measure()
+        }
+    }
+}
+
 // MARK: - Library UI
 
 struct HubLibraryView: View {
     let onPlay: (String) -> Void
     @StateObject private var model = HubLibraryModel()
     @State private var detail: String?
+    /// The game whose settings sheet is open.
+    @State private var settingsFor: KLHubGameRow?
+    @State private var showAppSettings = false
 
     var body: some View {
         Group {
@@ -346,6 +685,8 @@ struct HubLibraryView: View {
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
         .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
+        .sheet(item: $settingsFor) { g in HubGameSettingsView(game: g) }
+        .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
     }
 
     private func play(_ target: String) {
@@ -384,6 +725,8 @@ struct HubLibraryView: View {
             } else if model.account != nil {
                 Button("Check for updates") { model.checkUpdates() }.font(.footnote)
             }
+            Button { showAppSettings = true } label: { Label("Settings", systemImage: "gearshape") }
+                .font(.footnote)
         }
     }
 
@@ -417,7 +760,13 @@ struct HubLibraryView: View {
                     Button(manageTitle(st)) { detail = g.target }
                 }
                 #endif
+                Spacer()
+                Button { settingsFor = g } label: { Label("Settings", systemImage: "gearshape") }
+                    .labelStyle(.iconOnly)
+                    .help("Language and immersion for this game")
             }
+            Text(HubGameSettingsView.summary(g.target))
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
