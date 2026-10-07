@@ -680,13 +680,13 @@ int kl_glibc_load(FILE *out, int run) {
     g_failed = 0;
     if (run) {
         // The memory budget a glibc (PC) guest is told — sysinfo() and
-        // /proc/meminfo — is the machine's, up to 16 GB (a Vision Pro), not the
+        // /proc/meminfo — is the machine's, up to 12 GB (above Alyx's ~11.2 GiB minimum, under the Vision Pro's 16), not the
         // 6 GB Quest-2 identity the Android guests get: kl_mem_total() still
         // caps it at the host's real RAM. Half-Life: Alyx's VR main menu raises
         // "system memory is below the minimum requirements"
         // (#HLVR_MainMenu_Attention_MinSpec_RAM) below ~11.2 GiB of total RAM.
         // KL_MEM_TOTAL_MB still overrides.
-        setenv("KL_MEM_TOTAL_MB", "16384", 0);
+        setenv("KL_MEM_TOTAL_MB", "12288", 0);
         setup_root();
         // hlvr.sh's environment: cd to the root, and case-insensitive path
         // matching for loose files.
