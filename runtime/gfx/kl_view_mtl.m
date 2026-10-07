@@ -571,16 +571,66 @@ static const float *klvm_display_tan(int eye, const float *rendered, float out[4
     return out;
 }
 
+// KL_VIEW_SWIM=1 — the swim, as a number. For world points straight ahead of
+// the head at 0.5, 1, 3 m and far away, where THIS composite draws the guest's
+// picture of the point (the record's render pose, the same model-view the pass
+// uses) against where the point really is from the head now: the angular error
+// a world-fixed object shows, in arcminutes, mean and worst over 2 s. Zero is a
+// world that stays put; a turn with a stale, unpredicted render pose leaves the
+// neck's translation (the eyes swing on a lever about the neck) uncorrected,
+// largest on near content. Monocular, at the head (the viewer's eye offset).
+static void klvm_swim(const kl_ovrp_render_pose *r, const kl_reproject_uniforms *u,
+                      const float hp[3], const float hq[4]) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VIEW_SWIM", 0);
+    if (!on || !r || !r->serial) return;
+    static const float dist[4] = { 0.5f, 1.0f, 3.0f, 1000.0f };
+    static double sum[4], worst[4], dsum, t0;
+    static unsigned n;
+    simd_quatf qd = simd_quaternion(hq[0], hq[1], hq[2], hq[3]);
+    simd_quatf qr = simd_quaternion(r->qx, r->qy, r->qz, r->qw);
+    simd_float3 pd = simd_make_float3(hp[0], hp[1], hp[2]);
+    simd_float3 pr = simd_make_float3(r->px, r->py, r->pz);
+    for (int i = 0; i < 4; i++) {
+        simd_float3 w = pd + simd_act(qd, simd_make_float3(0, 0, -dist[i]));
+        simd_float3 v = simd_act(simd_inverse(qr), w - pr);          // render-head frame
+        if (!(v.z < -1e-4f)) continue;
+        simd_float3 qp = v * (u->depth / -v.z);                       // on the quad
+        simd_float4 s = simd_mul(u->model_view, simd_make_float4(qp, 1.0f));
+        simd_float3 sd = simd_normalize(s.xyz);
+        float c = -sd.z; if (c > 1) c = 1;
+        double e = acos(c) * 180.0 / M_PI * 60.0;                       // arcmin off the centre
+        sum[i] += e; if (e > worst[i]) worst[i] = e;
+    }
+    dsum += 2.0 * acos(fmin(1.0, fabs(simd_dot(qd.vector, qr.vector)))) * 180.0 / M_PI;
+    n++;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (!t0) t0 = now;
+    if (now - t0 >= 2.0 && n) {
+        fprintf(stderr, "  [vmtl] swim over %u composites (arcmin, mean/worst): 0.5 m %.1f/%.1f, "
+                        "1 m %.1f/%.1f, 3 m %.1f/%.1f, far %.1f/%.1f; render->display turn %.2f deg avg\n",
+                n, sum[0] / n, worst[0], sum[1] / n, worst[1], sum[2] / n, worst[2], sum[3] / n, worst[3],
+                dsum / n);
+        for (int i = 0; i < 4; i++) sum[i] = worst[i] = 0;
+        dsum = 0; n = 0; t0 = now;
+    }
+}
+
 static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
 
     // Where the head is now; the delta against r is what this pass corrects.
+    // WITH its position, as the device compositor's originFromHead has it, so
+    // the translation term (kl_reproject_build) differences two positions in
+    // one space rather than the render position against the origin.
     simd_float4x4 device = matrix_identity_float4x4;
+    float hp[3] = { 0, 0, 0 }, hq[4] = { 0, 0, 0, 1 };
     if (have) {
-        float px, py, pz, qx, qy, qz, qw;
-        kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
-        device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
+        kl_ovrp_get_head_pose(&hp[0], &hp[1], &hp[2], &hq[0], &hq[1], &hq[2], &hq[3]);
+        device = simd_matrix4x4(simd_quaternion(hq[0], hq[1], hq[2], hq[3]));
+        device.columns[3] = simd_make_float4(hp[0], hp[1], hp[2], 1.0f);
     }
 
     int eye = klvm_eye();
@@ -589,8 +639,10 @@ static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y
     simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
     // grid_per_eye = 0: this window draws ONE eye, so the grid it binds has one
     // block and that block was built with this eye's viewport.
-    return kl_reproject_build(have ? &r : NULL, eye, device,
-                              matrix_identity_float4x4, proj, slice, flip_y, 0);
+    kl_reproject_uniforms u = kl_reproject_build(have ? &r : NULL, eye, device,
+                                                 matrix_identity_float4x4, proj, slice, flip_y, 0);
+    if (have) klvm_swim(&r, &u, hp, hq);
+    return u;
 }
 
 // Which frame of the guest's this composite would be showing, and 0 for "none

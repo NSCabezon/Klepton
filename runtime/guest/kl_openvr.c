@@ -570,16 +570,28 @@ static int sys_distortion(void *s, int eye, float u, float v, float *out) {
     for (int i = 0; i < 3; i++) { out[i * 2] = u; out[i * 2 + 1] = v; }
     return 1;
 }
+// GetEyeToHeadTransform: the eye in head space, read as the constant it is
+// (kl_ovrp_eye_local) — the display's offset from the eye midpoint the head
+// pose is published at, and the cant if KL_OVRP_EYE_CANT gives it to the guest.
+// It used to be the DIFFERENCE of two world-space reads, the eye view and the
+// head: before the first WaitGetPoses latch each of those is a read of the LIVE
+// head, published from another thread at the display rate, so a head moving
+// while the game asked put that motion into a transform the game reads once and
+// keeps — a per-eye offset and turn baked into every frame after. Logged with
+// the numbers so a device log says what the game was told.
 static HmdMatrix34_t sys_eye_to_head(void *s, int eye) {
     (void)s;
-    float hp[3], hq[4], ep[3], eq[4], t[4];
-    kl_ovrp_get_guest_head_pose(&hp[0], &hp[1], &hp[2], &hq[0], &hq[1], &hq[2], &hq[3]);
-    kl_ovrp_eye_view(eye, &ep[0], &ep[1], &ep[2], &eq[0], &eq[1], &eq[2], &eq[3], t);
-    float d[3] = { ep[0] - hp[0], ep[1] - hp[1], ep[2] - hp[2] }, lp[3], lq[4];
-    quat_rotate_inv(hq, d, lp);
-    quat_conj_mul(hq, eq, lq);
+    float lp[3], lq[4];
+    kl_ovrp_eye_local(eye ? 1 : 0, lp, lq);
     if (fabsf(lp[0]) < 1e-4f && fabsf(lp[1]) < 1e-4f && fabsf(lp[2]) < 1e-4f)   // no frontend yet
         lp[0] = eye ? 0.032f : -0.032f;
+    static int said;
+    if (said < 8) {
+        said++;
+        fprintf(stderr, "  [openvr] GetEyeToHeadTransform(eye %d) -> (%.4f, %.4f, %.4f) m, turned "
+                        "(%.4f, %.4f, %.4f, %.4f)\n", eye, (double)lp[0], (double)lp[1], (double)lp[2],
+                (double)lq[0], (double)lq[1], (double)lq[2], (double)lq[3]);
+    }
     HmdMatrix34_t m;
     quat_to_m34(lq, lp, &m);
     return m;
@@ -655,6 +667,20 @@ static int sys_connected(void *s, uint32_t i) { (void)s; return i < NDEV; }
 #define PERR_WRONGTYPE 1
 #define PERR_TOOSMALL 3
 #define PERR_UNKNOWN 4
+// KL_OPENVR_INPUT_TRACE: each distinct (call, device, property) asked, once.
+static void prop_note(const char *call, uint32_t dev, int prop, int answered) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OPENVR_INPUT_TRACE", 0);
+    if (!on) return;
+    static struct { const char *c; uint32_t d; int p; } seen[256];
+    static int n;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < n; i++) if (seen[i].c == call && seen[i].d == dev && seen[i].p == prop) { pthread_mutex_unlock(&mu); return; }
+    if (n < 256) { seen[n].c = call; seen[n].d = dev; seen[n].p = prop; n++; }
+    pthread_mutex_unlock(&mu);
+    fprintf(stderr, "  [openvr] %s(device %u, prop %d) -> %s\n", call, dev, prop, answered ? "answered" : "UNKNOWN");
+}
 static const char *prop_string(uint32_t dev, int prop) {
     int left = dev == DEV_LEFT;
     switch (prop) {
@@ -673,6 +699,7 @@ static const char *prop_string(uint32_t dev, int prop) {
 static uint32_t sys_prop_string(void *s, uint32_t dev, int prop, char *buf, uint32_t n, int *err) {
     (void)s;
     const char *v = dev < NDEV ? prop_string(dev, prop) : NULL;
+    prop_note("GetStringTrackedDeviceProperty", dev, prop, v != NULL);
     if (!v) { if (err) *err = PERR_UNKNOWN; if (buf && n) buf[0] = 0; return 0; }
     uint32_t need = (uint32_t)strlen(v) + 1;
     if (buf && n >= need) { memcpy(buf, v, need); if (err) *err = PERR_OK; }
@@ -689,6 +716,7 @@ static float sys_prop_float(void *s, uint32_t dev, int prop, int *err) {
     case 2014: v = 1.0f; break;                                        // DeviceBatteryPercentage
     default: ok = 0;
     }
+    prop_note("GetFloatTrackedDeviceProperty", dev, prop, ok);
     if (err) *err = ok ? PERR_OK : PERR_UNKNOWN;
     return v;
 }
@@ -700,28 +728,29 @@ static int32_t sys_prop_int(void *s, uint32_t dev, int prop, int *err) {
     case 3007: v = dev == DEV_LEFT ? 1 : dev == DEV_RIGHT ? 2 : 0; break;   // ControllerRoleHint
     default: ok = 0;
     }
+    prop_note("GetInt32TrackedDeviceProperty", dev, prop, ok);
     if (err) *err = ok ? PERR_OK : PERR_UNKNOWN;
     return v;
 }
 static int sys_prop_bool(void *s, uint32_t dev, int prop, int *err) {
-    (void)s; (void)dev; (void)prop;
+    (void)s; prop_note("GetBoolTrackedDeviceProperty", dev, prop, 0);
     if (err) *err = PERR_UNKNOWN;
     return 0;
 }
 static uint64_t sys_prop_u64(void *s, uint32_t dev, int prop, int *err) {
-    (void)s; (void)dev; (void)prop;
+    (void)s; prop_note("GetUint64TrackedDeviceProperty", dev, prop, 0);
     if (err) *err = PERR_UNKNOWN;
     return 0;
 }
 static HmdMatrix34_t sys_prop_m34(void *s, uint32_t dev, int prop, int *err) {
-    (void)s; (void)dev; (void)prop;
+    (void)s; prop_note("GetMatrix34TrackedDeviceProperty", dev, prop, 0);
     HmdMatrix34_t m;
     memset(&m, 0, sizeof m);
     if (err) *err = PERR_UNKNOWN;
     return m;
 }
 static uint32_t sys_prop_array(void *s, uint32_t dev, int prop, uint32_t tag, void *buf, uint32_t n, int *err) {
-    (void)s; (void)dev; (void)prop; (void)tag; (void)buf; (void)n;
+    (void)s; (void)tag; (void)buf; (void)n; prop_note("GetArrayTrackedDeviceProperty", dev, prop, 0);
     if (err) *err = PERR_UNKNOWN;
     return 0;
 }
@@ -982,9 +1011,17 @@ static void predict_frame(void) {
     if (on) {
         float hz = kl_ovrp_display_frequency();
         double period = 1000.0 / (hz > 0 ? hz : 90.0);
-        double ahead = fixed_ms > 0 ? (double)fixed_ms : g_work_ema_ms + period;
+        // To when the frame is first SEEN: its work, then the wait for the
+        // compositor's next frame (half a period on average), then that
+        // frame's own lead to its presentation (kl_ovrp_head_lead_s, measured
+        // off the frontend; one period when it dates nothing).
+        double lead = kl_ovrp_head_lead_s() * 1000.0;
+        double ahead = fixed_ms > 0 ? (double)fixed_ms
+                                    : g_work_ema_ms + (lead > 0 ? lead + period * 0.5 : period);
         if (ahead < 0) ahead = 0;
-        if (ahead > OVR_PREDICT_MAX_MS) ahead = OVR_PREDICT_MAX_MS;
+        static double cap = -1;
+        if (cap < 0) cap = kl_env_float("KL_OPENVR_PREDICT_MAX_MS", (float)OVR_PREDICT_MAX_MS);
+        if (ahead > cap) ahead = cap;
         d.ahead_ms = ahead;
         d.valid = kl_ovrp_head_predict_delta(now_s() + ahead / 1000.0, d.q, d.p);
         if (!d.valid) { d.q[0] = d.q[1] = d.q[2] = 0; d.q[3] = 1; d.p[0] = d.p[1] = d.p[2] = 0; }
@@ -1487,6 +1524,30 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
     // the rendered area. The frame's tangents come from that matrix instead
     // (KL_OPENVR_SUBMIT_PROJ=0 keeps ours). Layout, pack 8: Texture_t 16, pose
     // 48 at +16, depth { handle 8, HmdMatrix44 at +72, range } at +64.
+    // What the depth the game hands us looks like (VRTextureDepthInfo_t at +64:
+    // handle, mProjection at +72, vRange at +136) — the input positional
+    // reprojection would need. Logged for the first frames, both eyes.
+    if (flags & 0x10) {
+        static int said;
+        if (said < 4) {
+            said++;
+            const uint8_t *tb = (const uint8_t *)tex;
+            const VRVulkanTextureData_t *dv = *(const VRVulkanTextureData_t *const *)(tb + 64);
+            const float *pm = (const float *)(tb + 72), *rg = (const float *)(tb + 136);
+            fprintf(stderr, "  [openvr] eye %d depth: handle %p", eye, (const void *)dv);
+            if (dv) {
+                fprintf(stderr, " image %#llx %ux%u fmt %u samples %u",
+                        (unsigned long long)dv->m_nImage, dv->m_nWidth, dv->m_nHeight,
+                        dv->m_nFormat, dv->m_nSampleCount);
+                if (flags & SUBMIT_VULKAN_ARRAY_DATA)
+                    fprintf(stderr, " layer %u of %u", ((const VRVulkanTextureArrayData_t *)dv)->m_unArrayIndex,
+                            ((const VRVulkanTextureArrayData_t *)dv)->m_unArraySize);
+            }
+            fprintf(stderr, "; range %.4f..%.4f; projection row2 (%.5f %.5f %.5f %.5f) row3 (%.3f %.3f %.3f %.3f)\n",
+                    (double)rg[0], (double)rg[1], (double)pm[8], (double)pm[9], (double)pm[10], (double)pm[11],
+                    (double)pm[12], (double)pm[13], (double)pm[14], (double)pm[15]);
+        }
+    }
     if ((flags & 0x10) && kl_env_on("KL_OPENVR_SUBMIT_PROJ", 1)) {
         const float *m = (const float *)((const uint8_t *)tex + 72);     // row-major 4x4
         float m00 = m[0], m02 = m[2], m11 = m[5], m12 = m[6];
@@ -1593,49 +1654,69 @@ static uint32_t co_focus_process(void *s) { (void)s; return (uint32_t)getpid(); 
 
 // ---- IVRInput ------------------------------------------------------------------------------------
 //
-// Alyx's action set is fixed and its names are in libclient (/actions/default,
-// /interact, /move, /weapon, /dev, /scroll). There is no action manifest to read
-// here — the binaries depot does not carry hlvr/cfg/actions.json, and SteamVR's
-// binding UI does not exist — so each action is bound by NAME to the Touch-style
-// inputs kl_ovrp holds, in the spirit of Alyx's default Oculus Touch bindings:
+// Alyx's action set is fixed (hlvr/cfg/actions.json) and SteamVR's binding UI
+// does not exist here, so each action is bound by NAME to the Touch-style
+// inputs kl_ovrp holds — exactly as the game's own Oculus Touch bindings
+// (hlvr/cfg/bindings_touch.json) bind them, which is what its prompts, tutorials
+// and the "press <button> to start" gate after every load assume:
 //
-//   trigger           Use, Fire, TriggerPull, ArmGrenade, MenuInteract
-//   grip              UseGrip, GGLock (gravity gloves), HandCurl, SqueezeXenGrenade
-//   A / X (lower)     EjectClip, ShowInventory... (on the hand that asks)
-//   B / Y (upper)     OpenChamber / ReleaseSlide, ToggleBurstFire, MenuDismiss
-//   left stick        Walk (vector2), MoveBack, Scroll
-//   right stick       Teleport (up), TurnLeft/TurnRight (flick), ContinuousTurn
-//   menu (Start)      ToggleMenu
-//   poses             HandPoseLeft/Right — the controller pose
+//   trigger (either)    TriggerPull (pull), MenuInteract, MenuDismiss, Use, GGLock
+//   grip (either)       HandCurl (pull), Use, GGLock
+//   X / A (lower)       HealthPen, ToggleLaserSight, ArmGrenade, ArmXenGrenade,
+//                       SqueezeXenGrenade; right A: EjectClip, OpenChamber
+//   right B (upper)     Reload, ReleaseSlide, AltFire, ToggleBurstFire
+//   right trigger       Fire
+//   left Y / Start      ToggleMenu
+//   left stick          Teleport (any direction), TeleportTurn (position),
+//                       Walk / AdjustHeight (click)
+//   right stick         TurnLeft / TurnRight / WalkMantle (north) /
+//                       ShiftDashJump + MoveBack (south), ContinuousTurn
+//                       (position), ShowInventory (click)
+//   either stick        Scroll (position)
+//   poses / skeletons   HandPose* / HandSkeleton* — the controller
+//
+// The table this replaced was written "in the spirit of" those bindings before
+// the file was at hand, and differed where it mattered: MenuDismiss — the
+// action behind Alyx's "Pulsa <origin> para empezar" gate after a load — was on
+// B/Y, so the trigger the prompt (and every player) reaches for did nothing, the
+// level never started, and the hands stayed dead until the pause menu.
+// KL_OPENVR_LEGACY_BINDINGS=1 is not offered: the old table has no basis.
 //
 // A handle carries what it was bound to, so the per-frame reads are a switch.
 enum { SRC_NONE, SRC_TRIGGER, SRC_GRIP, SRC_LOWER, SRC_UPPER, SRC_STICK, SRC_STICK_Y,
        SRC_STICK_X, SRC_STICK_UP, SRC_STICK_DOWN, SRC_STICK_LEFT, SRC_STICK_RIGHT,
-       SRC_STICK_CLICK, SRC_MENU, SRC_POSE, SRC_SKELETON, SRC_HAPTIC };
+       SRC_STICK_CLICK, SRC_MENU, SRC_POSE, SRC_SKELETON, SRC_HAPTIC,
+       SRC_TRIGGER_OR_GRIP, SRC_STICK_ANY };
 typedef struct { const char *suffix; int src; int hand; } bind;     // hand: -1 either, 0 L, 1 R
 static const bind k_bind[] = {
-    { "/in/TriggerPull", SRC_TRIGGER, -1 }, { "/in/Use", SRC_TRIGGER, -1 },
-    { "/in/Fire", SRC_TRIGGER, -1 }, { "/in/ArmGrenade", SRC_TRIGGER, -1 },
-    { "/in/ArmXenGrenade", SRC_TRIGGER, -1 }, { "/in/MenuInteract", SRC_TRIGGER, -1 },
-    { "/in/AltFire", SRC_TRIGGER, -1 }, { "/in/HealthPen", SRC_TRIGGER, -1 },
-    { "/in/UseGrip", SRC_GRIP, -1 }, { "/in/GGLock", SRC_GRIP, -1 }, { "/in/HandCurl", SRC_GRIP, -1 },
-    { "/in/SqueezeXenGrenade", SRC_GRIP, -1 },
-    { "/in/EjectClip", SRC_LOWER, -1 }, { "/in/ShowInventory", SRC_LOWER, -1 },
-    { "/in/Reload", SRC_LOWER, -1 },
-    { "/in/OpenChamber", SRC_UPPER, -1 }, { "/in/ReleaseSlide", SRC_UPPER, -1 },
-    { "/in/ToggleBurstFire", SRC_UPPER, -1 }, { "/in/ToggleLaserSight", SRC_UPPER, -1 },
-    { "/in/MenuDismiss", SRC_UPPER, -1 },
-    { "/in/Walk", SRC_STICK, 0 }, { "/in/WalkMantle", SRC_STICK, 0 }, { "/in/MoveBack", SRC_STICK_DOWN, 0 },
-    { "/in/Scroll", SRC_STICK_Y, -1 }, { "/in/ScrollTouchPad", SRC_STICK_Y, -1 },
-    { "/in/Teleport", SRC_STICK_UP, 1 }, { "/in/TeleportTurn", SRC_STICK, 1 },
-    { "/in/TurnLeft", SRC_STICK_LEFT, 1 }, { "/in/TurnRight", SRC_STICK_RIGHT, 1 },
-    { "/in/ContinuousTurn", SRC_STICK_X, 1 }, { "/in/AdjustHeight", SRC_STICK_Y, 1 },
-    { "/in/MoveCrouchToggle", SRC_STICK_DOWN, 1 }, { "/in/MoveStandToggle", SRC_STICK_UP, 0 },
-    { "/in/ShiftDashJump", SRC_STICK_CLICK, 0 },
-    { "/in/ToggleMenu", SRC_MENU, 0 },
+    // /actions/default
+    { "/in/TriggerPull", SRC_TRIGGER, -1 }, { "/in/HandCurl", SRC_GRIP, -1 },
     { "/in/HandPoseLeft", SRC_POSE, 0 }, { "/in/HandPoseRight", SRC_POSE, 1 },
     { "/in/HandSkeletonLeft", SRC_SKELETON, 0 }, { "/in/HandSkeletonRight", SRC_SKELETON, 1 },
     { "/in/HapticVibration", SRC_HAPTIC, -1 },
+    // /actions/dev
+    { "/in/ToggleMenu", SRC_MENU, -1 },
+    { "/in/MenuInteract", SRC_TRIGGER, -1 }, { "/in/MenuDismiss", SRC_TRIGGER, -1 },
+    // /actions/interact
+    { "/in/Use", SRC_TRIGGER_OR_GRIP, -1 }, { "/in/UseGrip", SRC_GRIP, -1 },
+    { "/in/GGLock", SRC_TRIGGER_OR_GRIP, -1 },
+    { "/in/HealthPen", SRC_LOWER, -1 }, { "/in/ToggleLaserSight", SRC_LOWER, -1 },
+    { "/in/ArmGrenade", SRC_LOWER, -1 }, { "/in/ArmXenGrenade", SRC_LOWER, -1 },
+    { "/in/SqueezeXenGrenade", SRC_LOWER, -1 },
+    // /actions/weapon
+    { "/in/Fire", SRC_TRIGGER, 1 },
+    { "/in/ShowInventory", SRC_STICK_CLICK, 1 },
+    { "/in/Reload", SRC_UPPER, 1 }, { "/in/ReleaseSlide", SRC_UPPER, 1 },
+    { "/in/AltFire", SRC_UPPER, 1 }, { "/in/ToggleBurstFire", SRC_UPPER, 1 },
+    { "/in/EjectClip", SRC_LOWER, 1 }, { "/in/OpenChamber", SRC_LOWER, 1 },
+    // /actions/move
+    { "/in/Teleport", SRC_STICK_ANY, 0 }, { "/in/TeleportTurn", SRC_STICK, 0 },
+    { "/in/Walk", SRC_STICK_CLICK, 0 }, { "/in/AdjustHeight", SRC_STICK_CLICK, 0 },
+    { "/in/TurnLeft", SRC_STICK_LEFT, 1 }, { "/in/TurnRight", SRC_STICK_RIGHT, 1 },
+    { "/in/WalkMantle", SRC_STICK_UP, 1 }, { "/in/ShiftDashJump", SRC_STICK_DOWN, 1 },
+    { "/in/MoveBack", SRC_STICK_DOWN, 1 }, { "/in/ContinuousTurn", SRC_STICK, 1 },
+    // /actions/scroll
+    { "/in/Scroll", SRC_STICK, -1 },
 };
 
 #define MAX_ACTIONS 256
@@ -1655,6 +1736,39 @@ static float g_input_time;
 #define H_SOURCE_LEFT  1
 #define H_SOURCE_RIGHT 2
 #define H_SOURCE_HEAD  3
+
+// KL_OPENVR_INPUT_TRACE=1: once every 5 s, how many times each IVRInput call
+// was made since the last report and the action sets the last
+// UpdateActionState activated — the "what does the game ask for in play" view.
+enum { IT_UPDATE, IT_DIGITAL, IT_ANALOG, IT_POSE_NOW, IT_POSE_NEXT, IT_SKEL, IT_BONE_COUNT,
+       IT_BONE_DATA, IT_BONE_REF, IT_BONE_HIER, IT_SUMMARY, IT_ORIGINS, IT_TRACK_LEVEL, IT_N };
+static const char *const k_it_name[IT_N] = {
+    "UpdateActionState", "GetDigitalActionData", "GetAnalogActionData", "GetPoseActionDataRelativeToNow",
+    "GetPoseActionDataForNextFrame", "GetSkeletalActionData", "GetBoneCount", "GetSkeletalBoneData",
+    "GetSkeletalReferenceTransforms", "GetBoneHierarchy", "GetSkeletalSummaryData", "GetActionOrigins",
+    "GetSkeletalTrackingLevel"
+};
+static _Atomic unsigned g_it_count[IT_N];
+static char g_it_sets[256];
+static int input_trace_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OPENVR_INPUT_TRACE", 0);
+    return on;
+}
+#define IN_NOTE(k) do { if (input_trace_on()) atomic_fetch_add(&g_it_count[k], 1); } while (0)
+static void input_trace_report(float now) {
+    static float t0;
+    if (!input_trace_on()) return;
+    if (!t0) t0 = now;
+    if (now - t0 < 5.0f) return;
+    t0 = now;
+    fprintf(stderr, "  [openvr] input calls over 5 s (sets: %s):", g_it_sets);
+    for (int i = 0; i < IT_N; i++) {
+        unsigned c = atomic_exchange(&g_it_count[i], 0);
+        if (c) fprintf(stderr, " %s %u", k_it_name[i], c);
+    }
+    fprintf(stderr, "\n");
+}
 
 static int in_manifest(void *s, const char *p) {
     (void)s;
@@ -1700,11 +1814,32 @@ static int in_source_handle(void *s, const char *path, uint64_t *h) {
        : !strcmp(path, "/user/head") ? H_SOURCE_HEAD : 0x100 + (uint64_t)(strlen(path) & 0xff);
     return 0;
 }
+static void skel_advance(float now);
 static int in_update(void *s, const VRActiveActionSet_t *sets, uint32_t size, uint32_t n) {
-    (void)s; (void)sets; (void)size; (void)n;
+    (void)s;
     g_update_n++;
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     g_input_time = (float)t.tv_sec + (float)t.tv_nsec * 1e-9f;
+    skel_advance(g_input_time);
+    IN_NOTE(IT_UPDATE);
+    if (input_trace_on() && sets && size >= sizeof *sets) {
+        char buf[256]; size_t o = 0;
+        buf[0] = 0;
+        for (uint32_t i = 0; i < n && o + 2 < sizeof buf; i++) {
+            const VRActiveActionSet_t *a = (const VRActiveActionSet_t *)((const uint8_t *)sets + (size_t)i * size);
+            uint64_t k = a->ulActionSet - 0x1000;
+            int w = snprintf(buf + o, sizeof buf - o, "%s%s", i ? "," : "",
+                             k < (uint64_t)g_nsets ? g_sets[k] : "?");
+            if (w > 0) o += (size_t)w;
+            if (a->ulRestrictedToDevice) {
+                w = snprintf(buf + o, sizeof buf - o, "[dev %llu]", (unsigned long long)a->ulRestrictedToDevice);
+                if (w > 0 && o + (size_t)w < sizeof buf) o += (size_t)w;
+            }
+        }
+        memcpy(g_it_sets, buf, sizeof g_it_sets < sizeof buf ? sizeof g_it_sets : sizeof buf);
+        g_it_sets[sizeof g_it_sets - 1] = 0;
+    }
+    input_trace_report(g_input_time);
     return 0;
 }
 static action *act_of(uint64_t h) {
@@ -1730,7 +1865,9 @@ static void read_src(int src, int hand, int *on, float *x, float *y) {
     case SRC_STICK_LEFT:  *on = sx < -0.7f; *x = (float)*on; break;
     case SRC_STICK_RIGHT: *on = sx > 0.7f; *x = (float)*on; break;
     case SRC_STICK_CLICK: *on = (b & (right ? KL_OVRP_RAW_RTHUMBSTICK : KL_OVRP_RAW_LTHUMBSTICK)) != 0; *x = (float)*on; break;
-    case SRC_MENU:    *on = (b & KL_OVRP_RAW_START) != 0; *x = (float)*on; break;
+    case SRC_MENU:    *on = (b & KL_OVRP_RAW_START) != 0 || (!right && (b & KL_OVRP_RAW_Y)); *x = (float)*on; break;
+    case SRC_TRIGGER_OR_GRIP: *x = fmaxf(trig, grip); *on = trig > 0.5f || grip > 0.5f; break;
+    case SRC_STICK_ANY: *on = sx * sx + sy * sy > 0.49f; *x = (float)*on; break;
     default: break;
     }
 }
@@ -1770,12 +1907,16 @@ static int sys_controller_state(void *s, uint32_t dev, VRControllerState_t *st, 
 // Which hands an action reads: the restriction the guest asked for, else the
 // binding's own hand, else both (OR / larger magnitude).
 static int hands_for(const action *a, uint64_t restrict_to, int out[2]) {
+    // A one-handed binding asked about the other hand: nothing is bound there.
+    if (a->hand >= 0 && ((restrict_to == H_SOURCE_LEFT && a->hand != 0) ||
+                         (restrict_to == H_SOURCE_RIGHT && a->hand != 1))) { out[0] = a->hand; return 0; }
     if (restrict_to == H_SOURCE_LEFT) { out[0] = 0; return 1; }
     if (restrict_to == H_SOURCE_RIGHT) { out[0] = 1; return 1; }
     if (a->hand >= 0) { out[0] = a->hand; return 1; }
     out[0] = 0; out[1] = 1; return 2;
 }
 static int in_digital(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t restrict_to) {
+    IN_NOTE(IT_DIGITAL);
     (void)s;
     if (!d || size < 24) return 4;
     memset(d, 0, 24);
@@ -1789,7 +1930,7 @@ static int in_digital(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t r
         if (o && !on) { on = 1; src_hand = hs[i]; }
     }
     int slot = restrict_to == H_SOURCE_RIGHT ? 2 : restrict_to == H_SOURCE_LEFT ? 1 : 0;
-    d[0] = 1;                                                         // bActive
+    d[0] = n > 0;                                                     // bActive: bound on that hand
     uint64_t origin = src_hand ? H_SOURCE_RIGHT : H_SOURCE_LEFT;
     memcpy(d + 8, &origin, 8);
     d[16] = (uint8_t)on;
@@ -1809,6 +1950,7 @@ static int in_digital(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t r
     return 0;
 }
 static int in_analog(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t restrict_to) {
+    IN_NOTE(IT_ANALOG);
     (void)s;
     if (!d || size < 48) return 4;
     memset(d, 0, 48);
@@ -1822,7 +1964,7 @@ static int in_analog(void *s, uint64_t h, uint8_t *d, uint32_t size, uint64_t re
         read_src(a->src, hs[i], &o, &x, &y);
         if (fabsf(x) + fabsf(y) > fabsf(bx) + fabsf(by)) { bx = x; by = y; src_hand = hs[i]; }
     }
-    d[0] = 1;
+    d[0] = n > 0;
     uint64_t origin = src_hand ? H_SOURCE_RIGHT : H_SOURCE_LEFT;
     memcpy(d + 8, &origin, 8);
     memcpy(d + 16, &bx, 4); memcpy(d + 20, &by, 4);
@@ -1834,7 +1976,19 @@ static int pose_data(uint64_t h, int origin, uint8_t *d, uint32_t size, uint64_t
     action *a = act_of(h);
     if (!a) return 3;
     int hand = restrict_to == H_SOURCE_LEFT ? 0 : restrict_to == H_SOURCE_RIGHT ? 1 : a->hand;
-    if (a->src != SRC_POSE || hand < 0) return 0;
+    // A skeleton action is a pose action too: SteamVR answers it with the
+    // skeleton's base pose (/pose/raw for a Touch), and Alyx asks for its
+    // in-game hands exactly that way — GetPoseActionDataRelativeToNow on
+    // HandSkeletonLeft/Right, the HandPose actions being the menus'. Answering
+    // only SRC_POSE left the in-game hand inactive (no hand, nothing to grab).
+    int skel = a->src == SRC_SKELETON && kl_env_on("KL_OPENVR_SKELETON", 1);
+    if (!a->polled) {
+        a->polled = 1;
+        fprintf(stderr, "  [openvr] pose data asked of %s (restricted to %llu): %s\n", a->name,
+                (unsigned long long)restrict_to,
+                (a->src == SRC_POSE || skel) && hand >= 0 ? "answered with the controller pose" : "INACTIVE");
+    }
+    if ((a->src != SRC_POSE && !skel) || hand < 0) return 0;
     int saved = g_origin;
     g_origin = origin;
     TrackedDevicePose_t p;
@@ -1847,24 +2001,250 @@ static int pose_data(uint64_t h, int origin, uint8_t *d, uint32_t size, uint64_t
     return 0;
 }
 static int in_pose_now(void *s, uint64_t h, int origin, float secs, uint8_t *d, uint32_t size, uint64_t r) {
+    IN_NOTE(IT_POSE_NOW);
     (void)s; (void)secs; return pose_data(h, origin, d, size, r);
 }
 static int in_pose_next(void *s, uint64_t h, int origin, uint8_t *d, uint32_t size, uint64_t r) {
+    IN_NOTE(IT_POSE_NEXT);
     (void)s; return pose_data(h, origin, d, size, r);
 }
-// Skeletal input: no bone data — reported as an active action with no skeleton
-// (the summary below carries the curls), which games treat as a controller
-// without finger tracking.
+// ---- skeletal input: a Touch hand, animated from trigger, grip and touches ----
+// Half-Life: Alyx draws and animates the player's hands IN GAME from
+// /actions/default/in/HandSkeletonLeft/Right (bindings_touch.json binds them to
+// /user/hand/*/input/skeleton/*) — the finger curls, and whether there is a hand
+// to draw at all. The pause menu and the main menu draw from the pose actions
+// alone, which is why hands worked there and nowhere else. This bridge used to
+// answer the skeleton as INACTIVE (bActive 0) with no bones (GetBoneCount and
+// GetSkeletalBoneData -> NoData): in game no hand appeared, nothing could be
+// grabbed, and a hand left over from the menu stayed frozen where it was (ALVR
+// documents the same "frozen hand" for a skeleton component never fed).
+//
+// Now the skeleton is what SteamVR's Oculus driver serves for a Touch
+// (EVRSkeletalTrackingLevel Partial): SteamVR's 31-bone hand, rooted at the
+// controller's /pose/raw (the pose Alyx's HandPose actions bind, so the two
+// agree), animated between ALVR's measured Touch poses — kl_openvr_hand.h —
+// by the thumb touch, the index trigger (touch, then pull) and the grip.
+// KL_OPENVR_SKELETON=0 restores the old inactive answer, the A/B.
+#include "kl_openvr_hand.h"
+
+// EVRSkeletalTransformSpace / EVRSkeletalMotionRange / EVRSkeletalReferencePose
+enum { SK_MODEL = 0, SK_PARENT = 1 };
+enum { SK_WITH_CONTROLLER = 0, SK_WITHOUT_CONTROLLER = 1 };
+enum { SK_BIND = 0, SK_OPEN = 1, SK_FIST = 2, SK_GRIP_LIMIT = 3 };
+static const int8_t k_bone_parent[KLOVR_BONES] = {
+    -1, 0,  1, 2, 3, 4,  1, 6, 7, 8, 9,  1, 11, 12, 13, 14,  1, 16, 17, 18, 19,
+     1, 21, 22, 23, 24,  0, 0, 0, 0, 0
+};
+static const char *const k_bone_name[KLOVR_BONES] = {
+    "Root", "Wrist", "Thumb0", "Thumb1", "Thumb2", "Thumb3",
+    "IndexFinger0", "IndexFinger1", "IndexFinger2", "IndexFinger3", "IndexFinger4",
+    "MiddleFinger0", "MiddleFinger1", "MiddleFinger2", "MiddleFinger3", "MiddleFinger4",
+    "RingFinger0", "RingFinger1", "RingFinger2", "RingFinger3", "RingFinger4",
+    "PinkyFinger0", "PinkyFinger1", "PinkyFinger2", "PinkyFinger3", "PinkyFinger4",
+    "Aux_Thumb", "Aux_IndexFinger", "Aux_MiddleFinger", "Aux_RingFinger", "Aux_PinkyFinger"
+};
+static int skeleton_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_OPENVR_SKELETON", 1);
+        fprintf(stderr, "  [openvr] hand skeleton: %s (KL_OPENVR_SKELETON)\n",
+                on ? "active, 31 bones animated from trigger/grip/touches (Touch, partial tracking)"
+                   : "INACTIVE (no bones) — in-game hands will not appear");
+    }
+    return on;
+}
+// The skeleton's hand: 0/1 from the action's binding (HandSkeletonLeft/Right).
+static int skel_hand(uint64_t h) {
+    action *a = act_of(h);
+    if (!a || a->src != SRC_SKELETON) return -1;
+    return a->hand;
+}
+static void bone_lerp(klovr_bone *o, const klovr_bone *a, const klovr_bone *b, float t) {
+    for (int i = 0; i < 3; i++) o->p[i] = a->p[i] + (b->p[i] - a->p[i]) * t;
+    o->p[3] = 1.0f;
+    float d = 0, q[4];
+    for (int i = 0; i < 4; i++) d += a->q[i] * b->q[i];
+    float sgn = d < 0 ? -1.0f : 1.0f;
+    d = fabsf(d);
+    float wa, wb;
+    if (d > 0.9995f) { wa = 1.0f - t; wb = t; }
+    else {
+        float th = acosf(d), st = sinf(th);
+        wa = sinf((1.0f - t) * th) / st; wb = sinf(t * th) / st;
+    }
+    float n = 0;
+    for (int i = 0; i < 4; i++) { q[i] = a->q[i] * wa + b->q[i] * wb * sgn; n += q[i] * q[i]; }
+    n = n > 0 ? 1.0f / sqrtf(n) : 1.0f;
+    for (int i = 0; i < 4; i++) o->q[i] = q[i] * n;
+}
+// Per-hand animation state, advanced once per UpdateActionState: touches ease
+// in and out over ~60 ms as a Touch driver's do, so a finger lifting off a
+// button moves rather than teleports.
+static struct { float thumb, index; float t; } g_skel_anim[2];
+static void skel_inputs(int hand, int *thumb_touch, int *index_touch, float *trig, float *grip) {
+    uint32_t b = 0, t = 0; float tr = 0, gr = 0, sx = 0, sy = 0;
+    kl_ovrp_controller_input(hand, &b, &t, &tr, &gr, &sx, &sy);
+    uint32_t face = hand ? (KL_OVRP_RAW_A | KL_OVRP_RAW_B | KL_OVRP_RAW_RTHUMBSTICK)
+                         : (KL_OVRP_RAW_X | KL_OVRP_RAW_Y | KL_OVRP_RAW_LTHUMBSTICK);
+    *thumb_touch = ((t | b) & face) != 0 || fabsf(sx) > 0.1f || fabsf(sy) > 0.1f;
+    *index_touch = (t & (hand ? KL_OVRP_RAW_RINDEX_TRIGGER : KL_OVRP_RAW_LINDEX_TRIGGER)) != 0 || tr > 0.02f;
+    *trig = tr < 0 ? 0 : tr > 1 ? 1 : tr;
+    *grip = gr < 0 ? 0 : gr > 1 ? 1 : gr;
+}
+static void skel_advance(float now) {
+    for (int h = 0; h < 2; h++) {
+        int tt, it; float tr, gr;
+        skel_inputs(h, &tt, &it, &tr, &gr);
+        float dt = g_skel_anim[h].t > 0 ? now - g_skel_anim[h].t : 1.0f;
+        if (!(dt >= 0) || dt > 1.0f) dt = 1.0f;
+        float k = 1.0f - expf(-dt / 0.06f);
+        g_skel_anim[h].thumb += ((float)tt - g_skel_anim[h].thumb) * k;
+        g_skel_anim[h].index += ((float)it - g_skel_anim[h].index) * k;
+        g_skel_anim[h].t = now;
+    }
+}
+// The hand in PARENT space — ALVR's Controller::GetBoneTransform, with the
+// touch animation progress from g_skel_anim.
+static void skel_parent(int hand, int with_controller, klovr_bone out[KLOVR_BONES]) {
+    int left = hand == 0, tt, it; float trig, grip;
+    skel_inputs(hand, &tt, &it, &trig, &grip);
+    float thumb_p = g_skel_anim[hand & 1].thumb, index_p = g_skel_anim[hand & 1].index;
+    klovr_bone a[KLOVR_BONES], b[KLOVR_BONES];
+    memset(a, 0, sizeof a); memset(b, 0, sizeof b);
+    out[0] = (klovr_bone){ { 0, 0, 0, 1 }, { 1, 0, 0, 0 } };
+    out[1] = left ? (klovr_bone){ { -0.034038f, 0.036503f, 0.164722f, 1 }, { -0.055147f, -0.078608f, -0.920279f, 0.379296f } }
+                  : (klovr_bone){ {  0.034038f, 0.036503f, 0.164722f, 1 }, { -0.055147f, -0.078608f,  0.920279f, -0.379296f } };
+    klovr_GetThumbBoneTransform(with_controller, left, 0, a);
+    klovr_GetThumbBoneTransform(with_controller, left, 1, b);
+    for (int i = 2; i < 6; i++) bone_lerp(&out[i], &a[i], &b[i], thumb_p);
+    if (trig > 0) {
+        klovr_GetTriggerBoneTransform(with_controller, left, 1, 0, a);
+        klovr_GetTriggerBoneTransform(with_controller, left, 1, 1, b);
+        for (int i = 6; i < KLOVR_BONES; i++) bone_lerp(&out[i], &a[i], &b[i], trig);
+    } else {
+        klovr_GetTriggerBoneTransform(with_controller, left, 0, 0, a);
+        klovr_GetTriggerBoneTransform(with_controller, left, 1, 0, b);
+        for (int i = 6; i < KLOVR_BONES; i++) bone_lerp(&out[i], &a[i], &b[i], index_p);
+    }
+    if (grip > 0) {
+        klovr_GetGripClickBoneTransform(with_controller, left, b);
+        for (int i = 11; i < 26; i++) bone_lerp(&out[i], &out[i], &b[i], grip);
+        for (int i = 28; i < KLOVR_BONES; i++) bone_lerp(&out[i], &out[i], &b[i], grip);
+    }
+}
+// A reference pose: open = nothing touched or pulled, fist = everything
+// curled (trigger and grip clicked, thumb down), bind = the open hand.
+static void skel_reference(int hand, int pose, klovr_bone out[KLOVR_BONES]) {
+    int left = hand == 0;
+    klovr_bone a[KLOVR_BONES];
+    memset(a, 0, sizeof a);
+    out[0] = (klovr_bone){ { 0, 0, 0, 1 }, { 1, 0, 0, 0 } };
+    out[1] = left ? (klovr_bone){ { -0.034038f, 0.036503f, 0.164722f, 1 }, { -0.055147f, -0.078608f, -0.920279f, 0.379296f } }
+                  : (klovr_bone){ {  0.034038f, 0.036503f, 0.164722f, 1 }, { -0.055147f, -0.078608f,  0.920279f, -0.379296f } };
+    int fist = pose == SK_FIST || pose == SK_GRIP_LIMIT;
+    klovr_GetThumbBoneTransform(0, left, fist, out);
+    klovr_GetTriggerBoneTransform(0, left, fist, fist, out);
+    if (fist) {
+        klovr_GetGripClickBoneTransform(0, left, a);
+        for (int i = 11; i < 26; i++) out[i] = a[i];
+        for (int i = 28; i < KLOVR_BONES; i++) out[i] = a[i];
+    }
+}
+// Parent space -> model space (relative to the root): compose down the chain.
+// The aux bones hang off the root, so they are the same in both.
+static void skel_to_model(klovr_bone b[KLOVR_BONES]) {
+    for (int i = 1; i < KLOVR_BONES; i++) {
+        int pi = k_bone_parent[i];
+        if (pi <= 0) continue;                       // root's children: root is identity
+        const klovr_bone *pb = &b[pi];
+        // (w, x, y, z) -> (x, y, z, w) for the helpers
+        float pq[4] = { pb->q[1], pb->q[2], pb->q[3], pb->q[0] };
+        float lq[4] = { b[i].q[1], b[i].q[2], b[i].q[3], b[i].q[0] }, oq[4], op[3];
+        quat_rotate(pq, b[i].p, op);
+        quat_mul(pq, lq, oq);
+        for (int k = 0; k < 3; k++) b[i].p[k] = pb->p[k] + op[k];
+        b[i].q[0] = oq[3]; b[i].q[1] = oq[0]; b[i].q[2] = oq[1]; b[i].q[3] = oq[2];
+    }
+}
+// GetSkeletalActionData(action, InputSkeletalActionData_t *, size): bActive,
+// activeOrigin.
 static int in_skeletal(void *s, uint64_t h, uint8_t *d, uint32_t size) {
-    (void)s; (void)h;
+    IN_NOTE(IT_SKEL);
+    (void)s;
     if (!d || size < 16) return 4;
     memset(d, 0, 16);
+    action *a = act_of(h);
+    if (!a) return 3;
+    int hand = skel_hand(h);
+    if (hand < 0 || !skeleton_on()) return 0;
+    d[0] = 1;
+    uint64_t o = hand ? H_SOURCE_RIGHT : H_SOURCE_LEFT;
+    memcpy(d + 8, &o, 8);
+    return 0;
+}
+static int in_bone_count(void *s, uint64_t h, uint32_t *n) {
+    IN_NOTE(IT_BONE_COUNT);
+    (void)s;
+    if (!n) return 4;
+    *n = 0;
+    if (skel_hand(h) < 0 || !skeleton_on()) return 13;               // NoData
+    *n = KLOVR_BONES;
+    return 0;
+}
+static int in_bone_hierarchy(void *s, uint64_t h, int32_t *out, uint32_t n) {
+    IN_NOTE(IT_BONE_HIER);
+    (void)s;
+    if (skel_hand(h) < 0 || !skeleton_on()) return 13;
+    if (!out || n < KLOVR_BONES) return 4;                           // InvalidParam (size mismatch)
+    for (int i = 0; i < KLOVR_BONES; i++) out[i] = k_bone_parent[i];
+    return 0;
+}
+static int in_bone_name(void *s, uint64_t h, int32_t bone, char *buf, uint32_t n) {
+    (void)s;
+    if (skel_hand(h) < 0 || !skeleton_on()) return 13;
+    if (bone < 0 || bone >= KLOVR_BONES) return 4;
+    const char *v = k_bone_name[bone];
+    if (!buf || n < strlen(v) + 1) return 14;
+    memcpy(buf, v, strlen(v) + 1);
+    return 0;
+}
+static int in_skel_reference(void *s, uint64_t h, int space, int pose, klovr_bone *out, uint32_t n) {
+    IN_NOTE(IT_BONE_REF);
+    (void)s;
+    int hand = skel_hand(h);
+    if (hand < 0 || !skeleton_on()) return 13;
+    prop_note("GetSkeletalReferenceTransforms(hand,space*10+pose)", (uint32_t)hand, space * 10 + pose, 1);
+    if (!out || n != KLOVR_BONES) return 4;
+    skel_reference(hand, pose, out);
+    if (space == SK_MODEL) skel_to_model(out);
+    return 0;
+}
+static int in_bone_data(void *s, uint64_t h, int space, int range, klovr_bone *out, uint32_t n) {
+    IN_NOTE(IT_BONE_DATA);
+    (void)s;
+    int hand = skel_hand(h);
+    if (hand < 0 || !skeleton_on()) return 13;
+    if (!out || n != KLOVR_BONES) {
+        static int said;
+        if (said++ < 4) fprintf(stderr, "  [openvr] GetSkeletalBoneData asked for %u bones (we have %d)\n", n, KLOVR_BONES);
+        return 4;
+    }
+    skel_parent(hand, range != SK_WITHOUT_CONTROLLER, out);
+    if (space == SK_MODEL) skel_to_model(out);
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [openvr] GetSkeletalBoneData: first answer (hand %d, %s space, %s)\n", hand,
+                space == SK_MODEL ? "model" : "parent", range == SK_WITHOUT_CONTROLLER ? "without controller" : "with controller");
     return 0;
 }
 static int in_dominant(void *s, int *role) { (void)s; if (role) *role = 2; return 0; }
 static int in_no_data(void *s) { (void)s; return 13; }                 // VRInputError_NoData
-static int in_tracking_level(void *s, uint64_t h, int *lvl) { (void)s; (void)h; if (lvl) *lvl = 0; return 0; }
+static int in_tracking_level(void *s, uint64_t h, int *lvl) {
+    IN_NOTE(IT_TRACK_LEVEL);      // Partial: a Touch
+    (void)s; if (lvl) *lvl = skel_hand(h) >= 0 && skeleton_on() ? 1 : 0; return 0;
+}
 static int in_summary(void *s, uint64_t h, int type, float *out) {
+    IN_NOTE(IT_SUMMARY);
     (void)s; (void)type;
     action *a = act_of(h);
     if (!out) return 4;
@@ -1891,7 +2271,37 @@ static int in_false(void *s) { (void)s; return 0; }
 // those three were logging stubs returning None with the out-array left
 // zeroed, i.e. "bound to nothing" (k_ulInvalidInputValueHandle). The origins
 // are the hand source handles the action reads from.
+// The ORIGINS of an action — what a game names in a prompt ("press <origin> to
+// start") and looks up with GetOriginLocalizedName. SteamVR answers one origin
+// per bound input COMPONENT ("/user/hand/left/input/trigger"), named by hand,
+// controller and button; this bridge answered the hand itself, so Alyx's
+// post-load gate read "Pulsa Left Hand para empezar" and named no button at
+// all. Origins are now (hand, source) handles, named for the PS VR2 Sense
+// buttons the frontend maps onto the Touch layout (KleptonControllers).
+#define H_ORIGIN_BASE 0x10000000ull
+static uint64_t origin_handle(int hand, int src) { return H_ORIGIN_BASE + (uint64_t)hand * 0x100 + (uint64_t)src; }
+static int origin_decode(uint64_t o, int *hand, int *src) {
+    if (o == H_SOURCE_LEFT || o == H_SOURCE_RIGHT) { *hand = o == H_SOURCE_RIGHT; *src = SRC_NONE; return 1; }
+    if (o < H_ORIGIN_BASE || o >= H_ORIGIN_BASE + 0x200) return 0;
+    *hand = (int)((o - H_ORIGIN_BASE) >> 8); *src = (int)((o - H_ORIGIN_BASE) & 0xff);
+    return 1;
+}
+static const char *origin_input_name(int hand, int src) {
+    switch (src) {
+    case SRC_TRIGGER: return "Trigger";
+    case SRC_GRIP: return "Grip";
+    case SRC_TRIGGER_OR_GRIP: return "Trigger";
+    case SRC_LOWER: return hand ? "Cross Button" : "Square Button";
+    case SRC_UPPER: return hand ? "Circle Button" : "Triangle Button";
+    case SRC_MENU: return hand ? "Options Button" : "Create Button";
+    case SRC_STICK_CLICK: return "Stick Click";
+    case SRC_STICK: case SRC_STICK_X: case SRC_STICK_Y: case SRC_STICK_ANY:
+    case SRC_STICK_UP: case SRC_STICK_DOWN: case SRC_STICK_LEFT: case SRC_STICK_RIGHT: return "Stick";
+    default: return NULL;
+    }
+}
 static int in_origins(void *s, uint64_t set, uint64_t h, uint64_t *out, uint32_t n) {
+    IN_NOTE(IT_ORIGINS);
     (void)s; (void)set;
     if (!out || !n) return 4;                                          // InvalidParam
     memset(out, 0, (size_t)n * sizeof *out);
@@ -1899,18 +2309,38 @@ static int in_origins(void *s, uint64_t set, uint64_t h, uint64_t *out, uint32_t
     if (!a) return 3;                                                  // InvalidHandle
     uint32_t k = 0;
     if (a->src != SRC_NONE) {
-        if (a->hand != 1 && k < n) out[k++] = H_SOURCE_LEFT;
-        if (a->hand != 0 && k < n) out[k++] = H_SOURCE_RIGHT;
+        // Poses, skeletons and haptics keep the hand: there is no button.
+        int comp = origin_input_name(1, a->src) != NULL;
+        if (a->hand != 1 && k < n) out[k++] = comp ? origin_handle(0, a->src) : H_SOURCE_LEFT;
+        if (a->hand != 0 && k < n) out[k++] = comp ? origin_handle(1, a->src) : H_SOURCE_RIGHT;
     }
     static int said;                       // called every frame for the skeletons
     if (said < 64) { said++; TRACE("GetActionOrigins %s -> %u origin(s)\n", a->name, k); }
     return 0;
 }
+// GetOriginLocalizedName(origin, buf, size, unStringSectionsToInclude):
+// VRInputString_Hand 0x01, _ControllerType 0x02, _InputSource 0x04, All = -1.
 static int in_origin_name(void *s, uint64_t origin, char *buf, uint32_t n, int32_t bits) {
-    (void)s; (void)bits;
-    const char *v = origin == H_SOURCE_LEFT ? "Left Hand" : origin == H_SOURCE_RIGHT ? "Right Hand"
-                  : origin == H_SOURCE_HEAD ? "Headset" : NULL;
-    if (!v) return 3;
+    (void)s;
+    char v[96];
+    int hand = 0, src = SRC_NONE;
+    if (origin == H_SOURCE_HEAD) snprintf(v, sizeof v, "Headset");
+    else if (origin_decode(origin, &hand, &src)) {
+        const char *in = origin_input_name(hand, src);
+        if (bits == 0) bits = -1;
+        size_t o = 0;
+        v[0] = 0;
+        if (bits & 0x01) o += (size_t)snprintf(v + o, sizeof v - o, "%s", hand ? "Right" : "Left");
+        if ((bits & 0x02) && o < sizeof v)
+            o += (size_t)snprintf(v + o, sizeof v - o, "%sSense", o ? " " : "");
+        if ((bits & 0x04) && in && o < sizeof v)
+            o += (size_t)snprintf(v + o, sizeof v - o, "%s%s", o ? " " : "", in);
+        if (!in && o < sizeof v) o += (size_t)snprintf(v + o, sizeof v - o, "%sHand", o ? " " : "");
+        if (!o) snprintf(v, sizeof v, "%s", in ? in : (hand ? "Right Hand" : "Left Hand"));
+    } else return 3;
+    static int said;
+    if (said < 16) { said++; fprintf(stderr, "  [openvr] GetOriginLocalizedName(%#llx, sections %#x) -> \"%s\"\n",
+                                     (unsigned long long)origin, (unsigned)bits, v); }
     if (!buf || n < strlen(v) + 1) return 14;                          // BufferTooSmall
     memcpy(buf, v, strlen(v) + 1);
     return 0;
@@ -1920,9 +2350,15 @@ static int in_origin_info(void *s, uint64_t origin, InputOriginInfo_t *o, uint32
     (void)s;
     if (!o || size < sizeof *o) return 4;
     memset(o, 0, size);
-    if (origin != H_SOURCE_LEFT && origin != H_SOURCE_RIGHT && origin != H_SOURCE_HEAD) return 3;
-    o->devicePath = origin;
-    o->trackedDeviceIndex = origin == H_SOURCE_LEFT ? DEV_LEFT : origin == H_SOURCE_RIGHT ? DEV_RIGHT : DEV_HMD;
+    int hand = 0, src = SRC_NONE;
+    if (origin == H_SOURCE_HEAD) { o->devicePath = H_SOURCE_HEAD; o->trackedDeviceIndex = DEV_HMD; return 0; }
+    if (!origin_decode(origin, &hand, &src)) return 3;
+    o->devicePath = hand ? H_SOURCE_RIGHT : H_SOURCE_LEFT;
+    o->trackedDeviceIndex = hand ? DEV_RIGHT : DEV_LEFT;
+    const char *comp = src == SRC_TRIGGER || src == SRC_TRIGGER_OR_GRIP ? "trigger" : src == SRC_GRIP ? "grip"
+                     : src == SRC_LOWER ? (hand ? "a" : "x") : src == SRC_UPPER ? (hand ? "b" : "y")
+                     : src == SRC_MENU ? "menu" : origin_input_name(hand, src) ? "thumbstick" : "";
+    snprintf(o->rchRenderModelComponentName, sizeof o->rchRenderModelComponentName, "%s", comp);
     return 0;
 }
 // No variant in the built-in bindings: the empty string, as SteamVR answers.
@@ -2006,6 +2442,40 @@ static int mb_read(void *s, uint64_t h, char *buf, uint32_t size, uint32_t *need
     return 0;
 }
 
+// ---- IVRRenderModels: none to offer -------------------------------------------
+// Alyx asks for the controllers' render models once a level has STARTED (it
+// never got that far before the "press to start" gate worked): GetComponentCount,
+// then LoadRenderModel_Async. As a logging stub that answered 0 —
+// VRRenderModelError_None, "loaded" — and left the RenderModel_t * NULL, and
+// libvr read its triangle count at +0x18: SIGSEGV in libvr.so+0xb53bc on the
+// first frame of play (measured on the Mac). NotSupported (200) is an honest
+// "there is no model": the game draws its own hands and controllers.
+#define RM_NOT_SUPPORTED 200
+static int rm_load_model(void *s, const char *name, void **out) {
+    (void)s;
+    if (out) *out = NULL;
+    static int said;
+    if (said < 4) { said++; fprintf(stderr, "  [openvr] LoadRenderModel_Async(\"%s\") -> NotSupported "
+                                            "(no render models here)\n", name ? name : ""); }
+    return RM_NOT_SUPPORTED;
+}
+static int rm_load_texture(void *s, int32_t id, void **out) { (void)s; (void)id; if (out) *out = NULL; return RM_NOT_SUPPORTED; }
+static int rm_load_d3d(void *s, int32_t id, void *dev, void **out) { (void)s; (void)id; (void)dev; if (out) *out = NULL; return RM_NOT_SUPPORTED; }
+static int rm_load_into_d3d(void *s, int32_t id, void *tex) { (void)s; (void)id; (void)tex; return RM_NOT_SUPPORTED; }
+static void rm_free(void *s, void *p) { (void)s; (void)p; }
+static uint32_t rm_zero_u32(void *s) { (void)s; return 0; }
+static uint32_t rm_name_err(void *s, const char *name, char *buf, uint32_t n, int *err) {
+    (void)s; (void)name;
+    if (buf && n) buf[0] = 0;
+    if (err) *err = RM_NOT_SUPPORTED;
+    return 0;
+}
+static const char *rm_err_name(void *s, int e) {
+    (void)s;
+    return e == 0 ? "VRRenderModelError_None" : e == 100 ? "VRRenderModelError_Loading"
+         : e == RM_NOT_SUPPORTED ? "VRRenderModelError_NotSupported" : "VRRenderModelError_Unknown";
+}
+
 // ---- implemented slots ----------------------------------------------------------------------------
 #define SYS "IVRSystem_026"
 #define COMP "IVRCompositor_029"
@@ -2074,8 +2544,9 @@ static const impl g_impl[] = {
     { INP, "GetPoseActionDataRelativeToNow", (void *)in_pose_now },
     { INP, "GetPoseActionDataForNextFrame", (void *)in_pose_next },
     { INP, "GetSkeletalActionData", (void *)in_skeletal }, { INP, "GetDominantHand", (void *)in_dominant },
-    { INP, "GetBoneCount", (void *)in_no_data }, { INP, "GetSkeletalBoneData", (void *)in_no_data },
-    { INP, "GetSkeletalReferenceTransforms", (void *)in_no_data },
+    { INP, "GetBoneCount", (void *)in_bone_count }, { INP, "GetSkeletalBoneData", (void *)in_bone_data },
+    { INP, "GetBoneHierarchy", (void *)in_bone_hierarchy }, { INP, "GetBoneName", (void *)in_bone_name },
+    { INP, "GetSkeletalReferenceTransforms", (void *)in_skel_reference },
     { INP, "GetSkeletalBoneDataCompressed", (void *)in_no_data },
     { INP, "GetSkeletalTrackingLevel", (void *)in_tracking_level },
     { INP, "GetSkeletalSummaryData", (void *)in_summary },
@@ -2084,6 +2555,18 @@ static const impl g_impl[] = {
     { INP, "GetActionOrigins", (void *)in_origins }, { INP, "GetOriginLocalizedName", (void *)in_origin_name },
     { INP, "GetOriginTrackedDeviceInfo", (void *)in_origin_info },
     { INP, "GetBindingVariant", (void *)in_binding_variant },
+
+    { "IVRRenderModels_006", "LoadRenderModel_Async", (void *)rm_load_model },
+    { "IVRRenderModels_006", "FreeRenderModel", (void *)rm_free },
+    { "IVRRenderModels_006", "LoadTexture_Async", (void *)rm_load_texture },
+    { "IVRRenderModels_006", "FreeTexture", (void *)rm_free },
+    { "IVRRenderModels_006", "LoadTextureD3D11_Async", (void *)rm_load_d3d },
+    { "IVRRenderModels_006", "LoadIntoTextureD3D11_Async", (void *)rm_load_into_d3d },
+    { "IVRRenderModels_006", "FreeTextureD3D11", (void *)rm_free },
+    { "IVRRenderModels_006", "GetRenderModelCount", (void *)rm_zero_u32 },
+    { "IVRRenderModels_006", "GetRenderModelThumbnailURL", (void *)rm_name_err },
+    { "IVRRenderModels_006", "GetRenderModelOriginalPath", (void *)rm_name_err },
+    { "IVRRenderModels_006", "GetRenderModelErrorNameFromEnum", (void *)rm_err_name },
 
     { CHAP, "GetCalibrationState", (void *)ch_state }, { CHAP, "GetPlayAreaSize", (void *)ch_size },
     { CHAP, "GetPlayAreaRect", (void *)ch_rect }, { CHAP, "AreBoundsVisible", (void *)co_false },
