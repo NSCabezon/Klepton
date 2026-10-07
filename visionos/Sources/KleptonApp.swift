@@ -146,6 +146,9 @@ enum Lifecycle {
         // stdio, but it also runs atexit handlers and static destructors inside
         // a guest whose threads are still live, and one of those blocking would
         // turn a clean exit into a watchdog kill with a truncated log.
+        // Steam stops showing the game as played. The runtime's atexit would
+        // too, but only if every guest atexit before it returns; say it first.
+        kl_steam_shutdown()
         fflush(nil)
         exit(0)
     }
@@ -158,6 +161,14 @@ struct KleptonApp: App {
     /// immersive scene's `.upperLimbVisibility` live. The object is the shared
     /// singleton the panel edits, not a second copy.
     @ObservedObject private var chroma = KleptonChroma.shared
+
+    init() {
+        // A single-game build's guest asks Steam from its first boot; the hub
+        // registers the backend when Play picks a game (HubLaunch.select).
+        #if canImport(SteamDepot) && !KL_HUB
+        KleptonSteamBridge.register()
+        #endif
+    }
 
     var body: some Scene {
         WindowGroup { KleptonRootView() }
