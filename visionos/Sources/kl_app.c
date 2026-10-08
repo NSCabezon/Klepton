@@ -401,7 +401,14 @@ int kl_app_configure(const char *resources, const char *container) {
         mkdir(g_libdir, 0755);
         setenv("KL_GLIBC_MODDIRS", g_libdir, 0);
         setenv("KL_GLIBC_SYSROOT", "", 0);
-        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console", 0);
+        // Fidelity level 0 (2x MSAA, 0.78 scale) fixed: on device 4x MSAA cost
+        // 38% fps and 1.7 GB at the same resolution and did not remove the
+        // jaggies (2026-10-08, D2/D3). The OpenVR knobs are the M1 pipeline,
+        // the best picture of the on-device bisect.
+        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 0", 0);
+        setenv("KL_OPENVR_MINIMAL", "1", 0);
+        setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
+        setenv("KL_REPROJECT_OFF", "0", 0);
     }
     kl_driver_init(g_target, g_libdir, g_door);
     kl_driver_set_phase_hook(app_phase);
