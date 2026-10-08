@@ -1587,10 +1587,18 @@ typedef struct {
     // whose position is visibly changing. OpenXR carries the same distinction
     // in XrSpaceVelocity.velocityFlags, which kl_openxr answers from this.
     int   motion_valid;
+    // The instant this sample is ABOUT, in the frontend's tracker clock
+    // (CACurrentMediaTime / CLOCK_UPTIME_RAW seconds), or 0 when the frontend
+    // dates nothing (the macOS viewer). Rides in the struct for the reason the
+    // motion does: every latch copies a klovrp_pose by value, so the time the
+    // guest's frame was drawn at is coherent with the pose it was drawn with.
+    // Read only by the depth-reprojection modes (kl_ovrp_render_pose.pose_time).
+    double t;
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
     0,   // motion_valid: nothing has been published, so there is nothing to know
+    0,   // t: and it is about no instant
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -2057,8 +2065,9 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // from the same sample. It stopped being the whole story when an OpenXR
     // guest arrived: velocity there is a chained output struct on any space,
     // and zeros in it are an assertion rather than a silence.
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
+    v.t = g_head_pose_time;
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
     // Pose trace, once a second: the pushed head Y + tracking-origin frame
@@ -2834,7 +2843,34 @@ void kl_ovrp_frame_begin_external(void) {
     r->stage = -1;
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
+    // The latched sample's own instant; a guest that predicts moves it with
+    // kl_ovrp_frame_set_pose_time. No depth until the guest files one.
+    r->pose_time = h.t;
+    r->depth_valid = 0;
     g_frames.pending_index = (int)s;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+// See kl_ovrp.h. Both write the PENDING record, which frame_end_external files
+// whole — so a value set here belongs to exactly the frame being built.
+void kl_ovrp_frame_set_pose_time(double t) {
+    pthread_mutex_lock(&g_frames.mu);
+    g_frames.pending.pose_time = t;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+void kl_ovrp_frame_set_depth(int eye, float m22, float m23, float range_min,
+                             float range_max, int valid) {
+    if ((unsigned)eye > 1) return;
+    pthread_mutex_lock(&g_frames.mu);
+    kl_ovrp_render_pose *r = &g_frames.pending;
+    r->depth_m22[eye] = m22;
+    r->depth_m23[eye] = m23;
+    r->depth_range[0] = range_min;
+    r->depth_range[1] = range_max;
+    // Valid only once BOTH eyes have said so: a frame with one eye's depth is
+    // composited without depth rather than with one eye at the wrong distance.
+    if (valid) r->depth_valid |= 1 << eye; else r->depth_valid &= ~(1 << eye);
     pthread_mutex_unlock(&g_frames.mu);
 }
 
@@ -3053,6 +3089,10 @@ static double klovrp_to_tracker_clock(double mono_s) {
     return mono_s - mono_now + up_now;
 }
 
+// The same re-basing, for a caller outside this file that has to date a pose
+// it predicted (kl_openvr's declared frame pose) in the tracker's clock.
+double kl_ovrp_tracker_time(double mono_s) { return klovrp_to_tracker_clock(mono_s); }
+
 int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3) {
     kl_ovrp_head_at_fn fn = __atomic_load_n(&g_head_at, __ATOMIC_ACQUIRE);
     if (!fn) return 0;
@@ -3084,7 +3124,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
@@ -3102,7 +3142,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
