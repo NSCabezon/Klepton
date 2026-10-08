@@ -2429,7 +2429,7 @@ nothing, and prints the unresolved imports grouped by category.
   grid is drawn only between the mailbox's `begin_loading` and `end_loading`
   (`kl_ovrp_grid_mask`) — otherwise the main menu would stay black. Logs
   `[openvr] fade -> r g b a over N s`, `fade grid IN/out`, `load begins/ends`.
-- `KL_GATE_TOAST=0` — (`mb_gate_prompt`) no "press to start" panel. Default:
+- `KL_GATE_TOAST=1` — (`mb_gate_prompt`) show a "press to start" panel (default off: with the fade in place the gate reads fine on its own). When on:
   Alyx's `hlvr/interstitials` `show_message` ("Pulsa Trigger para empezar")
   shows a head-locked panel "Pulsa el gatillo para empezar" / "Pull the
   trigger to start" (game language) until `end_loading` (or the next
