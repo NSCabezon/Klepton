@@ -131,12 +131,12 @@ TARGETS = {
         #     ovrp_RecenterTrackingOrigin, which the calibration calls).
         #  - First boot shows the seated calibration ("hold any button"), then
         #     the language-select room. Spanish because the host locale is
-        #     es_ES. Still wrong there: ~100 "Invalid texture unit!" rejects a
-        #     frame (Unity 2019.4's cap of 32, see kl_guestpoke.c — this
-        #     build's offsets are not measured), 16 shaders Unity reports as
+        #     es_ES. Unity 2019.4's texture-unit cap of 32 rejected ~100 binds
+        #     a frame there (black slabs, blank labels); this build's offsets
+        #     are measured and the raise to 64 is on (kl_guestpoke.c). Still
+        #     wrong: 16 shaders Unity reports as
         #     "GLSL compilation failed, no infolog" (likely compute kernels, beside "Kernel at index (11) is invalid", on an
-        #     ES 3.0 ANGLE), and the room renders very dark with blank button
-        #     labels.
+        #     ES 3.0 ANGLE), and no controller/hand models seen yet.
         "libs":    None,
         "srcdir":  "ieytd/lib/arm64-v8a",
         "tree":    "ieytd",
