@@ -65,7 +65,7 @@ void kl_stream_hello_from_ovrp(kl_stream_hello *out, const float tan[2][4],
                                const char *device);
 
 // One POSE. Fills the header and pose_id (returned), records (pose_id, t_pose,
-// head pose) in the 64-entry ring VIDEO frames are matched against, and sends.
+// head pose) in the 256-entry ring VIDEO frames are matched against, and sends.
 uint32_t kl_stream_client_send_pose(kl_stream_client *c, kl_stream_pose *p);
 
 // ...the same, built from kl_ovrp: latches (kl_ovrp_frame_latch — in stream

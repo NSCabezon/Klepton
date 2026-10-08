@@ -433,7 +433,7 @@ final class KLStreamFramePublisher {
             var pose7: [Float] = [p.0, p.1, p.2, p.3, p.4, p.5, p.6]
             kl_ovrp_frame_end_external(Int32(stage), &pose7, &tan8)
         } else {
-            // The POSE fell out of the ring (a host more than 64 frames behind):
+            // The POSE fell out of the ring (a host more than 256 poses behind):
             // keep the latched pose rather than invent one. Counted as pose-miss.
             kl_ovrp_frame_end_external(Int32(stage), nil, &tan8)
         }
