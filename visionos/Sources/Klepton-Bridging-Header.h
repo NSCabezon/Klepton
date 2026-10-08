@@ -42,3 +42,4 @@
 // the user's real Steam account through a backend the app registers
 // (KleptonSteamBridge.swift), and the app says "playing off" on teardown.
 #import "kl_steam_bridge.h"
+#import "kl_stream_client.h"
