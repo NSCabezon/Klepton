@@ -73,6 +73,6 @@ void kl_stream_enc_close(void);
 // The last composed frame into a CAMetalLayer (the preview). 1 if drawn.
 int  kl_stream_preview_present(void *metal_layer, int pw, int ph);
 
-double kl_stream_now(void);     // CLOCK_UPTIME_RAW seconds (== CACurrentMediaTime)
+double kl_stream_host_now(void);     // CLOCK_UPTIME_RAW seconds (== CACurrentMediaTime)
 
 #endif

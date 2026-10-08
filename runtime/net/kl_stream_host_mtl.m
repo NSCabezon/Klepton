@@ -184,7 +184,7 @@ static void vt_out(void *refcon, void *frame_refcon, OSStatus status, VTEncodeIn
         free(m);
         return;
     }
-    float ms = (float)((kl_stream_now() - m->t_encode_start) * 1000.0);
+    float ms = (float)((kl_stream_host_now() - m->t_encode_start) * 1000.0);
     int key = 1;
     CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, false);
     if (att && CFArrayGetCount(att) > 0) {
@@ -340,7 +340,7 @@ int kl_stream_enc_frame(int stage, int w, int h, int kbps, float fps, int force_
         static int max_inflight = -1;
         if (max_inflight < 0) max_inflight = kl_env_int("KL_STREAM_MAX_INFLIGHT", 2);
         if (__atomic_load_n(&g_inflight, __ATOMIC_ACQUIRE) >= max_inflight) return -2;
-        meta->t_compose_start = kl_stream_now();
+        meta->t_compose_start = kl_stream_host_now();
         CVPixelBufferRef pb = NULL;
         if (CVPixelBufferPoolCreatePixelBuffer(NULL, g_pool, &pb) != kCVReturnSuccess || !pb) return -1;
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
@@ -400,7 +400,7 @@ int kl_stream_enc_frame(int stage, int w, int h, int kbps, float fps, int force_
         g_last_y = ty; g_last_c = tc;
         [g_last_lock unlock];
 
-        meta->t_encode_start = kl_stream_now();
+        meta->t_encode_start = kl_stream_host_now();
         kl_stream_frame_meta *m = malloc(sizeof *m);
         *m = *meta;
         g_out = out;

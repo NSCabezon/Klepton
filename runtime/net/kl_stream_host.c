@@ -46,7 +46,7 @@
 
 #define SH "[stream-host] "
 
-double kl_stream_now(void) {
+double kl_stream_host_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_UPTIME_RAW, &t);
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
@@ -243,7 +243,7 @@ static void on_hello(const kl_stream_hello *m, size_t n,
         send_to(from, fl, &ack, sizeof ack);
         return;
     }
-    double now = kl_stream_now();
+    double now = kl_stream_host_now();
     double timeout = kl_env_int("KL_STREAM_TIMEOUT_MS", 2000) / 1000.0;
     pthread_mutex_lock(&g_mu);
     int same = C.active && addr_eq(&C.addr, C.addr_len, from, fl);
@@ -290,7 +290,7 @@ static void on_pose(const kl_stream_pose *m, size_t n,
     if (n < sizeof *m) return;
     pthread_mutex_lock(&g_mu);
     int ok = C.active && addr_eq(&C.addr, C.addr_len, from, fl);
-    if (ok) C.last_heard = kl_stream_now();
+    if (ok) C.last_heard = kl_stream_host_now();
     pthread_mutex_unlock(&g_mu);
     if (!ok) return;
     uint64_t ns = mono_ns();
@@ -343,7 +343,7 @@ static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storag
             kl_stream_ping p;
             memcpy(&p, buf, sizeof p);
             hdr_init(&p.h, KL_STREAM_PONG);
-            p.t_reply = kl_stream_now();
+            p.t_reply = kl_stream_host_now();
             send_to(from, fl, &p, sizeof p);
         }
         break;
@@ -351,7 +351,7 @@ static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storag
         if (n >= sizeof(kl_stream_ping)) {
             kl_stream_ping p;
             memcpy(&p, buf, sizeof p);
-            S.rtt_ms = (kl_stream_now() - p.t_send) * 1000.0;
+            S.rtt_ms = (kl_stream_host_now() - p.t_send) * 1000.0;
         }
         break;
     case KL_STREAM_BYE: {
@@ -402,7 +402,7 @@ static void stats_tick(double dt) {
 static void *net_thread(void *arg) {
     (void)arg;
     uint8_t buf[2048];
-    double t_stats = kl_stream_now(), t_ping = t_stats;
+    double t_stats = kl_stream_host_now(), t_ping = t_stats;
     double timeout = kl_env_int("KL_STREAM_TIMEOUT_MS", 2000) / 1000.0;
     for (;;) {
         struct pollfd pf[2] = { { g_fd, POLLIN, 0 }, { -1, POLLIN, 0 } };
@@ -420,7 +420,7 @@ static void *net_thread(void *arg) {
             }
         }
         if (r > 0 && np == 2 && (pf[1].revents & POLLIN)) DNSServiceProcessResult(g_dns);
-        double now = kl_stream_now();
+        double now = kl_stream_host_now();
         pthread_mutex_lock(&g_mu);
         int gone = C.active && now - C.last_heard > timeout;
         if (gone) C.active = 0;
@@ -502,9 +502,9 @@ int kl_stream_host_start(const char *guest) {
 }
 
 int kl_stream_host_wait_hello(double timeout_s, const volatile int *quit) {
-    double t_end = timeout_s >= 0 ? kl_stream_now() + timeout_s : 0;
+    double t_end = timeout_s >= 0 ? kl_stream_host_now() + timeout_s : 0;
     pthread_mutex_lock(&g_mu);
-    while (!C.configured && !(quit && *quit) && (timeout_s < 0 || kl_stream_now() < t_end)) {
+    while (!C.configured && !(quit && *quit) && (timeout_s < 0 || kl_stream_host_now() < t_end)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 100 * 1000000L;
@@ -539,7 +539,7 @@ static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
         return;
     }
     unsigned sent = 0;
-    double t_send0 = kl_stream_now();
+    double t_send0 = kl_stream_host_now();
     for (uint32_t i = 0; i < count; i++) {
         size_t off = (size_t)i * KL_STREAM_MTU_PAYLOAD;
         size_t len = n - off < KL_STREAM_MTU_PAYLOAD ? n - off : KL_STREAM_MTU_PAYLOAD;
@@ -548,7 +548,7 @@ static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
         memcpy(pkt + sizeof *v, au + off, len);
         if (send_client(pkt, sizeof *v + len) == 0) sent++;
     }
-    S.send_ms += (kl_stream_now() - t_send0) * 1000.0;
+    S.send_ms += (kl_stream_host_now() - t_send0) * 1000.0;
     S.frames++;
     S.total_frames++;
     if (keyframe) { S.keyframes++; S.total_key++; }
