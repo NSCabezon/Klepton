@@ -2674,7 +2674,7 @@ static int mb_register(void *s, const char *name, uint64_t *h) {
     return 0;
 }
 static int mb_unregister(void *s, uint64_t h) { (void)s; (void)h; return 0; }
-// KL_GATE_TOAST (default on): Alyx's interstitial messages carry the "press to
+// KL_GATE_TOAST (default off; =1 shows it): Alyx's interstitial messages carry the "press to
 // start" gate — after each load it sends {"type": "show_message", "text":
 // "Pulsa Trigger para empezar"} and, once the trigger unpauses the level,
 // {"type": "end_loading"}. SteamVR's web helper draws that text; here the
@@ -2700,7 +2700,7 @@ static int mb_json_str(const char *msg, const char *key, char *out, size_t n) {
 }
 static void mb_gate_prompt(const char *addr, const char *msg) {
     static int on = -1;
-    if (on < 0) on = kl_env_on("KL_GATE_TOAST", 1);
+    if (on < 0) on = kl_env_on("KL_GATE_TOAST", 0);
     if (!addr || strcmp(addr, "hlvr/interstitials")) return;
     char type[48], text[200];
     if (!mb_json_str(msg, "type", type, sizeof type)) return;
