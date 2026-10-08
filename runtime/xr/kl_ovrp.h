@@ -806,4 +806,41 @@ enum {
 void kl_ovrp_haptics_apply(int hand, float amplitude, float seconds);
 void kl_ovrp_haptics_stop(int hand);
 
+
+// ---------------------------------------------------------------------------
+// The compositor's own fade and the "press to start" prompt
+//
+// OpenVR's IVRCompositor::FadeToColor asks the COMPOSITOR to blend a colour
+// over the scene (SteamVR hides level loads and Alyx's "Pulsa Trigger para
+// empezar" gate this way). kl_openvr.c files each request here; the frontend's
+// compositor (KleptonHUD.swift on visionOS, kl_view_mtl.m on the Mac) reads
+// the CURRENT colour every frame and draws it head-locked over the scene.
+// One clock: the start time is CLOCK_MONOTONIC, taken here, and the
+// interpolation is evaluated here, so neither side ever compares a guest time
+// with CACurrentMediaTime.
+//
+// `rgba` is straight (not premultiplied), each 0..1; `seconds` <= 0 is
+// immediate. kl_ovrp_fade_color answers the interpolated value and returns
+// nonzero when its alpha is above zero (something to draw).
+// FadeGrid is the same thing for SteamVR's grid environment, drawn here as
+// black under the colour fade; kl_ovrp_fade_color answers the two combined.
+// kl_ovrp_grid_mask scales the grid as DRAWN (not as answered to the guest):
+// 1 by default; kl_openvr.c lowers it outside a level load, because Alyx fades
+// the grid in at boot and only out at a level's start gate — on SteamVR its
+// web helper's interstitials drive that, and without them the main menu would
+// stay black.
+void  kl_ovrp_fade_to(float r, float g, float b, float a, float seconds);
+void  kl_ovrp_grid_to(float alpha, float seconds);
+void  kl_ovrp_grid_mask(float alpha, float seconds);
+float kl_ovrp_grid_alpha(void);
+void  kl_ovrp_fade_current(float rgba[4]);   // the colour fade alone (GetCurrentFadeColor)
+int   kl_ovrp_fade_color(float rgba[4]);
+
+// A head-locked prompt the frontend shows until it is cleared: Alyx's mailbox
+// "show_message" after a load (cleared by "end_loading"). NULL or "" clears.
+// kl_ovrp_prompt copies the text (empty when none) and returns a serial that
+// changes on every set or clear, so a frontend rebuilds its panel only then.
+void     kl_ovrp_set_prompt(const char *text);
+unsigned kl_ovrp_prompt(char *buf, int n);
+
 #endif

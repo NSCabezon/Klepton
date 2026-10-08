@@ -2419,6 +2419,21 @@ nothing, and prints the unresolved imports grouped by category.
   -> `unpaused the game` -> `gate open`. Before 2026-10-07 every level after the
   menu sat at `state 4 countdown 3 ... GATE HELD`: the `alyx-startup-no-pause`
   patch stopped the countdown, so no hands, no world sound, until the pause menu.
+- `KL_OPENVR_FADE=0` — (`co_fade_to` / `co_fade_grid`) the old no-op fades:
+  nothing drawn, GetCurrentFadeColor / GetCurrentGridAlpha read fully clear.
+  Default: FadeToColor and FadeGrid are filed in kl_ovrp (`kl_ovrp_fade_to`,
+  `kl_ovrp_grid_to`, one CLOCK_MONOTONIC clock) and drawn head-locked over the
+  scene by KleptonHUD.swift (device) and kl_view_mtl.m (Mac); the grid as black.
+  Background fades are only answered back. Alyx never calls FadeToColor: it
+  fades the GRID in at boot and out (1.5 s) at each level's start gate, so the
+  grid is drawn only between the mailbox's `begin_loading` and `end_loading`
+  (`kl_ovrp_grid_mask`) — otherwise the main menu would stay black. Logs
+  `[openvr] fade -> r g b a over N s`, `fade grid IN/out`, `load begins/ends`.
+- `KL_GATE_TOAST=0` — (`mb_gate_prompt`) no "press to start" panel. Default:
+  Alyx's `hlvr/interstitials` `show_message` ("Pulsa Trigger para empezar")
+  shows a head-locked panel "Pulsa el gatillo para empezar" / "Pull the
+  trigger to start" (game language) until `end_loading` (or the next
+  `begin_loading` / `hide_message`). `kl_ovrp_set_prompt` / `kl_ovrp_prompt`.
 - `KL_OPENVR_CMD_AT="<secs>:<cmd>[;<secs>:<cmd>...]"` — (`alyx_cmd_at`) run each
   console command on the game's thread (libclient's engine client, the call its
   menu makes for `setpause`) that many seconds after the first
