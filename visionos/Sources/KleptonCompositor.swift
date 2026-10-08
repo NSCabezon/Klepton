@@ -833,6 +833,9 @@ final class KleptonCompositor {
             controllers.forgetAccessoryPoses()
             Task { await runARKit() }
         }
+        // "Mando izquierdo desconectado" — the HUD card for a Sense controller
+        // that is asleep or dropped, from the same poll.
+        hud?.updateControllerPresence(controllers.presentHands)
 
         // The anchors themselves, not their transforms: the grip pose is built
         // from the hand skeleton (the metacarpal a fist closes around) and so
