@@ -354,14 +354,34 @@ static const char *const g_gl_extensions[] = {
 // so even a mistaken advertisement can't fault a per-eye draw — this door is about
 // steering each engine to the path it actually supports.)
 extern const char *kl_driver_target_name(void);
+//
+// ...and only when the ANGLE that will compile those shaders can. Offering the
+// extension to a guest whose ANGLE then refuses `#extension GL_OVR_multiview2`
+// is worse than not offering it: Unity 2019.4 (IEYTD) takes the multiview stereo
+// mode on the strength of the string, every num_views shader fails to compile,
+// and the frame is black at full frame rate. Without it Unity falls back to
+// multi-pass stereo, which the per-eye path renders. KL_GL_MULTIVIEW=0/1
+// overrides both the target list and the ANGLE probe.
 static int klgl_want_multiview(void) {
+    int forced = kl_env_int("KL_GL_MULTIVIEW", -1);
+    if (forced >= 0) return forced != 0;
     const char *t = kl_driver_target_name();
     if (!t) return 0;
     // ieytd/ieytd2/ieytd-<n> (Unity), and the HL2Q3VR Source-VR family (hl2, portal
     // — both liblauncher) whose single-pass stereo is baked around GL_OVR_multiview.
-    return strncmp(t, "ieytd", 5) == 0 ||
-           strcmp(t, "hl2") == 0 ||
-           strcmp(t, "portal") == 0;
+    int want = strncmp(t, "ieytd", 5) == 0 ||
+               strcmp(t, "hl2") == 0 ||
+               strcmp(t, "portal") == 0;
+    if (want && kl_glfb_enabled() && kl_glfb_angle_multiview() == 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [gl] GL_OVR_multiview withheld from %s: this ANGLE "
+                            "cannot compile it (KL_GL_MULTIVIEW=1 forces it)\n", t);
+        }
+        return 0;
+    }
+    return want;
 }
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
