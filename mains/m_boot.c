@@ -859,6 +859,7 @@ static int stream_run(void) {
     } else {
         kl_stream_host_apply_defaults();
     }
+    kl_stream_host_install_pacer();
     pthread_t guest;
     if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
         fprintf(stderr, "stream: pthread_create failed\n");

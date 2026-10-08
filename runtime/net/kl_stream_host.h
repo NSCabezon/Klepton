@@ -39,6 +39,10 @@ int kl_stream_host_wait_hello(double timeout_s, const volatile int *quit);
 // the fake client sends) when the guest is started before any client.
 void kl_stream_host_apply_defaults(void);
 
+// KL_STREAM_LOCK_FPS (default 45): pace the guest's WaitGetPoses to that rate
+// (kl_openvr_set_frame_pacer). Call before the guest starts.
+void kl_stream_host_install_pacer(void);
+
 // The frame/encode loop and, with KL_STREAM_PREVIEW=1, a local SDL preview
 // window on the calling (main) thread. Returns when *quit is set.
 int kl_stream_host_run(const volatile int *quit);

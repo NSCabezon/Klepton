@@ -964,6 +964,21 @@ static float klovrp_forced_hz(void) {
     return forced;
 }
 
+static int g_submit_wh[2][2];
+void kl_ovrp_note_submit_size(int eye, int w, int h) {
+    if (eye < 0 || eye > 1 || w <= 0 || h <= 0) return;
+    __atomic_store_n(&g_submit_wh[eye][0], w, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_submit_wh[eye][1], h, __ATOMIC_RELAXED);
+}
+int kl_ovrp_submit_size(int eye, int *w, int *h) {
+    if (eye < 0 || eye > 1) return 0;
+    int ww = __atomic_load_n(&g_submit_wh[eye][0], __ATOMIC_RELAXED);
+    int hh = __atomic_load_n(&g_submit_wh[eye][1], __ATOMIC_RELAXED);
+    if (w) *w = ww;
+    if (h) *h = hh;
+    return ww > 0 && hh > 0;
+}
+
 void kl_ovrp_set_display_frequency(float hz) {
     // An explicit override wins over a measurement — the whole point of forcing
     // a rate is a guest that mishandles the real one, so letting the compositor's

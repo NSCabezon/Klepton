@@ -118,6 +118,10 @@ typedef struct {
     double   since_video_s;     // since the last decoded frame; -1 = never
     // The last full second.
     float    video_fps, decode_ms, kbps, rtt_ms, p2p_ms;
+    float    interval_ms, interval_sd_ms;   // between decoded frames: cadence
+    uint32_t fec_fixed;         // total fragments rebuilt from parity
+    // Whole-session means: decode, and the decoded-frame interval + its sd.
+    float    decode_ms_mean, interval_ms_mean, interval_sd_ms_all;
     // Totals.
     uint32_t frames_decoded, frames_lost, idr_requests, decode_errors,
              pose_misses, poses_sent;
@@ -125,6 +129,24 @@ typedef struct {
 } kl_stream_client_status;
 
 void kl_stream_client_get_status(kl_stream_client *c, kl_stream_client_status *s);
+
+// The decoded picture is native biplanar 4:2:0 ('420v', or 'x420' for a
+// 10-bit stream) unless KL_STREAM_DECODE_BGRA=1. The app turns it into the
+// per-eye RGB stage textures with this Metal source — vertex kl_stream_yuv_v,
+// fragment kl_stream_yuv_f (texture 0 = luma plane as R8/R16Unorm, texture 1 =
+// chroma plane as RG8/RG16Unorm, buffer 0 = kl_stream_yuv_uniforms), one
+// render pass per eye (slice) into a bgra8Unorm (NOT _srgb) VIEW of the
+// bgra8Unorm_srgb stage texture, sized eye_w x frame_h: it writes the
+// sRGB-encoded bytes as they are (texture usage needs .pixelFormatView).
+// Shared by KleptonStreamClient.swift and the Mac harness, so the conversion
+// the headset runs is the one measured and checked on the Mac.
+typedef struct {
+    uint32_t x0, eye_w, frame_w, frame_h;   // x0 = eye * eye_w
+    float    y_off, y_scale, c_off, c_scale;
+} kl_stream_yuv_uniforms;
+const char *kl_stream_yuv_msl(void);
+// Range constants for a decoded pixel format (x0/eye_w/frame_* left 0).
+void kl_stream_yuv_params(OSType pixfmt, kl_stream_yuv_uniforms *u);
 const char *kl_stream_client_state_name(int state);
 
 #ifdef __cplusplus

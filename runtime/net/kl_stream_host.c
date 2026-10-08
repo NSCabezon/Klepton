@@ -16,12 +16,25 @@
 //   KL_STREAM_PORT=9944          UDP port (KL_STREAM_PORT_DEFAULT)
 //   KL_STREAM_NAME=<s>           Bonjour instance name (default: computer name)
 //   KL_STREAM_BITRATE_KBPS=100000  average bitrate; capped by HELLO.max_bitrate_kbps
-//   KL_STREAM_FPS=60             ExpectedFrameRate / HELLO_ACK.host_fps_target
-//   KL_STREAM_SCALE=1.0          encoded eye size = HELLO eye size x this
+//   KL_STREAM_FPS=<lock or 60>   ExpectedFrameRate / HELLO_ACK.host_fps_target
+//   KL_STREAM_LOCK_FPS=45        pace the guest's WaitGetPoses to this rate and tell
+//                                it a display of this rate (0 = free-running, the
+//                                client's Hz). Even cadence; the headset reprojects
+//                                to 90 Hz.
+//   KL_STREAM_SCALE=<unset>      unset: encoded eye size = what the guest SUBMITS
+//                                (its rendered rect, KL_STREAM_MAX_EYE caps the
+//                                longest side). Set: HELLO eye size x this.
+//   KL_STREAM_MAX_EYE=0          cap on the auto eye size's longest side (0 = none)
+//   KL_STREAM_MAX_MPIX=7.0       cap on the auto frame's megapixels, both eyes (0 = none):
+//                                the encoder's 45 fps budget (~2.4 ms/MP on M1 Max)
+//   KL_STREAM_PACE_MS=8          spread each frame's packets over this long (0 = burst)
+//   KL_STREAM_FEC=10             one XOR parity packet per N fragments (0 = off)
+//   KL_STREAM_TEST_DROP=0        drop this fraction of VIDEO packets (loss tests)
 //   KL_STREAM_WAIT=1             wait for the first HELLO before booting the guest
 //                                (0 = boot now with the built-in Vision Pro defaults)
 //   KL_STREAM_TIMEOUT_MS=2000    no POSE for this long = client gone
 //   KL_STREAM_PREVIEW=1          local preview window of the encoded SBS frame
+//   KL_STREAM_BONJOUR=0          do not advertise (loopback tests)
 #include "kl_stream_host.h"
 #include "kl_stream_proto.h"
 
@@ -32,6 +45,9 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +57,11 @@
 #include <unistd.h>
 
 #include "kl_env.h"
+#include "kl_openvr.h"
 #include "kl_ovrp.h"
+#include "kl_stream_tx.h"
 #include "kl_vulkan.h"
+#include <mach/mach_time.h>
 
 #define SH "[stream-host] "
 
@@ -86,6 +105,8 @@ static int g_guest_running;        // set once the guest thread exists
 static volatile int g_idr;         // force a keyframe on the next frame
 static uint32_t g_seq[16];         // per-type send sequence
 static uint32_t g_frame_id;
+static double g_pace_period, g_pace_next;   // KL_STREAM_LOCK_FPS (pace_wait)
+static volatile int g_pace_off;   // KL_STREAM_LOCK_AB: this half is free-running
 
 // pose_id -> host receipt time, for the pose-age statistic
 #define POSE_RING 1024
@@ -100,6 +121,17 @@ static struct {
     uint64_t bytes;
     double   rtt_ms;
     unsigned long long total_frames, total_key;
+    unsigned parity, dropped, queue_drops;
+    // guest cadence: intervals between new guest frames (frame thread)
+    double   iv_sum, iv_sq;
+    unsigned iv_n;
+    double   iv_max;
+    // the guest's own frame clock: WaitGetPoses to WaitGetPoses (pace_wait)
+    double   wgp_sum, wgp_sq, wgp_max;
+    unsigned wgp_n, wgp_late, wgp_wake_late;   // overran the slot / woke > 1 ms late
+    // frames actually handed to the encoder: the cadence the headset gets
+    double   enc_sum, enc_sq, enc_max;
+    unsigned enc_n;
 } S;
 
 static void hdr_init(kl_stream_hdr *h, uint16_t type) {
@@ -158,6 +190,18 @@ static void send_to(const struct sockaddr_storage *a, socklen_t al, const void *
 
 // ---- display description -> kl_ovrp ------------------------------------------
 
+// KL_STREAM_LOCK_FPS (default 45; 0 = off).
+static float lock_fps(void) {
+    float f = kl_env_float("KL_STREAM_LOCK_FPS", 45.0f);
+    return f >= 10.0f && f <= 240.0f ? f : 0.0f;
+}
+// Auto encode size (KL_STREAM_SCALE unset): follow what the guest submits.
+static int auto_size(void) {
+    const char *e = getenv("KL_STREAM_SCALE");
+    return !e || !*e;
+}
+
+
 static void apply_display(const char *who, const char *device, float hz,
                           uint32_t eye_w, uint32_t eye_h, const kl_stream_eye eye[2]) {
     int late = __atomic_load_n(&g_guest_running, __ATOMIC_ACQUIRE);
@@ -172,7 +216,11 @@ static void apply_display(const char *who, const char *device, float hz,
         C.tan[e][0] = d->tan_left; C.tan[e][1] = d->tan_right;
         C.tan[e][2] = d->tan_up;   C.tan[e][3] = d->tan_down;
     }
-    if (hz > 0) kl_ovrp_set_display_frequency(hz);
+    // With the lock the guest is told the LOCKED rate: Alyx paces its own
+    // frame timing/prediction against the display it is told about, and the
+    // headset reprojects to its real 90 Hz.
+    float told = lock_fps() > 0 ? lock_fps() : hz;
+    if (told > 0) kl_ovrp_set_display_frequency(told);
     if (eye_w && eye_h) kl_ovrp_set_eye_texture_size((int)eye_w, (int)eye_h);
     C.hz = hz; C.eye_w = eye_w; C.eye_h = eye_h;
     fprintf(stderr, SH "display from %s (%s): %.1f Hz, eye %ux%u, IPD %.1f mm, "
@@ -262,7 +310,7 @@ static void on_hello(const kl_stream_hello *m, size_t n,
         int kbps = kl_env_int("KL_STREAM_BITRATE_KBPS", 100000);
         if (m->max_bitrate_kbps && (int)m->max_bitrate_kbps < kbps) kbps = (int)m->max_bitrate_kbps;
         C.kbps = kbps;
-        C.fps = kl_env_float("KL_STREAM_FPS", 60.0f);
+        C.fps = kl_env_float("KL_STREAM_FPS", lock_fps() > 0 ? lock_fps() : 60.0f);
         C.addr = *from; C.addr_len = fl;
         C.active = 1;
         // A new session numbers its poses from scratch, so a pose_id the guest
@@ -270,8 +318,9 @@ static void on_hello(const kl_stream_hello *m, size_t n,
         // this client's: frames until its first POSE is drawn go out with 0.
         memset(g_pose_ring, 0, sizeof g_pose_ring);
         g_idr = 1;
-        fprintf(stderr, SH "client %s connected: streaming %dx%d HEVC at %d kbit/s, %.0f fps target\n",
-                who, C.frame_w, C.frame_h, C.kbps, (double)C.fps);
+        fprintf(stderr, SH "client %s connected: streaming %s%dx%d HEVC at %d kbit/s, %.0f fps target%s\n",
+                who, auto_size() ? "(until the guest submits) " : "", C.frame_w, C.frame_h, C.kbps,
+                (double)C.fps, lock_fps() > 0 ? " (locked)" : "");
     }
     C.last_heard = now;
     C.configured = 1;
@@ -385,6 +434,30 @@ static void stats_tick(double dt) {
             (double)S.bytes * 8.0 / 1e6 / dt, S.packets / dt, S.poses / dt,
             S.age_n ? S.age_ms / S.age_n : 0.0, S.rtt_ms, who,
             S.total_frames, S.total_key, S.send_err ? " SEND ERRORS" : "");
+    if (S.iv_n) {
+        double m = S.iv_sum / S.iv_n, var = S.iv_sq / S.iv_n - m * m;
+        fprintf(stderr, SH "  guest cadence: %.1f fps, interval %.1f ms, sd %.2f ms, max %.1f ms; "
+                           "%u parity pkts (FEC %d), pace %.1f ms%s%s\n",
+                S.iv_n / dt, m, var > 0 ? sqrt(var) : 0.0, S.iv_max, S.parity,
+                kl_env_int("KL_STREAM_FEC", 10), (double)kl_env_float("KL_STREAM_PACE_MS", 8.0f),
+                S.dropped ? " (test drops on)" : "",
+                g_pace_period <= 0 ? " [free]" : g_pace_off ? " [AB: free]" : " [locked]");
+    }
+    if (S.wgp_n) {
+        double m = S.wgp_sum / S.wgp_n, var = S.wgp_sq / S.wgp_n - m * m;
+        fprintf(stderr, SH "  guest WaitGetPoses: %.1f fps, interval %.1f ms, sd %.2f ms, max %.1f ms, "
+                           "%u overran their slot, %u woke >1 ms late%s\n",
+                S.wgp_n / dt, m, var > 0 ? sqrt(var) : 0.0, S.wgp_max, S.wgp_late, S.wgp_wake_late,
+                g_pace_off ? " [AB: free]" : " [locked]");
+    }
+    if (S.enc_n) {
+        double m = S.enc_sum / S.enc_n, var = S.enc_sq / S.enc_n - m * m;
+        fprintf(stderr, SH "  frames encoded: %.1f fps, interval %.1f ms, sd %.2f ms, max %.1f ms%s\n",
+                S.enc_n / dt, m, var > 0 ? sqrt(var) : 0.0, S.enc_max,
+                g_pace_period <= 0 ? " [free]" : g_pace_off ? " [AB: free]" : " [locked]");
+    }
+    if (S.queue_drops) fprintf(stderr, SH "  %u encoded frames dropped: the sender queue was full\n",
+                               S.queue_drops);
     if (S.retries) fprintf(stderr, SH "  %u sends retried on a full interface queue (ENOBUFS)\n", S.retries);
     if (f) fprintf(stderr, SH "  pose tag check: frame head vs echoed POSE head differ by %.3f deg "
                            "at worst%s\n", (double)S.tag_err_deg,
@@ -394,6 +467,10 @@ static void stats_tick(double dt) {
     S.frames = S.keyframes = S.packets = S.poses = S.send_err = 0;
     S.enc_ms = S.compose_ms = S.age_ms = S.render_ms = S.send_ms = 0;
     S.retries = S.skipped = S.untagged = 0;
+    S.parity = S.dropped = S.queue_drops = 0;
+    S.iv_sum = S.iv_sq = S.iv_max = 0; S.iv_n = 0;
+    S.wgp_sum = S.wgp_sq = S.wgp_max = 0; S.wgp_n = 0; S.wgp_late = S.wgp_wake_late = 0;
+    S.enc_sum = S.enc_sq = S.enc_max = 0; S.enc_n = 0;
     S.tag_err_deg = 0;
     S.age_n = 0;
     S.bytes = 0;
@@ -478,6 +555,9 @@ int kl_stream_host_start(const char *guest) {
         close(g_fd); g_fd = -1;
         return -1;
     }
+    if (!kl_env_on("KL_STREAM_BONJOUR", 1)) {
+        fprintf(stderr, SH "Bonjour off (KL_STREAM_BONJOUR=0): reachable by address only\n");
+    } else {
     TXTRecordRef txt;
     TXTRecordCreate(&txt, 0, NULL);
     TXTRecordSetValue(&txt, "guest", (uint8_t)strlen(g_guest), g_guest);
@@ -493,6 +573,7 @@ int kl_stream_host_start(const char *guest) {
     if (e != kDNSServiceErr_NoError) {
         fprintf(stderr, SH "DNSServiceRegister failed (%d) — reachable by address only\n", (int)e);
         g_dns = NULL;
+    }
     }
     pthread_t t;
     if (pthread_create(&t, NULL, net_thread, NULL)) { perror(SH "pthread_create"); return -1; }
@@ -518,41 +599,89 @@ int kl_stream_host_wait_hello(double timeout_s, const volatile int *quit) {
 
 // ---- frame out ---------------------------------------------------------------------
 
+// The encoder's output goes through a small queue to the sender thread, which
+// paces each frame's packets over KL_STREAM_PACE_MS (kl_stream_tx.c) without
+// holding VideoToolbox's callback thread. When a newer frame is already
+// waiting the current one is sent out at once (`hurry`), so pacing never adds
+// a frame of latency.
+#define TXQ 4
+static struct {
+    kl_stream_frame_meta m;
+    uint8_t *au;
+    size_t   n;
+    int      key;
+    float    ms_encode;
+} g_txq[TXQ];
+static unsigned g_txq_head, g_txq_tail;      // head = next to send
+static pthread_mutex_t g_txq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_txq_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_tx_hurry;
+
 static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t n,
                        int keyframe, float ms_encode) {
-    uint8_t pkt[sizeof(kl_stream_video) + KL_STREAM_MTU_PAYLOAD];
-    kl_stream_video *v = (kl_stream_video *)pkt;
-    memset(v, 0, sizeof *v);
-    v->frame_id = m->frame_id;
-    v->pose_id = m->pose_id;
-    v->t_pose = m->t_pose;
-    v->flags = keyframe ? KL_STREAM_VIDEO_KEYFRAME : 0;
-    v->frame_bytes = (uint32_t)n;
-    uint32_t count = (uint32_t)((n + KL_STREAM_MTU_PAYLOAD - 1) / KL_STREAM_MTU_PAYLOAD);
-    v->frag_count = (uint16_t)count;
-    memcpy(v->tan, m->tan, sizeof v->tan);
-    v->host_ms_render = m->ms_render;
-    v->host_ms_encode = ms_encode;
-    if (count > 0xffff) {
+    uint8_t *copy = malloc(n ? n : 1);
+    if (!copy) return;
+    memcpy(copy, au, n);
+    pthread_mutex_lock(&g_txq_mu);
+    if (g_txq_tail - g_txq_head >= TXQ) {
+        // The link is not keeping up: drop this frame and ask for a keyframe,
+        // since every later P-frame would reference it.
+        pthread_mutex_unlock(&g_txq_mu);
+        free(copy);
+        S.queue_drops++;
+        g_idr = 1;
+        return;
+    }
+    unsigned i = g_txq_tail % TXQ;
+    g_txq[i].m = *m; g_txq[i].au = copy; g_txq[i].n = n;
+    g_txq[i].key = keyframe; g_txq[i].ms_encode = ms_encode;
+    g_txq_tail++;
+    g_tx_hurry = g_txq_tail - g_txq_head > 1;
+    pthread_cond_signal(&g_txq_cv);
+    pthread_mutex_unlock(&g_txq_mu);
+}
+
+static int tx_send(void *ctx, void *pkt, size_t n) {
+    (void)ctx;
+    hdr_init((kl_stream_hdr *)pkt, KL_STREAM_VIDEO);
+    return send_client(pkt, n);
+}
+
+static void send_frame(const kl_stream_frame_meta *m, const uint8_t *au, size_t n,
+                       int keyframe, float ms_encode) {
+    kl_stream_video v;
+    memset(&v, 0, sizeof v);
+    v.frame_id = m->frame_id;
+    v.pose_id = m->pose_id;
+    v.t_pose = m->t_pose;
+    v.flags = keyframe ? KL_STREAM_VIDEO_KEYFRAME : 0;
+    memcpy(v.tan, m->tan, sizeof v.tan);
+    v.host_ms_render = m->ms_render;
+    v.host_ms_encode = ms_encode;
+    static int fec = -1;
+    static double pace_s, drop;
+    if (fec < 0) {
+        fec = kl_env_int("KL_STREAM_FEC", 10);
+        pace_s = kl_env_float("KL_STREAM_PACE_MS", 8.0f) / 1000.0;
+        drop = kl_env_float("KL_STREAM_TEST_DROP", 0.0f);
+        fprintf(stderr, SH "sender: FEC %d (1 XOR parity packet per N fragments, 0 = off), "
+                        "pace %.1f ms per frame (0 = burst), test drop %.3f\n",
+                fec, pace_s * 1000.0, drop);
+    }
+    kl_stream_tx_result r;
+    double t_send0 = kl_stream_host_now();
+    if (kl_stream_tx_frame(&v, au, n, fec, pace_s, &g_tx_hurry, drop, tx_send, NULL, &r) != 0) {
         fprintf(stderr, SH "frame %u is %zu bytes — more fragments than the protocol can "
                         "number; dropped (lower KL_STREAM_BITRATE_KBPS)\n", m->frame_id, n);
         return;
-    }
-    unsigned sent = 0;
-    double t_send0 = kl_stream_host_now();
-    for (uint32_t i = 0; i < count; i++) {
-        size_t off = (size_t)i * KL_STREAM_MTU_PAYLOAD;
-        size_t len = n - off < KL_STREAM_MTU_PAYLOAD ? n - off : KL_STREAM_MTU_PAYLOAD;
-        hdr_init(&v->h, KL_STREAM_VIDEO);
-        v->frag_index = (uint16_t)i;
-        memcpy(pkt + sizeof *v, au + off, len);
-        if (send_client(pkt, sizeof *v + len) == 0) sent++;
     }
     S.send_ms += (kl_stream_host_now() - t_send0) * 1000.0;
     S.frames++;
     S.total_frames++;
     if (keyframe) { S.keyframes++; S.total_key++; }
-    S.packets += sent;
+    S.packets += r.sent;
+    S.parity += r.parity;
+    S.dropped += r.dropped;
     S.bytes += n;
     S.enc_ms += ms_encode;
     S.compose_ms += (m->t_encode_start - m->t_compose_start) * 1000.0;
@@ -563,19 +692,199 @@ static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
     }
 }
 
+static void *sender_thread(void *arg) {
+    (void)arg;
+    pthread_setname_np("klepton stream tx");
+    for (;;) {
+        pthread_mutex_lock(&g_txq_mu);
+        while (g_txq_head == g_txq_tail) pthread_cond_wait(&g_txq_cv, &g_txq_mu);
+        unsigned i = g_txq_head % TXQ;
+        kl_stream_frame_meta m = g_txq[i].m;
+        uint8_t *au = g_txq[i].au;
+        size_t n = g_txq[i].n;
+        int key = g_txq[i].key;
+        float ms = g_txq[i].ms_encode;
+        g_tx_hurry = g_txq_tail - g_txq_head > 1;
+        pthread_mutex_unlock(&g_txq_mu);
+        send_frame(&m, au, n, key, ms);
+        free(au);
+        pthread_mutex_lock(&g_txq_mu);
+        g_txq_head++;
+        g_tx_hurry = g_txq_tail - g_txq_head > 1;
+        pthread_mutex_unlock(&g_txq_mu);
+    }
+    return NULL;
+}
+
+// ---- KL_STREAM_LOCK_FPS: the guest's frame clock ----------------------------
+// The host has no compositor vsync: Alyx's WaitGetPoses returns at once and the
+// guest runs as fast as the Mac lets it — 33-40 fps wandering, which the
+// headset shows as judder against its 90 Hz. This makes WaitGetPoses return on
+// a fixed grid of 1/lock seconds instead. A frame that overruns its slot by
+// less than half a period keeps the grid (the next one starts at once); more
+// than that re-anchors the grid at now rather than bursting to catch up.
+// The interval between WaitGetPoses RETURNS (when the game starts a frame,
+// which is what sets the picture cadence), for the 1 s line.
+static void note_wgp(double t) {
+    static double t_prev;
+    if (t_prev > 0) {
+        double iv = (t - t_prev) * 1000.0;
+        S.wgp_sum += iv; S.wgp_sq += iv * iv; S.wgp_n++;
+        if (iv > S.wgp_max) S.wgp_max = iv;
+    }
+    t_prev = t;
+}
+
+static void pace_wait(void) {
+    static mach_timebase_info_data_t tb;
+    static double ab_s = -1;
+    if (!tb.denom) mach_timebase_info(&tb);
+    double now = kl_stream_host_now();
+    // KL_STREAM_LOCK_AB=<s>: alternate locked / free every <s> seconds, for an
+    // A/B of the cadence inside one run (the 1 s line says which is on).
+    if (ab_s < 0) ab_s = kl_env_float("KL_STREAM_LOCK_AB", 0.0f);
+    if (ab_s > 0 && ((long)(now / ab_s) & 1)) {
+        g_pace_next = 0; g_pace_off = 1;
+        note_wgp(now);
+        return;
+    }
+    g_pace_off = 0;
+    if (g_pace_next <= 0) g_pace_next = now;
+    static int qos;
+    if (!qos++) {
+        // The game's frame thread decides the cadence: wake it like one.
+        // (Measured on a loaded Mac: at default QoS 30+ of 45 wakes a second
+        // came > 1 ms late, sd 3 ms on a grid that was otherwise exact.)
+        int rq = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        fprintf(stderr, SH "pacer: guest frame thread QoS user-interactive: %s\n", rq ? strerror(rq) : "ok");
+        if (kl_env_on("KL_STREAM_PACE_RT", 0)) {
+            // Mach time-constraint (real-time) policy for the waiting thread:
+            // period = the lock, a small computation budget. Experimental.
+            thread_time_constraint_policy_data_t pol;
+            double tps = (double)tb.denom / tb.numer * 1e9;   // ticks per second
+            pol.period = (uint32_t)(g_pace_period * tps);
+            pol.computation = (uint32_t)(0.002 * tps);
+            pol.constraint = (uint32_t)(0.004 * tps);
+            pol.preemptible = 1;
+            kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                                 THREAD_TIME_CONSTRAINT_POLICY,
+                                                 (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+            fprintf(stderr, SH "pacer: real-time policy (KL_STREAM_PACE_RT=1): %s\n", kr ? "refused" : "ok");
+        }
+    }
+    if (now < g_pace_next) {
+        // Sleep to KL_STREAM_PACE_SPIN_MS (1.5) before the slot, then spin:
+        // the kernel's wake-up is the jitter, not the clock.
+        static double spin = -1;
+        if (spin < 0) spin = kl_env_float("KL_STREAM_PACE_SPIN_MS", 1.5f) / 1000.0;
+        double sleep_to = g_pace_next - spin;
+        if (sleep_to > now) {
+            uint64_t ticks = (uint64_t)((sleep_to - now) * 1e9 * tb.denom / tb.numer);
+            mach_wait_until(mach_absolute_time() + ticks);
+        }
+        while (kl_stream_host_now() < g_pace_next) { /* spin */ }
+        if (kl_stream_host_now() - g_pace_next > 0.001) S.wgp_wake_late++;
+    } else if (now - g_pace_next > 0.002) {
+        S.wgp_late++;
+        // Overran its slot: start now and re-anchor the grid here. Never
+        // catch up — a short frame after a long one is the 27/17 ms
+        // alternation that reads as judder (measured: sd 6.5 ms that way).
+        g_pace_next = now;
+    }
+    note_wgp(kl_stream_host_now());
+    g_pace_next += g_pace_period;
+}
+
+void kl_stream_host_install_pacer(void) {
+    float f = lock_fps();
+    if (f <= 0) {
+        fprintf(stderr, SH "frame rate NOT locked (KL_STREAM_LOCK_FPS=0): the guest runs free\n");
+        return;
+    }
+    g_pace_period = 1.0 / f;
+    kl_openvr_set_frame_pacer(pace_wait);
+    fprintf(stderr, SH "frame rate locked to %.1f fps: WaitGetPoses paced to %.1f ms, the guest is "
+                    "told a %.1f Hz display (KL_STREAM_LOCK_FPS=0 to run free)\n",
+            (double)f, 1000.0 / f, (double)f);
+}
+
 static volatile int g_sig;
 static void on_sig(int s) { (void)s; g_sig = 1; }
 
 typedef struct { const volatile int *quit; } frame_args;
 
+// The encoded eye size when KL_STREAM_SCALE is unset: the largest rect the
+// guest submitted over the last ~60 frames (Alyx's dynamic resolution may
+// alternate sizes frame to frame; the max is what keeps every frame 1:1 or
+// downscaled, never upscaled), adopted once it has been the target for 30
+// frames so a change re-creates the encoder (a keyframe) rarely. Even sizes.
+static void pick_auto_size(int *fw, int *fh) {
+    static int cur_w, cur_h, cand_w, cand_h, cand_n, said;
+    static int hist_w[64], hist_h[64], hist_i;
+    int w = 0, h = 0;
+    for (int e = 0; e < 2; e++) {
+        int ew = 0, eh = 0;
+        if (kl_ovrp_submit_size(e, &ew, &eh)) { if (ew > w) w = ew; if (eh > h) h = eh; }
+    }
+    if (w <= 0 || h <= 0) {
+        if (cur_w) { *fw = 2 * cur_w; *fh = cur_h; }
+        return;   // nothing submitted yet: the HELLO-derived size
+    }
+    int w0 = w, h0 = h;
+    int cap = kl_env_int("KL_STREAM_MAX_EYE", 0);
+    if (cap > 0 && (w > cap || h > cap)) {
+        double sc = (double)cap / (w > h ? w : h);
+        w = (int)(w * sc + 0.5); h = (int)(h * sc + 0.5);
+    }
+    // The encoder's budget: VideoToolbox HEVC on the M1 Max takes ~2.4 ms per
+    // megapixel of the side-by-side frame and does not overlap frames, so its
+    // throughput is 1/latency (4608x1920 22 ms, 6144x2400 35.6 ms). 7 MP is
+    // ~17 ms: 45 fps with room for the compose. 0 = no budget.
+    float mpix = kl_env_float("KL_STREAM_MAX_MPIX", 7.0f);
+    if (mpix > 0 && 2.0 * w * h > mpix * 1e6) {
+        double sc = sqrt(mpix * 1e6 / (2.0 * w * h));
+        w = (int)(w * sc + 0.5); h = (int)(h * sc + 0.5);
+    }
+    w = (w + 1) & ~1; h = (h + 1) & ~1;
+    hist_w[hist_i % 64] = w; hist_h[hist_i % 64] = h; hist_i++;
+    int mw = 0, mh = 0;
+    for (int i = 0; i < 64 && i < hist_i; i++) {
+        if (hist_w[i] > mw) mw = hist_w[i];
+        if (hist_h[i] > mh) mh = hist_h[i];
+    }
+    if (!cur_w) { cur_w = mw; cur_h = mh; }
+    else if (mw != cur_w || mh != cur_h) {
+        if (mw == cand_w && mh == cand_h) cand_n++;
+        else { cand_w = mw; cand_h = mh; cand_n = 1; }
+        if (cand_n >= 30) { cur_w = cand_w; cur_h = cand_h; cand_n = 0; said = 0; }
+    } else cand_n = 0;
+    if (!said++)
+        fprintf(stderr, SH "encode size follows the guest: it submits %dx%d per eye -> encoding "
+                        "%dx%d (both eyes; KL_STREAM_MAX_MPIX %.1f / KL_STREAM_MAX_EYE cap it, "
+                        "KL_STREAM_SCALE overrides)\n", w0, h0,
+                2 * cur_w, cur_h, (double)kl_env_float("KL_STREAM_MAX_MPIX", 7.0f));
+    *fw = 2 * cur_w; *fh = cur_h;
+}
+
 static void *frame_thread(void *arg) {
     const volatile int *quit = ((frame_args *)arg)->quit;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     unsigned long long last = kl_vulkan_frame_serial();
     int said_first = 0;
     while (!(quit && *quit) && !g_sig) {
         unsigned long long s = kl_vulkan_frame_serial();
         if (s == last) { usleep(500); continue; }
         last = s;
+        {
+            static double t_prev;
+            double tn = kl_stream_host_now();
+            if (t_prev > 0) {
+                double iv = (tn - t_prev) * 1000.0;
+                S.iv_sum += iv; S.iv_sq += iv * iv; S.iv_n++;
+                if (iv > S.iv_max) S.iv_max = iv;
+            }
+            t_prev = tn;
+        }
         // The haptics envelope: once per hand per guest frame (kl_ovrp.h), and
         // forwarded only while someone can feel it.
         pthread_mutex_lock(&g_mu);
@@ -598,6 +907,7 @@ static void *frame_thread(void *arg) {
         if (!on || fw <= 0) continue;
         int stage = kl_ovrp_last_complete_stage();
         if (stage < 0) continue;
+        if (auto_size()) pick_auto_size(&fw, &fh);
         kl_ovrp_render_pose r;
         if (!kl_ovrp_stage_render_pose(stage, &r)) continue;
         kl_stream_frame_meta m;
@@ -633,6 +943,14 @@ static void *frame_thread(void *arg) {
         int rc = kl_stream_enc_frame(stage, fw, fh, kbps, fps, idr, &m, on_encoded);
         if (rc == -2) S.skipped++;
         if (rc == 0) {
+            static double t_prev_enc;
+            double tn = kl_stream_host_now();
+            if (t_prev_enc > 0) {
+                double iv = (tn - t_prev_enc) * 1000.0;
+                S.enc_sum += iv; S.enc_sq += iv * iv; S.enc_n++;
+                if (iv > S.enc_max) S.enc_max = iv;
+            }
+            t_prev_enc = tn;
             g_frame_id++;
             if (!said_first++)
                 fprintf(stderr, SH "first frame to the encoder: stage %d, pose_id %u, tangents "
@@ -693,7 +1011,9 @@ int kl_stream_host_run(const volatile int *quit) {
     signal(SIGTERM, on_sig);
     static frame_args fa;
     fa.quit = quit;
-    pthread_t ft;
+    pthread_t ft, st;
+    if (pthread_create(&st, NULL, sender_thread, NULL)) { perror(SH "pthread_create"); return 1; }
+    pthread_detach(st);
     if (pthread_create(&ft, NULL, frame_thread, &fa)) { perror(SH "pthread_create"); return 1; }
     fprintf(stderr, SH "frame-out running (audio stays on this Mac's output in this milestone)%s\n",
             kl_env_on("KL_STREAM_PREVIEW", 0) ? "; preview window on" : "");

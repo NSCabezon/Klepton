@@ -1215,9 +1215,13 @@ static void hand_trace_frame(void) {
     t0 = now;
 }
 
+static void (*g_wgp_pacer)(void);
+void kl_openvr_set_frame_pacer(void (*wait)(void)) { g_wgp_pacer = wait; }
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
+    if (g_wgp_pacer) g_wgp_pacer();
     ovr_pipeline_report();
     ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
@@ -1753,6 +1757,7 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     uint32_t w, h;
     eye_size(&w, &h);
     if (!w || !h || x1 <= x0 || y1 <= y0) return -1;
+    kl_ovrp_note_submit_size(eye, x1 - x0, y1 - y0);
     // KL_OPENVR_STAGE_SCALE=0 (KL_OPENVR_MINIMAL): no rescale. The stage image
     // is exactly the rendered rect, copied 1:1, and the compositor slot is
     // pointed at it for this frame — the picture reaches the compositor with

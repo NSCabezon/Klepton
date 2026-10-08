@@ -339,26 +339,28 @@ hevc: build/t_hevc
 #                              POSE at 90 Hz, reassembly, decode, ring-pose
 #                              check, PNGs in build/stream/
 #
-# `make streamtest` runs one against the other on loopback, clean and then with
-# 1% fragment loss (which must be recovered by IDR requests). Not in `make
+# `make streamtest` runs one against the other on loopback, clean, then with
+# 1% packet loss twice: with the default FEC (losses rebuilt from parity) and
+# with KL_STREAM_FEC=0 (recovered by IDR requests). Not in `make
 # check`: it needs the hardware HEVC encoder and a free UDP port.
 .PHONY: testhost streamtest
-build/kl_stream_testhost: tools/kl_stream_testhost.m runtime/net/kl_stream_proto.h
+build/kl_stream_testhost: tools/kl_stream_testhost.m runtime/net/kl_stream_proto.h \
+                          runtime/net/kl_stream_tx.c runtime/net/kl_stream_tx.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -O2 -fobjc-arc -o $@ tools/kl_stream_testhost.m \
+	$(CC) $(CFLAGS) -O2 -fobjc-arc -o $@ tools/kl_stream_testhost.m runtime/net/kl_stream_tx.c \
 	  -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
 	  -framework CoreGraphics -framework CoreText -framework Foundation
 
 testhost: build/kl_stream_testhost
 
-build/kl_stream_harness: tools/kl_stream_harness.c $(RUNTIME) $(RUNTIME_HDRS)
+build/kl_stream_harness: tools/kl_stream_harness.c tools/kl_stream_harness_mtl.m $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/kl_stream_harness.c $(RUNTIME) $(LDLIBS) \
-	  -framework CoreGraphics -framework ImageIO
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/kl_stream_harness.c tools/kl_stream_harness_mtl.m $(RUNTIME) $(LDLIBS) \
+	  -framework CoreGraphics -framework ImageIO -framework Metal -framework Foundation
 
 STREAMTEST_PORT ?= 19944
 streamtest: build/kl_stream_testhost build/kl_stream_harness
-	@rm -rf build/stream && mkdir -p build/stream/clean build/stream/lossy
+	@rm -rf build/stream && mkdir -p build/stream/clean build/stream/lossy build/stream/lossy-nofec
 	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
 	  KL_TESTHOST_HAPTICS_S=2 ./build/kl_stream_testhost > build/stream/clean/host.log 2>&1 & \
 	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 \
@@ -369,6 +371,11 @@ streamtest: build/kl_stream_testhost build/kl_stream_harness
 	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
 	    --out build/stream/lossy > build/stream/lossy/client.log 2>&1; rc=$$?; \
 	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy/client.log; wait; exit $$rc
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_DROP=0.01 KL_STREAM_FEC=0 ./build/kl_stream_testhost > build/stream/lossy-nofec/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
+	    --out build/stream/lossy-nofec > build/stream/lossy-nofec/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy-nofec/client.log; wait; exit $$rc
 
 # The video TEXTURE gate: a natively-decoded biplanar frame through
 # CVMetalTextureCache + EGL_METAL_TEXTURE_ANGLE to sampled pixels, compared
@@ -443,7 +450,7 @@ vatest: build/t_variadic
 # runtime/net/kl_stream_host.{c,m} is the KL_STREAM_HOST=1 frontend ("Jugar
 # desde el Mac"): host-only like the viewer, so it is named here and nowhere in
 # RUNTIME_SHIP.
-STREAM_HOST := runtime/net/kl_stream_host.c runtime/net/kl_stream_host_mtl.m
+STREAM_HOST := runtime/net/kl_stream_host.c runtime/net/kl_stream_host_mtl.m runtime/net/kl_stream_tx.c
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
               runtime/gfx/kl_view_mtl.m $(STREAM_HOST) $(RUNTIME_HDRS)
 	@mkdir -p build

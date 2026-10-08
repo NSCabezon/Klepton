@@ -30,7 +30,9 @@
 //   KL_TESTHOST_EYE      1024     cap on the per-eye size (longest side)
 //   KL_TESTHOST_KBPS     30000    average bitrate
 //   KL_TESTHOST_GOP      600      frames between scheduled keyframes
-//   KL_TESTHOST_DROP     0        probability of dropping each VIDEO fragment
+//   KL_TESTHOST_DROP     0        probability of dropping each VIDEO packet (data or parity)
+//   KL_STREAM_FEC        10       XOR parity packet per N fragments (0 = off)
+//   KL_STREAM_PACE_MS    8        spread a frame's packets over this long (0 = burst)
 //   KL_TESTHOST_HAPTICS_S 0       seconds between haptic buzzes (0 = never)
 //   KL_TESTHOST_SECONDS  0        run time, then BYE and exit (0 = forever)
 //   KL_TESTHOST_LOWLAT   1        try EnableLowLatencyRateControl
@@ -58,6 +60,7 @@
 #include <unistd.h>
 
 #include "kl_stream_proto.h"
+#include "kl_stream_tx.h"
 
 static double now_s(void) {
     static mach_timebase_info_data_t tb;
@@ -366,33 +369,40 @@ typedef struct {
     double t_render0, t_render1, t_enc0;
 } frame_meta;
 
+static int tx_send(void *ctx, void *pkt, size_t n) {
+    (void)ctx;
+    pthread_mutex_lock(&g_mu);
+    int ok = g_have_client;
+    send_to_client(pkt, n, KL_STREAM_VIDEO);
+    pthread_mutex_unlock(&g_mu);
+    return ok ? 0 : -1;
+}
+
+// Through the real host's sender (runtime/net/kl_stream_tx.c): same FEC and
+// pacing knobs (KL_STREAM_FEC, KL_STREAM_PACE_MS), plus KL_TESTHOST_DROP.
+static unsigned g_fec_parity, g_tx_dropped;
 static void send_frame(const uint8_t *data, size_t len, const frame_meta *m, int key) {
-    static double drop = -1;
-    if (drop < 0) drop = env_f("KL_TESTHOST_DROP", 0);
-    uint32_t id = ++g_frame_id;
-    uint16_t count = (uint16_t)((len + KL_STREAM_MTU_PAYLOAD - 1) / KL_STREAM_MTU_PAYLOAD);
-    uint8_t pkt[sizeof(kl_stream_video) + KL_STREAM_MTU_PAYLOAD];
-    for (uint16_t i = 0; i < count; i++) {
-        kl_stream_video v = {0};
-        v.frame_id = id;
-        v.pose_id = m->pose_id;
-        v.t_pose = m->t_pose;
-        v.flags = key ? KL_STREAM_VIDEO_KEYFRAME : 0;
-        v.frame_bytes = (uint32_t)len;
-        v.frag_index = i;
-        v.frag_count = count;
-        memcpy(v.tan, m->tan, sizeof v.tan);
-        v.host_ms_render = (float)((m->t_render1 - m->t_render0) * 1000);
-        v.host_ms_encode = (float)((now_s() - m->t_enc0) * 1000);
-        size_t off = (size_t)i * KL_STREAM_MTU_PAYLOAD;
-        size_t n = len - off < KL_STREAM_MTU_PAYLOAD ? len - off : KL_STREAM_MTU_PAYLOAD;
-        memcpy(pkt, &v, sizeof v);
-        memcpy(pkt + sizeof v, data + off, n);
-        if (drop > 0 && (double)arc4random() / UINT32_MAX < drop) continue;
-        pthread_mutex_lock(&g_mu);
-        send_to_client(pkt, sizeof v + n, KL_STREAM_VIDEO);
-        pthread_mutex_unlock(&g_mu);
+    static double drop = -1, pace_s;
+    static int fec;
+    if (drop < 0) {
+        drop = env_f("KL_TESTHOST_DROP", 0);
+        fec = env_int("KL_STREAM_FEC", 10);
+        pace_s = env_f("KL_STREAM_PACE_MS", 8) / 1000.0;
+        printf("[testhost] sender: FEC %d, pace %.1f ms, drop %.3f\n", fec, pace_s * 1000, drop);
     }
+    uint32_t id = ++g_frame_id;
+    kl_stream_video v = {0};
+    v.frame_id = id;
+    v.pose_id = m->pose_id;
+    v.t_pose = m->t_pose;
+    v.flags = key ? KL_STREAM_VIDEO_KEYFRAME : 0;
+    memcpy(v.tan, m->tan, sizeof v.tan);
+    v.host_ms_render = (float)((m->t_render1 - m->t_render0) * 1000);
+    v.host_ms_encode = (float)((now_s() - m->t_enc0) * 1000);
+    kl_stream_tx_result r;
+    if (kl_stream_tx_frame(&v, data, len, fec, pace_s, NULL, drop, tx_send, NULL, &r) != 0) return;
+    g_fec_parity += r.parity;
+    g_tx_dropped += r.dropped;
     g_bytes_sent += len;
     g_frames_sent++;
     if (key) g_keyframes++;
@@ -577,9 +587,11 @@ int main(int argc, char **argv) {
                 pthread_mutex_unlock(&g_mu);
                 if (have)
                     printf("[testhost] sent %.1f fps (%u key total), %.1f Mbps, poses in %.1f/s "
-                           "(last id %u, age %.1f ms), IDR requests %u, rtt %.1f ms\n",
+                           "(last id %u, age %.1f ms), IDR requests %u, rtt %.1f ms, "
+                           "parity %u, dropped %u\n",
                            g_frames_sent / dt, g_keyframes, g_bytes_sent * 8 / dt / 1e6, prx / dt,
-                           pose.pose_id, have_pose ? (now - pose.t_pose) * 1000 : 0, irx, rtt);
+                           pose.pose_id, have_pose ? (now - pose.t_pose) * 1000 : 0, irx, rtt,
+                           g_fec_parity, g_tx_dropped);
                 g_frames_sent = 0; g_bytes_sent = 0; last_report = now;
             }
             if (!have || !fw || !fh) continue;

@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define KL_STREAM_MAGIC        0x54534C4Bu   // "KLST"
-#define KL_STREAM_VERSION      1u
+#define KL_STREAM_VERSION      2u   // 2: VIDEO.fec_n + XOR parity packets
 #define KL_STREAM_PORT_DEFAULT 9944
 #define KL_STREAM_BONJOUR      "_klepton-stream._udp"
 #define KL_STREAM_MTU_PAYLOAD  1200          // video bytes per VIDEO packet; fits a 1280 IPv6 MTU
@@ -129,8 +129,19 @@ typedef struct {
 // enough to start reassembly. Payload: HEVC, length-prefixed NAL units
 // (4-byte big-endian length, as in an hvcC sample); a keyframe carries
 // VPS/SPS/PPS as its first NAL units.
+//
+// Forward error correction (v2): with fec_n > 0 the data fragments are taken
+// in groups of fec_n (group g = fragments g*fec_n .. g*fec_n+fec_n-1, the last
+// group may be shorter) and each group is followed by ONE parity packet:
+// a VIDEO packet with KL_STREAM_VIDEO_PARITY set, frag_index = the GROUP index,
+// and a payload that is the XOR of the group's data payloads, each zero-padded
+// to the group's first (longest) fragment — so its length is
+// min(KL_STREAM_MTU_PAYLOAD, frame_bytes - g*fec_n*KL_STREAM_MTU_PAYLOAD).
+// Any ONE missing data fragment of a group is rebuilt from the others plus
+// the parity. Encoder/decoder: runtime/net/kl_stream_tx.c / kl_stream_client.c.
 enum {
     KL_STREAM_VIDEO_KEYFRAME = 1u << 0,
+    KL_STREAM_VIDEO_PARITY   = 1u << 1,
 };
 typedef struct {
     kl_stream_hdr h;
@@ -146,7 +157,10 @@ typedef struct {
     float         tan[2][4];
     float         host_ms_render;  // guest frame work (WaitGetPoses -> Submit)
     float         host_ms_encode;  // encode time of this frame
+    uint16_t      fec_n;           // data fragments per parity group, 0 = no FEC (v2)
+    uint16_t      reserved;
     // followed by payload bytes: min(KL_STREAM_MTU_PAYLOAD, frame_bytes - frag_index*KL_STREAM_MTU_PAYLOAD)
+    // (a PARITY packet: see above)
 } kl_stream_video;
 
 typedef struct {
