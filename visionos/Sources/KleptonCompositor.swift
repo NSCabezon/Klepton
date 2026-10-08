@@ -474,6 +474,33 @@ final class KleptonCompositor {
     // it has had to stand in. See displayOriginFromDevice for why holding it is
     // not the same kind of guess as the identity it replaced.
     private var lastGoodOriginFromDevice: simd_float4x4?
+    // ---- KL_REPROJECT_DEPTH_MODE (kl_reproject.h) — the swim fix ----------
+    // 0: everything below is inert and the composite is the one it always was.
+    // 1: the drawable gets the anchor of the instant the picture was DRAWN at,
+    //    found in `anchorRing` (every anchor updatePoses handed the guest) by
+    //    the frame record's pose_time, so the system reprojects render ->
+    //    scanout. 2: the same, and the eye pass writes the game's own depth.
+    private let depthMode = Int(kl_reproject_depth_mode())
+    private var anchorRing: [(t: TimeInterval, anchor: DeviceAnchor)] = []
+    private var anchorRingNext = 0
+    private static let anchorRingSize = 32           // ~355 ms at 90 Hz
+    private var depthPipeline: MTLRenderPipelineState?
+    private var depthProbePipeline: MTLComputePipelineState?
+    private var depthProbeBuffers: [MTLBuffer] = []
+    private var depthProbeN = 0
+    private var depthProbeLast = 0.0
+    /// Always-pass WITH writes: what the guest's panels and Klepton's own
+    /// overlays are drawn with once the eye pass has written real scene depth
+    /// (mode 2), so a panel is never hidden behind the world it floats in and
+    /// still tells the system's reprojection where it is.
+    private var overSceneDepthState: MTLDepthStencilState?
+    /// Did the eye pass of the encoder being built write the game's depth?
+    private var depthWrittenThisPass = false
+    private var depth2DViews: [ObjectIdentifier: MTLTexture] = [:]
+    private var swimFrames = 0, swimRing = 0, swimQuery = 0, swimFallback = 0
+    private var swimDepthFrames = 0
+    private var swimAgeSum = 0.0, swimAgeMax = 0.0, swimAgeN = 0
+    private var swimT0 = 0.0
     private var anchorWalkedBack = 0
     private var anchorHeld = 0
     private var anchorUnknown = 0
@@ -655,6 +682,113 @@ final class KleptonCompositor {
         return recenterXform * held
     }
 
+    // MARK: depth reprojection (KL_REPROJECT_DEPTH_MODE)
+
+    private func pushRenderAnchor(_ anchor: DeviceAnchor, at t: TimeInterval) {
+        if anchorRing.count < Self.anchorRingSize {
+            anchorRing.append((t, anchor))
+        } else {
+            anchorRing[anchorRingNext] = (t, anchor)
+        }
+        anchorRingNext = (anchorRingNext + 1) % Self.anchorRingSize
+    }
+
+    /// The anchor the guest's picture was drawn with: the ring entry for the
+    /// frame record's `pose_time`, else the tracker asked for that instant
+    /// (the guest bridge PREDICTED its pose to an instant the ring never held),
+    /// else nil — and the caller then uses the display anchor, i.e. mode 0.
+    private func renderAnchor(for r: kl_ovrp_render_pose?,
+                              presentation: TimeInterval) -> DeviceAnchor? {
+        swimFrames += 1
+        guard let r, r.pose_time > 0 else { swimFallback += 1; return nil }
+        let t = r.pose_time
+        let age = presentation - t
+        if age > -1, age < 5 {
+            swimAgeSum += age; swimAgeN += 1
+            if age > swimAgeMax { swimAgeMax = age }
+        }
+        for e in anchorRing where abs(e.t - t) < 0.0005 {
+            swimRing += 1
+            return e.anchor
+        }
+        if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) {
+            swimQuery += 1
+            return a
+        }
+        swimFallback += 1
+        return nil
+    }
+
+    /// The MTLTexture behind kl_glfb's depth slot, as the `depth2d` the shader
+    /// declares. MoltenVK backs a 1-layer image with a 2D texture; anything
+    /// else gets a 2D view of its first slice (cached — one per texture).
+    private func eyeDepth(_ eye: Int, _ stage: Int) -> MTLTexture? {
+        guard let p = kl_glfb_eye_mtl_depth(Int32(eye), Int32(stage)) else { return nil }
+        let t = Unmanaged<MTLTexture>.fromOpaque(p).takeUnretainedValue() as MTLTexture
+        if t.textureType == .type2D { return t }
+        let key = ObjectIdentifier(t)
+        if let v = depth2DViews[key] { return v }
+        let v = t.makeTextureView(pixelFormat: t.pixelFormat, textureType: .type2D,
+                                  levels: 0..<1, slices: 0..<1)
+        if let v { depth2DViews[key] = v }
+        return v
+    }
+
+    /// Once a second in depth mode 2: a 32x32 sample of eye 0's depth, read on
+    /// the GPU after this frame, summarised by kl_reproject_depth_probe_note
+    /// for the [swim] line.
+    private func encodeDepthProbe(_ cmd: MTLCommandBuffer, stage: Int,
+                                  rendered: kl_ovrp_render_pose, haveRendered: Bool,
+                                  drawable: LayerRenderer.Drawable) {
+        guard depthMode == 2, let kp = depthProbePipeline, haveRendered,
+              rendered.depth_valid & 1 != 0, let d0 = eyeDepth(0, stage) else { return }
+        let now = CACurrentMediaTime()
+        guard now - depthProbeLast >= 1.0 else { return }
+        depthProbeLast = now
+        if depthProbeBuffers.isEmpty {
+            for _ in 0..<2 {
+                if let b = device.makeBuffer(length: Int(KL_DEPTH_PROBE_SIDE * KL_DEPTH_PROBE_SIDE)
+                                             * MemoryLayout<Float>.stride,
+                                             options: .storageModeShared) {
+                    depthProbeBuffers.append(b)
+                }
+            }
+        }
+        guard !depthProbeBuffers.isEmpty, let ce = cmd.makeComputeCommandEncoder() else { return }
+        let buf = depthProbeBuffers[depthProbeN % depthProbeBuffers.count]
+        depthProbeN += 1
+        ce.label = "klepton depth probe"
+        ce.setComputePipelineState(kp)
+        ce.setTexture(d0, index: 0)
+        ce.setBuffer(buf, offset: 0, index: 0)
+        let side = Int(KL_DEPTH_PROBE_SIDE)
+        ce.dispatchThreadgroups(MTLSize(width: side / 8, height: side / 8, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        ce.endEncoding()
+        var du = withUnsafePointer(to: rendered) {
+            kl_reproject_depth_build($0, 0, drawable.computeProjection(viewIndex: 0))
+        }
+        cmd.addCompletedHandler { _ in
+            kl_reproject_depth_probe_note(buf.contents().assumingMemoryBound(to: Float.self),
+                                          Int32(side), &du)
+        }
+    }
+
+    /// The [swim] line, once a second (kl_reproject_swim_log).
+    private func noteSwim() {
+        guard depthMode >= 1 else { return }
+        let now = CACurrentMediaTime()
+        if swimT0 == 0 { swimT0 = now; return }
+        guard now - swimT0 >= 1.0 else { return }
+        let mean = swimAgeN > 0 ? swimAgeSum / Double(swimAgeN) * 1000 : 0
+        kl_reproject_swim_log(Int32(depthMode), UInt32(swimFrames), mean, swimAgeMax * 1000,
+                              UInt32(swimRing), UInt32(swimQuery), UInt32(swimFallback),
+                              UInt32(swimDepthFrames))
+        swimFrames = 0; swimRing = 0; swimQuery = 0; swimFallback = 0; swimDepthFrames = 0
+        swimAgeSum = 0; swimAgeMax = 0; swimAgeN = 0
+        swimT0 = now
+    }
+
     /// Sample every pose for this frame and push it across the seam.
     ///
     /// Called once per frame, *before* kl_app_frame(), so the guest renders
@@ -691,6 +825,10 @@ final class KleptonCompositor {
             // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
             kl_ovrp_set_head_pose_time(presentationTime)
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
+            // ...and remembered BY that instant, which is the key the frame
+            // record carries back (kl_ovrp_render_pose.pose_time — the same
+            // Double, never re-derived, so the lookup is exact).
+            if depthMode >= 1 { pushRenderAnchor(anchor, at: presentationTime) }
         }
 
         // Hands and controllers both go through KleptonControllers, which is a
@@ -880,6 +1018,35 @@ final class KleptonCompositor {
             dsdAlways.depthCompareFunction = .always
             dsdAlways.isDepthWriteEnabled = false
             depthPassState = device.makeDepthStencilState(descriptor: dsdAlways)
+
+            // KL_REPROJECT_DEPTH_MODE=2: the eye pass that writes the game's own
+            // depth, from its OWN library source (kl_reproject_depth_msl) so mode
+            // 0 compiles exactly what it always did. A failure here is named and
+            // the composite falls back to the 500 m quad (mode 1's picture).
+            if depthMode == 2 {
+                do {
+                    let dlib = try device.makeLibrary(source: String(cString: kl_reproject_depth_msl()),
+                                                      options: nil)
+                    let d = MTLRenderPipelineDescriptor()
+                    d.vertexFunction   = dlib.makeFunction(name: "kl_reproject_depth_v")
+                    d.fragmentFunction = dlib.makeFunction(name: "kl_reproject_depth_f")
+                    d.colorAttachments[0].pixelFormat = color
+                    d.depthAttachmentPixelFormat = .depth32Float
+                    d.maxVertexAmplificationCount = amplification
+                    depthPipeline = try device.makeRenderPipelineState(descriptor: d)
+                    if let k = dlib.makeFunction(name: "kl_depth_probe_k") {
+                        depthProbePipeline = try? device.makeComputePipelineState(function: k)
+                    }
+                    NSLog("[swim] depth pass ready (probe \(depthProbePipeline != nil ? "on" : "OFF"))")
+                } catch {
+                    NSLog("[swim] depth pass FAILED to build: \(error) — compositing with the "
+                          + "500 m quad depth instead")
+                }
+                let ods = MTLDepthStencilDescriptor()
+                ods.depthCompareFunction = .always
+                ods.isDepthWriteEnabled = true
+                overSceneDepthState = device.makeDepthStencilState(descriptor: ods)
+            }
 
             // The overlay pass — the guest's non-eye layers, which are the whole
             // of an Unreal title's UI. See encodeOverlays.
@@ -1909,7 +2076,15 @@ final class KleptonCompositor {
         let presentation = LayerRenderer.Clock.Instant.epoch
             .duration(to: main.frameTiming.presentationTime).timeInterval
         let displayAnchor = displayAnchor(at: presentation)
-        let originFromDevice = originFromDevice(displayAnchor)
+        // KL_REPROJECT_DEPTH_MODE >= 1: the anchor the picture was DRAWN at
+        // instead, for both the drawable and the composite's own math — so this
+        // pass corrects ~nothing and the system reprojects render -> scanout.
+        // Nil (no record, no answer) is the display anchor: mode 0 for that frame.
+        let frameAnchor = depthMode >= 1
+            ? (renderAnchor(for: haveRendered ? rendered : nil, presentation: presentation)
+               ?? displayAnchor)
+            : displayAnchor
+        let originFromDevice = originFromDevice(frameAnchor)
         // OpenXR's VIEW space is DEFINED as the midpoint between the eyes.
         // visionOS's device anchor is a point on the hardware and is not that
         // midpoint, so treating the two as equal declares an equality that is
@@ -2078,7 +2253,7 @@ final class KleptonCompositor {
         for drawable in drawables {
             // Per drawable, not once: each one is presented separately and each
             // is reprojected by the system against its own anchor.
-            drawable.deviceAnchor = displayAnchor
+            drawable.deviceAnchor = frameAnchor
             encoded += encodeComposite(drawable, cmd: cmd, stage: stage,
                                        completeStage: completeStage,
                                        rendered: rendered, haveRendered: haveRendered,
@@ -2096,6 +2271,10 @@ final class KleptonCompositor {
             loggedFirstPicture = true
             NSLog("[cp] first guest picture composited, after \(blackFrames) black frames")
         }
+
+        encodeDepthProbe(cmd, stage: stage, rendered: rendered, haveRendered: haveRendered,
+                         drawable: main)
+        noteSwim()
 
         // Did this command buffer actually RUN? "Presented" only means committed,
         // and a buffer stalled on a shared-event wait never executes — so a
@@ -2247,6 +2426,7 @@ final class KleptonCompositor {
 
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return 0 }
         enc.label = "klepton composite view\(viewIndices)"
+        depthWrittenThisPass = false
         if probe == 1 { enc.endEncoding(); return viewIndices.count }
         guard let pipeline, let sampler else { enc.endEncoding(); return 0 }
 
@@ -2518,7 +2698,39 @@ final class KleptonCompositor {
                     uniforms[n].grid_eye = 1
                 }
             }
-            enc.setRenderPipelineState(probePipeline ?? pipeline)
+            // Depth mode 2: the same quad, the same colour, and the game's own
+            // depth per pixel (kl_reproject_depth_f). Only for a frame whose
+            // record says BOTH of this pass's eyes had their depth copied, and
+            // the texture for each is where the record says — otherwise the
+            // 500 m quad, i.e. mode 1, for this frame.
+            var depthEyes: [MTLTexture] = []
+            if depthMode == 2, probePipeline == nil, depthPipeline != nil, haveRendered {
+                for vi in viewIndices.prefix(2) {
+                    guard rendered.depth_valid & Int32(1 << vi) != 0,
+                          let t = eyeDepth(vi, stage) else { depthEyes = []; break }
+                    depthEyes.append(t)
+                }
+            }
+            if let dp = depthPipeline, !depthEyes.isEmpty {
+                enc.setRenderPipelineState(dp)
+                // Slot 2 is amplification index 0's eye, slot 3 index 1's — the
+                // colour's own convention (`src`), so a one-view pass binds its
+                // single eye to both.
+                enc.setFragmentTexture(depthEyes[0], index: 2)
+                enc.setFragmentTexture(depthEyes.count > 1 ? depthEyes[1] : depthEyes[0], index: 3)
+                var du = withUnsafePointer(to: rendered) { r in
+                    viewIndices.map { vi in
+                        kl_reproject_depth_build(r, Int32(vi), drawable.computeProjection(viewIndex: vi))
+                    }
+                }
+                du.withUnsafeMutableBytes { buf in
+                    enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 2)
+                }
+                depthWrittenThisPass = true
+                swimDepthFrames += 1
+            } else {
+                enc.setRenderPipelineState(probePipeline ?? pipeline)
+            }
             if let depthState { enc.setDepthStencilState(depthState) }
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
@@ -2571,6 +2783,7 @@ final class KleptonCompositor {
                 * Self.headFromView(drawable.views[vi].transform, midpoint: eyeMidpointInDevice)
             return KLHUDView(viewProj: drawable.computeProjection(viewIndex: vi) * originFromView.inverse)
         }
+        hud.depthOverScene = depthWrittenThisPass
         hud.encode(enc, views: views, recenter: recenterXform)
     }
 
@@ -2768,6 +2981,10 @@ final class KleptonCompositor {
         // position carries the quad's real distance, so what lands in the
         // buffer is where the panel actually is.
         if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
+        // Over a depth the GAME wrote (mode 2), a panel cannot take the eye
+        // pass's .greater: anything of the world nearer than the panel would
+        // hide it. Always-pass, writing its own depth.
+        else if depthWrittenThisPass, let s = overSceneDepthState { enc.setDepthStencilState(s) }
         let n = Int(kl_ovrp_overlay_count())
         if n == 0 { return 0 }
         var drawn = 0
@@ -2803,7 +3020,10 @@ final class KleptonCompositor {
                                   drawable: drawable, originFromHead: originFromHead) {
                     drewEquirect = true
                 }
-                if drewEquirect, let depthState { enc.setDepthStencilState(depthState) }
+                if drewEquirect,
+                   let s = depthWrittenThisPass && !writeDepth ? overSceneDepthState : depthState {
+                    enc.setDepthStencilState(s)
+                }
                 continue
             }
             // KL_OVERLAY_SKIP_HEADLOCKED=1: drop head-locked overlays. In AC Nexus
@@ -2867,6 +3087,7 @@ final class KleptonCompositor {
             // The equirect branch above may have swapped the depth state for
             // its behind-everything compare; restore the quad's before drawing.
             if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
+            else if depthWrittenThisPass, let s = overSceneDepthState { enc.setDepthStencilState(s) }
             enc.setRenderPipelineState(pipe)
             enc.setFragmentTexture(texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)

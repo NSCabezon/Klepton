@@ -319,7 +319,32 @@ typedef struct {
     // so the headset can pair the picture with the DeviceAnchor it sent.
     uint64_t head_tag;
     double   head_time;
+    // ---- depth reprojection (KL_REPROJECT_DEPTH_MODE, kl_reproject.h) ----
+    // The instant the head pose above is ABOUT, in the frontend's tracker clock
+    // (CACurrentMediaTime seconds — the value it passed to
+    // kl_ovrp_set_head_pose_time, moved to the predicted instant when the guest
+    // bridge predicts). 0 = unknown. The visionOS compositor finds the
+    // DeviceAnchor for this instant and hands it to the drawable, so the
+    // system's own reprojection starts from the pose the picture was drawn at.
+    double   pose_time;
+    // The guest's depth, when it submitted one (OpenVR Submit_TextureWithDepth):
+    // the projection's z row, z_clip = m22 * z_view + m23 with w_clip = -z_view,
+    // per eye, and the depth range it declared. depth_valid is a bit per eye;
+    // 3 means both eyes' depth images were copied for this stage
+    // (kl_glfb_eye_mtl_depth) and match this frame.
+    float    depth_m22[2], depth_m23[2];
+    float    depth_range[2];
+    int      depth_valid;
 } kl_ovrp_render_pose;
+
+// Set on the frame being BUILT (the one kl_ovrp_frame_begin_external opened and
+// kl_ovrp_frame_end_external will file). See the fields above.
+void kl_ovrp_frame_set_pose_time(double t);
+void kl_ovrp_frame_set_depth(int eye, float m22, float m23, float range_min,
+                             float range_max, int valid);
+// CLOCK_MONOTONIC seconds -> the tracker's clock (CLOCK_UPTIME_RAW), the
+// re-basing kl_ovrp_head_predict_delta applies before it asks the frontend.
+double kl_ovrp_tracker_time(double mono_s);
 
 // What the guest rendered `stage` with. Returns 0 (and leaves *out untouched)
 // if nothing has been recorded for that stage yet.
@@ -819,5 +844,42 @@ enum {
 // the rest of this seam: see the note above `kl_ovrp_haptics_pull`.
 void kl_ovrp_haptics_apply(int hand, float amplitude, float seconds);
 void kl_ovrp_haptics_stop(int hand);
+
+
+// ---------------------------------------------------------------------------
+// The compositor's own fade and the "press to start" prompt
+//
+// OpenVR's IVRCompositor::FadeToColor asks the COMPOSITOR to blend a colour
+// over the scene (SteamVR hides level loads and Alyx's "Pulsa Trigger para
+// empezar" gate this way). kl_openvr.c files each request here; the frontend's
+// compositor (KleptonHUD.swift on visionOS, kl_view_mtl.m on the Mac) reads
+// the CURRENT colour every frame and draws it head-locked over the scene.
+// One clock: the start time is CLOCK_MONOTONIC, taken here, and the
+// interpolation is evaluated here, so neither side ever compares a guest time
+// with CACurrentMediaTime.
+//
+// `rgba` is straight (not premultiplied), each 0..1; `seconds` <= 0 is
+// immediate. kl_ovrp_fade_color answers the interpolated value and returns
+// nonzero when its alpha is above zero (something to draw).
+// FadeGrid is the same thing for SteamVR's grid environment, drawn here as
+// black under the colour fade; kl_ovrp_fade_color answers the two combined.
+// kl_ovrp_grid_mask scales the grid as DRAWN (not as answered to the guest):
+// 1 by default; kl_openvr.c lowers it outside a level load, because Alyx fades
+// the grid in at boot and only out at a level's start gate — on SteamVR its
+// web helper's interstitials drive that, and without them the main menu would
+// stay black.
+void  kl_ovrp_fade_to(float r, float g, float b, float a, float seconds);
+void  kl_ovrp_grid_to(float alpha, float seconds);
+void  kl_ovrp_grid_mask(float alpha, float seconds);
+float kl_ovrp_grid_alpha(void);
+void  kl_ovrp_fade_current(float rgba[4]);   // the colour fade alone (GetCurrentFadeColor)
+int   kl_ovrp_fade_color(float rgba[4]);
+
+// A head-locked prompt the frontend shows until it is cleared: Alyx's mailbox
+// "show_message" after a load (cleared by "end_loading"). NULL or "" clears.
+// kl_ovrp_prompt copies the text (empty when none) and returns a serial that
+// changes on every set or clear, so a frontend rebuilds its panel only then.
+void     kl_ovrp_set_prompt(const char *text);
+unsigned kl_ovrp_prompt(char *buf, int n);
 
 #endif

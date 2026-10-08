@@ -47,6 +47,15 @@ static id<MTLCommandQueue>        g_queue;
 static id<MTLRenderPipelineState> g_pipe;      // the plain blit, for the liveness downsample
 static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass
 static id<MTLRenderPipelineState> g_pipe_ov;   // the GUEST's layers, blended, KL_GUEST_OVERLAYS
+// KL_REPROJECT_DEPTH_MODE=2 / KL_CP_DEPTH_VIS (kl_reproject.h). The viewer has
+// no depth attachment and no system reprojection to feed, so what depth buys
+// here is the INSTRUMENT: the false-colour pass (KL_CP_DEPTH_VIS=1) and the
+// once-a-second probe behind the [swim] line — the same shaders the device runs.
+static id<MTLRenderPipelineState> g_pipe_dvis;
+static id<MTLComputePipelineState> g_depth_probe;
+static id<MTLBuffer>              g_depth_probe_buf[2];
+static unsigned                   g_depth_probe_n, g_depth_frames, g_swim_frames;
+static double                     g_depth_probe_t, g_swim_t0;
 static id<MTLSamplerState>        g_samp;
 static id<MTLSharedEvent>         g_event;
 static id<MTLTexture>             g_stat;
@@ -694,7 +703,7 @@ static void *klvm_first_layer_texture(void) {
 #define KLVM_TOAST_W 1024
 #define KLVM_TOAST_H 288
 #define KLVM_TOAST_QMAX 16
-typedef struct { char *name, *desc, *icon; } klvm_toast;
+typedef struct { char *name, *desc, *icon; const char *header; } klvm_toast;   // header NULL: achievement; icon "-": none
 static klvm_toast g_tq[KLVM_TOAST_QMAX];
 static int g_tq_n;
 static pthread_mutex_t g_tq_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -715,7 +724,7 @@ static void klvm_toast_push(const char *api, const char *name, const char *desc,
     pthread_mutex_lock(&g_tq_mu);
     if (g_tq_n < KLVM_TOAST_QMAX) {
         g_tq[g_tq_n++] = (klvm_toast){ strdup(name ? name : ""), strdup(desc ? desc : ""),
-                                       strdup(icon ? icon : "") };
+                                       strdup(icon ? icon : ""), NULL };
     }
     pthread_mutex_unlock(&g_tq_mu);
 }
@@ -770,30 +779,33 @@ static id<MTLTexture> klvm_toast_raster(const klvm_toast *t) {
     CGRect ir = CGRectMake(48, (H - 192) / 2.0, 192, 192);
     CGPathRef ip = CGPathCreateWithRoundedRect(ir, 28, 28, NULL);
     CGImageRef img = NULL;
-    if (t->icon && *t->icon) {
+    int no_icon = t->icon && !strcmp(t->icon, "-");
+    if (t->icon && *t->icon && !no_icon) {
         CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)t->icon,
                                                              (CFIndex)strlen(t->icon), false);
         CGImageSourceRef src = u ? CGImageSourceCreateWithURL(u, NULL) : NULL;
         if (src) { img = CGImageSourceCreateImageAtIndex(src, 0, NULL); CFRelease(src); }
         if (u) CFRelease(u);
     }
-    CGContextSaveGState(c);
-    CGContextAddPath(c, ip);
-    CGContextClip(c);
-    if (img) CGContextDrawImage(c, ir, img);
-    else { CGContextSetRGBFillColor(c, 0.85, 0.66, 0.22, 1); CGContextFillRect(c, ir); }
-    CGContextRestoreGState(c);
+    if (!no_icon) {
+        CGContextSaveGState(c);
+        CGContextAddPath(c, ip);
+        CGContextClip(c);
+        if (img) CGContextDrawImage(c, ir, img);
+        else { CGContextSetRGBFillColor(c, 0.85, 0.66, 0.22, 1); CGContextFillRect(c, ir); }
+        CGContextRestoreGState(c);
+    }
     CGPathRelease(ip);
     if (img) CGImageRelease(img);
     // Text column.
-    double x = 48 + 192 + 40, maxw = W - x - 48;
+    double x = no_icon ? 72 : 48 + 192 + 40, maxw = W - x - 48;
     CTFontRef fh = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 34, NULL);
     CTFontRef fn = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 50, NULL);
     CTFontRef fd = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 32, NULL);
     CGColorRef gold = CGColorCreateSRGB(1.0, 0.80, 0.35, 1);
     CGColorRef white = CGColorCreateSRGB(1, 1, 1, 1);
     CGColorRef grey = CGColorCreateSRGB(0.78, 0.80, 0.84, 1);
-    CTLineRef lh = klvm_line(klvm_toast_header(), fh, gold, maxw);
+    CTLineRef lh = klvm_line(t->header ? t->header : klvm_toast_header(), fh, gold, maxw);
     CTLineRef ln = klvm_line(t->name, fn, white, maxw);
     // Baselines from the top: header 78, name 146, description lines 198 / 240.
     CGContextSetTextPosition(c, x, H - 78);  CTLineDraw(lh, c);
@@ -851,7 +863,10 @@ static const char *klvm_toast_msl =
     "  VO o; o.p = float4(c.x * 2 - 1, 1 - c.y * 2, 0, 1); o.uv = c; return o; }\n"
     "fragment float4 klvm_toast_f(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
     "                             sampler s [[sampler(0)]], constant float &a [[buffer(0)]]) {\n"
-    "  return t.sample(s, i.uv) * a; }\n";
+    "  return t.sample(s, i.uv) * a; }\n"
+    "fragment float4 klvm_fade_f(VO i [[stage_in]], constant float4 &c [[buffer(0)]]) {\n"
+    "  return float4(c.rgb * c.a, c.a); }\n";
+static id<MTLRenderPipelineState> g_fpipe;    // the compositor fade (kl_ovrp_fade_color)
 
 static void klvm_toast_start(void) {
     g_tstart = klvm_now();
@@ -870,15 +885,81 @@ static void klvm_toast_start(void) {
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     g_tpipe = pd.vertexFunction && pd.fragmentFunction
         ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+    pd.fragmentFunction = [lib newFunctionWithName:@"klvm_fade_f"];
+    g_fpipe = pd.vertexFunction && pd.fragmentFunction
+        ? [g_dev newRenderPipelineStateWithDescriptor:pd error:nil] : nil;
     if (!g_tpipe)
         fprintf(stderr, "  [toast] viewer toast pipeline failed: %s — unlocks are only logged\n",
                 err.localizedDescription.UTF8String ?: "?");
 }
 
+// The compositor fade and the gate prompt (kl_ovrp.h), the host twins of
+// KleptonHUD.swift's: the fade over the whole window, the prompt panel in its
+// middle, both under the achievement toast.
+static unsigned       g_pserial;
+static int            g_pon;
+static id<MTLTexture> g_ptex;
+static void klvm_fade_prompt_draw(id<MTLCommandBuffer> cmd, id<MTLTexture> target) {
+    float c[4];
+    int fade = g_fpipe && kl_ovrp_fade_color(c);
+    static int was_fading;
+    if (fade != was_fading) {
+        was_fading = fade;
+        fprintf(stderr, "  [view] compositor fade %s (%.2f %.2f %.2f a %.2f)\n",
+                fade ? "drawing" : "clear", c[0], c[1], c[2], c[3]);
+    }
+    char text[256];
+    unsigned serial = kl_ovrp_prompt(text, sizeof text);
+    if (serial != g_pserial) {
+        g_pserial = serial;
+        int was = g_pon;
+        g_pon = text[0] != 0;
+        g_ptex = nil;
+        if (g_pon) {
+            int es = klvm_toast_es();
+            klvm_toast t = { (char *)(es ? "Pulsa el gatillo para empezar" : "Pull the trigger to start"),
+                             strcmp(text, "-") ? text : (char *)"", (char *)"-",
+                             es ? "Nivel cargado" : "Level loaded" };
+            g_ptex = klvm_toast_raster(&t);
+        }
+        if (g_pon || was)
+            fprintf(stderr, "  [view] gate prompt %s%s%s\n", g_pon ? "shown: " : "cleared", g_pon ? text : "",
+                    g_pon && !g_ptex ? " (raster FAILED)" : "");
+    }
+    if (!fade && !g_ptex) return;
+    double tw = target.width, th = target.height;
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = target;
+    p.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:p];
+    enc.label = @"klepton viewer fade + prompt";
+    if (fade) {
+        [enc setViewport:(MTLViewport){ 0, 0, tw, th, 0.0, 1.0 }];
+        [enc setRenderPipelineState:g_fpipe];
+        [enc setFragmentBytes:c length:sizeof c atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    if (g_ptex && g_tpipe) {
+        double w = fmin(tw * 0.6, KLVM_TOAST_W * fmax(th / 1400.0, 0.5));
+        double h = w * KLVM_TOAST_H / KLVM_TOAST_W;
+        float a = 1.0f;
+        [enc setViewport:(MTLViewport){ (tw - w) * 0.5, (th - h) * 0.5, w, h, 0.0, 1.0 }];
+        [enc setRenderPipelineState:g_tpipe];
+        [enc setFragmentTexture:g_ptex atIndex:0];
+        [enc setFragmentSamplerState:g_samp atIndex:0];
+        [enc setFragmentBytes:&a length:sizeof a atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    [enc endEncoding];
+}
+
 // Drawn last, over whatever the frame is. Fade 0.3 s in and out, 5 s on
 // screen (KL_TOAST_SECS), then the next queued one.
 static void klvm_toast_draw(id<MTLCommandBuffer> cmd, id<MTLTexture> target) {
-    if (!g_tpipe || !target) return;
+    if (!target) return;
+    klvm_fade_prompt_draw(cmd, target);
+    if (!g_tpipe) return;
     double now = klvm_now();
     if (!g_ttest_fired && g_tstart > 0 && now - g_tstart >= 5.0 && kl_env_on("KL_TOAST_TEST", 0)) {
         g_ttest_fired = 1;
@@ -1018,6 +1099,27 @@ int kl_viewmtl_start(void *metal_layer) {
                                     "overlay", 1);
     g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
                               "kl_reproject_f", "reprojection");
+    if (kl_reproject_depth_mode() == 2 || kl_reproject_depth_vis()) {
+        NSError *derr = nil;
+        id<MTLLibrary> dlib = [g_dev newLibraryWithSource:
+                                  [NSString stringWithUTF8String:kl_reproject_depth_msl()]
+                                                  options:nil error:&derr];
+        if (!dlib)
+            fprintf(stderr, "  [swim] depth shaders failed to compile: %s\n",
+                    derr.localizedDescription.UTF8String ?: "?");
+        if (dlib && kl_reproject_depth_vis())
+            g_pipe_dvis = klvm_pipeline(kl_reproject_depth_msl(), "kl_reproject_depth_v",
+                                        "kl_reproject_depthvis_f", "depth false-colour");
+        id<MTLFunction> kf = [dlib newFunctionWithName:@"kl_depth_probe_k"];
+        if (kf) g_depth_probe = [g_dev newComputePipelineStateWithFunction:kf error:&derr];
+        for (int i = 0; i < 2 && g_depth_probe; i++)
+            g_depth_probe_buf[i] = [g_dev newBufferWithLength:KL_DEPTH_PROBE_SIDE * KL_DEPTH_PROBE_SIDE
+                                                              * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        fprintf(stderr, "  [swim] viewer: depth false-colour %s, depth probe %s\n",
+                g_pipe_dvis ? "ON" : "off", g_depth_probe ? "on" : "OFF");
+    }
+
     // Fall back rather than refuse to start. This is retried every frame, so
     // returning 0 on a shader that will never compile is a viewer that stays
     // black forever and says why exactly once — where the blit is a picture,
@@ -1202,7 +1304,23 @@ static void klvm_eye_aspect(int stage, int eye, id<MTLTexture> src, double *w, d
 static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye,
                              id<MTLTexture> src, kl_blit_uniforms bu, int flip) {
         kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
-        [enc setRenderPipelineState:g_pipe_rp];
+        // KL_CP_DEPTH_VIS: the same quad, coloured by the game's depth.
+        id<MTLTexture> dtex = nil;
+        kl_ovrp_render_pose dr;
+        if (g_pipe_dvis && kl_ovrp_stage_render_pose(stage, &dr) && (dr.depth_valid & (1 << eye))) {
+            void *dp = kl_glfb_eye_mtl_depth(eye, stage);
+            if (dp) dtex = (__bridge id<MTLTexture>)dp;
+        }
+        if (dtex) {
+            kl_reproject_depth_uniforms du = kl_reproject_depth_build(&dr, eye, u.projection);
+            [enc setRenderPipelineState:g_pipe_dvis];
+            [enc setVertexBytes:&du length:sizeof du atIndex:2];
+            [enc setFragmentTexture:dtex atIndex:2];
+            [enc setFragmentTexture:dtex atIndex:3];
+            g_depth_frames++;
+        } else {
+            [enc setRenderPipelineState:g_pipe_rp];
+        }
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
         // The unwarp grid. Identity until the guest's eye textures are
@@ -1262,6 +1380,47 @@ static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye
         id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
         [enc setVertexBuffer:gbuf offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+}
+
+// Once a second, in depth mode 2 or under KL_CP_DEPTH_VIS: sample eye 0's
+// depth (32x32, on the GPU, after this frame) for the [swim] line, and print
+// that line — the viewer's half of it, with no anchors (there are none here).
+static void klvm_depth_probe(id<MTLCommandBuffer> cmd, int stage) {
+    if (!g_depth_probe) return;
+    g_swim_frames++;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (!g_swim_t0) g_swim_t0 = now;
+    if (now - g_swim_t0 >= 1.0) {
+        kl_reproject_swim_log(kl_reproject_depth_mode(), g_swim_frames, 0, 0, 0, 0, 0,
+                              g_depth_frames);
+        g_swim_frames = g_depth_frames = 0;
+        g_swim_t0 = now;
+    }
+    if (now - g_depth_probe_t < 1.0) return;
+    kl_ovrp_render_pose r;
+    if (!kl_ovrp_stage_render_pose(stage, &r) || !(r.depth_valid & 1)) return;
+    void *dp = kl_glfb_eye_mtl_depth(0, stage);
+    if (!dp) return;
+    g_depth_probe_t = now;
+    id<MTLBuffer> buf = g_depth_probe_buf[g_depth_probe_n++ & 1];
+    id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+    if (!ce || !buf) return;
+    ce.label = @"klepton depth probe";
+    [ce setComputePipelineState:g_depth_probe];
+    [ce setTexture:(__bridge id<MTLTexture>)dp atIndex:0];
+    [ce setBuffer:buf offset:0 atIndex:0];
+    [ce dispatchThreadgroups:MTLSizeMake(KL_DEPTH_PROBE_SIDE / 8, KL_DEPTH_PROBE_SIDE / 8, 1)
+       threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce endEncoding];
+    // The viewer's own frustum stands in for a drawable's: only its near plane
+    // is read, for the clamp, and the probe reports raw and linear depth.
+    simd_float4x4 proj = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    kl_reproject_depth_uniforms du = kl_reproject_depth_build(&r, 0, proj);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)b;
+        kl_reproject_depth_probe_note((const float *)buf.contents, KL_DEPTH_PROBE_SIDE, &du);
+    }];
 }
 
 int kl_viewmtl_present(int win_w, int win_h) {
@@ -1558,6 +1717,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         }];
     }
 
+    klvm_depth_probe(cmd, stage);
     klvm_toast_draw(cmd, drawable.texture);
     [cmd presentDrawable:drawable];
     [cmd commit];
