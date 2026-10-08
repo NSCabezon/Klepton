@@ -39,7 +39,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define KLSC_RING   64
+#define KLSC_RING   256
 #define KLSC_SLOTS  8
 #define KLSC_MAX_FRAME (24u << 20)   // a frame bigger than this is garbage, not video
 

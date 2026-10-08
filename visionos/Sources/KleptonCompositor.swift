@@ -483,7 +483,7 @@ final class KleptonCompositor {
     private let depthMode = Int(kl_reproject_depth_mode())
     private var anchorRing: [(t: TimeInterval, anchor: DeviceAnchor)] = []
     private var anchorRingNext = 0
-    private static let anchorRingSize = 32           // ~355 ms at 90 Hz
+    private static let anchorRingSize = 64           // ~710 ms at 90 Hz (the Mac stream adds Wi-Fi + encode)
     private var depthPipeline: MTLRenderPipelineState?
     private var depthProbePipeline: MTLComputePipelineState?
     private var depthProbeBuffers: [MTLBuffer] = []
