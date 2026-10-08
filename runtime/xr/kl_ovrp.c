@@ -335,6 +335,36 @@ static uint64_t klovrp_RecenterTrackingOrigin2(int flags) {
     return OVRP_SUCCESS;
 }
 
+// --- The EyeLevel tracking origin -------------------------------------------
+//
+// Every frontend publishes the head in a FLOOR frame (the viewer at a standing
+// 1.6 m, visionOS from ARKit's floor-anchored world). That is what a FloorLevel
+// guest asked for and nothing has to change for one. But OVRPlugin's DEFAULT
+// origin is EyeLevel, where the origin is wherever the head was at startup (or
+// at the last recenter) — so a guest that never calls SetTrackingOriginType
+// (I Expect You To Die, a seated title) was handed a head 1.6 m above an origin
+// it believes is at eye height. Its calibration panel, placed at the rig origin,
+// then sat 1.7 m below the view: a black frame with a fully working game.
+//
+// So for an EyeLevel guest the node poses it READS (and only those — the
+// compositor's records stay in the frontend's frame, so reprojection deltas are
+// untouched) are taken relative to an anchor: the standing eye height until the
+// guest recenters, then the head position at that recenter. Yaw is NOT
+// recentred; only the position is. KL_OVRP_EYELEVEL=0 restores the old,
+// floor-frame answer.
+static int   g_recenter_count;
+static int   g_anchor_set;           // a recenter has captured the head
+static float g_anchor[3];
+
+static void klovrp_eyelevel_recenter(void);   // below, after the head pose
+
+static uint64_t klovrp_RecenterTrackingOrigin(unsigned flags) {
+    (void)flags;
+    ovrp_hit("ovrp_RecenterTrackingOrigin");
+    klovrp_eyelevel_recenter();
+    return 1;   // ovrpBool True (OVRP_1_0_0); libunity ignores it
+}
+
 static uint64_t klovrp_GetAudioOutId2(const void **out)      { return klovrp_GetDeviceId2("ovrp_GetAudioOutId2", out); }
 static uint64_t klovrp_GetAudioInId2(const void **out)       { return klovrp_GetDeviceId2("ovrp_GetAudioInId2", out); }
 
@@ -658,7 +688,7 @@ static uint64_t klovrp_GetSystemHeadsetType2(int *out) {
 static uint64_t klovrp_GetLocalTrackingSpaceRecenterCount(int *out) {
     ovrp_hit("ovrp_GetLocalTrackingSpaceRecenterCount");
     if (!out) return -1001;
-    *out = 0;
+    *out = g_recenter_count;   // bumped by ovrp_RecenterTrackingOrigin
     return OVRP_SUCCESS;
 }
 
@@ -1862,6 +1892,32 @@ static klovrp_pose klovrp_head(void) {
         return h;
     }
     return klovrp_head_published();
+}
+
+static int klovrp_eyelevel_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_EYELEVEL", 1);
+    return on && g_tracking_origin == 0;
+}
+
+// The point an EyeLevel guest's origin sits at, in the frontend's floor frame.
+static void klovrp_eyelevel_anchor(float out[3]) {
+    out[0] = out[1] = out[2] = 0.0f;
+    if (!klovrp_eyelevel_on()) return;
+    if (g_anchor_set) { memcpy(out, g_anchor, sizeof g_anchor); return; }
+    static float h = -1.0f;   // read once: this runs ~20 times a guest frame
+    if (h < 0.0f) h = kl_env_float("KL_OVRP_EYE_HEIGHT", 1.6f);
+    out[1] = h;
+}
+
+static void klovrp_eyelevel_recenter(void) {
+    klovrp_pose h = klovrp_head_published();
+    g_anchor[0] = h.px; g_anchor[1] = h.py; g_anchor[2] = h.pz;
+    g_anchor_set = 1;
+    g_recenter_count++;
+    fprintf(stderr, "  [ovrp] recenter #%d: EyeLevel origin now at head "
+                    "(%.3f, %.3f, %.3f)%s\n", g_recenter_count, h.px, h.py, h.pz,
+            klovrp_eyelevel_on() ? "" : " (not applied: FloorLevel or KL_OVRP_EYELEVEL=0)");
 }
 
 // The shortest angle between two orientations, in degrees. Used only to report
@@ -3585,8 +3641,10 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     float *f = out;
     f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
     f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c
-    f[4] = p->px; f[5] = p->py;      // position at +0x10
-    f[6] = p->pz;
+    float anc[3];
+    klovrp_eyelevel_anchor(anc);     // zero unless an EyeLevel guest (see above)
+    f[4] = p->px - anc[0]; f[5] = p->py - anc[1];   // position at +0x10
+    f[6] = p->pz - anc[2];
         // Velocity at +0x1c and angular velocity at +0x34, both of which were left
     // zero until now. libunity copies all four vectors straight into its XR
     // node state, so a zero here is not "unknown", it is "not moving" — and
@@ -6602,6 +6660,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_Initialize5",   (void *)klovrp_Initialize5},
     {"ovrp_Initialize6",   (void *)klovrp_Initialize6},
     {"ovrp_RecenterTrackingOrigin2", (void *)klovrp_RecenterTrackingOrigin2},
+    {"ovrp_RecenterTrackingOrigin", (void *)klovrp_RecenterTrackingOrigin},
     {"ovrp_GetAudioOutId2",       (void *)klovrp_GetAudioOutId2},
     {"ovrp_GetAudioInId2",        (void *)klovrp_GetAudioInId2},
     {"ovrp_GetDisplayAdapterId2", (void *)klovrp_GetDisplayAdapterId2},
@@ -6881,7 +6940,6 @@ static const char *const g_ovrp_result_ok[] = {
     // implementations above — they answer the same ovrpSuccess, but they are
     // where the timewarp bookkeeping is latched.
     "ovrp_EndEye2",
-    "ovrp_RecenterTrackingOrigin",
     // Thread-scheduling hints from PlayerSettings, set once at init; void
     // configuration like the setters above.
     "ovrp_AutoThreadScheduling", "ovrp_SetThreadPerformance",
