@@ -2630,6 +2630,19 @@ cleared/not stored and RESOLVED. Stock MoltenVK has no such extension. Two halve
   are not comparable; two phases of one run interleaved for minutes are. 10 is a
   good period. A suspended/resumed instance keeps the phase it began in.
 
+Which MoltenVK runs (stock or the fork). There is ONE slot, `vendor-moltenvk/out/`
+(`macos/libMoltenVK.dylib`, `xros|xrsim/MoltenVK.framework`); no runtime choice.
+`make mvk` fills it with the stock prebuilt; `make mvk-fdm` (tools/mvk_fdm_build.sh)
+builds the fork for macOS + visionOS + simulator and overwrites it (stamp
+`vendor-moltenvk/.klepton-fdm`; `rm vendor-moltenvk/.klepton-fdm && make mvk` puts
+stock back). The visionOS app embeds whatever is in the slot: `visionos/run.sh` runs
+`mkmvk.sh` on every build, which wraps `out/xros` + `out/xrsim` into
+`visionos/Frameworks/MoltenVK.xcframework`. So a hub built from a checkout whose slot
+holds the fork SHIPS the fork; with `KL_FOVEATE` unset the spoof is off, Alyx never
+sees the extension, no density-map pass exists and the fork's code is inert (verified
+on the Mac: same picture as stock). On the Mac, `KL_MVK_DYLIB=<path>` loads any
+other build for an A/B (e.g. the main checkout's stock dylib).
+
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
 The Vulkan side of BONELAB. Not part of the runtime yet —
