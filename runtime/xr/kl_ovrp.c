@@ -1587,10 +1587,18 @@ typedef struct {
     // whose position is visibly changing. OpenXR carries the same distinction
     // in XrSpaceVelocity.velocityFlags, which kl_openxr answers from this.
     int   motion_valid;
+    // The frontend's own name for this sample (kl_ovrp_set_head_pose_tag) and
+    // the instant it is about (kl_ovrp_set_head_pose_time), HEAD only. Inside
+    // the pose rather than beside it so every latch that copies the pose copies
+    // its name in the same breath: the streaming host echoes the tag of the
+    // pose a frame was RENDERED with, and a tag read beside the seqlock could
+    // name the next sample instead. 0 / 0.0 = the frontend never named one.
+    uint64_t tag;
+    double   tag_time;
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-    0,   // motion_valid: nothing has been published, so there is nothing to know
+    0, 0, 0,   // motion_valid (then tag, tag_time): nothing has been published, so there is nothing to know
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -2033,6 +2041,13 @@ void kl_ovrp_set_head_pose_time(double t) {
     g_head_pose_time = t;
 }
 
+// The tag the NEXT published head pose carries into the frame record; same
+// thread and same call order as kl_ovrp_set_head_pose_time.
+static uint64_t g_head_pose_tag;
+void kl_ovrp_set_head_pose_tag(uint64_t tag) {
+    g_head_pose_tag = tag;
+}
+
 // How far ahead of "now" the frontend predicts the head it publishes — the
 // compositor's own lead (its presentation time minus the moment it queried),
 // smoothed. A guest predicting its frame to when it will be SEEN adds this:
@@ -2057,8 +2072,10 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // from the same sample. It stopped being the whole story when an OpenXR
     // guest arrived: velocity there is a chained output struct on any space,
     // and zeros in it are an assertion rather than a silence.
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
+    v.tag = g_head_pose_tag;
+    v.tag_time = g_head_pose_time;
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
     // Pose trace, once a second: the pushed head Y + tracking-origin frame
@@ -2402,6 +2419,8 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     r->stage = -1;
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
+    r->head_tag = h.tag;
+    r->head_time = h.tag_time;
     // Unity's own frame counter — the number it picks its stage from.
     g_frames.pending_index = guest_frame_index;
     pthread_mutex_unlock(&g_frames.mu);
@@ -2834,6 +2853,8 @@ void kl_ovrp_frame_begin_external(void) {
     r->stage = -1;
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
+    r->head_tag = h.tag;
+    r->head_time = h.tag_time;
     g_frames.pending_index = (int)s;
     pthread_mutex_unlock(&g_frames.mu);
 }
@@ -3084,7 +3105,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
@@ -3102,7 +3123,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
