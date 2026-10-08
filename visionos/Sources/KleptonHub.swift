@@ -63,6 +63,29 @@ enum HubLaunch {
         return t
     }
 
+    /// KL_STREAM_AUTOCONNECT=1 (+ KL_STREAM_HOST_ADDR=ip[:port], and
+    /// KL_HUB_GAME for the game, default alyx) skips the library and goes
+    /// straight to "Jugar desde el Mac" — the scripted/simulator test path.
+    static func scriptedStream() -> KLStreamTarget? {
+        guard klEnvOn("KL_STREAM_AUTOCONNECT", default: false),
+              let t = KLStreamTarget.fromEnvironment() else { return nil }
+        selectForStream(ProcessInfo.processInfo.environment["KL_HUB_GAME"] ?? "alyx")
+        NSLog("[hub] KL_STREAM_AUTOCONNECT: streaming from \(t.name) (\(t.host ?? "?"):\(t.port))")
+        return t
+    }
+
+    /// "Jugar desde el Mac" for `target`: the game's presentation settings
+    /// (immersion, hand matting) and controller calibration, as Play applies
+    /// them — and nothing else. No KL_TARGET, no Steam, no guest: the game
+    /// runs on the Mac. Backgrounding ends the process (and the stream) as in
+    /// any game session.
+    static func selectForStream(_ target: String) {
+        KleptonChroma.shared.loadGame(target)
+        KleptonTuning.shared.loadGame(target)
+        Lifecycle.keepAlive = false
+        NSLog("[hub] \(target): Jugar desde el Mac")
+    }
+
     /// The selected game becomes the runtime's target. Must run before BootView is
     /// created (its state reads klTargetName()) and before kl_app_configure.
     static func select(_ target: String) {
@@ -759,7 +782,11 @@ struct HubAppSettingsView: View {
 
 struct HubLibraryView: View {
     let onPlay: (String) -> Void
+    /// "Jugar desde el Mac" (KleptonStreamClient.swift): the game, and the Mac.
+    var onPlayFromMac: (String, KLStreamTarget) -> Void = { _, _ in }
     @StateObject private var model = HubLibraryModel()
+    /// The Macs advertising the stream service, live while the library is up.
+    @StateObject private var macs = KLStreamBrowser()
     @State private var detail: String?
     /// The game whose settings sheet is open.
     @State private var settingsFor: KLHubGameRow?
@@ -779,7 +806,8 @@ struct HubLibraryView: View {
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
-        .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
+        .onAppear { Lifecycle.keepAlive = true; model.checkUpdates(); macs.start() }
+        .onDisappear { macs.stop() }
         .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
     }
@@ -860,6 +888,8 @@ struct HubLibraryView: View {
                     .labelStyle(.iconOnly)
                     .help("Language and immersion for this game")
             }
+            // The second way to play, on its own row so the first stays as it was.
+            if Self.streamable(g) { playFromMacButton(g) }
             Text(HubGameSettingsView.summary(g.target))
                 .font(.caption).foregroundStyle(.secondary)
             if let r = model.lastSession[g.target] {
@@ -869,6 +899,37 @@ struct HubLibraryView: View {
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    /// Which games the Mac can run for the headset. The host side exists for
+    /// Alyx only (the OpenVR guest); the card shows nothing new for the rest.
+    static func streamable(_ g: KLHubGameRow) -> Bool { g.target == "alyx" }
+
+    /// The second way to play: the game runs on the Mac and streams here. It
+    /// needs no game data on the headset, so it ignores the card's download
+    /// state; it needs a Mac, so it is disabled until one is found. With
+    /// several, a menu picks one.
+    @ViewBuilder private func playFromMacButton(_ g: KLHubGameRow) -> some View {
+        let found = macs.macs
+        let busy = model.verifying != nil || model.preparing != nil
+        HStack(spacing: 10) {
+            if found.count > 1 {
+                Menu {
+                    ForEach(found) { m in
+                        Button(m.name) { onPlayFromMac(g.target, m) }
+                    }
+                } label: { Label("Jugar desde el Mac", systemImage: "desktopcomputer") }
+                .disabled(busy)
+            } else {
+                Button {
+                    if let m = found.first { onPlayFromMac(g.target, m) }
+                } label: { Label("Jugar desde el Mac", systemImage: "desktopcomputer") }
+                .disabled(found.isEmpty || busy)
+            }
+            Text(found.isEmpty ? "Buscando un Mac con Klepton…"
+                 : found.count == 1 ? found[0].name : "\(found.count) Macs")
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
     }
 
     private func manageTitle(_ st: HubLibraryModel.Status) -> String {
