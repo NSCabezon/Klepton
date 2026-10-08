@@ -7184,3 +7184,89 @@ void kl_ovrp_report(FILE *f) {
     for (unsigned i = 0; i < g_novrp; i++)
         if (!g_ovrp[i].calls) fprintf(f, "    %s\n", g_ovrp[i].name);
 }
+
+// ---- The compositor fade and the prompt (kl_ovrp.h) --------------------------
+// Three channels: 0 the colour fade, 1 the grid (drawn as black under it),
+// 2 the grid's draw mask (alpha only; starts at 1, kl_ovrp_grid_mask).
+static pthread_mutex_t g_fade_mu = PTHREAD_MUTEX_INITIALIZER;
+static float  g_fade_from[3][4] = { [2] = { 0, 0, 0, 1 } }, g_fade_to[3][4] = { [2] = { 0, 0, 0, 1 } };
+static double g_fade_t0[3], g_fade_len[3];
+static double fade_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void fade_eval(int ch, double now, float o[4]) {          // g_fade_mu held
+    double k = g_fade_len[ch] > 0 ? (now - g_fade_t0[ch]) / g_fade_len[ch] : 1.0;
+    if (k < 0) k = 0;
+    if (k > 1) k = 1;
+    for (int i = 0; i < 4; i++)
+        o[i] = g_fade_from[ch][i] + (float)k * (g_fade_to[ch][i] - g_fade_from[ch][i]);
+}
+static float fade_clamp01(float v) { return v != v ? 0.0f : v < 0 ? 0.0f : v > 1 ? 1.0f : v; }
+static void fade_set(int ch, float r, float g, float b, float a, float seconds) {
+    double now = fade_now();
+    float t[4] = { fade_clamp01(r), fade_clamp01(g), fade_clamp01(b), fade_clamp01(a) };
+    pthread_mutex_lock(&g_fade_mu);
+    float cur[4];
+    fade_eval(ch, now, cur);
+    memcpy(g_fade_from[ch], cur, sizeof cur);
+    // Fading from clear, the colour is the target's from the start: only the
+    // alpha ramps (no grey wash on a fade to black from nothing).
+    if (cur[3] <= 0.0f) memcpy(g_fade_from[ch], t, 3 * sizeof(float));
+    memcpy(g_fade_to[ch], t, sizeof t);
+    g_fade_t0[ch] = now;
+    g_fade_len[ch] = seconds > 0 && seconds == seconds ? seconds : 0;
+    pthread_mutex_unlock(&g_fade_mu);
+}
+void kl_ovrp_fade_to(float r, float g, float b, float a, float seconds) { fade_set(0, r, g, b, a, seconds); }
+void kl_ovrp_grid_to(float alpha, float seconds) { fade_set(1, 0, 0, 0, alpha, seconds); }
+void kl_ovrp_grid_mask(float alpha, float seconds) { fade_set(2, 0, 0, 0, alpha, seconds); }
+float kl_ovrp_grid_alpha(void) {
+    float o[4];
+    double now = fade_now();
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(1, now, o);
+    pthread_mutex_unlock(&g_fade_mu);
+    return o[3];
+}
+void kl_ovrp_fade_current(float rgba[4]) {
+    double now = fade_now();
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(0, now, rgba);
+    pthread_mutex_unlock(&g_fade_mu);
+}
+int kl_ovrp_fade_color(float rgba[4]) {
+    double now = fade_now();
+    float f[4], g[4], m[4];
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(0, now, f);
+    fade_eval(1, now, g);
+    fade_eval(2, now, m);
+    pthread_mutex_unlock(&g_fade_mu);
+    g[3] *= m[3];
+    // The fade over the (black) grid, "over" in straight alpha.
+    float a = f[3] + g[3] * (1.0f - f[3]);
+    for (int i = 0; i < 3; i++) rgba[i] = a > 0 ? f[i] * f[3] / a : 0.0f;
+    rgba[3] = a;
+    return a > 0.0f;
+}
+
+static pthread_mutex_t g_prompt_mu = PTHREAD_MUTEX_INITIALIZER;
+static char     g_prompt[256];
+static unsigned g_prompt_serial;
+void kl_ovrp_set_prompt(const char *text) {
+    pthread_mutex_lock(&g_prompt_mu);
+    const char *t = text ? text : "";
+    if (strcmp(t, g_prompt)) {
+        snprintf(g_prompt, sizeof g_prompt, "%s", t);
+        g_prompt_serial++;
+    }
+    pthread_mutex_unlock(&g_prompt_mu);
+}
+unsigned kl_ovrp_prompt(char *buf, int n) {
+    pthread_mutex_lock(&g_prompt_mu);
+    if (buf && n > 0) snprintf(buf, (size_t)n, "%s", g_prompt);
+    unsigned s = g_prompt_serial;
+    pthread_mutex_unlock(&g_prompt_mu);
+    return s;
+}

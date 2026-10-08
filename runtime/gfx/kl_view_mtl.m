@@ -694,7 +694,7 @@ static void *klvm_first_layer_texture(void) {
 #define KLVM_TOAST_W 1024
 #define KLVM_TOAST_H 288
 #define KLVM_TOAST_QMAX 16
-typedef struct { char *name, *desc, *icon; } klvm_toast;
+typedef struct { char *name, *desc, *icon; const char *header; } klvm_toast;   // header NULL: achievement; icon "-": none
 static klvm_toast g_tq[KLVM_TOAST_QMAX];
 static int g_tq_n;
 static pthread_mutex_t g_tq_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -715,7 +715,7 @@ static void klvm_toast_push(const char *api, const char *name, const char *desc,
     pthread_mutex_lock(&g_tq_mu);
     if (g_tq_n < KLVM_TOAST_QMAX) {
         g_tq[g_tq_n++] = (klvm_toast){ strdup(name ? name : ""), strdup(desc ? desc : ""),
-                                       strdup(icon ? icon : "") };
+                                       strdup(icon ? icon : ""), NULL };
     }
     pthread_mutex_unlock(&g_tq_mu);
 }
@@ -770,30 +770,33 @@ static id<MTLTexture> klvm_toast_raster(const klvm_toast *t) {
     CGRect ir = CGRectMake(48, (H - 192) / 2.0, 192, 192);
     CGPathRef ip = CGPathCreateWithRoundedRect(ir, 28, 28, NULL);
     CGImageRef img = NULL;
-    if (t->icon && *t->icon) {
+    int no_icon = t->icon && !strcmp(t->icon, "-");
+    if (t->icon && *t->icon && !no_icon) {
         CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)t->icon,
                                                              (CFIndex)strlen(t->icon), false);
         CGImageSourceRef src = u ? CGImageSourceCreateWithURL(u, NULL) : NULL;
         if (src) { img = CGImageSourceCreateImageAtIndex(src, 0, NULL); CFRelease(src); }
         if (u) CFRelease(u);
     }
-    CGContextSaveGState(c);
-    CGContextAddPath(c, ip);
-    CGContextClip(c);
-    if (img) CGContextDrawImage(c, ir, img);
-    else { CGContextSetRGBFillColor(c, 0.85, 0.66, 0.22, 1); CGContextFillRect(c, ir); }
-    CGContextRestoreGState(c);
+    if (!no_icon) {
+        CGContextSaveGState(c);
+        CGContextAddPath(c, ip);
+        CGContextClip(c);
+        if (img) CGContextDrawImage(c, ir, img);
+        else { CGContextSetRGBFillColor(c, 0.85, 0.66, 0.22, 1); CGContextFillRect(c, ir); }
+        CGContextRestoreGState(c);
+    }
     CGPathRelease(ip);
     if (img) CGImageRelease(img);
     // Text column.
-    double x = 48 + 192 + 40, maxw = W - x - 48;
+    double x = no_icon ? 72 : 48 + 192 + 40, maxw = W - x - 48;
     CTFontRef fh = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 34, NULL);
     CTFontRef fn = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 50, NULL);
     CTFontRef fd = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 32, NULL);
     CGColorRef gold = CGColorCreateSRGB(1.0, 0.80, 0.35, 1);
     CGColorRef white = CGColorCreateSRGB(1, 1, 1, 1);
     CGColorRef grey = CGColorCreateSRGB(0.78, 0.80, 0.84, 1);
-    CTLineRef lh = klvm_line(klvm_toast_header(), fh, gold, maxw);
+    CTLineRef lh = klvm_line(t->header ? t->header : klvm_toast_header(), fh, gold, maxw);
     CTLineRef ln = klvm_line(t->name, fn, white, maxw);
     // Baselines from the top: header 78, name 146, description lines 198 / 240.
     CGContextSetTextPosition(c, x, H - 78);  CTLineDraw(lh, c);
@@ -851,7 +854,10 @@ static const char *klvm_toast_msl =
     "  VO o; o.p = float4(c.x * 2 - 1, 1 - c.y * 2, 0, 1); o.uv = c; return o; }\n"
     "fragment float4 klvm_toast_f(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
     "                             sampler s [[sampler(0)]], constant float &a [[buffer(0)]]) {\n"
-    "  return t.sample(s, i.uv) * a; }\n";
+    "  return t.sample(s, i.uv) * a; }\n"
+    "fragment float4 klvm_fade_f(VO i [[stage_in]], constant float4 &c [[buffer(0)]]) {\n"
+    "  return float4(c.rgb * c.a, c.a); }\n";
+static id<MTLRenderPipelineState> g_fpipe;    // the compositor fade (kl_ovrp_fade_color)
 
 static void klvm_toast_start(void) {
     g_tstart = klvm_now();
@@ -870,15 +876,81 @@ static void klvm_toast_start(void) {
     pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     g_tpipe = pd.vertexFunction && pd.fragmentFunction
         ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+    pd.fragmentFunction = [lib newFunctionWithName:@"klvm_fade_f"];
+    g_fpipe = pd.vertexFunction && pd.fragmentFunction
+        ? [g_dev newRenderPipelineStateWithDescriptor:pd error:nil] : nil;
     if (!g_tpipe)
         fprintf(stderr, "  [toast] viewer toast pipeline failed: %s — unlocks are only logged\n",
                 err.localizedDescription.UTF8String ?: "?");
 }
 
+// The compositor fade and the gate prompt (kl_ovrp.h), the host twins of
+// KleptonHUD.swift's: the fade over the whole window, the prompt panel in its
+// middle, both under the achievement toast.
+static unsigned       g_pserial;
+static int            g_pon;
+static id<MTLTexture> g_ptex;
+static void klvm_fade_prompt_draw(id<MTLCommandBuffer> cmd, id<MTLTexture> target) {
+    float c[4];
+    int fade = g_fpipe && kl_ovrp_fade_color(c);
+    static int was_fading;
+    if (fade != was_fading) {
+        was_fading = fade;
+        fprintf(stderr, "  [view] compositor fade %s (%.2f %.2f %.2f a %.2f)\n",
+                fade ? "drawing" : "clear", c[0], c[1], c[2], c[3]);
+    }
+    char text[256];
+    unsigned serial = kl_ovrp_prompt(text, sizeof text);
+    if (serial != g_pserial) {
+        g_pserial = serial;
+        int was = g_pon;
+        g_pon = text[0] != 0;
+        g_ptex = nil;
+        if (g_pon) {
+            int es = klvm_toast_es();
+            klvm_toast t = { (char *)(es ? "Pulsa el gatillo para empezar" : "Pull the trigger to start"),
+                             strcmp(text, "-") ? text : (char *)"", (char *)"-",
+                             es ? "Nivel cargado" : "Level loaded" };
+            g_ptex = klvm_toast_raster(&t);
+        }
+        if (g_pon || was)
+            fprintf(stderr, "  [view] gate prompt %s%s%s\n", g_pon ? "shown: " : "cleared", g_pon ? text : "",
+                    g_pon && !g_ptex ? " (raster FAILED)" : "");
+    }
+    if (!fade && !g_ptex) return;
+    double tw = target.width, th = target.height;
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = target;
+    p.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:p];
+    enc.label = @"klepton viewer fade + prompt";
+    if (fade) {
+        [enc setViewport:(MTLViewport){ 0, 0, tw, th, 0.0, 1.0 }];
+        [enc setRenderPipelineState:g_fpipe];
+        [enc setFragmentBytes:c length:sizeof c atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    if (g_ptex && g_tpipe) {
+        double w = fmin(tw * 0.6, KLVM_TOAST_W * fmax(th / 1400.0, 0.5));
+        double h = w * KLVM_TOAST_H / KLVM_TOAST_W;
+        float a = 1.0f;
+        [enc setViewport:(MTLViewport){ (tw - w) * 0.5, (th - h) * 0.5, w, h, 0.0, 1.0 }];
+        [enc setRenderPipelineState:g_tpipe];
+        [enc setFragmentTexture:g_ptex atIndex:0];
+        [enc setFragmentSamplerState:g_samp atIndex:0];
+        [enc setFragmentBytes:&a length:sizeof a atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    [enc endEncoding];
+}
+
 // Drawn last, over whatever the frame is. Fade 0.3 s in and out, 5 s on
 // screen (KL_TOAST_SECS), then the next queued one.
 static void klvm_toast_draw(id<MTLCommandBuffer> cmd, id<MTLTexture> target) {
-    if (!g_tpipe || !target) return;
+    if (!target) return;
+    klvm_fade_prompt_draw(cmd, target);
+    if (!g_tpipe) return;
     double now = klvm_now();
     if (!g_ttest_fired && g_tstart > 0 && now - g_tstart >= 5.0 && kl_env_on("KL_TOAST_TEST", 0)) {
         g_ttest_fired = 1;

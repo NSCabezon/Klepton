@@ -1838,16 +1838,61 @@ static int co_submit_array(void *s, int eye, const Texture_t *tex, uint32_t idx,
     return co_submit_impl(eye, tex, b, flags, (int)idx);
 }
 static void co_void(void *s) { (void)s; }
-// Fades and the grid are the compositor's to draw, and there is no compositor
-// layer for them here: both read as fully clear. Typed, because a float or an
-// HmdColor_t comes back in s0-s3 and a generic stub leaves those as garbage.
+// Fades and the grid are the compositor's to draw. SteamVR hides a level load
+// and Alyx's "press to start" gate behind them; without them the player sees
+// the stale start screen or the paused, half-started level. Each request is
+// filed with kl_ovrp (kl_ovrp_fade_to / kl_ovrp_grid_to, one CLOCK_MONOTONIC
+// clock) and the frontend's compositor draws the current colour head-locked
+// over the scene (KleptonHUD.swift, kl_view_mtl.m). A BACKGROUND fade colours
+// what SteamVR shows behind a scene that is not submitting — never over it —
+// so it is only remembered and answered back. The grid is drawn as black.
+// KL_OPENVR_FADE=0: the old behaviour — nothing drawn, every read fully clear.
+// Typed, because a float or an HmdColor_t comes back in s0-s3 and a generic
+// stub leaves those as garbage.
 typedef struct { float r, g, b, a; } HmdColor_t;
-static HmdColor_t co_fade_color(void *s, int background) { (void)s; (void)background; return (HmdColor_t){ 0, 0, 0, 0 }; }
-static float co_grid_alpha(void *s) { (void)s; return 0.0f; }
-static void co_fade_to(void *s, float t, float r, float g, float b, float a, int bg) {
-    (void)s; (void)t; (void)r; (void)g; (void)b; (void)a; (void)bg;
+static HmdColor_t g_fade_bg;
+static int fade_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_OPENVR_FADE", 1);
+        fprintf(stderr, "  [openvr] compositor fades %s (KL_OPENVR_FADE)\n", on ? "ON" : "off");
+    }
+    return on;
 }
-static void co_fade_grid(void *s, float t, int in) { (void)s; (void)t; (void)in; }
+static HmdColor_t co_fade_color(void *s, int background) {
+    (void)s;
+    if (!fade_on()) return (HmdColor_t){ 0, 0, 0, 0 };
+    if (background & 0xff) return g_fade_bg;
+    float c[4];
+    kl_ovrp_fade_current(c);
+    return (HmdColor_t){ c[0], c[1], c[2], c[3] };
+}
+static float co_grid_alpha(void *s) { (void)s; return fade_on() ? kl_ovrp_grid_alpha() : 0.0f; }
+static void co_fade_to(void *s, float t, float r, float g, float b, float a, int bg) {
+    (void)s;
+    bg &= 0xff;                                   // a C++ bool: only the low byte is defined
+    static float last[6] = { -1, -1, -1, -1, -1, -1 };
+    float cur[6] = { r, g, b, a, t, (float)bg };
+    if (memcmp(cur, last, sizeof cur)) {           // once per change, not per frame
+        memcpy(last, cur, sizeof cur);
+        fprintf(stderr, "  [openvr] fade -> %.2f %.2f %.2f %.2f over %.2f s%s%s\n",
+                r, g, b, a, t, bg ? " (background)" : "", fade_on() ? "" : " (ignored, KL_OPENVR_FADE=0)");
+    }
+    if (!fade_on()) return;
+    if (bg) { g_fade_bg = (HmdColor_t){ r, g, b, a }; return; }
+    kl_ovrp_fade_to(r, g, b, a, t);
+}
+static void co_fade_grid(void *s, float t, int in) {
+    (void)s;
+    in &= 0xff;
+    static int last = -1;
+    if (in != last) {
+        last = in;
+        fprintf(stderr, "  [openvr] fade grid %s over %.2f s%s\n", in ? "IN" : "out", t,
+                fade_on() ? "" : " (ignored, KL_OPENVR_FADE=0)");
+    }
+    if (fade_on()) kl_ovrp_grid_to(in ? 1.0f : 0.0f, t);
+}
 static void co_suspend(void *s, int on) {
     (void)s;
     TRACE("SuspendRendering(%d)\n", on);
@@ -2629,12 +2674,68 @@ static int mb_register(void *s, const char *name, uint64_t *h) {
     return 0;
 }
 static int mb_unregister(void *s, uint64_t h) { (void)s; (void)h; return 0; }
+// KL_GATE_TOAST (default on): Alyx's interstitial messages carry the "press to
+// start" gate — after each load it sends {"type": "show_message", "text":
+// "Pulsa Trigger para empezar"} and, once the trigger unpauses the level,
+// {"type": "end_loading"}. SteamVR's web helper draws that text; here the
+// frontend shows a head-locked prompt (kl_ovrp_set_prompt) until end_loading
+// (or the next begin_loading / hide_message).
+static int mb_json_str(const char *msg, const char *key, char *out, size_t n) {
+    char pat[64];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = msg ? strstr(msg, pat) : NULL;
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p++ != ':') return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p++ != '"') return 0;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < n) {
+        if (*p == '\\' && p[1]) p++;
+        out[i++] = *p++;
+    }
+    out[i] = 0;
+    return 1;
+}
+static void mb_gate_prompt(const char *addr, const char *msg) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GATE_TOAST", 1);
+    if (!addr || strcmp(addr, "hlvr/interstitials")) return;
+    char type[48], text[200];
+    if (!mb_json_str(msg, "type", type, sizeof type)) return;
+    // The grid (FadeGrid) is drawn only while a load is in progress: black over
+    // the stale frame from begin_loading, revealed again at end_loading. Alyx
+    // fades it in at boot and out only at a level's gate, so without this the
+    // main menu (whose load ends without a gate) would stay black.
+    if (fade_on()) {
+        if (!strcmp(type, "begin_loading")) {
+            fprintf(stderr, "  [openvr] load begins: grid drawn (alpha %.2f)\n", kl_ovrp_grid_alpha());
+            kl_ovrp_grid_mask(1.0f, 0.0f);
+        } else if (!strcmp(type, "end_loading")) {
+            fprintf(stderr, "  [openvr] load ends: grid hidden over 0.5 s\n");
+            kl_ovrp_grid_mask(0.0f, 0.5f);
+        }
+    }
+    if (!on) return;
+    if (!strcmp(type, "show_message")) {
+        if (!mb_json_str(msg, "text", text, sizeof text) || !text[0]) snprintf(text, sizeof text, "-");
+        fprintf(stderr, "  [openvr] gate prompt ON: \"%s\" (KL_GATE_TOAST)\n", text);
+        kl_ovrp_set_prompt(text);
+    } else if (!strcmp(type, "end_loading") || !strcmp(type, "begin_loading") || !strcmp(type, "hide_message")) {
+        char cur[8];
+        kl_ovrp_prompt(cur, sizeof cur);
+        if (cur[0]) fprintf(stderr, "  [openvr] gate prompt off (%s)\n", type);
+        kl_ovrp_set_prompt(NULL);
+    }
+}
 static int mb_send(void *s, uint64_t h, const char *addr, const char *msg) {
     (void)s;
     static int n;
     if (n++ < 16)
         fprintf(stderr, "  [openvr] IVRMailbox::SendMessage(#%llu -> \"%s\"): %.200s\n",
                 (unsigned long long)h, addr ? addr : "", msg ? msg : "");
+    mb_gate_prompt(addr, msg);
     return 0;
 }
 static int mb_read(void *s, uint64_t h, char *buf, uint32_t size, uint32_t *needed) {
@@ -2926,6 +3027,8 @@ static const impl g_impl[] = {
     { COMP, "Submit", (void *)co_submit }, { COMP, "SubmitWithArrayIndex", (void *)co_submit_array },
     { COMP, "FadeToColor", (void *)co_fade_to }, { COMP, "GetCurrentFadeColor", (void *)co_fade_color },
     { COMP, "FadeGrid", (void *)co_fade_grid }, { COMP, "GetCurrentGridAlpha", (void *)co_grid_alpha },
+    // Both return void in IVRCompositor_029; there is no override to clear.
+    { COMP, "ClearSkyboxOverride", (void *)co_void }, { COMP, "ClearStageOverride", (void *)co_void },
     { COMP, "SuspendRendering", (void *)co_suspend },
     { COMP, "ClearLastSubmittedFrame", (void *)co_void }, { COMP, "PostPresentHandoff", (void *)co_void },
     { COMP, "GetFrameTiming", (void *)co_frame_timing },
