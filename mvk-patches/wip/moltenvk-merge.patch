@@ -1,0 +1,830 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+index 9092954..f6e4e5f 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+@@ -113,10 +113,43 @@
+ 	
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 
++	// Klepton KL_MVK_MERGE_SUSPEND: a barrier BETWEEN the segments of a suspended instance
++	// whose Metal encoder is held open (Source 2 records one at the start of a resuming
++	// command buffer; Vulkan VUID-VkSubmitInfo-pCommandBuffers-06193 forbids it, real
++	// drivers shrug). Nothing executes between the segments, so it can only order the
++	// first segment's work before the second's: treat it as a barrier INSIDE the render
++	// pass instance (what an in-pass vkCmdPipelineBarrier gets below), unless it is one
++	// that needs the Metal pass split (an attachment going GENERAL, an input attachment).
++	id<MTLRenderCommandEncoder> mtlRendEnc = cmdEncoder->_mtlRenderEncoder;
++	bool intoHeld = false;
++	if ( !mtlRendEnc && cmdEncoder->getIdleHeldRenderEncoder() ) {
++		const char* why = nullptr;
++		for (auto& b : _barriers) {
++			// An attachment of the held instance going to GENERAL is what stock MoltenVK splits
++			// a Metal pass for inside an instance (a feedback loop: the next draws may SAMPLE it).
++			// Source 2 issues GENERAL -> GENERAL (a plain memory barrier) between its scene
++			// segments; a real transition into GENERAL still splits, and KL_MVK_MERGE_STRICT=1
++			// splits on either.
++			if (b.type == MVKPipelineBarrier::Image && b.newLayout == VK_IMAGE_LAYOUT_GENERAL && cmdEncoder->isHeldAttachmentImage(b.mvkImage) &&
++				(mvkfov::isMergeStrict() || b.mvkImage->klGetLayout(b.baseMipLevel, b.baseArrayLayer) != VK_IMAGE_LAYOUT_GENERAL)) {
++				why = "a barrier takes an attachment to GENERAL between the segments"; break;
++			}
++			if (mvkIsAnyFlagEnabled(_dependencyFlags, VK_DEPENDENCY_BY_REGION_BIT) &&
++				mvkIsAnyFlagEnabled(b.dstAccessMask, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)) {
++				why = "an input-attachment barrier between the segments"; break;
++			}
++		}
++		cmdEncoder->traceHeldBarrier(_barriers.size(), _barriers.size() ? &_barriers[0] : nullptr, why);
++		if ( !why ) {
++			intoHeld = true;
++			mtlRendEnc = cmdEncoder->getIdleHeldRenderEncoder();
++		}
++	}
++
+ #if MVK_MACOS
+ 	// Calls below invoke MTLBlitCommandEncoder so must apply this first.
+ 	// Check if pipeline barriers are available and we are in a renderpass.
+-	if (mtlFeats.memoryBarriers && cmdEncoder->_mtlRenderEncoder) {
++	if (mtlFeats.memoryBarriers && mtlRendEnc) {
+ 		for (auto& b : _barriers) {
+ 			MTLRenderStages srcStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.srcStageMask, false);
+ 			MTLRenderStages dstStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.dstStageMask, true);
+@@ -124,7 +157,7 @@
+ 				case MVKPipelineBarrier::Memory: {
+ 					MTLBarrierScope scope = (mvkMTLBarrierScopeFromVkAccessFlags(b.srcAccessMask) |
+ 											 mvkMTLBarrierScopeFromVkAccessFlags(b.dstAccessMask));
+-					[cmdEncoder->_mtlRenderEncoder memoryBarrierWithScope: scope
++					[mtlRendEnc memoryBarrierWithScope: scope
+ 															  afterStages: srcStages
+ 															 beforeStages: dstStages];
+ 					break;
+@@ -132,7 +165,7 @@
+ 
+ 				case MVKPipelineBarrier::Buffer: {
+ 					id<MTLResource> mtlRez = b.mvkBuffer->getMTLBuffer();
+-					[cmdEncoder->_mtlRenderEncoder memoryBarrierWithResources: &mtlRez
++					[mtlRendEnc memoryBarrierWithResources: &mtlRez
+ 																		count: 1
+ 																  afterStages: srcStages
+ 																 beforeStages: dstStages];
+@@ -144,7 +177,7 @@
+ 					for (uint8_t plnIdx = 0; plnIdx < plnCnt; plnIdx++) {
+ 						mtlRezs[plnIdx] = b.mvkImage->getMTLTexture(plnIdx);
+ 					}
+-					[cmdEncoder->_mtlRenderEncoder memoryBarrierWithResources: mtlRezs
++					[mtlRendEnc memoryBarrierWithResources: mtlRezs
+ 																		count: plnCnt
+ 																  afterStages: srcStages
+ 																 beforeStages: dstStages];
+@@ -157,6 +190,20 @@
+ 	}
+ #endif
+ 
++	if (intoHeld) {
++		// Layout bookkeeping only (a host sync on macOS-managed memory would open a blit
++		// encoder, which ends the held encoder the stock way first).
++		for (auto& b : _barriers) {
++			switch (b.type) {
++				case MVKPipelineBarrier::Memory: cmdEncoder->getDevice()->applyMemoryBarrier(b, cmdEncoder, kMVKCommandUsePipelineBarrier); break;
++				case MVKPipelineBarrier::Buffer: b.mvkBuffer->applyBufferMemoryBarrier(b, cmdEncoder, kMVKCommandUsePipelineBarrier); break;
++				case MVKPipelineBarrier::Image:  b.mvkImage->applyImageMemoryBarrier(b, cmdEncoder, kMVKCommandUsePipelineBarrier); break;
++				default: break;
++			}
++		}
++		return;
++	}
++
+ 	if (!cmdEncoder->_mtlRenderEncoder && cmdEncoder->isUsingMetalArgumentBuffers() && cmdEncoder->getDevice()->hasResidencySet()) {
+ 		cmdEncoder->endCurrentMetalEncoding();
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 11d41d0..cff5fb1 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -66,6 +66,27 @@ typedef struct MVKCommandEncodingContext {
+ 	VkRenderingFlags getRenderingFlags() { return _renderPass ? _renderPass->getRenderingFlags() : 0; }
+ 	~MVKCommandEncodingContext();
+ 
++	// Klepton KL_MVK_MERGE_SUSPEND: a SUSPENDING dynamic-rendering instance whose
++	// Metal render encoder was left OPEN (no store actions, no endEncoding) for the
++	// RESUMING instance in a later command buffer of this submission to continue in,
++	// so the attachments never leave tile memory between the segments.
++	id<MTLRenderCommandEncoder> heldRenderEncoder = nil;	// not retained (see retainIfImmediatelyEncoding)
++	id<MTLCommandBuffer> heldMTLCmdBuffer = nil;			// the command buffer it encodes into
++	MVKSmallVector<MVKImageView*, 8> heldAttachments;		// for the store actions of a fallback
++	MVKFoveationPassState heldFov;							// Klepton FDM state of the held instance
++	bool heldIsRenderingEntireAttachment = false;
++	bool heldAreaEntire = false;							// KL_MVK_AREA_ENTIRE decision of a suspended instance
++	bool heldAreaEntireValid = false;						//   ...kept for its resumed segments
++	uint32_t heldSerial = 0;								// encoderSerial of the encoder that held it
++	uint32_t encoderSerial = 0;								// one per MVKCommandEncoder::beginEncoding
++
++	/** Ends a held encoder that nobody resumed (invalid usage); its contents are lost. */
++	void abandonHeldRenderEncoder();
++
++	/** Occlusion-query resets recorded between held segments, encoded when the held encoder ends. */
++	struct PendingQueryReset { id<MTLBuffer> buffer; NSUInteger offset; NSUInteger length; };
++	MVKSmallVector<PendingQueryReset, 4> pendingQueryResets;
++
+ private:
+ 	MVKRenderPass* _renderPass = nullptr;
+ 	MVKFramebuffer* _framebuffer = nullptr;
+@@ -293,6 +314,31 @@ public:
+ 	/** If a render encoder is active, encodes store actions for all attachments to it. */
+ 	void encodeStoreActions(bool storeOverride = false);
+ 
++	/** Klepton KL_MVK_MERGE_SUSPEND: ends a render encoder a SUSPENDING instance left open, storing its attachments. */
++	void flushHeldRenderEncoder(const char* why);
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: continues a RESUMING instance in the held encoder. Returns false to fall back. */
++	bool resumeHeldRenderEncoder(MVKCommand* rendCmd, const VkRenderingInfo* pRenderingInfo, VkSubpassContents contents,
++								 MVKArrayRef<VkClearValue> clearValues, MVKArrayRef<MVKImageView*> attachments);
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: leaves a SUSPENDING instance's encoder open for its resumption. Returns false if it cannot. */
++	bool holdSuspendedRenderEncoder();
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: the held encoder, if one is held and this encoder has no Metal encoder open; else nil. */
++	id<MTLRenderCommandEncoder> getIdleHeldRenderEncoder();
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: whether the image is one of the held instance's attachments. */
++	bool isHeldAttachmentImage(MVKImage* image);
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: KL_MVK_MERGE_DEBUG trace of a barrier met between held segments. */
++	void traceHeldBarrier(size_t count, const MVKPipelineBarrier* barriers, const char* why);
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: defers an occlusion-query reset fill while a segment is held. Returns whether deferred. */
++	bool deferQueryResetWhileHeld(id<MTLBuffer> buffer, NSUInteger offset, NSUInteger length);
++
++	/** Klepton KL_MVK_MERGE_SUSPEND: encodes the deferred query resets (after the held encoder ended). */
++	void encodePendingQueryResets();
++
+ 	/** Returns whether or not we are presently in a render pass. */
+ 	bool isInRenderPass() { return _pEncodingContext->getRenderPass() != nullptr; }
+ 
+@@ -565,6 +611,8 @@ protected:
+ 	MVKCommandUse _mtlBlitEncoderUse;
+ 	bool _isRenderingEntireAttachment;
+ 	MVKFoveationPassState _fov;		// Klepton FDM: the render pass instance being encoded
++	uint32_t _ctxSerial = 0;		// Klepton merge: this encoder's encoderSerial in its context
++	bool _inEndEncoding = false;	// Klepton merge: the holder's own endEncoding must not flush
+ };
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index cfedf9e..8d1d63c 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -27,6 +27,10 @@
+ #include "MVKCmdRendering.h"
+ #include <sys/mman.h>
+ 
++#include <execinfo.h>
++#include <typeinfo>
++#include <atomic>
++
+ using namespace std;
+ 
+ 
+@@ -68,9 +72,31 @@
+ 
+ // Release rendering objects in case this instance is destroyed before ending the current renderpass.
+ MVKCommandEncodingContext::~MVKCommandEncodingContext() {
++	abandonHeldRenderEncoder();
+ 	setRenderingContext(nullptr, nullptr);
+ }
+ 
++// Klepton KL_MVK_MERGE_SUSPEND: a held encoder still open when its Metal command buffer
++// is committed means a suspended instance nobody resumed in this submission (invalid
++// Vulkan usage). Metal will not commit a command buffer with an encoder still open, so
++// end it; its store actions were never set and its contents are lost.
++void MVKCommandEncodingContext::abandonHeldRenderEncoder() {
++	if ( !heldRenderEncoder ) { return; }
++	mvkfov::logOnce("merge:abandon", "[mvk-merge] a suspended render pass instance was never resumed in its submission; its open encoder is ended without storing (logged once)\n");
++	[heldRenderEncoder endEncoding];
++	heldRenderEncoder = nil;
++	heldMTLCmdBuffer = nil;
++	heldAttachments.clear();
++	heldFov.reset();
++	// No encoder to put the deferred query resets in: zero them from the CPU.
++	for (auto& r : pendingQueryResets) {
++		NSUInteger end = std::min<NSUInteger>(r.offset + r.length, r.buffer.length);
++		if (r.buffer.contents && end > r.offset) { mvkClear((char*)r.buffer.contents + r.offset, end - r.offset); }
++	}
++	pendingQueryResets.clear();
++	mvkfov::noteMerge(2, "never resumed");
++}
++
+ 
+ #pragma mark -
+ #pragma mark MVKCurrentSubpassInfo
+@@ -424,6 +450,8 @@
+ 
+ void MVKCommandEncoder::beginEncoding(id<MTLCommandBuffer> mtlCmdBuff, MVKCommandEncodingContext* pEncodingContext) {
+ 	_pEncodingContext = pEncodingContext;
++	_ctxSerial = ++pEncodingContext->encoderSerial;
++	_inEndEncoding = false;
+ 
+     _subpassContents = VK_SUBPASS_CONTENTS_INLINE;
+     _renderSubpassIndex = 0;
+@@ -446,8 +474,25 @@
+ 	}
+ }
+ 
++// KL_MVK_MERGE_DEBUG=2: name every command encoded while a suspended encoder is held (budgeted).
++static int mergeTraceBudget() {
++	static int b = -1;
++	if (b < 0) { const char* e = getenv("KL_MVK_MERGE_DEBUG"); b = (e && atoi(e) >= 2) ? 400 : 0; }
++	return b;
++}
++static std::atomic<int> s_mergeTraceLeft{-1};
++
+ void MVKCommandEncoder::encodeCommandsImpl(MVKCommand* command) {
++	if (s_mergeTraceLeft.load() < 0) { s_mergeTraceLeft = mergeTraceBudget(); }
++	if (s_mergeTraceLeft.load() > 0 && _pEncodingContext && _pEncodingContext->heldRenderEncoder) {
++		s_mergeTraceLeft--;
++		fprintf(stderr, "[mvk-merge] -- next command buffer while held (serial %u)\n", _ctxSerial);
++	}
+     while(command) {
++		if (s_mergeTraceLeft.load() > 0 && _pEncodingContext && _pEncodingContext->heldRenderEncoder) {
++			s_mergeTraceLeft--;
++			fprintf(stderr, "[mvk-merge]    held, encoding %s\n", typeid(*command).name());
++		}
+         uint32_t prevMVPassIdx = _multiviewPassIndex;
+         command->encode(this);
+ 
+@@ -463,8 +508,10 @@
+ }
+ 
+ void MVKCommandEncoder::endEncoding() {
++	_inEndEncoding = true;		// an encoder this command buffer left open for a resume stays open
+ 	endCurrentMetalEncoding();
+ 	finishQueries();
++	_inEndEncoding = false;
+ }
+ 
+ void MVKCommandEncoder::encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer) {
+@@ -504,6 +551,11 @@
+ 	MVKFramebuffer* mvkFB;
+ 	bool isResumingSuspended = (mvkIsAnyFlagEnabled(_pEncodingContext->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT) &&
+ 								mvkIsAnyFlagEnabled(pRenderingInfo->flags, VK_RENDERING_RESUMING_BIT));
++	// Klepton KL_MVK_MERGE_SUSPEND: continue in the encoder the suspended segment left open.
++	if (isResumingSuspended && _pEncodingContext->heldRenderEncoder &&
++		resumeHeldRenderEncoder(rendCmd, pRenderingInfo, contents, MVKArrayRef(clearValues, attCnt), MVKArrayRef(imageViews, attCnt))) {
++		return;
++	}
+ 	if (isResumingSuspended) {
+ 		mvkRP = _pEncodingContext->getRenderPass();
+ 		mvkRP->setRenderingFlags(pRenderingInfo->flags);
+@@ -548,6 +600,21 @@
+ 									mvkVkExtent2DsAreEqual(_renderArea.extent, getFramebufferExtent()));
+ 	_clearValues.assign(clearValues.begin(), clearValues.end());
+ 	_attachments.assign(attachments.begin(), attachments.end());
++	// Klepton KL_MVK_AREA_ENTIRE: a multisampled render area anchored at the origin is
++	// "the entire attachment": Metal bounds the pass to renderTargetWidth/Height (the
++	// area), so a CLEAR becomes a clear load action and DONT_CARE + resolve a plain
++	// resolve, instead of Load + a clearing draw and store-and-resolve. Kept for every
++	// segment of a suspended instance (the store decision belongs to its last segment).
++	bool isResuming = mvkIsAnyFlagEnabled(renderPass->getRenderingFlags(), VK_RENDERING_RESUMING_BIT);
++	if (isResuming && _pEncodingContext->heldAreaEntireValid) {
++		_isRenderingEntireAttachment = _pEncodingContext->heldAreaEntire;
++	} else if ( !_isRenderingEntireAttachment && mvkfov::isOriginAreaEntire() &&
++			   _renderArea.offset.x == 0 && _renderArea.offset.y == 0 &&
++			   renderPass->getSubpass(0)->getSampleCount() > VK_SAMPLE_COUNT_1_BIT) {
++		_isRenderingEntireAttachment = true;
++	}
++	_pEncodingContext->heldAreaEntire = _isRenderingEntireAttachment;
++	_pEncodingContext->heldAreaEntireValid = mvkIsAnyFlagEnabled(renderPass->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT);
+ 	fovBeginRenderpass();
+ 
+ 	setSubpass(passCmd, subpassContents, 0, cmdUse);
+@@ -1271,14 +1338,200 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	endRenderpass();
+ }
+ 
++#pragma mark Klepton KL_MVK_MERGE_SUSPEND (suspended dynamic rendering in one Metal encoder)
++
++// Stock MoltenVK ends the Metal render encoder at every SUSPENDING vkCmdEndRendering
++// and starts a new one at the RESUMING vkCmdBeginRendering, so every attachment is
++// stored at the end of each segment and loaded back at the start of the next (Alyx's
++// scene pass: 4 segments x 2x/4x MSAA colour + D32S8, recorded on several threads).
++// Vulkan forbids action and synchronization commands between a suspended instance and
++// its resumption, so the encoder can stay open: the suspending command buffer hands it
++// to the submission's encoding context un-ended, and the resuming one continues in it.
++// Anything else touching Metal in between (or a different MTLCommandBuffer, queries,
++// prefill) ends it with the stock store actions — the stock path, nothing lost.
++
++bool MVKCommandEncoder::holdSuspendedRenderEncoder() {
++	if ( !mvkfov::isMergeSuspendEnabled() ) { return false; }
++	auto* ctx = _pEncodingContext;
++	const char* why = nullptr;
++	MVKRenderSubpass* sp = getSubpass();
++	if ( !_mtlRenderEncoder ) { why = "no open render encoder at the suspend"; }
++	else if (_cmdBuffer->_immediateCmdEncoder) { why = "prefilled command buffers"; }
++	else if (_cmdBuffer->_needsVisibilityResultMTLBuffer || _cmdBuffer->_hasStageCounterTimestampCommand) { why = "occlusion or timestamp queries"; }
++	else if ( !sp || (sp->isMultiview() && sp->getMultiviewMetalPassCount() != 1) ) { why = "multiview split into several Metal passes"; }
++	else if (ctx->heldRenderEncoder) { why = "an encoder is already held"; }
++	if (why) {
++		char key[96];
++		snprintf(key, sizeof(key), "merge:nohold:%s", why);
++		mvkfov::logOnce(key, "[mvk-merge] a suspending segment ends its encoder (stock store/load): %s (logged once)\n", why);
++		mvkfov::noteMerge(2, why);
++		return false;
++	}
++	ctx->heldRenderEncoder = _mtlRenderEncoder;
++	ctx->heldMTLCmdBuffer = _mtlCmdBuffer;
++	ctx->heldAttachments.assign(_attachments.begin(), _attachments.end());
++	ctx->heldIsRenderingEntireAttachment = _isRenderingEntireAttachment;
++	ctx->heldFov = _fov;
++	ctx->heldSerial = _ctxSerial;
++	_mtlRenderEncoder = nil;
++	mvkfov::logOnce("merge:first", "[mvk-merge] first suspending segment left open for its resumption\n");
++	mvkfov::noteMerge(0, nullptr);
++	return true;
++}
++
++bool MVKCommandEncoder::resumeHeldRenderEncoder(MVKCommand* rendCmd, const VkRenderingInfo* pRenderingInfo, VkSubpassContents contents,
++												MVKArrayRef<VkClearValue> clearValues, MVKArrayRef<MVKImageView*> attachments) {
++	auto* ctx = _pEncodingContext;
++	const char* why = nullptr;
++	if (ctx->heldMTLCmdBuffer != _mtlCmdBuffer) { why = "the resume is in another MTLCommandBuffer"; }
++	else if (_cmdBuffer->_immediateCmdEncoder || _cmdBuffer->_needsVisibilityResultMTLBuffer || _cmdBuffer->_hasStageCounterTimestampCommand) {
++		why = "queries or prefill in the resuming command buffer";
++	} else if (_mtlRenderEncoder || _mtlComputeEncoder || _mtlBlitEncoder) { why = "an encoder is open at the resume"; }
++	else if (attachments.size() != ctx->heldAttachments.size()) { why = "different attachments"; }
++	else {
++		for (size_t i = 0; i < attachments.size(); i++) {
++			if (attachments[i] != ctx->heldAttachments[i]) { why = "different attachments"; break; }
++		}
++	}
++	if (why) {
++		flushHeldRenderEncoder(why);
++		return false;
++	}
++
++	MVKRenderPass* mvkRP = ctx->getRenderPass();
++	mvkRP->setRenderingFlags(pRenderingInfo->flags);
++
++	// What beginRenderpass() and setSubpass() set up, minus a new Metal render pass.
++	_renderArea = pRenderingInfo->renderArea;
++	_isRenderingEntireAttachment = ctx->heldIsRenderingEntireAttachment;
++	ctx->heldAreaEntireValid = mvkIsAnyFlagEnabled(pRenderingInfo->flags, VK_RENDERING_SUSPENDING_BIT);
++	_clearValues.assign(clearValues.begin(), clearValues.end());
++	_attachments.assign(attachments.begin(), attachments.end());
++	_fov = ctx->heldFov;
++	_lastMultiviewPassCmd = rendCmd;
++	_subpassContents = contents;
++	_renderSubpassIndex = 0;
++	_multiviewPassIndex = 0;
++	auto& mtlFeats = getMetalFeatures();
++	_canUseLayeredRendering = mtlFeats.layeredRendering && (mtlFeats.multisampleLayeredRendering || getSubpass()->getSampleCount() == VK_SAMPLE_COUNT_1_BIT);
++
++	_mtlRenderEncoder = ctx->heldRenderEncoder;
++	ctx->heldRenderEncoder = nil;
++	ctx->heldMTLCmdBuffer = nil;
++	ctx->heldAttachments.clear();
++	ctx->heldFov.reset();
++	// A new command buffer binds everything again: start the Metal-side tracking clean.
++	getState().beginGraphicsEncoding(getSampleCount());
++	mvkfov::noteMerge(1, nullptr);
++	return true;
++}
++
++id<MTLRenderCommandEncoder> MVKCommandEncoder::getIdleHeldRenderEncoder() {
++	if ( !_pEncodingContext || _mtlRenderEncoder || _mtlComputeEncoder || _mtlBlitEncoder ) { return nil; }
++	return _pEncodingContext->heldRenderEncoder;
++}
++
++bool MVKCommandEncoder::isHeldAttachmentImage(MVKImage* image) {
++	if ( !_pEncodingContext || !image ) { return false; }
++	for (auto* iv : _pEncodingContext->heldAttachments) {
++		if (iv && iv->getImage() == image) { return true; }
++	}
++	return false;
++}
++
++void MVKCommandEncoder::traceHeldBarrier(size_t count, const MVKPipelineBarrier* barriers, const char* why) {
++	static int left = -1;
++	if (left < 0) { const char* e = getenv("KL_MVK_MERGE_DEBUG"); left = (e && *e && *e != '0') ? 16 : 0; }
++	if (left <= 0) { return; }
++	left--;
++	fprintf(stderr, "[mvk-merge] barrier between held segments (%zu): %s\n", count, why ? why : "kept in the open encoder");
++	for (size_t i = 0; i < count; i++) {
++		const auto& b = barriers[i];
++		fprintf(stderr, "[mvk-merge]   type %d src stage %#llx access %#llx -> dst stage %#llx access %#llx%s",
++				(int)b.type, (unsigned long long)b.srcStageMask, (unsigned long long)b.srcAccessMask,
++				(unsigned long long)b.dstStageMask, (unsigned long long)b.dstAccessMask, b.type == MVKPipelineBarrier::Image ? "" : "\n");
++		if (b.type == MVKPipelineBarrier::Image) {
++			fprintf(stderr, " image %p (%ux%u x%u samples %u) layout %d -> %d%s\n", (void*)b.mvkImage,
++					b.mvkImage->getExtent3D().width, b.mvkImage->getExtent3D().height, b.mvkImage->getLayerCount(),
++					(unsigned)b.mvkImage->getSampleCount(), (int)b.mvkImage->klGetLayout(b.baseMipLevel, b.baseArrayLayer),
++					(int)b.newLayout, isHeldAttachmentImage(b.mvkImage) ? " [held attachment]" : "");
++		}
++	}
++}
++
++bool MVKCommandEncoder::deferQueryResetWhileHeld(id<MTLBuffer> buffer, NSUInteger offset, NSUInteger length) {
++	if ( !buffer || !getIdleHeldRenderEncoder() ) { return false; }
++	_pEncodingContext->pendingQueryResets.push_back({ buffer, offset, length });
++	return true;
++}
++
++void MVKCommandEncoder::encodePendingQueryResets() {
++	auto* ctx = _pEncodingContext;
++	if ( !ctx || ctx->pendingQueryResets.empty() || ctx->heldRenderEncoder ) { return; }
++	MVKSmallVector<MVKCommandEncodingContext::PendingQueryReset, 4> resets;
++	for (auto& r : ctx->pendingQueryResets) { resets.push_back(r); }
++	ctx->pendingQueryResets.clear();
++	id<MTLBlitCommandEncoder> blitEncoder = getMTLBlitEncoder(kMVKCommandUseResetQueryPool);
++	for (auto& r : resets) {
++		[blitEncoder fillBuffer: r.buffer range: NSMakeRange(r.offset, r.length) value: 0];
++	}
++}
++
++void MVKCommandEncoder::flushHeldRenderEncoder(const char* why) {
++	auto* ctx = _pEncodingContext;
++	if ( !ctx || !ctx->heldRenderEncoder ) { return; }
++	id<MTLRenderCommandEncoder> held = ctx->heldRenderEncoder;
++	ctx->heldRenderEncoder = nil;
++
++	// The stock end of a suspending segment: store every attachment for the resumption.
++	id<MTLRenderCommandEncoder> mine = _mtlRenderEncoder;
++	_mtlRenderEncoder = held;
++	MVKRenderPass* rp = ctx->getRenderPass();
++	if (rp) { rp->getSubpass(0)->encodeStoreActions(this, ctx->heldIsRenderingEntireAttachment, ctx->heldAttachments.contents(), true); }
++	barrierUpdate(kMVKBarrierStageVertex, held, MTLRenderStageVertex);
++	barrierUpdate(kMVKBarrierStageFragment, held, MTLRenderStageFragment);
++	[held endEncoding];
++	_mtlRenderEncoder = mine;
++	encodePendingQueryResets();
++
++	ctx->heldMTLCmdBuffer = nil;
++	ctx->heldAttachments.clear();
++	ctx->heldFov.reset();
++	// KL_MVK_MERGE_DEBUG=1: who ended it (the first 8 times), to find what an app does between segments.
++	static int dbg = -1;
++	if (dbg < 0) { const char* e = getenv("KL_MVK_MERGE_DEBUG"); dbg = (e && *e && *e != '0') ? 8 : 0; }
++	if (dbg > 0) {
++		dbg--;
++		void* frames[12];
++		int n = backtrace(frames, 12);
++		fprintf(stderr, "[mvk-merge] flush (%s) from:\n", why);
++		backtrace_symbols_fd(frames, n, 2);
++	}
++	char key[128];
++	snprintf(key, sizeof(key), "merge:flush:%s", why);
++	mvkfov::logOnce(key, "[mvk-merge] an open suspended encoder was ended with store actions: %s (logged once)\n", why);
++	mvkfov::noteMerge(2, why);
++}
++
+ void MVKCommandEncoder::endRenderpass() {
+ 	if (hasMoreMultiviewPasses()) {
+ 		beginNextMultiviewPass();
+ 		return;
+ 	}
+ 
+-	encodeStoreActions();
+-	endMetalRenderEncoding();
++	// Klepton KL_MVK_MERGE_SUSPEND: a suspending segment leaves its encoder open for the
++	// resuming one (no store actions, no endEncoding); everything else as below.
++	bool held = mvkIsAnyFlagEnabled(_pEncodingContext->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT) &&
++				holdSuspendedRenderEncoder();
++	if ( !held ) {
++		encodeStoreActions();
++		endMetalRenderEncoding();
++		encodePendingQueryResets();
++	}
++	if ( !mvkIsAnyFlagEnabled(_pEncodingContext->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT) &&
++		mvkIsAnyFlagEnabled(_pEncodingContext->getRenderingFlags(), VK_RENDERING_RESUMING_BIT)) {
++		mvkfov::noteSceneFrame();
++	}
+ 	// Klepton FDM: the shadows' contents into the real attachments, before anything
+ 	// after the render pass (including its external dependency) can read them.
+ 	// A SUSPENDING dynamic-rendering instance is not over: its attachments are only
+@@ -1314,6 +1567,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ }
+ 
+ void MVKCommandEncoder::endCurrentMetalEncoding() {
++	// Klepton KL_MVK_MERGE_SUSPEND: any other Metal work in this command buffer before
++	// the resume (the holder's own end of encoding excepted) ends the held encoder first.
++	if (_pEncodingContext && _pEncodingContext->heldRenderEncoder && !_inEndEncoding) {
++		flushHeldRenderEncoder("Metal work between the segments");
++	}
+ 	endMetalRenderEncoding();
+ 	encodeBarrierUpdates();
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h
+index 94c6a64..e49265a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h
+@@ -133,6 +133,47 @@ namespace mvkfov {
+ 
+ 	/** Logs a message at most once per key string. */
+ 	void logOnce(const char* key, const char* fmt, ...) __printflike(2, 3);
++
++	// ---- Klepton: suspended dynamic rendering kept in ONE Metal render encoder ----
++	// (MVKCommandEncoder::holdSuspendedRenderEncoder / resumeHeldRenderEncoder)
++
++	/**
++	 * KL_MVK_MERGE_SUSPEND=1 (default off): a SUSPENDING dynamic-rendering instance leaves
++	 * its Metal render encoder open, and the RESUMING instance later in the same submission
++	 * continues in it — no store/load of every attachment at each segment boundary.
++	 * Inside a KL_MVK_MERGE_AB "stock" phase this returns false.
++	 */
++	bool isMergeSuspendEnabled();
++
++	/**
++	 * KL_MVK_AREA_ENTIRE=1 (default off; implied by KL_MVK_MEMORYLESS_MSAA): a MULTISAMPLED
++	 * render pass instance whose render area starts at the origin is treated as rendering its
++	 * entire attachments (Metal's renderTargetWidth/Height bound it to the area), so a CLEAR
++	 * is a clear load action instead of Load + a clearing draw, and DONT_CARE + resolve is a
++	 * plain resolve instead of store-and-resolve. Alyx's dynamic resolution draws each eye
++	 * into the top-left of a bigger image, so without this every MSAA attachment is loaded
++	 * and stored once per frame even when the segments are merged.
++	 * Inside a KL_MVK_MERGE_AB "stock" phase this returns false.
++	 */
++	bool isOriginAreaEntire();
++
++	/**
++	 * KL_MVK_MEMORYLESS_MSAA=1 (default off): multisampled colour/depth/stencil attachment
++	 * images get MTLStorageModeMemoryless textures. Only valid for an app that never samples,
++	 * copies, loads or stores them — with merged segments and KL_MVK_AREA_ENTIRE, Alyx's MSAA
++	 * targets are cleared, rendered and resolved inside one encoder. A store that would have
++	 * been needed is logged (once per reason) and becomes don't-care: contents lost.
++	 */
++	bool isMemorylessMSAA();
++
++	/** KL_MVK_MERGE_STRICT=1: also end the held encoder at a GENERAL -> GENERAL barrier on its attachments (stock-safe). */
++	bool isMergeStrict();
++
++	/** Counts merge outcomes for the periodic [mvk-merge] line. what: 0 held, 1 resumed in the held encoder, 2 fell back. */
++	void noteMerge(int what, const char* why);
++
++	/** Counts the end of a resumed (merged or not) instance: a "frame" for the KL_MVK_MERGE_AB accounting. */
++	void noteSceneFrame();
+ }
+ 
+ /** What the end of a foveated render pass instance owes an attachment's real image. */
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm
+index b917179..30b92b3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm
+@@ -480,13 +480,23 @@ uint32_t getUnwarpOptions() {
+ 
+ #pragma mark Statistics
+ 
++// The in-process A/B has one subject: foveation (KL_FOVEATE_AB) or the suspend/resume
++// merge with its area treatment (KL_MVK_MERGE_AB). Phase 0 = the feature ON, 1 = OFF.
++enum { kABSubjectFov = 0, kABSubjectMerge = 1 };
++static int s_abSubject = kABSubjectFov;
+ static double abPeriod() {
+ 	static double p = -1;
+ 	if (p < 0) {
+ 		const char* v = getenv("KL_FOVEATE_AB");
++		const char* m = getenv("KL_MVK_MERGE_AB");
++		if (m && atof(m) >= 1.0) { v = m; s_abSubject = kABSubjectMerge; }
+ 		p = v ? atof(v) : 0;
+ 		if ( !(p >= 1.0) ) { p = 0; }
+-		if (p > 0) { fprintf(stderr, "[mvk-fov] KL_FOVEATE_AB=%.0f: foveation alternates ON/OFF every %.0f s in this run (per-phase GPU ms/frame below)\n", p, p); }
++		if (p > 0) {
++			fprintf(stderr, "[mvk-%s] %s=%.0f: %s alternates ON/OFF every %.0f s in this run (per-phase GPU ms/frame below)\n",
++					s_abSubject == kABSubjectMerge ? "merge" : "fov", s_abSubject == kABSubjectMerge ? "KL_MVK_MERGE_AB" : "KL_FOVEATE_AB",
++					p, s_abSubject == kABSubjectMerge ? "the suspend/resume merge (+ area/memoryless settings)" : "foveation", p);
++		}
+ 	}
+ 	return p;
+ }
+@@ -513,7 +523,64 @@ bool isGPUTimeEnabled() {
+ }
+ 
+ bool isABOffPhase() {
+-	return abPeriod() > 0 && abPhaseAt(CACurrentMediaTime()) == 1;
++	return abPeriod() > 0 && s_abSubject == kABSubjectFov && abPhaseAt(CACurrentMediaTime()) == 1;
++}
++
++static bool mergeABOff() {
++	return abPeriod() > 0 && s_abSubject == kABSubjectMerge && abPhaseAt(CACurrentMediaTime()) == 1;
++}
++
++bool isMemorylessMSAA() {
++	static int on = -1;
++	if (on < 0) {
++		on = envOn("KL_MVK_MEMORYLESS_MSAA", false) ? 1 : 0;
++		if (on) { fprintf(stderr, "[mvk-merge] KL_MVK_MEMORYLESS_MSAA=1: multisampled attachment images are memoryless (never sampled/copied/stored)\n"); }
++	}
++	return on;
++}
++
++bool isMergeSuspendEnabled() {
++	static int on = -1;
++	if (on < 0) {
++		on = envOn("KL_MVK_MERGE_SUSPEND", false) ? 1 : 0;
++		if (on) { fprintf(stderr, "[mvk-merge] KL_MVK_MERGE_SUSPEND=1: suspended/resumed dynamic rendering stays in one Metal render encoder\n"); }
++	}
++	return on && !mergeABOff();
++}
++
++bool isMergeStrict() {
++	static int on = -1;
++	if (on < 0) { on = envOn("KL_MVK_MERGE_STRICT", false) ? 1 : 0; }
++	return on;
++}
++
++bool isOriginAreaEntire() {
++	static int on = -1;
++	if (on < 0) {
++		on = (envOn("KL_MVK_AREA_ENTIRE", false) || isMemorylessMSAA()) ? 1 : 0;
++		if (on) { fprintf(stderr, "[mvk-merge] KL_MVK_AREA_ENTIRE: an MSAA render area at the origin counts as the entire attachment (clear/resolve, no load/store)\n"); }
++	}
++	return on && !mergeABOff();
++}
++
++static std::mutex s_mergeLock;
++static double s_mergeT0 = 0;
++static uint32_t s_mergeCnt[3] = {0, 0, 0};
++static const char* s_mergeWhy = nullptr;
++void noteMerge(int what, const char* why) {
++	if (what < 0 || what > 2) { return; }
++	double now = CACurrentMediaTime();
++	std::lock_guard<std::mutex> lock(s_mergeLock);
++	s_mergeCnt[what]++;
++	if (what == 2 && why) { s_mergeWhy = why; }
++	if (s_mergeT0 == 0) { s_mergeT0 = now; return; }
++	if (now - s_mergeT0 < 5.0) { return; }
++	bool why2 = s_mergeCnt[2] && s_mergeWhy;
++	fprintf(stderr, "[mvk-merge] last %.1f s: %u segments left open, %u resumed in the open encoder, %u fell back to store/load%s%s%s\n",
++			now - s_mergeT0, s_mergeCnt[0], s_mergeCnt[1], s_mergeCnt[2],
++			why2 ? " (last: " : "", why2 ? s_mergeWhy : "", why2 ? ")" : "");
++	s_mergeCnt[0] = s_mergeCnt[1] = s_mergeCnt[2] = 0;
++	s_mergeT0 = now;
+ }
+ 
+ static std::mutex s_statLock;
+@@ -541,8 +608,10 @@ static void maybeReport(double now) {
+ 	if (abPeriod() > 0 && s_abFrames[0] && s_abFrames[1]) {
+ 		double on = s_abBusy[0] * 1000.0 / s_abFrames[0], off = s_abBusy[1] * 1000.0 / s_abFrames[1];
+ 		double fpsOn = s_abSpan[0] > 0 ? s_abFrames[0] / s_abSpan[0] : 0, fpsOff = s_abSpan[1] > 0 ? s_abFrames[1] / s_abSpan[1] : 0;
+-		fprintf(stderr, "[mvk-fov] A/B so far: foveated %.2f GPU ms/frame at %.1f fps (%u frames) | full rate %.2f GPU ms/frame at %.1f fps (%u frames) | %+.1f%% GPU time\n",
+-				on, fpsOn, s_abFrames[0], off, fpsOff, s_abFrames[1], off > 0 ? (on - off) * 100.0 / off : 0.0);
++		bool m = s_abSubject == kABSubjectMerge;
++		fprintf(stderr, "[mvk-%s] A/B so far: %s %.2f GPU ms/frame at %.1f fps (%u frames) | %s %.2f GPU ms/frame at %.1f fps (%u frames) | %+.1f%% GPU time\n",
++				m ? "merge" : "fov", m ? "merged" : "foveated", on, fpsOn, s_abFrames[0], m ? "stock" : "full rate", off, fpsOff, s_abFrames[1],
++				off > 0 ? (on - off) * 100.0 / off : 0.0);
+ 	}
+ 	s_winStart = now;
+ 	s_busy = 0;
+@@ -567,12 +636,30 @@ void noteGPUTime(double start, double end) {
+ 	maybeReport(end);
+ }
+ 
++static void noteABFrame(double now, int ph) {
++	// Called with s_statLock held.
++	if (s_abLastT > 0 && ph >= 0 && ph == s_abLastPhase) { s_abSpan[ph] += now - s_abLastT; }
++	s_abLastT = now;
++	s_abLastPhase = ph;
++	if (ph >= 0) { s_abFrames[ph]++; }
++}
++
++void noteSceneFrame() {
++	if ( !(abPeriod() > 0 && s_abSubject == kABSubjectMerge) ) { return; }
++	double now = CACurrentMediaTime();
++	int ph = abPhaseAt(now);
++	std::lock_guard<std::mutex> lock(s_statLock);
++	noteABFrame(now, ph);
++	s_fullFrames++;
++	if ( !isGPUTimeEnabled() ) { maybeReport(now); }
++}
++
+ void noteFrame(bool foveated) {
+ 	double now = CACurrentMediaTime();
+ 	int ph = abPeriod() > 0 ? abPhaseAt(now) : -1;
+ 	std::lock_guard<std::mutex> lock(s_statLock);
+ 	if (foveated) { s_fovFrames++; } else { s_fullFrames++; }
+-	if (abPeriod() > 0) {
++	if (abPeriod() > 0 && s_abSubject == kABSubjectFov) {
+ 		if (s_abLastT > 0 && ph >= 0 && ph == s_abLastPhase) { s_abSpan[ph] += now - s_abLastT; }
+ 		s_abLastT = now;
+ 		s_abLastPhase = ph;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+index 45ddd3a..087ec6b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+@@ -202,6 +202,9 @@ public:
+     /** Returns the number of samples for each pixel of this image. */
+     VkSampleCountFlagBits getSampleCount() { return _samples; }
+ 
++	/** Klepton: the tracked layout of a subresource of plane 0 (UNDEFINED if unknown). */
++	VkImageLayout klGetLayout(uint32_t mipLevel, uint32_t arrayLayer);
++
+ 	/**
+ 	 * Returns the number of bytes per image row for the mip with the given width.
+ 	 * For non-compressed formats, this is the number of bytes in a row of texels.
+@@ -400,6 +403,7 @@ protected:
+ 	bool _hasMutableFormat;
+ 	bool _shouldSupportAtomics;
+ 	bool _isLinearForAtomics;
++	bool _klMemoryless = false;		// Klepton KL_MVK_MEMORYLESS_MSAA: a memoryless MSAA attachment
+ 	bool _is2DViewOn3DImageCompatible = false;
+ 	bool _isBlockTexelViewCompatible = false;
+ };
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ef8ca60..9af7eff 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -91,7 +91,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+                    newTextureWithDescriptor: mtlTexDesc
+                    offset: memoryBinding->_mtlTexelBufferOffset + _subresources[0].layout.offset
+                    bytesPerRow: _subresources[0].layout.rowPitch];
+-        } else if (dvcMem && dvcMem->getMTLHeap() && !_image->getIsDepthStencil()) {
++        } else if (dvcMem && dvcMem->getMTLHeap() && !_image->getIsDepthStencil() && !_image->_klMemoryless) {
+             // Metal support for depth/stencil from heaps is flaky
+             _heapAllocation.heap = dvcMem->getMTLHeap();
+             _heapAllocation.offset = memoryBinding->getDeviceMemoryOffset() + _subresources[0].layout.offset;
+@@ -174,7 +174,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     mtlTexDesc.mipmapLevelCount = _image->_mipLevels;
+     mtlTexDesc.sampleCount = mvkSampleCountFromVkSampleCountFlagBits(_image->_samples);
+     mtlTexDesc.arrayLength = _image->_arrayLayers;
+-	mtlTexDesc.usage = _image->getMTLTextureUsage(_mtlPixFmt);
++	mtlTexDesc.usage = _image->_klMemoryless ? MTLTextureUsageRenderTarget : _image->getMTLTextureUsage(_mtlPixFmt);
+     mtlTexDesc.storageMode = _image->getMTLStorageMode();
+     mtlTexDesc.cpuCacheMode = _image->getMTLCPUCacheMode();
+     // For 2D views of 3D and block texel views, we alias the underlying memory.
+@@ -1139,7 +1139,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+     return VK_SUCCESS;
+ }
+ 
++VkImageLayout MVKImage::klGetLayout(uint32_t mipLevel, uint32_t arrayLayer) {
++	if (_planes.empty()) { return VK_IMAGE_LAYOUT_UNDEFINED; }
++	MVKImageSubresource* rez = _planes[0]->getSubresource(mipLevel, arrayLayer);
++	return rez ? rez->layoutState : VK_IMAGE_LAYOUT_UNDEFINED;
++}
++
+ MTLStorageMode MVKImage::getMTLStorageMode() {
++	if (_klMemoryless) { return MTLStorageModeMemoryless; }
+     if ( !_memoryBindings[0]->_deviceMemory ) return MTLStorageModePrivate;
+ 
+     MTLStorageMode stgMode = _memoryBindings[0]->_deviceMemory->getMTLStorageMode();
+@@ -1237,6 +1244,14 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 	MVKPixelFormats* pixFmts = getPixelFormats();
+     _vkFormat = pCreateInfo->format;
+     _isAliasable = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_ALIAS_BIT);
++	// Klepton KL_MVK_MEMORYLESS_MSAA: a multisampled attachment lives only in tile memory.
++	// Valid only when the app never samples, copies, loads or stores it (see MVKFoveation.h).
++	_klMemoryless = mvkfov::isMemorylessMSAA() && _samples > VK_SAMPLE_COUNT_1_BIT && !_isAliasable && !pExtMemInfo &&
++					mvkIsAnyFlagEnabled(pCreateInfo->usage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
++	if (_klMemoryless) {
++		mvkfov::logOnce("merge:memoryless-img", "[mvk-merge] first memoryless MSAA attachment image (%ux%u x%u, %u samples, usage %#x)\n",
++						_extent.width, _extent.height, _arrayLayers, (unsigned)_samples, (unsigned)pCreateInfo->usage);
++	}
+ 	_hasMutableFormat = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+ 	_hasExtendedUsage = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+index eaf3509..9a1ff56 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+@@ -247,6 +247,10 @@
+ 
+     NSUInteger firstOffset = getVisibilityResultOffset(firstQuery);
+     NSUInteger lastOffset = getVisibilityResultOffset(firstQuery + queryCount);
++    // Klepton KL_MVK_MERGE_SUSPEND: between the segments of a held suspended instance the
++    // GPU zeroing waits until that encoder ends (no query of this submission can be used
++    // before then: a segment with queries is never merged).
++    if (cmdEncoder && cmdEncoder->deferQueryResetWhileHeld(getVisibilityResultMTLBuffer(), firstOffset, lastOffset - firstOffset)) { return; }
+     if (cmdEncoder) {
+         id<MTLBlitCommandEncoder> blitEncoder = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseResetQueryPool);
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index e0c39b2..df47a0f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -516,6 +516,7 @@
+ // any semaphores. We have delayed signalling the semaphores as long as possible to
+ // allow as much filling of the MTLCommandBuffer as possible before forcing a wait.
+ VkResult MVKQueueCommandBufferSubmission::commitActiveMTLCommandBuffer(bool signalCompletion) {
++	_encodingContext.abandonHeldRenderEncoder();	// Klepton KL_MVK_MERGE_SUSPEND: never commit with an open encoder
+ 
+ 	// If using inline semaphore waiting, do so now.
+ 	// When prefilled command buffers are used, multiple commits will happen because native semaphore
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+index bce9ef0..137d9e2 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+@@ -899,6 +899,12 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 
+ 	// If the renderpass is going to be suspended, and resumed later, store the contents to preserve them until then.
+ 	if (mvkIsAnyFlagEnabled(_renderPass->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT)) {
++		// Klepton KL_MVK_MEMORYLESS_MSAA: a memoryless attachment cannot be stored (Metal
++		// rejects it). Its contents are lost here; say so once.
++		if (isMemorylessAttachment) {
++			mvkfov::logOnce("merge:memoryless-store", "[mvk-merge] a memoryless MSAA attachment had to be stored between segments: contents LOST (merge off or fell back?) (logged once)\n");
++			return MTLStoreActionDontCare;
++		}
+ 		return MTLStoreActionStore;
+ 	}
+ 
+@@ -913,6 +919,7 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 
+ 	// Only allow the attachment to be discarded if we're actually
+ 	// rendering to the entire attachment and we're in the last subpass.
++	// (Klepton: a memoryless attachment returned above, before any store is possible.)
+ 	if (storeOverride || !isRenderingEntireAttachment || !isLastUseOfAttachment(subpass)) {
+ 		return hasResolveAttachment && canResolveFormat ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+ 	}
