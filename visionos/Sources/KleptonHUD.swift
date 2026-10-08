@@ -22,7 +22,7 @@
 //   * THE GATE PROMPT. Alyx's "Pulsa Trigger para empezar" after every load
 //     (mailbox show_message -> kl_ovrp_set_prompt): a panel "Pulsa el gatillo
 //     para empezar" held in front of the eyes until the level starts
-//     (end_loading). KL_GATE_TOAST=0 files nothing.
+//     (end_loading). KL_GATE_TOAST=1 turns it on (default off).
 //
 // Both are drawn by KleptonCompositor at the END of each composite encoder —
 // after the eye, the guest's layers and the loading skybox — with the same
