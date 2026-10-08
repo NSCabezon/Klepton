@@ -409,6 +409,10 @@ int kl_app_configure(const char *resources, const char *container) {
         setenv("KL_OPENVR_MINIMAL", "1", 0);
         setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
         setenv("KL_REPROJECT_OFF", "0", 0);
+        // Symmetric offer: Alyx renders l = r anyway, and the asymmetric one left
+        // its nasal strip undrawn — the timewarp swung it into view as a black
+        // rectangle with a magenta edge (2026-10-08, device-confirmed).
+        setenv("KL_OPENVR_SYM_PROJ", "1", 0);
     }
     kl_driver_init(g_target, g_libdir, g_door);
     kl_driver_set_phase_hook(app_phase);
