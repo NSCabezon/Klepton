@@ -1062,3 +1062,332 @@ float kl_reproject_delta_degrees(const kl_ovrp_render_pose *rendered,
     if (w > 1.0f) w = 1.0f;
     return 2.0f * acosf(w) * (180.0f / 3.14159265358979f);
 }
+
+// ===========================================================================
+// DEPTH REPROJECTION (KL_REPROJECT_DEPTH_MODE) — see kl_reproject.h.
+// ===========================================================================
+
+int kl_reproject_depth_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        int v = kl_env_int("KL_REPROJECT_DEPTH_MODE", 0);
+        m = (v >= 0 && v <= 2) ? v : 0;
+        if (m)
+            fprintf(stderr, "  [swim] KL_REPROJECT_DEPTH_MODE=%d: %s\n", m,
+                    m == 1 ? "the drawable gets the RENDER pose's anchor (system "
+                             "reprojects render -> scanout), 500 m quad depth"
+                           : "render anchor + the game's real depth written per pixel");
+    }
+    return m;
+}
+
+int kl_reproject_depth_conv(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = kl_env_str("KL_REPROJECT_DEPTH_CONV", NULL);
+        c = (e && (e[0] == 'r' || e[0] == 'R' || e[0] == '1')) ? 1 : 0;
+    }
+    return c;
+}
+
+int kl_reproject_depth_vis(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_CP_DEPTH_VIS", 0);
+    return v;
+}
+
+float kl_reproject_depth_linear(float d, float m22, float m23, int conv) {
+    if (conv == 1) {
+        // Reverse-Z, infinite far, the same near the matrix states.
+        if (!(fabsf(m22) > 1e-9f) || !(d > 1e-9f)) return -1.0f;
+        float n = m23 / m22;
+        return n > 0 ? n / d : -1.0f;
+    }
+    // The matrix literally: d = (m22 z + m23) / -z  =>  -z = m23 / (d + m22).
+    float den = d + m22;
+    if (!(fabsf(den) > 1e-9f)) return -1.0f;
+    float z = m23 / den;
+    return z > 0 ? z : -1.0f;
+}
+
+kl_reproject_depth_uniforms kl_reproject_depth_build(const kl_ovrp_render_pose *r,
+                                                     int eye, simd_float4x4 projection) {
+    kl_reproject_depth_uniforms u;
+    memset(&u, 0, sizeof u);
+    if ((unsigned)eye > 1) eye = 0;
+    u.m22 = r ? r->depth_m22[eye] : 0.0f;
+    u.m23 = r ? r->depth_m23[eye] : 0.0f;
+    // The drawable's near plane. Its projection is reverse-Z with an infinite
+    // far plane (kl_reproject_projection's shape, and Compositor Services'):
+    // clip.z = near, clip.w = -z, so the near is the z of column 3. Anything
+    // else is not that shape, and a conservative 10 cm stands in.
+    float n = projection.columns[3][2];
+    u.near_m = (n > 1e-4f && n < 1.0f) ? n : 0.1f;
+    if (s_depth == 0.0f) {
+        float v = kl_env_float("KL_REPROJECT_DEPTH", 0.0);
+        s_depth = (v > 0.0f) ? v : KL_REPROJECT_DEPTH;
+    }
+    u.far_m = s_depth > u.near_m ? s_depth : KL_REPROJECT_DEPTH;
+    u.conv = (uint32_t)kl_reproject_depth_conv();
+    u.vis = (uint32_t)kl_reproject_depth_vis();
+    return u;
+}
+
+// Appended to kl_msl_reproject (so it reuses that source's VOut helpers, the
+// sample, the chroma matte and kl_offscreen) — compiled ONLY by a compositor in
+// depth mode 2 or KL_CP_DEPTH_VIS, never by mode 0.
+//
+// The reconstruction. The eye picture is still the quad of kl_reproject_v —
+// same grid, same uv, same placement — so the COLOUR of every pixel is exactly
+// what mode 0 shows. What changes is the depth written for it. The quad vertex
+// at grid coordinate c is the ray (tx, ty, -1) of the RENDER eye, with
+// tx = mix(-l, r, c.x), ty = mix(-b, t, c.y); a pixel whose game depth says the
+// surface is `dist` metres down the view axis is the point dist * ray, and
+// projection * modelView * that point is
+//
+//     clip = dist * (PM * (tx, ty, -1, 0)) + PM * (0, 0, 0, 1)
+//
+// The first term is linear in c, so it interpolates as a varying (perspective-
+// correct, like c itself and like the uv — it is the same parameterisation of
+// the same plane); the second is constant per view. The fragment only has to
+// read the game's depth, linearise it and write clip.z / clip.w.
+static const char kl_msl_reproject_depth[] =
+"\n"
+"struct KLDepthU { float m22; float m23; float nearM; float farM;\n"
+"                  uint conv; uint vis; uint pad0; uint pad1; };\n"
+"struct VOutD { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
+"               uint srgb [[flat]]; uint src [[flat]];\n"
+"               uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
+"               float2 chromaRange [[flat]];\n"
+"               float4 dirClip; float4 orgClip [[flat]];\n"
+"               float4 dparm [[flat]]; uint dflags [[flat]]; };\n"
+"\n"
+// kl_reproject_v, line for line, plus the three reconstruction varyings. A copy
+// rather than a shared helper so that kl_msl_reproject — mode 0's source — is
+// not touched at all; keep the two in step.
+"vertex VOutD kl_reproject_depth_v(uint vid [[vertex_id]],\n"
+"                                  ushort amp [[amplification_id]],\n"
+"                                  constant KLReproj *ua [[buffer(0)]],\n"
+"                                  constant float2 *grid [[buffer(1)]],\n"
+"                                  constant KLDepthU *da [[buffer(2)]])\n"
+"{\n"
+"    constant KLReproj &u = ua[amp];\n"
+"    constant KLDepthU &du = da[amp];\n"
+"    uint nx = uint(grid[0].x), ny = uint(grid[0].y);\n"
+"    uint base = 1u + u.gridEye * (nx + 1u) * (ny + 1u);\n"
+"    uint cell = vid / 6u, k = vid % 6u;\n"
+"    uint2 g = uint2(cell % nx, cell / nx);\n"
+"    g.x += (k == 1u || k == 3u || k == 4u) ? 1u : 0u;\n"
+"    g.y += (k == 2u || k == 4u || k == 5u) ? 1u : 0u;\n"
+"    float2 c = float2(g) / float2(float(nx), float(ny));\n"
+"    float d = u.depth;\n"
+"    float tx = mix(-u.tangents.x, u.tangents.y, c.x);\n"
+"    float ty = mix(-u.tangents.w, u.tangents.z, c.y);\n"
+"    VOutD o;\n"
+"    o.slice = u.slice;\n"
+"    o.srgb = u.srgbDecode;\n"
+"    o.chromaOn = u.chromaOn;\n"
+"    o.chromaKey = float3(u.chromaKey);\n"
+"    o.chromaRange = float2(u.chromaMin, u.chromaMax);\n"
+"    o.src = uint(amp);\n"
+"    float4x4 pm = u.projection * u.modelView;\n"
+"    o.pos = u.visible == 0u ? kl_offscreen : pm * float4(tx * d, ty * d, -d, 1.0);\n"
+"    float2 uv = grid[base + g.y * (nx + 1u) + g.x];\n"
+"    if (u.flipY != 0u) uv.y = 1.0 - uv.y;\n"
+"    o.uv = uv;\n"
+"    o.dirClip = pm * float4(tx, ty, -1.0, 0.0);\n"
+"    o.orgClip = pm * float4(0.0, 0.0, 0.0, 1.0);\n"
+"    o.dparm = float4(du.m22, du.m23, du.nearM, du.farM);\n"
+"    o.dflags = (du.conv & 1u) | ((du.vis & 1u) << 1);\n"
+"    return o;\n"
+"}\n"
+"\n"
+// Nearest, by texel: a depth value is not something to filter across an edge.
+"static float kl_depth_read(depth2d<float> t, float2 uv)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    uint2 p = uint2(clamp(uv * sz, float2(0.0), sz - 1.0));\n"
+"    return t.read(p);\n"
+"}\n"
+"\n"
+// kl_reproject_depth_linear, in MSL — keep the two identical.
+"static float kl_depth_linear(float d, float m22, float m23, uint conv)\n"
+"{\n"
+"    if (conv == 1u) {\n"
+"        if (!(abs(m22) > 1e-9) || !(d > 1e-9)) return -1.0;\n"
+"        float n = m23 / m22;\n"
+"        return n > 0.0 ? n / d : -1.0;\n"
+"    }\n"
+"    float den = d + m22;\n"
+"    if (!(abs(den) > 1e-9)) return -1.0;\n"
+"    float z = m23 / den;\n"
+"    return z > 0.0 ? z : -1.0;\n"
+"}\n"
+"\n"
+// Near red -> far blue on a log scale from the near clamp to the far one; a
+// pixel with no finite depth is dark grey, so 'sky' is visibly its own answer.
+"static float4 kl_depth_false_colour(float dist, float nearM, float farM)\n"
+"{\n"
+"    if (dist <= 0.0) return float4(0.12, 0.12, 0.12, 1.0);\n"
+"    float t = saturate(log(max(dist, nearM) / nearM) / log(farM / nearM));\n"
+"    float s = 1.0 - t;\n"
+"    float3 jet = saturate(float3(1.5 - abs(4.0 * s - 3.0), 1.5 - abs(4.0 * s - 2.0),\n"
+"                                 1.5 - abs(4.0 * s - 1.0)));\n"
+"    return float4(jet, 1.0);\n"
+"}\n"
+"\n"
+"static float kl_depth_dist_at(VOutD in, depth2d<float> dep0, depth2d<float> dep1)\n"
+"{\n"
+"    float raw = in.src == 0u ? kl_depth_read(dep0, in.uv) : kl_depth_read(dep1, in.uv);\n"
+"    return kl_depth_linear(raw, in.dparm.x, in.dparm.y, in.dflags & 1u);\n"
+"}\n"
+"\n"
+"struct FOutD { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n"
+"\n"
+"fragment FOutD kl_reproject_depth_f(VOutD in [[stage_in]],\n"
+"                                    texture2d_array<float> tex [[texture(0)]],\n"
+"                                    texture2d_array<float> tex1 [[texture(1)]],\n"
+"                                    depth2d<float> dep0 [[texture(2)]],\n"
+"                                    depth2d<float> dep1 [[texture(3)]],\n"
+"                                    sampler samp [[sampler(0)]])\n"
+"{\n"
+"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    bool band = c.r > 0.98 && c.g < 0.02 && c.b > 0.98;\n"
+"#if KL_MAGENTA_KEY\n"
+"    if (band) c = float4(0.0, 0.0, 0.0, 1.0);\n"
+"#endif\n"
+"    float nearM = in.dparm.z, farM = in.dparm.w;\n"
+"    float dist = kl_depth_dist_at(in, dep0, dep1);\n"
+"    FOutD o;\n"
+"    o.color = (in.dflags & 2u) != 0u ? kl_depth_false_colour(band ? -1.0 : dist, nearM, farM)\n"
+"                                     : kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
+// No finite depth, or the unrendered band: the far clamp — the 500 m the quad
+// has always been at, never 0 (visionOS drops a frame whose depth is all 0).
+"    if (band || !(dist > 0.0)) dist = farM;\n"
+"    dist = clamp(dist, nearM, farM);\n"
+"    float4 clip = dist * in.dirClip + in.orgClip;\n"
+// Behind the display eye (only possible with a large render -> display delta):
+// the quad's own depth, i.e. mode 1's answer for this pixel.
+"    float z = clip.w > 1e-6 ? clip.z / clip.w : in.pos.z;\n"
+"    o.depth = clamp(z, 1e-7, 1.0);\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 kl_reproject_depthvis_f(VOutD in [[stage_in]],\n"
+"                                        depth2d<float> dep0 [[texture(2)]],\n"
+"                                        depth2d<float> dep1 [[texture(3)]])\n"
+"{\n"
+"    return kl_depth_false_colour(kl_depth_dist_at(in, dep0, dep1), in.dparm.z, in.dparm.w);\n"
+"}\n"
+"\n"
+"kernel void kl_depth_probe_k(depth2d<float> d [[texture(0)]],\n"
+"                             device float *out [[buffer(0)]],\n"
+"                             uint2 gid [[thread_position_in_grid]])\n"
+"{\n"
+"    const uint S = 32u;\n"
+"    if (gid.x >= S || gid.y >= S) return;\n"
+"    uint w = d.get_width(), h = d.get_height();\n"
+"    uint2 p = uint2(((gid.x * 2u + 1u) * w) / (2u * S), ((gid.y * 2u + 1u) * h) / (2u * S));\n"
+"    out[gid.y * S + gid.x] = d.read(p);\n"
+"}\n";
+
+static char *g_msl_reproject_depth;
+static void kl_reproject_depth_msl_build(void) {
+    size_t n = strlen(kl_msl_reproject) + strlen(kl_msl_reproject_depth) + 64;
+    char *s = malloc(n);
+    if (!s) return;
+    snprintf(s, n, "#define KL_MAGENTA_KEY %d\n%s%s", kl_env_on("KL_CP_MAGENTA_KEY", 1),
+             kl_msl_reproject, kl_msl_reproject_depth);
+    g_msl_reproject_depth = s;
+}
+const char *kl_reproject_depth_msl(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, kl_reproject_depth_msl_build);
+    return g_msl_reproject_depth ? g_msl_reproject_depth : "";
+}
+
+// ---- the [swim] line -------------------------------------------------------
+
+static pthread_mutex_t g_dstat_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int   have, conv, nvalid, n;
+    float raw_center, raw_median, raw_sky, raw_near;
+    float lin_center, lin_median, lin_sky, lin_near;
+    // The other convention's reading of the same samples, so one log line
+    // settles KL_REPROJECT_DEPTH_CONV.
+    float alt_center, alt_median, alt_near;
+    float m22, m23;
+} g_dstat;
+
+static int klr_cmpf(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+void kl_reproject_depth_probe_note(const float *raw, int side,
+                                   const kl_reproject_depth_uniforms *u) {
+    if (!raw || side <= 0 || side > 64 || !u) return;
+    int n = side * side, conv = (int)u->conv;
+    float lin[64 * 64], alt[64 * 64], rv[64 * 64];
+    int nv = 0, na = 0;
+    float near_d = 1e30f, near_raw = 0.0f, alt_near = 1e30f;
+    for (int i = 0; i < n; i++) {
+        float d = kl_reproject_depth_linear(raw[i], u->m22, u->m23, conv);
+        float a = kl_reproject_depth_linear(raw[i], u->m22, u->m23, !conv);
+        if (d > 0) { lin[nv++] = d; if (d < near_d) { near_d = d; near_raw = raw[i]; } }
+        if (a > 0) { alt[na++] = a; if (a < alt_near) alt_near = a; }
+        rv[i] = raw[i];
+    }
+    qsort(rv, (size_t)n, sizeof *rv, klr_cmpf);
+    if (nv) qsort(lin, (size_t)nv, sizeof *lin, klr_cmpf);
+    if (na) qsort(alt, (size_t)na, sizeof *alt, klr_cmpf);
+    int ci = (side / 2) * side + side / 2, si = 1 * side + side / 2;   // centre; top-centre = "sky"
+    pthread_mutex_lock(&g_dstat_mu);
+    g_dstat.have = 1;
+    g_dstat.conv = conv;
+    g_dstat.n = n;
+    g_dstat.nvalid = nv;
+    g_dstat.m22 = u->m22; g_dstat.m23 = u->m23;
+    g_dstat.raw_center = raw[ci];
+    g_dstat.raw_sky = raw[si];
+    g_dstat.raw_median = rv[n / 2];
+    g_dstat.raw_near = near_raw;
+    g_dstat.lin_center = kl_reproject_depth_linear(raw[ci], u->m22, u->m23, conv);
+    g_dstat.lin_sky = kl_reproject_depth_linear(raw[si], u->m22, u->m23, conv);
+    g_dstat.lin_median = nv ? lin[nv / 2] : -1.0f;
+    g_dstat.lin_near = nv ? near_d : -1.0f;
+    g_dstat.alt_center = kl_reproject_depth_linear(raw[ci], u->m22, u->m23, !conv);
+    g_dstat.alt_median = na ? alt[na / 2] : -1.0f;
+    g_dstat.alt_near = na ? alt_near : -1.0f;
+    pthread_mutex_unlock(&g_dstat_mu);
+}
+
+void kl_reproject_swim_log(int mode, unsigned frames, double age_mean_ms,
+                           double age_max_ms, unsigned ring_hits,
+                           unsigned query_hits, unsigned fallbacks,
+                           unsigned depth_frames) {
+    char dpart[512] = "depth: no probe yet";
+    pthread_mutex_lock(&g_dstat_mu);
+    if (g_dstat.have) {
+        const char *cn = g_dstat.conv ? "reverse" : "matrix";
+        const char *an = g_dstat.conv ? "matrix" : "reverse";
+        snprintf(dpart, sizeof dpart,
+                 "depth (%s, m22 %.5f m23 %.5f): centre raw %.5f = %.2f m, sky raw %.5f "
+                 "= %.2f m, median raw %.5f / %.2f m, nearest raw %.5f = %.3f m, %d/%d "
+                 "finite | as %s: centre %.2f m, median %.2f m, nearest %.3f m",
+                 cn, (double)g_dstat.m22, (double)g_dstat.m23,
+                 (double)g_dstat.raw_center, (double)g_dstat.lin_center,
+                 (double)g_dstat.raw_sky, (double)g_dstat.lin_sky,
+                 (double)g_dstat.raw_median, (double)g_dstat.lin_median,
+                 (double)g_dstat.raw_near, (double)g_dstat.lin_near,
+                 g_dstat.nvalid, g_dstat.n, an, (double)g_dstat.alt_center,
+                 (double)g_dstat.alt_median, (double)g_dstat.alt_near);
+    }
+    pthread_mutex_unlock(&g_dstat_mu);
+    unsigned asked = ring_hits + query_hits + fallbacks;
+    fprintf(stderr, "  [swim] mode %d, %u composites: anchor age mean %.1f ms max %.1f ms, "
+                    "ring hit %u/%u, query %u, fallback %u, depth written on %u | %s "
+                    "(-1 m = no finite depth)\n",
+            mode, frames, age_mean_ms, age_max_ms, ring_hits, asked, query_hits,
+            fallbacks, depth_frames, dpart);
+}

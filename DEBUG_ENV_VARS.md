@@ -1544,6 +1544,30 @@ The composite/timewarp pass — one file, compiled by both compositors
 - `KL_REPROJECT_TRANSLATE=0` — correct rotation only, which is what the
   composite did before the parallax above. Inert at the default depth, so this
   is only meaningful together with a finite `KL_REPROJECT_DEPTH`.
+- `KL_REPROJECT_DEPTH_MODE=0|1|2` — the swim fix (`kl_reproject.h`). **0**
+  (default): unchanged. **1** ("render anchor"): the visionOS compositor hands
+  `drawable.deviceAnchor` the DeviceAnchor of the instant the guest's frame was
+  drawn at (`kl_ovrp_render_pose.pose_time`, looked up in a 32-entry ring of the
+  anchors `updatePoses` published, else `queryDeviceAnchor(atTimestamp:)`, else
+  the display anchor) and builds the composite from it, so the system
+  reprojects render -> scanout; still the 500 m quad depth. **2**: mode 1 plus
+  the game's real depth — the OpenVR bridge copies Submit_TextureWithDepth's
+  depth per eye per stage and the eye pass writes it, re-projected into the
+  drawable's projection (clamped to [drawable near, `KL_REPROJECT_DEPTH`]; no
+  depth / magenta band -> the far clamp, never 0). Panels and Klepton's HUD are
+  drawn always-pass over scene depth. One `[swim]` line a second: anchor age,
+  ring hits, fallbacks, depth probe (raw and linear, centre / top-centre "sky" /
+  median / nearest, under both conventions).
+- `KL_REPROJECT_DEPTH_CONV=matrix|reverse` — how a game depth value becomes a
+  distance. `matrix` (default): the submitted projection literally,
+  dist = m23 / (d + m22). `reverse`: reverse-Z infinite at the same near,
+  dist = (m23/m22) / d. Alyx (Mac, 2026-10-08): `matrix` is right — floor 1.5 m,
+  scene 4-40 m, sky raw 1.0 = no finite depth; `reverse` reads 4 cm everywhere.
+- `KL_CP_DEPTH_VIS=1` — the eye pass shows the game's linear depth as false
+  colour (near red -> far blue, no depth dark grey), in the Mac viewer
+  (needs the depth copy, i.e. `KL_REPROJECT_DEPTH_MODE=2`) and on device in mode 2.
+  `KL_OPENVR_DUMP` also writes `eyeN_depth.pfm` (raw game depth, quarter size)
+  in mode 2.
 - `KL_CHROMA=1` — chroma-key the guest's picture so the room shows through
   wherever it drew the key colour. Ported from VisionOSALVRClient with its maths
   and defaults intact, so a value found in that client transfers. Off by

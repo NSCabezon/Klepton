@@ -1368,6 +1368,178 @@ static void check_overlay_pixels(void) {
     }
 }
 
+
+// ---- KL_REPROJECT_DEPTH_MODE=2: the depth pass, run --------------------------
+//
+// The game's depth goes in as a depth texture cleared to one value, the pass
+// runs with no pose delta, and the depth it WRITES is read back. With the
+// drawable's projection reverse-Z infinite at near n, a surface at view depth
+// `dist` must land at exactly n / dist — and a value with no finite distance
+// (Source 2's far clear under the literal matrix) at the far clamp, never 0.
+// Also: the probe kernel reads the same value back, and both conventions of the
+// linearisation give what Alyx's logged matrix implies.
+static float klr_depth_run(id<MTLDevice> dev, id<MTLCommandQueue> q,
+                           id<MTLRenderPipelineState> ps, id<MTLComputePipelineState> probe,
+                           float game_d, float *probed) {
+    const float m22 = -0.95006f, m23 = -0.03749f, near = 0.1f;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 2; td.height = 2; td.arrayLength = 1;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    uint8_t px[16]; memset(px, 128, sizeof px);
+    [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
+             withBytes:px bytesPerRow:8 bytesPerImage:16];
+    // The game's depth, as the bridge hands it over: D32S8, private, written
+    // by a clear (a depth texture cannot be uploaded to).
+    MTLTextureDescriptor *gd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                     width:4 height:4 mipmapped:NO];
+    gd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    gd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> game = [dev newTextureWithDescriptor:gd];
+    MTLTextureDescriptor *od = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:4 height:4 mipmapped:NO];
+    od.usage = MTLTextureUsageRenderTarget;
+    od.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> outd = [dev newTextureWithDescriptor:od];
+    MTLTextureDescriptor *cd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+    cd.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> outc = [dev newTextureWithDescriptor:cd];
+    id<MTLBuffer> rb = [dev newBufferWithLength:16 * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> pb = [dev newBufferWithLength:KL_DEPTH_PROBE_SIDE * KL_DEPTH_PROBE_SIDE * 4
+                                        options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    MTLRenderPassDescriptor *gp = [MTLRenderPassDescriptor renderPassDescriptor];
+    gp.depthAttachment.texture = game;
+    gp.depthAttachment.loadAction = MTLLoadActionClear;
+    gp.depthAttachment.storeAction = MTLStoreActionStore;
+    gp.depthAttachment.clearDepth = game_d;
+    gp.stencilAttachment.texture = game;
+    gp.stencilAttachment.loadAction = MTLLoadActionClear;
+    gp.stencilAttachment.storeAction = MTLStoreActionStore;
+    [[cmd renderCommandEncoderWithDescriptor:gp] endEncoding];
+
+    kl_ovrp_render_pose r; memset(&r, 0, sizeof r);
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++) {
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+        r.depth_m22[e] = m22; r.depth_m23[e] = m23;
+    }
+    r.depth_valid = 3;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, near);
+    kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                 matrix_identity_float4x4, P, 0, 0, 0);
+    kl_reproject_depth_uniforms du = kl_reproject_depth_build(&r, 0, P);
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = outc;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    rp.depthAttachment.texture = outd;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = 0.0;
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+    dsd.depthCompareFunction = MTLCompareFunctionGreater;
+    dsd.depthWriteEnabled = YES;
+    [enc setDepthStencilState:[dev newDepthStencilStateWithDescriptor:dsd]];
+    [enc setRenderPipelineState:ps];
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
+    [enc setFragmentTexture:game atIndex:2];
+    [enc setFragmentTexture:game atIndex:3];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setVertexBytes:&du length:sizeof du atIndex:2];
+    klr_draw(enc);
+    [enc endEncoding];
+    id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+    [ce setComputePipelineState:probe];
+    [ce setTexture:game atIndex:0];
+    [ce setBuffer:pb offset:0 atIndex:0];
+    [ce dispatchThreadgroups:MTLSizeMake(KL_DEPTH_PROBE_SIDE / 8, KL_DEPTH_PROBE_SIDE / 8, 1)
+       threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce endEncoding];
+    id<MTLBlitCommandEncoder> be = [cmd blitCommandEncoder];
+    [be copyFromTexture:outd sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(4, 4, 1) toBuffer:rb destinationOffset:0
+    destinationBytesPerRow:16 destinationBytesPerImage:64];
+    [be endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (probed) {
+        *probed = ((const float *)pb.contents)[(KL_DEPTH_PROBE_SIDE / 2) * KL_DEPTH_PROBE_SIDE
+                                               + KL_DEPTH_PROBE_SIDE / 2];
+        kl_reproject_depth_probe_note((const float *)pb.contents, KL_DEPTH_PROBE_SIDE, &du);
+    }
+    return ((const float *)rb.contents)[1 * 4 + 1];
+}
+
+static void check_depth(void) {
+    printf("=== depth reprojection (KL_REPROJECT_DEPTH_MODE=2) ===\n");
+    const float m22 = -0.95006f, m23 = -0.03749f;
+    // Alyx's logged matrix, read literally: 0 at ~3.9 cm, 0.95 at infinity.
+    ok(fabsf(kl_reproject_depth_linear(0.0f, m22, m23, 0) - 0.03946f) < 1e-4f,
+       "matrix: raw 0 is the 3.9 cm near plane");
+    ok(kl_reproject_depth_linear(1.0f, m22, m23, 0) < 0,
+       "matrix: raw 1 (past 0.95) has no finite distance");
+    ok(fabsf(kl_reproject_depth_linear(0.95006f - 0.03749f / 2.0f, m22, m23, 0) - 2.0f) < 1e-3f,
+       "matrix: the raw value for 2 m linearises to 2 m");
+    ok(fabsf(kl_reproject_depth_linear(0.03946f / 2.0f, m22, m23, 1) - 2.0f) < 1e-2f &&
+       kl_reproject_depth_linear(0.0f, m22, m23, 1) < 0,
+       "reverse: n/d, and 0 is infinitely far");
+
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_depth_msl()]
+                                           options:nil error:&err];
+    if (!lib) printf("  %s\n", err.localizedDescription.UTF8String);
+    ok(lib != nil, "depth library compiles");
+    if (!lib) return;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_depth_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_depth_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps) printf("  %s\n", err.localizedDescription.UTF8String);
+    ok(ps != nil, "depth pass: vertex + fragment link (Depth32Float)");
+    MTLRenderPipelineDescriptor *vd = [MTLRenderPipelineDescriptor new];
+    vd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_depth_v"];
+    vd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_depthvis_f"];
+    vd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    ok([dev newRenderPipelineStateWithDescriptor:vd error:&err] != nil,
+       "false-colour pass links with no depth attachment");
+    id<MTLFunction> kf = [lib newFunctionWithName:@"kl_depth_probe_k"];
+    id<MTLComputePipelineState> probe = kf ? [dev newComputePipelineStateWithFunction:kf error:&err] : nil;
+    ok(probe != nil, "depth probe kernel builds");
+    if (!ps || !probe) return;
+
+    float probed = -1;
+    float raw2m = 0.95006f - 0.03749f / 2.0f;              // 2 m under the literal matrix
+    float z = klr_depth_run(dev, q, ps, probe, raw2m, &probed);
+    printf("  surface at 2 m wrote %.6f (want %.6f), probe read %.6f\n", z, 0.1f / 2.0f, probed);
+    ok(fabsf(z - 0.05f) < 1e-4f, "a surface at 2 m is written at near/2 m");
+    ok(fabsf(probed - raw2m) < 1e-6f, "the probe reads the raw game depth back");
+    kl_reproject_swim_log(2, 1, 0, 0, 0, 0, 0, 1);
+    z = klr_depth_run(dev, q, ps, probe, 1.0f, NULL);
+    printf("  no finite depth wrote %.7f (want %.7f = the %.0f m far clamp)\n", z,
+           0.1f / KL_REPROJECT_DEPTH, KL_REPROJECT_DEPTH);
+    ok(z > 0 && fabsf(z - 0.1f / KL_REPROJECT_DEPTH) < 1e-6f,
+       "sky goes to the far clamp, never 0");
+    z = klr_depth_run(dev, q, ps, probe, 0.0f, NULL);
+    ok(fabsf(z - 1.0f) < 1e-4f, "nearer than the drawable's near clamps to it (depth 1)");
+}
+
 int main(void) {
     @autoreleasepool {
         check_math();
@@ -1380,6 +1552,7 @@ int main(void) {
         check_proj_layers();
         check_overlay_math();
         check_overlay_pixels();
+        check_depth();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "
