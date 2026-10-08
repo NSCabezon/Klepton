@@ -7,4 +7,10 @@
 #ifndef KL_OPENVR_H
 #define KL_OPENVR_H
 void *kl_openvr_lookup(const char *name);
+
+// A frame clock for IVRCompositor::WaitGetPoses: called at its very start,
+// before the frame's poses are latched, so a pacer that sleeps hands the game
+// the freshest head. Unset (the default) = WaitGetPoses never waits. The Mac
+// stream host installs one for KL_STREAM_LOCK_FPS.
+void kl_openvr_set_frame_pacer(void (*wait)(void));
 #endif
