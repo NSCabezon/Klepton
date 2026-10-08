@@ -47,6 +47,15 @@ static id<MTLCommandQueue>        g_queue;
 static id<MTLRenderPipelineState> g_pipe;      // the plain blit, for the liveness downsample
 static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass
 static id<MTLRenderPipelineState> g_pipe_ov;   // the GUEST's layers, blended, KL_GUEST_OVERLAYS
+// KL_REPROJECT_DEPTH_MODE=2 / KL_CP_DEPTH_VIS (kl_reproject.h). The viewer has
+// no depth attachment and no system reprojection to feed, so what depth buys
+// here is the INSTRUMENT: the false-colour pass (KL_CP_DEPTH_VIS=1) and the
+// once-a-second probe behind the [swim] line — the same shaders the device runs.
+static id<MTLRenderPipelineState> g_pipe_dvis;
+static id<MTLComputePipelineState> g_depth_probe;
+static id<MTLBuffer>              g_depth_probe_buf[2];
+static unsigned                   g_depth_probe_n, g_depth_frames, g_swim_frames;
+static double                     g_depth_probe_t, g_swim_t0;
 static id<MTLSamplerState>        g_samp;
 static id<MTLSharedEvent>         g_event;
 static id<MTLTexture>             g_stat;
@@ -1090,6 +1099,27 @@ int kl_viewmtl_start(void *metal_layer) {
                                     "overlay", 1);
     g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
                               "kl_reproject_f", "reprojection");
+    if (kl_reproject_depth_mode() == 2 || kl_reproject_depth_vis()) {
+        NSError *derr = nil;
+        id<MTLLibrary> dlib = [g_dev newLibraryWithSource:
+                                  [NSString stringWithUTF8String:kl_reproject_depth_msl()]
+                                                  options:nil error:&derr];
+        if (!dlib)
+            fprintf(stderr, "  [swim] depth shaders failed to compile: %s\n",
+                    derr.localizedDescription.UTF8String ?: "?");
+        if (dlib && kl_reproject_depth_vis())
+            g_pipe_dvis = klvm_pipeline(kl_reproject_depth_msl(), "kl_reproject_depth_v",
+                                        "kl_reproject_depthvis_f", "depth false-colour");
+        id<MTLFunction> kf = [dlib newFunctionWithName:@"kl_depth_probe_k"];
+        if (kf) g_depth_probe = [g_dev newComputePipelineStateWithFunction:kf error:&derr];
+        for (int i = 0; i < 2 && g_depth_probe; i++)
+            g_depth_probe_buf[i] = [g_dev newBufferWithLength:KL_DEPTH_PROBE_SIDE * KL_DEPTH_PROBE_SIDE
+                                                              * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        fprintf(stderr, "  [swim] viewer: depth false-colour %s, depth probe %s\n",
+                g_pipe_dvis ? "ON" : "off", g_depth_probe ? "on" : "OFF");
+    }
+
     // Fall back rather than refuse to start. This is retried every frame, so
     // returning 0 on a shader that will never compile is a viewer that stays
     // black forever and says why exactly once — where the blit is a picture,
@@ -1274,7 +1304,23 @@ static void klvm_eye_aspect(int stage, int eye, id<MTLTexture> src, double *w, d
 static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye,
                              id<MTLTexture> src, kl_blit_uniforms bu, int flip) {
         kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
-        [enc setRenderPipelineState:g_pipe_rp];
+        // KL_CP_DEPTH_VIS: the same quad, coloured by the game's depth.
+        id<MTLTexture> dtex = nil;
+        kl_ovrp_render_pose dr;
+        if (g_pipe_dvis && kl_ovrp_stage_render_pose(stage, &dr) && (dr.depth_valid & (1 << eye))) {
+            void *dp = kl_glfb_eye_mtl_depth(eye, stage);
+            if (dp) dtex = (__bridge id<MTLTexture>)dp;
+        }
+        if (dtex) {
+            kl_reproject_depth_uniforms du = kl_reproject_depth_build(&dr, eye, u.projection);
+            [enc setRenderPipelineState:g_pipe_dvis];
+            [enc setVertexBytes:&du length:sizeof du atIndex:2];
+            [enc setFragmentTexture:dtex atIndex:2];
+            [enc setFragmentTexture:dtex atIndex:3];
+            g_depth_frames++;
+        } else {
+            [enc setRenderPipelineState:g_pipe_rp];
+        }
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
         // The unwarp grid. Identity until the guest's eye textures are
@@ -1334,6 +1380,47 @@ static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye
         id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
         [enc setVertexBuffer:gbuf offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+}
+
+// Once a second, in depth mode 2 or under KL_CP_DEPTH_VIS: sample eye 0's
+// depth (32x32, on the GPU, after this frame) for the [swim] line, and print
+// that line — the viewer's half of it, with no anchors (there are none here).
+static void klvm_depth_probe(id<MTLCommandBuffer> cmd, int stage) {
+    if (!g_depth_probe) return;
+    g_swim_frames++;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (!g_swim_t0) g_swim_t0 = now;
+    if (now - g_swim_t0 >= 1.0) {
+        kl_reproject_swim_log(kl_reproject_depth_mode(), g_swim_frames, 0, 0, 0, 0, 0,
+                              g_depth_frames);
+        g_swim_frames = g_depth_frames = 0;
+        g_swim_t0 = now;
+    }
+    if (now - g_depth_probe_t < 1.0) return;
+    kl_ovrp_render_pose r;
+    if (!kl_ovrp_stage_render_pose(stage, &r) || !(r.depth_valid & 1)) return;
+    void *dp = kl_glfb_eye_mtl_depth(0, stage);
+    if (!dp) return;
+    g_depth_probe_t = now;
+    id<MTLBuffer> buf = g_depth_probe_buf[g_depth_probe_n++ & 1];
+    id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+    if (!ce || !buf) return;
+    ce.label = @"klepton depth probe";
+    [ce setComputePipelineState:g_depth_probe];
+    [ce setTexture:(__bridge id<MTLTexture>)dp atIndex:0];
+    [ce setBuffer:buf offset:0 atIndex:0];
+    [ce dispatchThreadgroups:MTLSizeMake(KL_DEPTH_PROBE_SIDE / 8, KL_DEPTH_PROBE_SIDE / 8, 1)
+       threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce endEncoding];
+    // The viewer's own frustum stands in for a drawable's: only its near plane
+    // is read, for the clamp, and the probe reports raw and linear depth.
+    simd_float4x4 proj = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    kl_reproject_depth_uniforms du = kl_reproject_depth_build(&r, 0, proj);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)b;
+        kl_reproject_depth_probe_note((const float *)buf.contents, KL_DEPTH_PROBE_SIDE, &du);
+    }];
 }
 
 int kl_viewmtl_present(int win_w, int win_h) {
@@ -1630,6 +1717,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         }];
     }
 
+    klvm_depth_probe(cmd, stage);
     klvm_toast_draw(cmd, drawable.texture);
     [cmd presentDrawable:drawable];
     [cmd commit];

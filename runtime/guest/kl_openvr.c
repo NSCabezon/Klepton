@@ -242,7 +242,9 @@ static int g_origin = 1;                 // TrackingUniverseStanding
 // (AccessoryTrackingProvider.predictAnchor, to the compositor's presentation
 // time — KleptonControllers.sensePose), and the head's delta applied to a hand
 // would be wrong, a hand does not hang off the head.
-typedef struct { int valid; float q[4], p[3]; double ahead_ms; } head_delta;
+// target_s: the CLOCK_MONOTONIC instant the delta predicts to (0 when not
+// valid) — dated into the frame record for KL_REPROJECT_DEPTH_MODE.
+typedef struct { int valid; float q[4], p[3]; double ahead_ms, target_s; } head_delta;
 static head_delta g_pred;                // this frame's; guarded by g_pred_mu
 static pthread_mutex_t g_pred_mu = PTHREAD_MUTEX_INITIALIZER;
 static head_delta pred_get(void) {
@@ -1051,7 +1053,7 @@ static void pose_trace_report(const float pose7[7]) {
 // (still capped) — the knob for tuning it by eye.
 #define OVR_PREDICT_MAX_MS 50.0
 static void predict_frame(void) {
-    head_delta d = { 0, { 0, 0, 0, 1 }, { 0, 0, 0 }, 0 };
+    head_delta d = { 0, { 0, 0, 0, 1 }, { 0, 0, 0 }, 0, 0 };
     static int on = -1;
     static float fixed_ms;
     if (on < 0) {
@@ -1073,7 +1075,8 @@ static void predict_frame(void) {
         if (cap < 0) cap = kl_env_float("KL_OPENVR_PREDICT_MAX_MS", (float)OVR_PREDICT_MAX_MS);
         if (ahead > cap) ahead = cap;
         d.ahead_ms = ahead;
-        d.valid = kl_ovrp_head_predict_delta(now_s() + ahead / 1000.0, d.q, d.p);
+        d.target_s = now_s() + ahead / 1000.0;
+        d.valid = kl_ovrp_head_predict_delta(d.target_s, d.q, d.p);
         if (!d.valid) { d.q[0] = d.q[1] = d.q[2] = 0; d.q[3] = 1; d.p[0] = d.p[1] = d.p[2] = 0; }
     }
     pthread_mutex_lock(&g_pred_mu);
@@ -1241,6 +1244,13 @@ static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
     {
         head_delta d = pred_get();
         pred_apply(&d, g_frame_pose, g_frame_pose + 3);
+        // The declared pose is now the PREDICTED head, so the frame is about
+        // the predicted instant, not the latched sample's (which
+        // kl_ovrp_frame_begin_external filed). Same clock re-basing the
+        // prediction itself used, so the compositor can ask the tracker for
+        // the very anchor this pose came from (KL_REPROJECT_DEPTH_MODE >= 1).
+        if (d.valid && d.target_s > 0)
+            kl_ovrp_frame_set_pose_time(kl_ovrp_tracker_time(d.target_s));
     }
     eye_tangents(0, g_frame_tan);
     eye_tangents(1, g_frame_tan + 4);
@@ -1286,6 +1296,10 @@ static struct {
     // rendered rect, one per size seen (Alyx's dynamic resolution alternates
     // a few), never freed — a diagnostic's memory, not a setting's.
     struct { uint32_t w, h, fmt; uint64_t img; void *mtl; } native[2][OVR_STAGES][4];
+    // KL_REPROJECT_DEPTH_MODE=2: the game's depth for (eye, stage), copied at
+    // Submit beside the colour — sized to the rendered rect, so the colour
+    // stage's normalised uv addresses it whether or not the colour was scaled.
+    struct { uint32_t w, h, fmt; uint64_t img; void *mtl; } depth[2][OVR_STAGES];
     PFN_vkCreateCommandPool CreateCommandPool;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
@@ -1407,6 +1421,85 @@ static void vk_dump(const VRVulkanTextureData_t *t, VkImage img, uint32_t layer,
                 }
             fclose(f);
             fprintf(stderr, "  [openvr] dumped %s (%ux%u, layer %u)\n", path, w, h, layer);
+        }
+    }
+    FreeMemory(V.dev, mem, NULL);
+    DestroyBuffer(V.dev, buf, NULL);
+}
+
+// KL_OPENVR_DUMP's depth twin: our depth copy for this eye, as a quarter-size
+// PFM of the RAW game depth values (eyeN_depth.pfm), beside the PPMs. The
+// ground truth for KL_REPROJECT_DEPTH_CONV — open it and look at which end the
+// sky is.
+static void vk_dump_depth(const VRVulkanTextureData_t *t, VkImage img, uint32_t w, uint32_t h,
+                          const char *name) {
+    const char *dir = getenv("KL_OPENVR_DUMP");
+    if (!dir || !*dir || !t->m_pPhysicalDevice) return;
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)kl_vulkan_sym("vkGetDeviceProcAddr");
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)kl_vulkan_sym("vkGetInstanceProcAddr");
+    if (!gdpa || !gipa) return;
+#define D(f) PFN_vk##f f = (PFN_vk##f)gdpa(V.dev, "vk" #f)
+    D(CreateBuffer); D(GetBufferMemoryRequirements); D(AllocateMemory); D(BindBufferMemory);
+    D(MapMemory); D(DestroyBuffer); D(FreeMemory);
+#undef D
+    PFN_vkGetPhysicalDeviceMemoryProperties gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        gipa((VkInstance)t->m_pInstance, "vkGetPhysicalDeviceMemoryProperties");
+    if (!CreateBuffer || !gmp) return;
+    VkDeviceSize sz = (VkDeviceSize)w * h * 4;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
+                               .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    VkBuffer buf; VkDeviceMemory mem; VkMemoryRequirements mr;
+    if (CreateBuffer(V.dev, &bci, NULL, &buf) != VK_SUCCESS) return;
+    GetBufferMemoryRequirements(V.dev, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mp; gmp((VkPhysicalDevice)t->m_pPhysicalDevice, &mp);
+    uint32_t ti = 0;
+    for (; ti < mp.memoryTypeCount; ti++)
+        if ((mr.memoryTypeBits & (1u << ti)) &&
+            (mp.memoryTypes[ti].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) break;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = ti };
+    if (ti == mp.memoryTypeCount || AllocateMemory(V.dev, &mai, NULL, &mem) != VK_SUCCESS) { DestroyBuffer(V.dev, buf, NULL); return; }
+    BindBufferMemory(V.dev, buf, mem, 0);
+    VkCommandBuffer cb = V.cb[0][0];
+    V.WaitForFences(V.dev, 1, &V.fence[0][0], VK_TRUE, UINT64_MAX);
+    V.ResetFences(V.dev, 1, &V.fence[0][0]);
+    V.ResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    V.BeginCommandBuffer(cb, &bi);
+    VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 } };
+    V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    VkBufferImageCopy reg = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                              .imageExtent = { w, h, 1 } };
+    V.CmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    V.EndCommandBuffer(cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    V.QueueSubmit(V.q, 1, &si, V.fence[0][0]);
+    V.WaitForFences(V.dev, 1, &V.fence[0][0], VK_TRUE, UINT64_MAX);
+    float *px = NULL;
+    if (MapMemory(V.dev, mem, 0, sz, 0, (void **)&px) == VK_SUCCESS && px) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s.pfm", dir, name);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            uint32_t ow = w / 4, oh = h / 4;
+            fprintf(f, "Pf\n%u %u\n-1.0\n", ow, oh);           // little-endian, rows bottom-up
+            for (uint32_t y = oh; y-- > 0;)
+                for (uint32_t x = 0; x < ow; x++) {
+                    float v = px[(size_t)(y * 4) * w + x * 4];
+                    fwrite(&v, sizeof v, 1, f);
+                }
+            fclose(f);
+            fprintf(stderr, "  [openvr] dumped %s (%ux%u raw game depth, centre %.5f)\n", path, w, h,
+                    (double)px[(size_t)(h / 2) * w + w / 2]);
         }
     }
     FreeMemory(V.dev, mem, NULL);
@@ -1539,8 +1632,108 @@ static int vk_zero_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t,
     return 0;
 }
 
+// KL_REPROJECT_DEPTH_MODE=2: the game's depth for one eye, as Submit's
+// VRTextureDepthInfo_t names it, and whether the copy below took it.
+typedef struct { const VRVulkanTextureData_t *t; uint32_t layer; int ok; } ovr_depth_src;
+
+// Record, into the eye's own copy command buffer (same submit, same fence, so
+// the depth is complete exactly when the colour is), a copy of the DEPTH aspect
+// of the rendered rect into our per-(eye, stage) depth image. Returns whether
+// it did. The rect is copied 1:1 at its own size whatever the colour path
+// does with it (scaled or native), so the colour stage's normalised uv
+// addresses it unchanged — the compositor samples both at one uv.
+//
+// Layouts: the game's depth is read as TRANSFER_SRC_OPTIMAL, as its colour is
+// (OpenVR's contract for the colour; it states none for the depth). MoltenVK
+// treats image layouts as no-ops, so this is a memory dependency on the game's
+// depth writes and nothing else.
+static int vk_record_depth(VkCommandBuffer cb, int eye, int stage, const ovr_depth_src *ds,
+                           int32_t x0, int32_t y0, int32_t x1, int32_t y1, int vflip) {
+    const VRVulkanTextureData_t *dt = ds->t;
+    static int said_skip;
+    const char *why = NULL;
+    if (!dt->m_nImage) why = "no image";
+    else if (vflip) why = "the colour is flipped (vMin > vMax) and a depth copy cannot flip";
+    else if (dt->m_nSampleCount > 1) why = "the depth is multisampled";
+    else if ((uint32_t)x1 > dt->m_nWidth || (uint32_t)y1 > dt->m_nHeight)
+        why = "the rendered rect is outside the depth image";
+    if (why) {
+        if (said_skip < 4) { said_skip++;
+            fprintf(stderr, "  [swim] eye %d depth NOT copied: %s (%ux%u fmt %u samples %u) — this "
+                            "frame composites without depth\n", eye, why, dt->m_nWidth, dt->m_nHeight,
+                    dt->m_nFormat, dt->m_nSampleCount); }
+        return 0;
+    }
+    uint32_t rw = (uint32_t)(x1 - x0), rh = (uint32_t)(y1 - y0);
+    VkFormat fmt = (VkFormat)dt->m_nFormat;
+    VkImageAspectFlags all = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (fmt == VK_FORMAT_D16_UNORM_S8_UINT || fmt == VK_FORMAT_D24_UNORM_S8_UINT ||
+        fmt == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        all |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    // Only formats the compositor can sample as depth2d<float> through
+    // MoltenVK's MTLTexture: D32 and D32S8 (Alyx's). Anything else is named.
+    if (fmt != VK_FORMAT_D32_SFLOAT && fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        if (said_skip < 4) { said_skip++;
+            fprintf(stderr, "  [swim] eye %d depth format %u is not D32/D32S8 — not copied\n",
+                    eye, (unsigned)fmt); }
+        return 0;
+    }
+    __typeof__(V.depth[0][0]) *slot = &V.depth[eye][stage];
+    if (!slot->img || slot->w != rw || slot->h != rh || slot->fmt != (uint32_t)fmt) {
+        // Re-created on a size change and the old one left allocated: the
+        // compositor may be sampling it this instant (the colour path's
+        // native images make the same choice). With a fixed fidelity level
+        // there is one size for the whole run.
+        uint64_t im = kl_vulkan_xr_image(rw, rh, 1, 1, (long long)fmt, 2);
+        void *mtl = im ? kl_vulkan_xr_image_mtl(im) : NULL;
+        if (!im || !mtl) {
+            if (said_skip < 4) { said_skip++;
+                fprintf(stderr, "  [swim] eye %d stage %d: could not create/export a %ux%u depth "
+                                "image (fmt %u)\n", eye, stage, rw, rh, (unsigned)fmt); }
+            return 0;
+        }
+        slot->img = im; slot->mtl = mtl; slot->w = rw; slot->h = rh; slot->fmt = (uint32_t)fmt;
+        kl_glfb_note_eye_mtl_depth(eye, stage, mtl, (int)rw, (int)rh);
+        static int said;
+        if (said < 2 * OVR_STAGES) { said++;
+            fprintf(stderr, "  [swim] eye %d stage %d: depth copy %ux%u fmt %u (layer %u of the "
+                            "game's %ux%u depth)\n", eye, stage, rw, rh, (unsigned)fmt, ds->layer,
+                    dt->m_nWidth, dt->m_nHeight); }
+    }
+    VkImage src = (VkImage)(uintptr_t)dt->m_nImage, dst = (VkImage)(uintptr_t)slot->img;
+    VkImageMemoryBarrier bar[2] = {
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = src,
+          .subresourceRange = { all, 0, 1, ds->layer, 1 } },
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0,
+          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dst,
+          .subresourceRange = { all, 0, 1, 0, 1 } },
+    };
+    V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, bar);
+    VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, ds->layer, 1 },
+                        .srcOffset = { x0, y0, 0 },
+                        .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                        .extent = { rw, rh, 1 } };
+    V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    VkImageMemoryBarrier done = bar[1];
+    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    done.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    done.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, NULL, 0, NULL, 1, &done);
+    return 1;
+}
+
 static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b,
-                       uint32_t layer) {
+                       uint32_t layer, ovr_depth_src *ds) {
     if (vk_setup(t) != 0) return -1;
     int32_t x0 = 0, y0 = 0, x1 = (int32_t)t->m_nWidth, y1 = (int32_t)t->m_nHeight;
     if (b) {
@@ -1664,6 +1857,7 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     done.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 0, NULL, 0, NULL, 1, &done);
+    if (ds && ds->t) ds->ok = vk_record_depth(cb, eye, stage, ds, x0, y0, x1, y1, vflip);
     V.EndCommandBuffer(cb);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     V.QueueSubmit(V.q, 1, &si, V.fence[eye][stage]);
@@ -1676,6 +1870,11 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
         vk_dump(t, src, layer, t->m_nWidth, t->m_nHeight, nm);
         snprintf(nm, sizeof nm, "eye%d_dst", eye);
         vk_dump(t, dst, 0, w, h, nm);
+        if (ds && ds->ok) {
+            snprintf(nm, sizeof nm, "eye%d_depth", eye);
+            vk_dump_depth(t, (VkImage)(uintptr_t)V.depth[eye][stage].img,
+                          V.depth[eye][stage].w, V.depth[eye][stage].h, nm);
+        }
     }
     return 0;
 }
@@ -1802,11 +2001,34 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
                     changed < 540 ? " — it renders into one image, not a rotation" : "");
         }
     }
+    // KL_REPROJECT_DEPTH_MODE=2: the depth Submit_TextureWithDepth carries,
+    // copied beside the colour (vk_record_depth) and its projection filed with
+    // the frame. Nothing here runs in any other mode — not even the read.
+    ovr_depth_src dsrc = { NULL, 0, 0 }, *dsp = NULL;
+    float dm22 = 0, dm23 = 0, drange[2] = { 0, 1 };
+    int want_depth = kl_reproject_depth_mode() == 2;
+    if (want_depth && (flags & 0x10)) {
+        const uint8_t *tb = (const uint8_t *)tex;
+        const VRVulkanTextureData_t *dv = *(const VRVulkanTextureData_t *const *)(tb + 64);
+        const float *pm = (const float *)(tb + 72), *rg = (const float *)(tb + 136);
+        dm22 = pm[10]; dm23 = pm[11]; drange[0] = rg[0]; drange[1] = rg[1];
+        if (dv) {
+            dsrc.t = dv;
+            dsrc.layer = (flags & SUBMIT_VULKAN_ARRAY_DATA)
+                ? ((const VRVulkanTextureArrayData_t *)dv)->m_unArrayIndex : layer;
+            dsp = &dsrc;
+        }
+    } else if (want_depth) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [swim] KL_REPROJECT_DEPTH_MODE=2 but Submit carries no depth "
+                                     "(flags %#x lack 0x10) — mode 1 behaviour\n", flags);
+    }
     const VRVulkanTextureData_t *vtd = (const VRVulkanTextureData_t *)tex->handle;
     int zc_ok = zc_frame_ok(g_submitted_mask == 0, vtd->m_nImage);
     if (vk_zero_copy_eye(eye, g_stage, vtd, b, layer, zc_ok,
                          (g_submitted_mask | (1u << eye)) == 3) != 0 &&
-        vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer) != 0) return 101;
+        vk_copy_eye(eye, g_stage, (const VRVulkanTextureData_t *)tex->handle, b, layer, dsp) != 0) return 101;
+    if (want_depth) kl_ovrp_frame_set_depth(eye, dm22, dm23, drange[0], drange[1], dsrc.ok);
 #else
     (void)b;
     return 101;
