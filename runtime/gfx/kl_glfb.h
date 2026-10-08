@@ -278,6 +278,17 @@ void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
                                   int w, int h);
 
+// ...and the eye's DEPTH, for the depth-reprojection mode
+// (KL_REPROJECT_DEPTH_MODE=2, kl_reproject.h). The OpenVR bridge copies the
+// game's submitted depth (Submit_TextureWithDepth) into an image of its own per
+// (eye, stage), exactly as it copies the colour, and records the MTLTexture
+// behind it here: a single-layer depth texture (MoltenVK's Depth32Float_Stencil8
+// for Alyx's D32_SFLOAT_S8_UINT) covering exactly the rect the colour stage
+// image shows, so the colour's normalised uv addresses it unchanged. Not
+// referenced, like the colour; NULL clears the slot.
+void kl_glfb_note_eye_mtl_depth(int eye, int stage, void *texture, int w, int h);
+void *kl_glfb_eye_mtl_depth(int eye, int stage);
+
 // Copy one array LAYER of a guest-owned texture into a provider-backed 2D eye
 // texture, and return the SLOT that now holds that picture (-1 on failure).
 //

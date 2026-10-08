@@ -324,6 +324,12 @@ final class KleptonHUD {
     private var promptModel = matrix_identity_float4x4
     private var ghostDepth: MTLDepthStencilState?
     private var toastDepth: MTLDepthStencilState?
+    /// Set by the compositor for each encode: the eye pass under this HUD wrote
+    /// the GAME's depth (KL_REPROJECT_DEPTH_MODE=2), not a 500 m plane, so the
+    /// ghost's `.greater` would let any nearer piece of the virtual world hide
+    /// a real controller. The body is then drawn always-pass (writing its own
+    /// depth) and only the rim keeps the test, against the body it outlines.
+    var depthOverScene = false
     private var sampler: MTLSamplerState?
     private var mesh: [(vb: MTLBuffer, ib: MTLBuffer, count: Int)] = []
     private var quad: MTLBuffer?
@@ -628,6 +634,7 @@ final class KleptonHUD {
             enc.setRenderPipelineState(solidPipe)
             if let ghostDepth { enc.setDepthStencilState(ghostDepth) }
             for h in 0...1 where ghosts[h].alpha > 0 {
+                if depthOverScene, let toastDepth { enc.setDepthStencilState(toastDepth) }
                 let m = mesh[h]
                 let model = recenter * ghosts[h].pose * ghostFix
                 // Body (light grey, lit), then the soft outline: the same mesh
@@ -644,6 +651,7 @@ final class KleptonHUD {
                 enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,
                                           indexBuffer: m.ib, indexBufferOffset: 0)
                 enc.setCullMode(.front)
+                if depthOverScene, let ghostDepth { enc.setDepthStencilState(ghostDepth) }
                 enc.setVertexBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 2)
                 enc.setFragmentBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 0)
                 enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,

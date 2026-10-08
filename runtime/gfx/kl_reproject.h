@@ -486,4 +486,82 @@ float kl_reproject_ndc_depth(const kl_reproject_uniforms *u);
 // applies no correction from the render pose toward the display pose.
 int kl_reproject_off(void);
 
+// ---------------------------------------------------------------------------
+// DEPTH REPROJECTION — the swim fix. KL_REPROJECT_DEPTH_MODE:
+//
+//   0  (default) exactly the pass above: the eye picture is a quad at
+//      KL_REPROJECT_DEPTH placed from the render pose toward the DISPLAY pose,
+//      and the drawable is told it was rendered at the display pose. Head
+//      TRANSLATION between the two is represented by nobody — the swim.
+//   1  "render anchor": the visionOS compositor hands the drawable the
+//      DeviceAnchor of the instant the picture was drawn at
+//      (kl_ovrp_render_pose.pose_time) and builds the composite from that same
+//      anchor, so this pass corrects ~nothing and the SYSTEM reprojects
+//      render -> scanout. Still the 500 m quad depth.
+//   2  mode 1 + the game's real depth: the eye pass writes, per pixel, the
+//      depth the game rendered (OpenVR Submit_TextureWithDepth, copied per eye
+//      per stage at Submit — kl_glfb_eye_mtl_depth), re-projected into the
+//      drawable's projection, so the system's reprojection has geometry.
+//
+// Latched once. The guest bridge reads it too (mode 2 is what makes it copy the
+// depth), so both sides agree by construction.
+int kl_reproject_depth_mode(void);
+// KL_REPROJECT_DEPTH_CONV=matrix|reverse — how the game's depth buffer value is
+// turned into a distance. `matrix` (default) takes the submitted projection
+// literally: z_clip = m22 z + m23, w = -z, so dist = m23 / (d + m22). `reverse`
+// reads it as reverse-Z with an infinite far plane at the same near:
+// dist = (m23 / m22) / d. The [swim] line prints both readings of the probe so
+// a device log settles which one is true.
+int kl_reproject_depth_conv(void);
+// KL_CP_DEPTH_VIS=1 — the eye pass shows the LINEAR depth as false colour
+// (near red -> far blue, no depth = dark grey) instead of the picture. In the
+// Mac viewer (kl_view_mtl.m) and in the device composite alike.
+int kl_reproject_depth_vis(void);
+
+// Per amplified view, at buffer(2) of the depth pass. Matches KLDepthU in
+// kl_reproject_depth_msl().
+typedef struct {
+    float    m22, m23;     // the game's projection z row, this eye
+    float    near_m;       // clamp: never nearer than the DRAWABLE's near plane
+    float    far_m;        // clamp and the "no depth" answer: KL_REPROJECT_DEPTH
+    uint32_t conv;         // kl_reproject_depth_conv()
+    uint32_t vis;          // kl_reproject_depth_vis()
+    uint32_t pad0, pad1;
+} kl_reproject_depth_uniforms;
+
+// `projection` is the drawable's (reverse-Z, infinite far): its near plane is
+// read out of it.
+kl_reproject_depth_uniforms kl_reproject_depth_build(const kl_ovrp_render_pose *r,
+                                                     int eye, simd_float4x4 projection);
+// The game's depth value -> metres along the view axis under `conv`; <= 0 means
+// no finite distance (sky, clear, or a value past the far plane).
+float kl_reproject_depth_linear(float d, float m22, float m23, int conv);
+
+// kl_reproject_msl() plus the depth pass, its false-colour twin and the probe
+// kernel. A SEPARATE library source on purpose: mode 0 compiles exactly the
+// string it always did, so nothing added here can break it.
+//
+//   vertex   kl_reproject_depth_v    — kl_reproject_v + the reconstruction
+//                                      varyings; buffer(2) = depth uniforms
+//   fragment kl_reproject_depth_f    — colour + [[depth(any)]]; depth textures
+//                                      at texture(2) (view 0) and texture(3)
+//   fragment kl_reproject_depthvis_f — false colour only, no depth output
+//                                      (the Mac viewer, which has no depth
+//                                      attachment)
+//   kernel   kl_depth_probe_k        — KL_DEPTH_PROBE_SIDE^2 raw samples of a
+//                                      depth texture into a float buffer
+const char *kl_reproject_depth_msl(void);
+#define KL_DEPTH_PROBE_SIDE 32
+
+// The probe's answer (side x side raw values, row-major, top row first), filed
+// for the next [swim] line. Called from a command buffer's completion handler.
+void kl_reproject_depth_probe_note(const float *raw, int side,
+                                   const kl_reproject_depth_uniforms *u);
+// The once-a-second [swim] line: the anchor half from the caller (zeros where
+// it has none — the Mac viewer), the depth half from the last probe.
+void kl_reproject_swim_log(int mode, unsigned frames, double age_mean_ms,
+                           double age_max_ms, unsigned ring_hits,
+                           unsigned query_hits, unsigned fallbacks,
+                           unsigned depth_frames);
+
 #endif

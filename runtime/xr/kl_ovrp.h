@@ -305,7 +305,32 @@ typedef struct {
     // alone cannot: an angle is a rate times an interval, so a large delta is
     // either a fast head or a stale pose and the two want opposite fixes.
     uint64_t submit_ns;
+    // ---- depth reprojection (KL_REPROJECT_DEPTH_MODE, kl_reproject.h) ----
+    // The instant the head pose above is ABOUT, in the frontend's tracker clock
+    // (CACurrentMediaTime seconds — the value it passed to
+    // kl_ovrp_set_head_pose_time, moved to the predicted instant when the guest
+    // bridge predicts). 0 = unknown. The visionOS compositor finds the
+    // DeviceAnchor for this instant and hands it to the drawable, so the
+    // system's own reprojection starts from the pose the picture was drawn at.
+    double   pose_time;
+    // The guest's depth, when it submitted one (OpenVR Submit_TextureWithDepth):
+    // the projection's z row, z_clip = m22 * z_view + m23 with w_clip = -z_view,
+    // per eye, and the depth range it declared. depth_valid is a bit per eye;
+    // 3 means both eyes' depth images were copied for this stage
+    // (kl_glfb_eye_mtl_depth) and match this frame.
+    float    depth_m22[2], depth_m23[2];
+    float    depth_range[2];
+    int      depth_valid;
 } kl_ovrp_render_pose;
+
+// Set on the frame being BUILT (the one kl_ovrp_frame_begin_external opened and
+// kl_ovrp_frame_end_external will file). See the fields above.
+void kl_ovrp_frame_set_pose_time(double t);
+void kl_ovrp_frame_set_depth(int eye, float m22, float m23, float range_min,
+                             float range_max, int valid);
+// CLOCK_MONOTONIC seconds -> the tracker's clock (CLOCK_UPTIME_RAW), the
+// re-basing kl_ovrp_head_predict_delta applies before it asks the frontend.
+double kl_ovrp_tracker_time(double mono_s);
 
 // What the guest rendered `stage` with. Returns 0 (and leaves *out untouched)
 // if nothing has been recorded for that stage yet.
