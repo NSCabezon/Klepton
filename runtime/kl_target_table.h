@@ -17,6 +17,7 @@ KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/li
 KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2)
 KL_TARGET_ROW("hl1", "hl1", "hl1.apk", "hl1/assets", "hl1/lib/arm64-v8a", "libxash", "hl1", "obb", KL_GUEST_GLES3JNI)
 KL_TARGET_ROW("hl2", "hl2", "hl2.apk", "hl2/assets", "hl2/lib/arm64-v8a", "liblauncher", "hl2", "obb", KL_GUEST_SDL2)
+KL_TARGET_ROW("ieytd", "ieytd", "ieytd.apk", "ieytd/assets", "ieytd/lib/arm64-v8a", "libmain", "ieytd", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("intotheradius", "intotheradius", "intotheradius.apk", "intotheradius/assets", "intotheradius/lib/arm64-v8a", "libUE4", "intotheradius", "Android/obb/com.CMGames.IntoTheRadius", KL_GUEST_UE4)
 KL_TARGET_ROW("jkxr_ja", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_ja", "jkxr_ja", "obb", KL_GUEST_JKXR)
 KL_TARGET_ROW("jkxr_jo", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_jo", "jkxr_jo", "obb", KL_GUEST_JKXR)
