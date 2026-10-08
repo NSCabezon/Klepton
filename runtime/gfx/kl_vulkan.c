@@ -2407,7 +2407,14 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
     // A depth image is not a colour image with a different format: it needs the
     // depth/stencil attachment usage, and asking for COLOR_ATTACHMENT on a depth
     // format is a validation error rather than a harmless extra bit.
-    VkImageUsageFlags usage = depth
+    // depth == 2 is a depth image that is also a COPY target: the OpenVR
+    // bridge's per-(eye, stage) copy of the game's submitted depth
+    // (KL_REPROJECT_DEPTH_MODE=2). Kept a separate value so the OpenXR depth
+    // swapchains (depth == 1) are created exactly as they always were.
+    VkImageUsageFlags usage = depth == 2
+        ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+        : depth
         ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
         : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);

@@ -1587,18 +1587,22 @@ typedef struct {
     // whose position is visibly changing. OpenXR carries the same distinction
     // in XrSpaceVelocity.velocityFlags, which kl_openxr answers from this.
     int   motion_valid;
-    // The frontend's own name for this sample (kl_ovrp_set_head_pose_tag) and
-    // the instant it is about (kl_ovrp_set_head_pose_time), HEAD only. Inside
-    // the pose rather than beside it so every latch that copies the pose copies
-    // its name in the same breath: the streaming host echoes the tag of the
-    // pose a frame was RENDERED with, and a tag read beside the seqlock could
-    // name the next sample instead. 0 / 0.0 = the frontend never named one.
+    // The instant this sample is ABOUT, in the frontend's tracker clock
+    // (CACurrentMediaTime / CLOCK_UPTIME_RAW seconds), or 0 when the frontend
+    // dates nothing (the macOS viewer). Rides in the struct for the reason the
+    // motion does: every latch copies a klovrp_pose by value, so the time the
+    // guest's frame was drawn at is coherent with the pose it was drawn with.
+    // Read by the depth-reprojection modes (kl_ovrp_render_pose.pose_time) and
+    // echoed by the streaming host (head_time).
+    double t;
+    // The frontend's own name for this sample (kl_ovrp_set_head_pose_tag),
+    // HEAD only, inside the pose for the same reason: the streaming host
+    // echoes the tag of the pose a frame was RENDERED with. 0 = never named.
     uint64_t tag;
-    double   tag_time;
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-    0, 0, 0,   // motion_valid (then tag, tag_time): nothing has been published, so there is nothing to know
+    0, 0, 0,   // motion_valid, t, tag: nothing has been published, so there is nothing to know
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -2074,8 +2078,8 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // and zeros in it are an assertion rather than a silence.
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
+    v.t = g_head_pose_time;
     v.tag = g_head_pose_tag;
-    v.tag_time = g_head_pose_time;
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
     // Pose trace, once a second: the pushed head Y + tracking-origin frame
@@ -2420,7 +2424,7 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
     r->head_tag = h.tag;
-    r->head_time = h.tag_time;
+    r->head_time = h.t;
     // Unity's own frame counter — the number it picks its stage from.
     g_frames.pending_index = guest_frame_index;
     pthread_mutex_unlock(&g_frames.mu);
@@ -2854,8 +2858,35 @@ void kl_ovrp_frame_begin_external(void) {
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
     r->head_tag = h.tag;
-    r->head_time = h.tag_time;
+    r->head_time = h.t;
+    // The latched sample's own instant; a guest that predicts moves it with
+    // kl_ovrp_frame_set_pose_time. No depth until the guest files one.
+    r->pose_time = h.t;
+    r->depth_valid = 0;
     g_frames.pending_index = (int)s;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+// See kl_ovrp.h. Both write the PENDING record, which frame_end_external files
+// whole — so a value set here belongs to exactly the frame being built.
+void kl_ovrp_frame_set_pose_time(double t) {
+    pthread_mutex_lock(&g_frames.mu);
+    g_frames.pending.pose_time = t;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+void kl_ovrp_frame_set_depth(int eye, float m22, float m23, float range_min,
+                             float range_max, int valid) {
+    if ((unsigned)eye > 1) return;
+    pthread_mutex_lock(&g_frames.mu);
+    kl_ovrp_render_pose *r = &g_frames.pending;
+    r->depth_m22[eye] = m22;
+    r->depth_m23[eye] = m23;
+    r->depth_range[0] = range_min;
+    r->depth_range[1] = range_max;
+    // Valid only once BOTH eyes have said so: a frame with one eye's depth is
+    // composited without depth rather than with one eye at the wrong distance.
+    if (valid) r->depth_valid |= 1 << eye; else r->depth_valid &= ~(1 << eye);
     pthread_mutex_unlock(&g_frames.mu);
 }
 
@@ -3073,6 +3104,10 @@ static double klovrp_to_tracker_clock(double mono_s) {
                         "re-based before the tracker is asked\n", mono_now - up_now);
     return mono_s - mono_now + up_now;
 }
+
+// The same re-basing, for a caller outside this file that has to date a pose
+// it predicted (kl_openvr's declared frame pose) in the tracker's clock.
+double kl_ovrp_tracker_time(double mono_s) { return klovrp_to_tracker_clock(mono_s); }
 
 int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3) {
     kl_ovrp_head_at_fn fn = __atomic_load_n(&g_head_at, __ATOMIC_ACQUIRE);
@@ -7204,4 +7239,90 @@ void kl_ovrp_report(FILE *f) {
     fprintf(f, "  --- resolved but never called ---\n");
     for (unsigned i = 0; i < g_novrp; i++)
         if (!g_ovrp[i].calls) fprintf(f, "    %s\n", g_ovrp[i].name);
+}
+
+// ---- The compositor fade and the prompt (kl_ovrp.h) --------------------------
+// Three channels: 0 the colour fade, 1 the grid (drawn as black under it),
+// 2 the grid's draw mask (alpha only; starts at 1, kl_ovrp_grid_mask).
+static pthread_mutex_t g_fade_mu = PTHREAD_MUTEX_INITIALIZER;
+static float  g_fade_from[3][4] = { [2] = { 0, 0, 0, 1 } }, g_fade_to[3][4] = { [2] = { 0, 0, 0, 1 } };
+static double g_fade_t0[3], g_fade_len[3];
+static double fade_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void fade_eval(int ch, double now, float o[4]) {          // g_fade_mu held
+    double k = g_fade_len[ch] > 0 ? (now - g_fade_t0[ch]) / g_fade_len[ch] : 1.0;
+    if (k < 0) k = 0;
+    if (k > 1) k = 1;
+    for (int i = 0; i < 4; i++)
+        o[i] = g_fade_from[ch][i] + (float)k * (g_fade_to[ch][i] - g_fade_from[ch][i]);
+}
+static float fade_clamp01(float v) { return v != v ? 0.0f : v < 0 ? 0.0f : v > 1 ? 1.0f : v; }
+static void fade_set(int ch, float r, float g, float b, float a, float seconds) {
+    double now = fade_now();
+    float t[4] = { fade_clamp01(r), fade_clamp01(g), fade_clamp01(b), fade_clamp01(a) };
+    pthread_mutex_lock(&g_fade_mu);
+    float cur[4];
+    fade_eval(ch, now, cur);
+    memcpy(g_fade_from[ch], cur, sizeof cur);
+    // Fading from clear, the colour is the target's from the start: only the
+    // alpha ramps (no grey wash on a fade to black from nothing).
+    if (cur[3] <= 0.0f) memcpy(g_fade_from[ch], t, 3 * sizeof(float));
+    memcpy(g_fade_to[ch], t, sizeof t);
+    g_fade_t0[ch] = now;
+    g_fade_len[ch] = seconds > 0 && seconds == seconds ? seconds : 0;
+    pthread_mutex_unlock(&g_fade_mu);
+}
+void kl_ovrp_fade_to(float r, float g, float b, float a, float seconds) { fade_set(0, r, g, b, a, seconds); }
+void kl_ovrp_grid_to(float alpha, float seconds) { fade_set(1, 0, 0, 0, alpha, seconds); }
+void kl_ovrp_grid_mask(float alpha, float seconds) { fade_set(2, 0, 0, 0, alpha, seconds); }
+float kl_ovrp_grid_alpha(void) {
+    float o[4];
+    double now = fade_now();
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(1, now, o);
+    pthread_mutex_unlock(&g_fade_mu);
+    return o[3];
+}
+void kl_ovrp_fade_current(float rgba[4]) {
+    double now = fade_now();
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(0, now, rgba);
+    pthread_mutex_unlock(&g_fade_mu);
+}
+int kl_ovrp_fade_color(float rgba[4]) {
+    double now = fade_now();
+    float f[4], g[4], m[4];
+    pthread_mutex_lock(&g_fade_mu);
+    fade_eval(0, now, f);
+    fade_eval(1, now, g);
+    fade_eval(2, now, m);
+    pthread_mutex_unlock(&g_fade_mu);
+    g[3] *= m[3];
+    // The fade over the (black) grid, "over" in straight alpha.
+    float a = f[3] + g[3] * (1.0f - f[3]);
+    for (int i = 0; i < 3; i++) rgba[i] = a > 0 ? f[i] * f[3] / a : 0.0f;
+    rgba[3] = a;
+    return a > 0.0f;
+}
+
+static pthread_mutex_t g_prompt_mu = PTHREAD_MUTEX_INITIALIZER;
+static char     g_prompt[256];
+static unsigned g_prompt_serial;
+void kl_ovrp_set_prompt(const char *text) {
+    pthread_mutex_lock(&g_prompt_mu);
+    const char *t = text ? text : "";
+    if (strcmp(t, g_prompt)) {
+        snprintf(g_prompt, sizeof g_prompt, "%s", t);
+        g_prompt_serial++;
+    }
+    pthread_mutex_unlock(&g_prompt_mu);
+}
+unsigned kl_ovrp_prompt(char *buf, int n) {
+    pthread_mutex_lock(&g_prompt_mu);
+    if (buf && n > 0) snprintf(buf, (size_t)n, "%s", g_prompt);
+    unsigned s = g_prompt_serial;
+    pthread_mutex_unlock(&g_prompt_mu);
+    return s;
 }

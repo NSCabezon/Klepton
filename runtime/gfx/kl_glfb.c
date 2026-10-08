@@ -3208,6 +3208,30 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
     }
 }
 
+// The depth twin of the table above — see kl_glfb.h. Kept apart rather than
+// added to g_eye_mtl so nothing that walks that table (the rate-map re-register,
+// the teardown) can ever mistake a depth texture for an eye picture.
+static struct { void *tex; int w, h; } g_eye_depth[2][KL_MTL_MAX_STAGES];
+
+void kl_glfb_note_eye_mtl_depth(int eye, int stage, void *texture, int w, int h) {
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return;
+    if (g_eye_depth[eye][stage].tex == texture) return;
+    g_eye_depth[eye][stage].tex = texture;
+    g_eye_depth[eye][stage].w = w;
+    g_eye_depth[eye][stage].h = h;
+    static int said;
+    if (said < 8) {
+        said++;
+        fprintf(stderr, "  [glfb] eye %d stage %d DEPTH is MTLTexture %p (%dx%d)%s\n",
+                eye, stage, texture, w, h, said == 8 ? " (further changes not logged)" : "");
+    }
+}
+
+void *kl_glfb_eye_mtl_depth(int eye, int stage) {
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return NULL;
+    return g_eye_depth[eye][stage].tex;
+}
+
 int kl_glfb_eye_mtl_origin_top_left(int eye, int stage) {
     if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return 0;
     return g_eye_mtl[eye][stage].top_left;
