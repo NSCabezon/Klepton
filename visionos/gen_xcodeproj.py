@@ -258,7 +258,8 @@ for _stack in (_icon_base, f"{_icon_base}-launcher"):
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
-         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonHUD.swift"]
+         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonHUD.swift",
+         "KleptonStreamClient.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 # The alyx build downloads its own game content from Steam (Sources/KleptonSteamContent.swift)
@@ -487,6 +488,7 @@ COMMON = f"""
 					"$(SRCROOT)/../runtime/libc",
 					"$(SRCROOT)/../runtime/gfx",
 					"$(SRCROOT)/../runtime/xr",
+					"$(SRCROOT)/../runtime/net",
 					"$(SRCROOT)/../runtime/media",
 					"$(SRCROOT)/../runtime/guest",
 					"$(SRCROOT)/../runtime/diag",

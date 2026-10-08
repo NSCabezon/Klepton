@@ -2938,3 +2938,33 @@ Not knobs — the shim reads these to answer the guest with host truth.
   the host's first preferred language (CFLocale — what a visionOS app launched
   from the Home View has, since it has no `LANG`; before, the headset reported
   en/US there), then en/US.
+
+## "Jugar desde el Mac" — headset client (`runtime/net/kl_stream_client.c`, `visionos/Sources/KleptonStreamClient.swift`)
+
+- `KL_STREAM_HOST_ADDR=ip[:port]` — a Mac to stream from without Bonjour (also
+  shown in the hub's list). IPv6 with a port goes in brackets:
+  `[fe80::1%en0]:9944`. Default port `KL_STREAM_PORT_DEFAULT` (9944).
+- `KL_STREAM_HOST_NAME=<name>` — the display name for that address (default: the address).
+- `KL_STREAM_AUTOCONNECT=1` — hub only: skip the library and go straight to
+  "Jugar desde el Mac" against `KL_STREAM_HOST_ADDR` (`KL_HUB_GAME` names the
+  game, default `alyx`). The scripted/simulator test path.
+- `KL_STREAM_MAX_KBPS=<n>` — HELLO's `max_bitrate_kbps` hint (default 0 = host decides).
+- `KL_STREAM_IDR_MIN_S=<s>` — minimum gap between IDR_REQUESTs (default 0.25);
+  an unanswered one is repeated every 2x this.
+- `KL_STREAM_NOSIGNAL_S=<s>` — seconds without a decoded frame before the state
+  is "no signal" ("Sin señal del Mac" card). Default 1.
+- `KL_STREAM_RCVBUF=<bytes>` — UDP receive buffer (default 8 MiB; a keyframe is
+  a burst of hundreds of fragments).
+- `KL_STREAM_LOG=0` — silence the once-a-second `[stream-client]` stats line.
+- `KL_STREAM_SIM_YAW_DPS=<deg/s>` — Simulator only (no world tracking there): the
+  fixed standing head the stream sends yaws at this rate. Default 0.
+
+## "Jugar desde el Mac" — test host (`tools/kl_stream_testhost.m`, `build/kl_stream_testhost`)
+
+- `KL_TESTHOST_PORT` (9944), `KL_TESTHOST_NAME` (Bonjour instance, default
+  "<Mac name> (test)"), `KL_TESTHOST_FPS` (72), `KL_TESTHOST_EYE` (cap on the
+  per-eye size, 1024), `KL_TESTHOST_KBPS` (30000), `KL_TESTHOST_GOP` (600),
+  `KL_TESTHOST_DROP` (probability of dropping each VIDEO fragment, 0),
+  `KL_TESTHOST_HAPTICS_S` (seconds between test buzzes, 0 = never),
+  `KL_TESTHOST_SECONDS` (run time then BYE, 0 = forever),
+  `KL_TESTHOST_LOWLAT` (1: try low-latency rate control).
