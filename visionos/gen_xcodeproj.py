@@ -490,6 +490,7 @@ COMMON = f"""
 					"$(SRCROOT)/../runtime/media",
 					"$(SRCROOT)/../runtime/guest",
 					"$(SRCROOT)/../runtime/diag",
+					"$(SRCROOT)/../runtime/net",
 					"$(inherited)",
 				);
 				// Two levels of escaping, and the first attempt had one. The

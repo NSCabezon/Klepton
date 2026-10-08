@@ -11,7 +11,7 @@ MVK_INC := -Ivendor-moltenvk/out/include
 # too. One -I per source directory is what buys that; gen_xcodeproj.py carries
 # the same list as HEADER_SEARCH_PATHS.
 RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr \
-               -Iruntime/media -Iruntime/guest -Iruntime/diag
+               -Iruntime/media -Iruntime/guest -Iruntime/diag -Iruntime/net
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
@@ -398,18 +398,35 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
+# runtime/net/kl_stream_host.{c,m} is the KL_STREAM_HOST=1 frontend ("Jugar
+# desde el Mac"): host-only like the viewer, so it is named here and nowhere in
+# RUNTIME_SHIP.
+STREAM_HOST := runtime/net/kl_stream_host.c runtime/net/kl_stream_host_mtl.m
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
+              runtime/gfx/kl_view_mtl.m $(STREAM_HOST) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-	  runtime/gfx/kl_view_mtl.m \
+	  runtime/gfx/kl_view_mtl.m $(STREAM_HOST) \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  -framework CoreText -framework CoreGraphics -framework ImageIO \
 	  $(shell pkg-config --libs sdl3)
 
 boot: build/m_boot
 	./build/m_boot $(LIBS)
+
+# The headset stand-in for KL_STREAM_HOST=1 (runtime/net/kl_stream_host.c):
+# HELLO with a Vision Pro-like display, POSE at 90 Hz with a yawing head, VIDEO
+# reassembled and decoded with VideoToolbox, every Nth frame written as PNG.
+#   KL_STREAM_HOST=1 KL_GLIBC_CONTENT=... ./build/m_boot alyx      (host)
+#   ./build/kl_stream_fakeclient -o build/stream-png -t 30           (client)
+build/kl_stream_fakeclient: tools/kl_stream_fakeclient.m runtime/net/kl_stream_proto.h
+	@mkdir -p build
+	$(CC) -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 -fobjc-arc -Iruntime/net -o $@ \
+	  tools/kl_stream_fakeclient.m -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	  -framework CoreGraphics -framework ImageIO -framework Foundation
+.PHONY: stream-fakeclient
+stream-fakeclient: build/kl_stream_fakeclient
 
 # ---- guest payloads we build ourselves ----
 #
