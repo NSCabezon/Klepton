@@ -14,6 +14,16 @@
 //     eye level, following the head lazily, ~5 s each, queued. KL_TOAST_TEST=1
 //     fires a fake one 5 s after the compositor starts.
 //
+//   * THE COMPOSITOR FADE. OpenVR's FadeToColor / FadeGrid (kl_openvr.c),
+//     filed in kl_ovrp and read here every frame (kl_ovrp_fade_color): a
+//     head-locked colour over the whole view, both eyes, drawn FIRST so the
+//     ghosts and panels stay readable over it. KL_OPENVR_FADE=0 files nothing.
+//
+//   * THE GATE PROMPT. Alyx's "Pulsa Trigger para empezar" after every load
+//     (mailbox show_message -> kl_ovrp_set_prompt): a panel "Pulsa el gatillo
+//     para empezar" held in front of the eyes until the level starts
+//     (end_loading). KL_GATE_TOAST=1 turns it on (default off).
+//
 // Both are drawn by KleptonCompositor at the END of each composite encoder —
 // after the eye, the guest's layers and the loading skybox — with the same
 // per-view projection and amplification as the eye pass, so they are solid in
@@ -42,9 +52,8 @@ struct KLToast {
     let api: String
     let name: String
     let desc: String
-    let icon: String
-    /// The card's first line; nil = the achievement header (KleptonToasts.header).
-    var header: String? = nil
+    let icon: String          // a file path; "" a gold placeholder; "-" no icon at all
+    var header: String? = nil // nil: the achievement header
 }
 
 /// A persistent status card, drawn in the toast's place for as long as it is
@@ -137,22 +146,25 @@ enum KLToastRaster {
         c.setLineWidth(4)
         c.strokePath()
         // Icon, 192 px, rounded, vertically centred; a gold square without one.
+        let noIcon = t.icon == "-"
         let ir = CGRect(x: 48, y: Double(H - 192) / 2, width: 192, height: 192)
         var img: CGImage?
-        if !t.icon.isEmpty,
+        if !t.icon.isEmpty, !noIcon,
            let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: t.icon) as CFURL, nil) {
             img = CGImageSourceCreateImageAtIndex(src, 0, nil)
         }
-        c.saveGState()
-        c.addPath(CGPath(roundedRect: ir, cornerWidth: 28, cornerHeight: 28, transform: nil))
-        c.clip()
-        if let img { c.draw(img, in: ir) } else {
-            c.setFillColor(red: 0.85, green: 0.66, blue: 0.22, alpha: 1)
-            c.fill(ir)
+        if !noIcon {
+            c.saveGState()
+            c.addPath(CGPath(roundedRect: ir, cornerWidth: 28, cornerHeight: 28, transform: nil))
+            c.clip()
+            if let img { c.draw(img, in: ir) } else {
+                c.setFillColor(red: 0.85, green: 0.66, blue: 0.22, alpha: 1)
+                c.fill(ir)
+            }
+            c.restoreGState()
         }
-        c.restoreGState()
         // Text column. Baselines from the top: header 78, name 146, desc 198/240.
-        let x = 48.0 + 192 + 40, maxW = Double(W) - x - 48
+        let x = noIcon ? 72.0 : 48.0 + 192 + 40, maxW = Double(W) - x - 48
         let fh = CTFontCreateUIFontForLanguage(.emphasizedSystem, 34, nil)
             ?? CTFontCreateWithName("Helvetica-Bold" as CFString, 34, nil)
         let fn = CTFontCreateUIFontForLanguage(.emphasizedSystem, 50, nil)
@@ -313,8 +325,26 @@ final class KleptonHUD {
     private let device: MTLDevice
     private var solidPipe: MTLRenderPipelineState?
     private var texPipe: MTLRenderPipelineState?
+    private var fadePipe: MTLRenderPipelineState?
+    private var fadeDepth: MTLDepthStencilState?
+    /// The compositor fade this frame (straight alpha), from kl_ovrp_fade_color.
+    private var fade = SIMD4<Float>(0, 0, 0, 0)
+
+    /// The gate prompt: kl_ovrp_prompt's serial seen last, and its panel.
+    private var promptSerial: UInt32 = 0
+    private var promptText = ""
+    private var promptTex: MTLTexture?
+    private var promptAlpha: Float = 0
+    private var promptPos: SIMD3<Float>?
+    private var promptModel = matrix_identity_float4x4
     private var ghostDepth: MTLDepthStencilState?
     private var toastDepth: MTLDepthStencilState?
+    /// Set by the compositor for each encode: the eye pass under this HUD wrote
+    /// the GAME's depth (KL_REPROJECT_DEPTH_MODE=2), not a 500 m plane, so the
+    /// ghost's `.greater` would let any nearer piece of the virtual world hide
+    /// a real controller. The body is then drawn always-pass (writing its own
+    /// depth) and only the rim keeps the test, against the body it outlines.
+    var depthOverScene = false
     private var sampler: MTLSamplerState?
     private var mesh: [(vb: MTLBuffer, ib: MTLBuffer, count: Int)] = []
     private var quad: MTLBuffer?
@@ -371,6 +401,16 @@ final class KleptonHUD {
                                  texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
         return t.sample(s, in.uv) * o.params.y;
     }
+    // The fade: one clip-space triangle covering the whole view, the same in
+    // every amplified view (head-locked by construction), at the far plane.
+    struct KLFOut { float4 pos [[position]]; };
+    vertex KLFOut kl_hud_fade_v(uint vid [[vertex_id]]) {
+        float2 p = float2(float((vid << 1) & 2), float(vid & 2)) * 2.0 - 1.0;
+        KLFOut o; o.pos = float4(p, 0, 1); return o;
+    }
+    fragment float4 kl_hud_fade_f(KLFOut in [[stage_in]], constant float4 &c [[buffer(0)]]) {
+        return float4(c.rgb * c.a, c.a);
+    }
     """
 
     init(device: MTLDevice, colorFormat: MTLPixelFormat, amplification: Int) {
@@ -395,9 +435,9 @@ final class KleptonHUD {
 
         do {
             let lib = try device.makeLibrary(source: Self.msl, options: nil)
-            func pipe(_ frag: String) throws -> MTLRenderPipelineState {
+            func pipe(_ frag: String, vertex: String = "kl_hud_v") throws -> MTLRenderPipelineState {
                 let d = MTLRenderPipelineDescriptor()
-                d.vertexFunction = lib.makeFunction(name: "kl_hud_v")
+                d.vertexFunction = lib.makeFunction(name: vertex)
                 d.fragmentFunction = lib.makeFunction(name: frag)
                 d.colorAttachments[0].pixelFormat = colorFormat
                 d.depthAttachmentPixelFormat = .depth32Float
@@ -412,6 +452,7 @@ final class KleptonHUD {
             }
             solidPipe = try pipe("kl_hud_solid_f")
             texPipe = try pipe("kl_hud_tex_f")
+            fadePipe = try pipe("kl_hud_fade_f", vertex: "kl_hud_fade_v")
         } catch {
             NSLog("[hud] pipelines failed: \(error) — no ghost controllers, toasts only logged")
         }
@@ -425,6 +466,12 @@ final class KleptonHUD {
         t.depthCompareFunction = .always
         t.isDepthWriteEnabled = true
         toastDepth = device.makeDepthStencilState(descriptor: t)
+        // The fade leaves the scene's depth alone: it is a colour over the
+        // view, and visionOS should keep reprojecting what is under it.
+        let fd = MTLDepthStencilDescriptor()
+        fd.depthCompareFunction = .always
+        fd.isDepthWriteEnabled = false
+        fadeDepth = device.makeDepthStencilState(descriptor: fd)
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear; sd.magFilter = .linear; sd.mipFilter = .notMipmapped
         sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
@@ -480,6 +527,15 @@ final class KleptonHUD {
         let now = CACurrentMediaTime()
         let dt = lastPrepare > 0 ? Float(min(now - lastPrepare, 0.1)) : 0
         lastPrepare = now
+        preparePrompt(originFromHead: originFromHead, dt: dt)
+        var c: [Float] = [0, 0, 0, 0]
+        let on = c.withUnsafeMutableBufferPointer { kl_ovrp_fade_color($0.baseAddress) } != 0
+        let newFade = on ? SIMD4<Float>(c[0], c[1], c[2], c[3]) : SIMD4<Float>(0, 0, 0, 0)
+        if (newFade.w > 0) != (fade.w > 0) {
+            NSLog("[hud] compositor fade \(newFade.w > 0 ? "drawing" : "clear")"
+                  + String(format: " (%.2f %.2f %.2f a %.2f)", newFade.x, newFade.y, newFade.z, newFade.w))
+        }
+        fade = newFade
         if !testFired && now - started >= 5 {
             testFired = true
             let es = KleptonToasts.spanish
@@ -528,29 +584,66 @@ final class KleptonHUD {
         // Lazy follow: the target is 1.2 m ahead along the head's YAW, 15 cm
         // below the eyes; the panel eases toward it (time constant 0.35 s), so
         // it stays in view without being nailed to the face.
+        toastModel = Self.panelModel(originFromHead: originFromHead, dist: 1.2, drop: 0.15,
+                                     tau: 0.35, dt: dt, pos: &toastPos)
+    }
+
+    /// The gate prompt: rebuilt when kl_ovrp_prompt's serial moves, faded
+    /// 0.25 s in and out, held ~1 m ahead at eye level and following the head
+    /// closely (0.12 s) — it is the thing to read right now, not a notice.
+    private func preparePrompt(originFromHead: simd_float4x4, dt: Float) {
+        var buf = [CChar](repeating: 0, count: 256)
+        let serial = buf.withUnsafeMutableBufferPointer { kl_ovrp_prompt($0.baseAddress, 256) }
+        if serial != promptSerial {
+            promptSerial = serial
+            promptText = String(cString: buf)
+            if !promptText.isEmpty {
+                let es = KleptonToasts.spanish
+                let t = KLToast(api: "gate",
+                                name: es ? "Pulsa el gatillo para empezar" : "Pull the trigger to start",
+                                desc: promptText == "-" ? "" : promptText, icon: "-",
+                                header: es ? "Nivel cargado" : "Level loaded")
+                promptTex = KLToastRaster.texture(t, device: device)
+                NSLog("[hud] gate prompt shown (\(promptText))" + (promptTex == nil ? " — raster FAILED" : ""))
+            } else if promptTex != nil {
+                NSLog("[hud] gate prompt cleared")
+            }
+        }
+        let step = dt / 0.25
+        promptAlpha = promptText.isEmpty ? max(0, promptAlpha - step) : min(1, promptAlpha + step)
+        if promptAlpha <= 0 { promptPos = nil; if promptText.isEmpty { promptTex = nil }; return }
+        promptModel = Self.panelModel(originFromHead: originFromHead, dist: 1.0, drop: 0.05,
+                                      tau: 0.12, dt: dt, pos: &promptPos)
+    }
+
+    /// A panel ahead of the head along its yaw, `drop` metres below the eyes,
+    /// easing toward that spot with time constant `tau`, upright and facing
+    /// the eyes. The toast's placement, shared with the prompt.
+    private static func panelModel(originFromHead: simd_float4x4, dist: Float, drop: Float,
+                                   tau: Float, dt: Float, pos: inout SIMD3<Float>?) -> simd_float4x4 {
         let h = SIMD3<Float>(originFromHead.columns.3.x, originFromHead.columns.3.y,
                              originFromHead.columns.3.z)
         var f = -SIMD3<Float>(originFromHead.columns.2.x, 0, originFromHead.columns.2.z)
         f = simd_length(f) > 1e-3 ? simd_normalize(f) : SIMD3(0, 0, -1)
-        let target = h + f * 1.2 + SIMD3(0, -0.15, 0)
-        if let p = toastPos, dt > 0 {
-            toastPos = p + (target - p) * (1 - exp(-dt / 0.35))
+        let target = h + f * dist + SIMD3(0, -drop, 0)
+        if let p = pos, dt > 0 {
+            pos = p + (target - p) * (1 - exp(-dt / tau))
         } else {
-            toastPos = target
+            pos = target
         }
-        let p = toastPos!
-        // Facing the eyes, upright.
+        let p = pos!
         var z = h - p
         z = simd_length(z) > 1e-3 ? simd_normalize(z) : SIMD3(0, 0, 1)
         var x = simd_cross(SIMD3<Float>(0, 1, 0), z)
         x = simd_length(x) > 1e-3 ? simd_normalize(x) : SIMD3(1, 0, 0)
         let y = simd_cross(z, x)
         let w: Float = 0.40, ht = w * Float(KLToastRaster.height) / Float(KLToastRaster.width)
-        toastModel = simd_float4x4(SIMD4(x * w, 0), SIMD4(y * ht, 0), SIMD4(z, 0), SIMD4(p, 1))
+        return simd_float4x4(SIMD4(x * w, 0), SIMD4(y * ht, 0), SIMD4(z, 0), SIMD4(p, 1))
     }
 
     var hasContent: Bool {
         (toastTex != nil && toastAlpha > 0) || ghosts.contains { $0.alpha > 0 }
+            || fade.w > 0 || (promptTex != nil && promptAlpha > 0)
     }
 
     // MARK: Encode
@@ -560,12 +653,24 @@ final class KleptonHUD {
     func encode(_ enc: MTLRenderCommandEncoder, views: [KLHUDView], recenter: simd_float4x4) {
         guard hasContent, let solidPipe, let texPipe, !views.isEmpty else { return }
         enc.setFrontFacing(.counterClockwise)
+
+        // The fade first: over the game, under Klepton's own things.
+        if fade.w > 0, let fadePipe {
+            enc.setRenderPipelineState(fadePipe)
+            if let fadeDepth { enc.setDepthStencilState(fadeDepth) }
+            enc.setCullMode(.none)
+            var c = fade
+            enc.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        }
+
         views.withUnsafeBytes { enc.setVertexBytes($0.baseAddress!, length: $0.count, index: 1) }
 
         if ghostsEnabled, mesh.count == 2 {
             enc.setRenderPipelineState(solidPipe)
             if let ghostDepth { enc.setDepthStencilState(ghostDepth) }
             for h in 0...1 where ghosts[h].alpha > 0 {
+                if depthOverScene, let toastDepth { enc.setDepthStencilState(toastDepth) }
                 let m = mesh[h]
                 let model = recenter * ghosts[h].pose * ghostFix
                 // Body (light grey, lit), then the soft outline: the same mesh
@@ -582,6 +687,7 @@ final class KleptonHUD {
                 enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,
                                           indexBuffer: m.ib, indexBufferOffset: 0)
                 enc.setCullMode(.front)
+                if depthOverScene, let ghostDepth { enc.setDepthStencilState(ghostDepth) }
                 enc.setVertexBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 2)
                 enc.setFragmentBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 0)
                 enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,
@@ -596,6 +702,20 @@ final class KleptonHUD {
             enc.setCullMode(.none)
             var o = KLHObj(model: toastModel, color: SIMD4(1, 1, 1, 1),
                            params: SIMD4(0, toastAlpha, 0, 0))
+            enc.setVertexBuffer(quad, offset: 0, index: 0)
+            enc.setVertexBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 2)
+            enc.setFragmentBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 0)
+            enc.setFragmentTexture(tex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+
+        if let tex = promptTex, promptAlpha > 0, let quad, let sampler {
+            enc.setRenderPipelineState(texPipe)
+            if let toastDepth { enc.setDepthStencilState(toastDepth) }
+            enc.setCullMode(.none)
+            var o = KLHObj(model: promptModel, color: SIMD4(1, 1, 1, 1),
+                           params: SIMD4(0, promptAlpha, 0, 0))
             enc.setVertexBuffer(quad, offset: 0, index: 0)
             enc.setVertexBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 2)
             enc.setFragmentBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 0)
