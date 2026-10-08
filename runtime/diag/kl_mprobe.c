@@ -29,6 +29,15 @@ static struct {
     const char       *(*class_get_name)(Il2CppClass *);
     void             *(*class_get_type)(Il2CppClass *);
     Il2CppObject     *(*type_get_object)(void *);
+    // Optional (KL_PROBE_FIELDS only): absent ones disable that probe alone.
+    void             *(*class_get_field_from_name)(Il2CppClass *, const char *);
+    Il2CppClass      *(*class_get_parent)(Il2CppClass *);
+    size_t            (*field_get_offset)(void *);
+    void              (*field_static_get_value)(void *, void *);
+    void             *(*field_get_type)(void *);
+    int               (*type_get_type)(void *);
+    const char       *(*class_get_namespace)(Il2CppClass *);
+    void             *(*method_get_return_type)(const MethodInfo *);
 } il;
 
 // Managed object layouts (v24 / Unity 2019.4, LP64). Only the fields read here.
@@ -65,6 +74,14 @@ static int mprobe_init(void) {
     BIND(class_get_type,            "il2cpp_class_get_type");
     BIND(type_get_object,           "il2cpp_type_get_object");
 #undef BIND
+    *(void **)&il.class_get_field_from_name = kl_sym(img, "il2cpp_class_get_field_from_name");
+    *(void **)&il.class_get_parent          = kl_sym(img, "il2cpp_class_get_parent");
+    *(void **)&il.field_get_offset          = kl_sym(img, "il2cpp_field_get_offset");
+    *(void **)&il.field_static_get_value    = kl_sym(img, "il2cpp_field_static_get_value");
+    *(void **)&il.field_get_type            = kl_sym(img, "il2cpp_field_get_type");
+    *(void **)&il.type_get_type             = kl_sym(img, "il2cpp_type_get_type");
+    *(void **)&il.class_get_namespace       = kl_sym(img, "il2cpp_class_get_namespace");
+    *(void **)&il.method_get_return_type    = kl_sym(img, "il2cpp_method_get_return_type");
     g_state = 1;
     return 1;
 }
@@ -393,6 +410,124 @@ static void mprobe_resolve_offsets(void) {
     }
 }
 
+// ---- KL_PROBE_FIELDS: follow a chain of fields from a static ---------------
+//
+//   KL_PROBE_FIELDS="Ns.Type:staticField.field.field,..."
+//
+// Reads the static, then each instance field in turn (searching base classes
+// too, so private fields of a parent resolve). A step written `name()` CALLS
+// that zero-argument method instead (static at the first step, so
+// `UnityEngine.Camera:get_main().get_cullingMask()` reads an engine property
+// no field holds). It then prints where the chain
+// ends: a reference prints its runtime CLASS, a value type its first four
+// bytes as int and float. Built for IEYTD, whose GameManager is a state machine
+// (`GameManager:_instance._fsm...`): which state a black-screened title is
+// sitting in is the first question, and nothing native can answer it.
+static void *probe_field_of(Il2CppClass *k, const char *name) {
+    for (; k; k = il.class_get_parent ? il.class_get_parent(k) : NULL) {
+        void *f = il.class_get_field_from_name(k, name);
+        if (f) return f;
+        if (!il.class_get_parent) break;
+    }
+    return NULL;
+}
+
+static int probe_type_is_ref(void *f) {
+    int t = il.type_get_type(il.field_get_type(f));
+    // STRING, CLASS, SZARRAY, OBJECT, ARRAY, GENERICINST-of-class (0x15 is
+    // ambiguous; treated as a reference — the generic value types this is
+    // pointed at are rare, and the class name printed says which it was).
+    return t == 0x0e || t == 0x12 || t == 0x14 || t == 0x15 || t == 0x1c || t == 0x1d;
+}
+
+static void probe_fields(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_FIELDS", NULL);
+    if (!spec || !*spec) return;
+    if (!il.class_get_field_from_name || !il.field_get_offset ||
+        !il.field_static_get_value || !il.field_get_type || !il.type_get_type) {
+        fprintf(stderr, "  [mprobe] fields: libil2cpp lacks the field API\n");
+        return;
+    }
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *save = NULL, *it = strtok_r(buf, ",", &save); it;
+         it = strtok_r(NULL, ",", &save)) {
+        char *colon = strchr(it, ':');
+        if (!colon) continue;
+        *colon = 0;
+        char ns[160] = "", name[128] = "";
+        const char *dot = strrchr(it, '.');
+        if (dot) { snprintf(ns, sizeof ns, "%.*s", (int)(dot - it), it);
+                   snprintf(name, sizeof name, "%s", dot + 1); }
+        else       snprintf(name, sizeof name, "%s", it);
+        Il2CppClass *k = find_class(ns, name);
+        if (!k) { fprintf(stderr, "  [mprobe] fields: no class %s\n", it); continue; }
+        char chain[512]; snprintf(chain, sizeof chain, "%s", colon + 1);
+        void *obj = NULL; uint8_t val[16] = {0}; int is_ref = 1, step = 0;
+        const char *fail = NULL;
+        for (char *s2 = NULL, *fn = strtok_r(chain, ".", &s2); fn;
+             fn = strtok_r(NULL, ".", &s2), step++) {
+            void *f;
+            size_t fl = strlen(fn);
+            if (fl > 2 && !strcmp(fn + fl - 2, "()")) {
+                // A getter: invoke it on the current object (static at step 0).
+                fn[fl - 2] = 0;
+                Il2CppClass *mk = step == 0 ? k
+                                : (is_ref && obj) ? il.object_get_class((Il2CppObject *)obj) : NULL;
+                const MethodInfo *m = NULL;
+                for (Il2CppClass *c = mk; c && !m;
+                     c = il.class_get_parent ? il.class_get_parent(c) : NULL) {
+                    m = il.class_get_method_from_name(c, fn, 0);
+                    if (!il.class_get_parent) break;
+                }
+                if (!m || !il.method_get_return_type) { fail = fn; break; }
+                Il2CppObject *r = invoke_on(step == 0 ? NULL : (Il2CppObject *)obj, m, NULL, fn);
+                int rt = il.type_get_type(il.method_get_return_type(m));
+                is_ref = rt == 0x0e || rt == 0x12 || rt == 0x14 || rt == 0x15 ||
+                         rt == 0x1c || rt == 0x1d;
+                if (is_ref) obj = r;
+                else { memset(val, 0, sizeof val);
+                       if (r) memcpy(val, il.object_unbox(r), 12); }
+                continue;
+            }
+            if (step == 0) {
+                f = probe_field_of(k, fn);
+                if (!f) { fail = fn; break; }
+                is_ref = probe_type_is_ref(f);
+                if (is_ref) il.field_static_get_value(f, &obj);
+                else        il.field_static_get_value(f, val);
+            } else {
+                if (!is_ref || !obj) { fail = fn; break; }
+                Il2CppClass *ok = il.object_get_class((Il2CppObject *)obj);
+                f = ok ? probe_field_of(ok, fn) : NULL;
+                if (!f) { fail = fn; break; }
+                size_t off = il.field_get_offset(f);
+                is_ref = probe_type_is_ref(f);
+                if (is_ref) memcpy(&obj, (uint8_t *)obj + off, sizeof obj);
+                else        memcpy(val, (uint8_t *)obj + off, sizeof val);
+            }
+        }
+        if (fail) {
+            fprintf(stderr, "  [mprobe f%u] %s:%s -> stopped at '%s' (%s)\n", frame,
+                    it, colon + 1, fail, obj || !is_ref ? "no such field" : "null");
+        } else if (is_ref) {
+            Il2CppClass *ok = obj ? il.object_get_class((Il2CppObject *)obj) : NULL;
+            fprintf(stderr, "  [mprobe f%u] %s:%s = %s%s%s\n", frame, it, colon + 1,
+                    !obj ? "null" : (ok && il.class_get_namespace) ? il.class_get_namespace(ok) : "",
+                    ok && il.class_get_namespace && *il.class_get_namespace(ok) ? "." : "",
+                    ok ? il.class_get_name(ok) : "");
+        } else {
+            // The first word as int and float, and three floats beside it for a
+            // Vector3-shaped answer (a getter's struct is unboxed 12 bytes deep;
+            // a field read copies 16, so the tail is whatever follows it).
+            int32_t i32; float f3[3]; memcpy(&i32, val, 4); memcpy(f3, val, 12);
+            fprintf(stderr, "  [mprobe f%u] %s:%s = %d (0x%x, %gf) [%g %g %g]\n",
+                    frame, it, colon + 1, i32, (unsigned)i32, (double)f3[0],
+                    (double)f3[0], (double)f3[1], (double)f3[2]);
+        }
+    }
+}
+
 void kl_mprobe_tick(unsigned frame) {
     // Independent of KL_PROBE_INPUT and of KL_PROBE_FROM: this one has to land
     // BEFORE the throw it exists to describe, and the throw here is on the
@@ -441,6 +576,7 @@ void kl_mprobe_tick(unsigned frame) {
 
     static int dumped_enums;
     if (!dumped_enums) { dumped_enums = 1; probe_dump_enums(); }
+    probe_fields(frame);
 
     // Input.GetJoystickNames and InputTracking.GetLocalPosition/Rotation are
     // NOT here: IL2CPP's managed stripping removed them, which is itself the

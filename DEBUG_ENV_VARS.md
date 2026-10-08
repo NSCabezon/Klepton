@@ -73,6 +73,13 @@ answers GL and kl_glfb never initializes.
   legal, is what no Android driver actually ships: AVPro Video walks this string
   with `strtok` in a bottom-tested loop and `strlen(NULL)`s the first token
 
+- `KL_GL_MULTIVIEW=0|1` — force `GL_OVR_multiview(2)` off or on in the GL
+  extension list and `GL_MAX_VIEWS_OVR`. Default: offered only to the targets
+  `klgl_want_multiview()` names (ieytd*, hl2, portal) AND, under `KL_GLFB`,
+  only when the ANGLE behind it exposes `GL_OVR_multiview2` (printed at init as
+  `[glfb] ANGLE GL_OVR_multiview2:`). The vendored Metal ANGLE does not, and
+  advertising it anyway made IEYTD bake num_views shaders ANGLE refused.
+
 - `KL_EGL_TRACE=1` — log every EGL entry point the guest actually REACHES, in
   order, with the interesting arguments. A census, not a diagnostic: it says
   nothing about what we answered. It exists because every EGL symbol binds at
@@ -794,6 +801,17 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   between the two is the measurement — `VRLaserPointer=0/1` means the laser
   exists and is switched off.
 
+- `KL_PROBE_FIELDS=<Ns.Type:static.field.field,...>` — follow a chain from a
+  static field through instance fields (base classes searched, so private
+  fields of a parent resolve) and print where it ends: a reference prints its
+  runtime class, a value its first word as int/float plus three floats (a
+  Vector3). A step written `name()` calls that zero-argument method instead —
+  static at the first step — so engine properties work too:
+  `UnityEngine.Camera:get_main().get_transform().get_position()`. Printed each
+  probe tick; needs `KL_PROBE_INPUT=1`. Found IEYTD sitting in
+  `GameManager:_instance._fsm._currentState = CalibrationState` behind a black
+  frame, and its calibration panel 1.7 m below the camera.
+
 **One caveat, recorded so it is not trusted.** The probe also prints
 `eventsystem: overUI=...`, which stays `no` even when the pointer works:
 `EventSystem.IsPointerOverGameObject()`'s zero-argument overload asks about
@@ -921,6 +939,14 @@ puts the camera on the ground with its hands underneath it.
   selected the EyeLevel origin (there the eye already is the origin). This is
   not cosmetic: with the head at y=0 under FloorLevel the menu renders above
   the view and the default hands sit ~1.7 m below the frustum.
+- `KL_OVRP_EYELEVEL=0` — turn off the EyeLevel origin anchor (default on).
+  Frontends publish the head in a floor frame; a guest that never selects
+  FloorLevel (OVRPlugin's default is EyeLevel — I Expect You To Die) reads its
+  node poses relative to an anchor instead: `KL_OVRP_EYE_HEIGHT` straight up
+  until the guest calls `ovrp_RecenterTrackingOrigin`, then the head position at
+  that recenter (position only, not yaw). Read side only: the compositor's
+  pose records stay in the floor frame. Off = the old answer, where IEYTD's
+  calibration panel sat 1.7 m below the view and the frame looked black.
 - `KL_OVRP_HANDS_IN_VIEW=1` — park both hands at a fixed spot inside the
   *current head's* frustum (head-relative, 15 cm out, 12 cm down, 55 cm
   forward), overriding whatever the frontend last wrote. Read side, so it
