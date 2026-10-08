@@ -208,7 +208,11 @@ print(phys[0]["identifier"])
   echo "[3/5] building for device ${DEVID}…"
   # generic/platform, not id= : the build must not depend on the device being awake
   set +e
-  xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+  # KL_CONFIG=Release: the optimised app (Swift compositor/HUD/controllers at -O).
+  # The runtime dylib is make's either way. Separate derived data per config.
+  CONFIG="${KL_CONFIG:-Debug}"
+  [ "$CONFIG" = Debug ] || DD_SUFFIX="$DD_SUFFIX-$CONFIG"
+  xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration "$CONFIG" \
     -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
     -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD'
   # xcodebuild's status, through the pipe. Testing for the .app is NOT enough: a
@@ -218,7 +222,7 @@ print(phys[0]["identifier"])
   # most expensive possible way to be told about a compile error.
   BUILD_RC=${PIPESTATUS[0]}
   set -e
-  APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
+  APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/$CONFIG-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
   if [ -n "${KL_BUILD_ONLY:-}" ]; then
