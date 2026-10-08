@@ -2712,8 +2712,11 @@ static void mb_gate_prompt(const char *addr, const char *msg) {
         if (!strcmp(type, "begin_loading")) {
             fprintf(stderr, "  [openvr] load begins: grid drawn (alpha %.2f)\n", kl_ovrp_grid_alpha());
             kl_ovrp_grid_mask(1.0f, 0.0f);
-        } else if (!strcmp(type, "end_loading")) {
-            fprintf(stderr, "  [openvr] load ends: grid hidden over 0.5 s\n");
+        } else if (!strcmp(type, "end_loading") || !strcmp(type, "show_message")) {
+            // show_message is the level's start gate: the load is done and the
+            // paused level should be seen (as on SteamVR), not black until the
+            // trigger — end_loading only comes after the unpause.
+            fprintf(stderr, "  [openvr] load ends (%s): grid hidden over 0.5 s\n", type);
             kl_ovrp_grid_mask(0.0f, 0.5f);
         }
     }
