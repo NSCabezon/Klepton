@@ -99,6 +99,56 @@ TARGETS = {
         "product": "KleptonSuperhot",
         "display": "SUPERHOT",
     },
+    "ieytd": {
+        # I Expect You To Die (Schell Games), Quest build 1.2.174682
+        # (com.schellgames.ieytdquest, versionCode 74682). Unity 2019.4.21f1 +
+        # IL2CPP on the LEGACY built-in VR path: boot.config says
+        # `vr-enabled=1` / `vr-device-list=Oculus`, with no xrsdk-pre-init line,
+        # so Unity drives libOVRPlugin + libvrapi itself (Beat Saber 1.6's shape,
+        # not 1.40's OculusXRPlugin). All three Oculus libraries are REPLACED
+        # (kl_ovrp / kl_ovrplat); what is translated is the title's own set:
+        # libAudioPluginOculusSpatializer, libOVRLipSync and
+        # libovravatarloader beside libmain/libunity/libil2cpp.
+        #
+        # Not a split binary: no OBB, everything is in the 533 MB APK.
+        #
+        # Measured on the Mac host (2026-10-08):
+        #  - `--gap` and the boot gate were clean on the first run: libmain +
+        #     libunity bind with 0 unresolved, JNI_OnLoad and initJni reach
+        #     no unimplemented call, and 600 null-driver frames pump clean.
+        #     The spatializer, OVRLipSync and the avatar loader translate like
+        #     any guest library; the spatializer is loaded at boot, the other
+        #     two are never dlopened before the first room, so nothing of
+        #     theirs had to be stubbed. Entitlement: kl_ovrplat's existing
+        #     answer for the app's own check (`_entitlementCheckPassed` = 1).
+        #  - Black at full frame rate twice over, for two different reasons:
+        #     (1) GL_OVR_multiview was offered by name to "ieytd*" but the
+        #     vendored Metal ANGLE cannot compile it — now withheld unless
+        #     ANGLE exposes it, and Unity takes multi-pass stereo; (2) the game
+        #     never selects FloorLevel, so it runs on OVRPlugin's EyeLevel
+        #     origin, and the floor-frame head put its calibration panel 1.7 m
+        #     below the view — now anchored (KL_OVRP_EYELEVEL, and a real
+        #     ovrp_RecenterTrackingOrigin, which the calibration calls).
+        #  - First boot shows the seated calibration ("hold any button"), then
+        #     the language-select room. Spanish because the host locale is
+        #     es_ES. Still wrong there: ~100 "Invalid texture unit!" rejects a
+        #     frame (Unity 2019.4's cap of 32, see kl_guestpoke.c — this
+        #     build's offsets are not measured), 16 shaders Unity reports as
+        #     "GLSL compilation failed, no infolog" (likely compute kernels, beside "Kernel at index (11) is invalid", on an
+        #     ES 3.0 ANGLE), and the room renders very dark with blank button
+        #     labels.
+        "libs":    None,
+        "srcdir":  "ieytd/lib/arm64-v8a",
+        "tree":    "ieytd",
+        "apk":     "ieytd.apk",
+        "assets":  "ieytd/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonIEYTD",
+        "display": "I Expect You To Die",
+    },
     "bonelab": {
         # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
         # (com.unity3d.player.UnityPlayerActivity, the Oculus VR intent
