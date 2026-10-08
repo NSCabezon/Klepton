@@ -595,8 +595,13 @@ static void sys_proj_raw(void *s, int eye, float *l, float *r, float *t, float *
     (void)s;
     float tan[4];
     eye_tangents(eye, tan);
-    // OpenVR's raw projection: left and TOP negative (its y points down).
-    *l = -tan[0]; *r = tan[1]; *t = -tan[2]; *b = tan[3];
+    // OpenVR's raw projection: left and top negative. The game's matrix puts
+    // `b` at the top of its image (Alyx renders up = b), so the display's UP
+    // tangent goes in b and DOWN in -t. The other way round mirrored the
+    // display's asymmetric cone (up 1.0, down 1.19) and every picture sat
+    // ~11 deg low, head-locked: the world tilted while turning and receded
+    // looking up (2026-10-08; a symmetric KL_OVRP_EYE_TAN made it vanish).
+    *l = -tan[0]; *r = tan[1]; *t = -tan[3]; *b = tan[2];
 }
 static HmdMatrix44_t sys_proj(void *s, int eye, float zn, float zf) {
     float l, r, t, b;
@@ -1758,9 +1763,9 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         if (m00 != 0.0f && m11 != 0.0f) {
             float rl = 2.0f / m00, sx = m02 * rl, bt = 2.0f / m11, sy = m12 * bt;
             float r = (sx + rl) * 0.5f, l = (sx - rl) * 0.5f, b2 = (sy + bt) * 0.5f, t2 = (sy - bt) * 0.5f;
-            float tn[4] = { -l, r, -t2, b2 };                 // left, right, up, down; positive
-            // OpenVR's raw y points DOWN (see sys_proj_raw); a matrix built the
-            // other way round shows up as a negative "down" — flip it then.
+            float tn[4] = { -l, r, b2, -t2 };                 // left, right, up, down; positive
+            // Up is b, down is -t (see sys_proj_raw); a matrix built the other
+            // way round shows up as both negative — flip it then.
             if (tn[2] < 0 && tn[3] < 0) { tn[2] = -tn[2]; tn[3] = -tn[3]; }
             static int said;
             if (said < 4) { said++;
