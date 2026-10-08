@@ -341,8 +341,14 @@ final class KLStreamSession: @unchecked Sendable {
 // MARK: - Decoded picture -> the compositor's eye seam
 
 /// Owns one 2-slice eye texture per swapchain stage (KL_OVRP_STAGES, 3 by
-/// default) and blits each decoded side-by-side frame's halves into the next
+/// default) and copies each decoded side-by-side frame's halves into the next
 /// stage: left half -> slice 0 (eye 0), right half -> slice 1 (eye 1).
+///
+/// The decoder's native biplanar 4:2:0 (420v, or x420 for a 10-bit stream) is
+/// the default: one render pass per eye with kl_stream_yuv_msl() — the shader
+/// the Mac harness times and checks — converts to RGB while splitting, into a
+/// bgra8Unorm view of the stage (the stream's values are already sRGB-encoded).
+/// KL_STREAM_DECODE_BGRA=1 decodes to BGRA and blits, as before.
 ///
 /// The blit is committed on the COMPOSITOR's own queue before its composite
 /// command buffer, so Metal orders the two and nothing has to wait on the CPU;
@@ -354,12 +360,43 @@ final class KLStreamFramePublisher {
     private var cache: CVMetalTextureCache?
     private var stages: [MTLTexture] = []
     private var eyeW = 0, eyeH = 0
+    private var stageViews: [MTLTexture] = []   // bgra8Unorm views, the YUV pass's targets
     private var next = 0
     private var logged = false
+    private var yuvPipe: MTLRenderPipelineState?
+    private var yuvFailed = false
 
     init(device: MTLDevice) {
         self.device = device
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+    }
+
+    private func yuvPipeline() -> MTLRenderPipelineState? {
+        if let yuvPipe { return yuvPipe }
+        if yuvFailed { return nil }
+        do {
+            let lib = try device.makeLibrary(source: String(cString: kl_stream_yuv_msl()), options: nil)
+            let d = MTLRenderPipelineDescriptor()
+            d.vertexFunction = lib.makeFunction(name: "kl_stream_yuv_v")
+            d.fragmentFunction = lib.makeFunction(name: "kl_stream_yuv_f")
+            d.colorAttachments[0].pixelFormat = .bgra8Unorm
+            d.inputPrimitiveTopology = .triangle
+            yuvPipe = try device.makeRenderPipelineState(descriptor: d)
+        } catch {
+            yuvFailed = true
+            NSLog("[stream] YUV split shader failed: \(error)")
+        }
+        return yuvPipe
+    }
+
+    private func planeTexture(_ pb: CVPixelBuffer, _ plane: Int, _ fmt: MTLPixelFormat)
+        -> (MTLTexture, CVMetalTexture)? {
+        guard let cache else { return nil }
+        var cv: CVMetalTexture?
+        let w = CVPixelBufferGetWidthOfPlane(pb, plane), h = CVPixelBufferGetHeightOfPlane(pb, plane)
+        guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, fmt, w, h, plane, &cv)
+                == kCVReturnSuccess, let cv, let t = CVMetalTextureGetTexture(cv) else { return nil }
+        return (t, cv)
     }
 
     private func ensureStages(w: Int, h: Int) -> Bool {
@@ -371,7 +408,7 @@ final class KLStreamFramePublisher {
         d.width = w
         d.height = h
         d.arrayLength = 2
-        d.usage = [.shaderRead]
+        d.usage = [.shaderRead, .renderTarget, .pixelFormatView]
         d.storageMode = .private
         var made: [MTLTexture] = []
         for i in 0..<n {
@@ -383,6 +420,7 @@ final class KLStreamFramePublisher {
             made.append(t)
         }
         stages = made
+        stageViews = made.compactMap { $0.makeTextureView(pixelFormat: .bgra8Unorm) }
         eyeW = w; eyeH = h; next = 0
         // Register once per allocation; the table holds the pointer, `stages`
         // holds the reference.
@@ -402,29 +440,63 @@ final class KLStreamFramePublisher {
         let W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb)
         let ew = W / 2
         guard ew > 0, H > 0, ensureStages(w: ew, h: H) else { return false }
-        var cvtex: CVMetalTexture?
-        let r = CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .bgra8Unorm_srgb,
-                                                          W, H, 0, &cvtex)
-        guard r == kCVReturnSuccess, let cvtex, let src = CVMetalTextureGetTexture(cvtex),
-              let cmd = queue.makeCommandBuffer(), let blit = cmd.makeBlitCommandEncoder()
-        else {
-            NSLog("[stream] could not wrap the decoded frame for Metal (\(r))")
-            return false
-        }
+        let fmt = CVPixelBufferGetPixelFormatType(pb)
         let stage = next % stages.count
-        next += 1
         let dst = stages[stage]
-        cmd.label = "klepton stream frame \(info.frame_id)"
-        for eye in 0..<2 {
-            blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: MTLOrigin(x: eye * ew, y: 0, z: 0),
-                      sourceSize: MTLSize(width: ew, height: H, depth: 1),
-                      to: dst, destinationSlice: eye, destinationLevel: 0,
-                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        if fmt == kCVPixelFormatType_32BGRA {
+            var cvtex: CVMetalTexture?
+            let r = CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .bgra8Unorm_srgb,
+                                                              W, H, 0, &cvtex)
+            guard r == kCVReturnSuccess, let cvtex, let src = CVMetalTextureGetTexture(cvtex),
+                  let cmd = queue.makeCommandBuffer(), let blit = cmd.makeBlitCommandEncoder()
+            else {
+                NSLog("[stream] could not wrap the decoded frame for Metal (\(r))")
+                return false
+            }
+            cmd.label = "klepton stream frame \(info.frame_id)"
+            for eye in 0..<2 {
+                blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: eye * ew, y: 0, z: 0),
+                          sourceSize: MTLSize(width: ew, height: H, depth: 1),
+                          to: dst, destinationSlice: eye, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            }
+            blit.endEncoding()
+            cmd.addCompletedHandler { _ in withExtendedLifetime((cvtex, pb)) {} }
+            cmd.commit()
+        } else {
+            let ten = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            guard stage < stageViews.count, let pipe = yuvPipeline(),
+                  let (ty, cy) = planeTexture(pb, 0, ten ? .r16Unorm : .r8Unorm),
+                  let (tc, cc) = planeTexture(pb, 1, ten ? .rg16Unorm : .rg8Unorm),
+                  let cmd = queue.makeCommandBuffer()
+            else {
+                NSLog("[stream] could not wrap the decoded YUV frame for Metal (format \(fmt))")
+                return false
+            }
+            cmd.label = "klepton stream frame \(info.frame_id) (yuv)"
+            var u = kl_stream_yuv_uniforms()
+            kl_stream_yuv_params(fmt, &u)
+            u.eye_w = UInt32(ew); u.frame_w = UInt32(W); u.frame_h = UInt32(H)
+            for eye in 0..<2 {
+                let rp = MTLRenderPassDescriptor()
+                rp.colorAttachments[0].texture = stageViews[stage]
+                rp.colorAttachments[0].slice = eye
+                rp.colorAttachments[0].loadAction = .dontCare
+                rp.colorAttachments[0].storeAction = .store
+                guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return false }
+                enc.setRenderPipelineState(pipe)
+                u.x0 = UInt32(eye * ew)
+                enc.setFragmentBytes(&u, length: MemoryLayout<kl_stream_yuv_uniforms>.stride, index: 0)
+                enc.setFragmentTexture(ty, index: 0)
+                enc.setFragmentTexture(tc, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
+            cmd.addCompletedHandler { _ in withExtendedLifetime((cy, cc, pb)) {} }
+            cmd.commit()
         }
-        blit.endEncoding()
-        cmd.addCompletedHandler { _ in withExtendedLifetime((cvtex, pb)) {} }
-        cmd.commit()
+        next += 1
 
         // The frame record: this stage now holds a picture rendered at
         // ring[pose_id] with VIDEO.tan.

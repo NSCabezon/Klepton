@@ -625,6 +625,13 @@ void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw);
 // failed measurement rather than passed on, because this one is a divisor.
 void kl_ovrp_set_display_frequency(float hz);
 
+// The size of the rect the guest actually rendered and submitted for `eye`
+// (the newest submission), whatever the stage image it is copied/scaled
+// into. Filed by the guest bridge (kl_openvr's Submit); read by the Mac stream
+// host to encode at the rendered size. _submit_size returns 0 until filed.
+void kl_ovrp_note_submit_size(int eye, int w, int h);
+int  kl_ovrp_submit_size(int eye, int *w, int *h);
+
 // Pin the display rate for a target known to mishandle a measured one (Steam
 // Link's VR client crashes on anything but a value stated up front), so the run
 // need not pass KL_DISPLAY_HZ by hand. The env still wins. Set before boot.

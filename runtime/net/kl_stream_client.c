@@ -12,6 +12,10 @@
 //     completes, every frame older than F that is still incomplete is dropped —
 //     a picture that would be shown after a newer one is worse than none — and
 //     every frame id between the previous completed frame and F counts as LOST.
+//   * Before any of that, FEC (protocol v2): a VIDEO packet flagged PARITY is
+//     the XOR of a group of fec_n data fragments; when exactly one fragment of
+//     a group is missing it is rebuilt in place (klsc_fec_try), so a single
+//     loss per group never becomes a lost frame.
 //   * After any loss the next P-frames reference a picture the decoder never
 //     had, so they are not submitted: the client waits for a keyframe and asks
 //     for one (IDR_REQUEST), re-asking every KL_STREAM_IDR_MIN_S (0.25 s) until
@@ -35,6 +39,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -80,6 +85,12 @@ typedef struct {
     size_t    cap;
     kl_stream_video meta;
     double    t_last;
+    // FEC (KL_STREAM_VIDEO_PARITY): one parity payload per group of fec_n
+    uint16_t  fec_n, groups;
+    uint8_t  *par;       // groups * KL_STREAM_MTU_PAYLOAD
+    size_t    par_cap;
+    uint8_t  *par_have;  // one byte per group
+    size_t    par_have_cap;
 } klsc_slot;
 
 typedef struct {
@@ -133,7 +144,12 @@ struct kl_stream_client {
 
     // counters: totals and the current 1 s window
     uint32_t          tot_decoded, tot_lost, tot_idr, tot_dec_err, tot_pose_miss,
-                      tot_poses, tot_skipped;
+                      tot_poses, tot_skipped, tot_fec_fixed;
+    int               decode_bgra;      // KL_STREAM_DECODE_BGRA=1: the old BGRA output
+    // cadence: intervals between decoded frames (rx thread)
+    double            t_prev_decoded;
+    double            w_iv_sum, w_iv_sq, t_iv_sum, t_iv_sq, t_decode_ms;
+    uint32_t          w_iv_n, t_iv_n;
     uint32_t          w_decoded;
     double            w_decode_ms;
     uint64_t          w_bytes;
@@ -316,7 +332,24 @@ static void klsc_drop_session(kl_stream_client *c) {
 
 static int klsc_make_session(kl_stream_client *c) {
     klsc_drop_session(c);
-    int32_t pixfmt = kCVPixelFormatType_32BGRA;
+    // Native biplanar 4:2:0 by default — what the hardware decoder produces,
+    // so no conversion pass inside VideoToolbox; the app converts to RGB in
+    // the shader that splits the eyes (kl_stream_yuv_msl). 10-bit streams
+    // (Main10) come out as x420. KL_STREAM_DECODE_BGRA=1 = the old BGRA output.
+    int32_t pixfmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    const char *fmtname = "420v (native YUV)";
+    if (c->decode_bgra) {
+        pixfmt = kCVPixelFormatType_32BGRA;
+        fmtname = "BGRA";
+    } else {
+        CFTypeRef bpc = CMFormatDescriptionGetExtension(c->fmt, CFSTR("BitsPerComponent"));
+        int bits = 8;
+        if (bpc && CFGetTypeID(bpc) == CFNumberGetTypeID()) CFNumberGetValue(bpc, kCFNumberIntType, &bits);
+        if (bits > 8) {
+            pixfmt = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+            fmtname = "x420 (native 10-bit YUV)";
+        }
+    }
     CFNumberRef pf = CFNumberCreate(NULL, kCFNumberSInt32Type, &pixfmt);
     CFDictionaryRef iosurf = CFDictionaryCreate(NULL, NULL, NULL, 0,
                                                 &kCFTypeDictionaryKeyCallBacks,
@@ -338,8 +371,8 @@ static int klsc_make_session(kl_stream_client *c) {
     }
     VTSessionSetProperty(c->sess, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
     CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(c->fmt);
-    klsc_log("[stream-client] HEVC decoder up: %dx%d (BGRA, IOSurface/Metal)",
-             d.width, d.height);
+    klsc_log("[stream-client] HEVC decoder up: %dx%d (%s, IOSurface/Metal)",
+             d.width, d.height, fmtname);
     return 0;
 }
 
@@ -434,10 +467,18 @@ static int klsc_decode(kl_stream_client *c, klsc_slot *s) {
         if (st == kVTInvalidSessionErr) klsc_drop_session(c);
         return -1;
     }
+    double tnow = kl_stream_now();
     pthread_mutex_lock(&c->mu);
     c->tot_decoded++;
     c->w_decoded++;
     c->w_decode_ms += ms;
+    if (c->t_prev_decoded > 0) {
+        double iv = (tnow - c->t_prev_decoded) * 1000.0;
+        c->w_iv_sum += iv; c->w_iv_sq += iv * iv; c->w_iv_n++;
+        c->t_iv_sum += iv; c->t_iv_sq += iv * iv; c->t_iv_n++;
+    }
+    c->t_decode_ms += ms;
+    c->t_prev_decoded = tnow;
     pthread_mutex_unlock(&c->mu);
     return 0;
 }
@@ -446,6 +487,38 @@ static int klsc_decode(kl_stream_client *c, klsc_slot *s) {
 // reassembly
 
 static void klsc_free_slot(klsc_slot *s) { s->used = 0; }
+
+static size_t klsc_frag_len(const klsc_slot *s, uint32_t i) {
+    size_t off = (size_t)i * KL_STREAM_MTU_PAYLOAD;
+    return s->frame_bytes - off < KL_STREAM_MTU_PAYLOAD ? s->frame_bytes - off : KL_STREAM_MTU_PAYLOAD;
+}
+
+// Group g has its parity and exactly one data fragment missing: rebuild it.
+// Returns 1 when a fragment was rebuilt.
+static int klsc_fec_try(kl_stream_client *c, klsc_slot *s, uint32_t g) {
+    if (!s->fec_n || g >= s->groups || !s->par_have[g]) return 0;
+    uint32_t a = g * s->fec_n, b = a + s->fec_n;
+    if (b > s->frag_count) b = s->frag_count;
+    uint32_t miss = 0, missing = 0;
+    for (uint32_t i = a; i < b; i++) if (!s->have[i]) { missing = i; if (++miss > 1) return 0; }
+    if (miss != 1) return 0;
+    uint8_t tmp[KL_STREAM_MTU_PAYLOAD];
+    size_t plen = klsc_frag_len(s, a);
+    memcpy(tmp, s->par + (size_t)g * KL_STREAM_MTU_PAYLOAD, plen);
+    for (uint32_t i = a; i < b; i++) {
+        if (i == missing) continue;
+        const uint8_t *src = s->buf + (size_t)i * KL_STREAM_MTU_PAYLOAD;
+        size_t len = klsc_frag_len(s, i);
+        for (size_t k = 0; k < len; k++) tmp[k] ^= src[k];
+    }
+    memcpy(s->buf + (size_t)missing * KL_STREAM_MTU_PAYLOAD, tmp, klsc_frag_len(s, missing));
+    s->have[missing] = 1;
+    s->got++;
+    pthread_mutex_lock(&c->mu);
+    c->tot_fec_fixed++;
+    pthread_mutex_unlock(&c->mu);
+    return 1;
+}
 
 static void klsc_complete(kl_stream_client *c, klsc_slot *s) {
     uint32_t f = s->frame_id;
@@ -499,11 +572,15 @@ static void klsc_on_video(kl_stream_client *c, const uint8_t *pkt, size_t n) {
     memcpy(&v, pkt, sizeof v);
     const uint8_t *payload = pkt + sizeof v;
     size_t plen = n - sizeof v;
+    int parity = (v.flags & KL_STREAM_VIDEO_PARITY) != 0;
     if (v.frame_bytes == 0 || v.frame_bytes > KLSC_MAX_FRAME || v.frag_count == 0 ||
-        v.frag_index >= v.frag_count ||
         (uint32_t)v.frag_count != (v.frame_bytes + KL_STREAM_MTU_PAYLOAD - 1) / KL_STREAM_MTU_PAYLOAD)
         return;
-    size_t off = (size_t)v.frag_index * KL_STREAM_MTU_PAYLOAD;
+    uint32_t groups = v.fec_n ? ((uint32_t)v.frag_count + v.fec_n - 1) / v.fec_n : 0;
+    if (parity ? (!v.fec_n || v.frag_index >= groups) : v.frag_index >= v.frag_count) return;
+    // A parity packet's index is its group; its payload is as long as the
+    // group's first data fragment.
+    size_t off = (size_t)v.frag_index * (parity ? v.fec_n : 1u) * KL_STREAM_MTU_PAYLOAD;
     size_t want = v.frame_bytes - off < KL_STREAM_MTU_PAYLOAD ? v.frame_bytes - off
                                                               : KL_STREAM_MTU_PAYLOAD;
     if (plen != want) return;
@@ -542,20 +619,47 @@ static void klsc_on_video(kl_stream_client *c, const uint8_t *pkt, size_t n) {
             s->have = malloc(s->have_cap);
             if (!s->have) { s->have_cap = 0; return; }
         }
+        if (groups && s->par_cap < (size_t)groups * KL_STREAM_MTU_PAYLOAD) {
+            free(s->par);
+            s->par_cap = (size_t)groups * KL_STREAM_MTU_PAYLOAD;
+            s->par = malloc(s->par_cap);
+            if (!s->par) { s->par_cap = 0; return; }
+        }
+        if (groups && s->par_have_cap < groups) {
+            free(s->par_have);
+            s->par_have_cap = groups;
+            s->par_have = malloc(s->par_have_cap);
+            if (!s->par_have) { s->par_have_cap = 0; return; }
+        }
         memset(s->have, 0, v.frag_count);
+        if (groups) memset(s->par_have, 0, groups);
         s->used = 1;
         s->frame_id = v.frame_id;
         s->frame_bytes = v.frame_bytes;
         s->frag_count = v.frag_count;
+        s->fec_n = v.fec_n;
+        s->groups = (uint16_t)groups;
         s->got = 0;
         s->meta = v;
+        s->meta.flags &= ~KL_STREAM_VIDEO_PARITY;
     }
-    if (s->frame_bytes != v.frame_bytes || s->frag_count != v.frag_count) return;
-    if (s->have[v.frag_index]) return;    // duplicate
-    s->have[v.frag_index] = 1;
-    memcpy(s->buf + off, payload, plen);
-    s->got++;
+    if (s->frame_bytes != v.frame_bytes || s->frag_count != v.frag_count || s->fec_n != v.fec_n)
+        return;
+    uint32_t g;
+    if (parity) {
+        g = v.frag_index;
+        if (s->par_have[g]) return;       // duplicate
+        s->par_have[g] = 1;
+        memcpy(s->par + (size_t)g * KL_STREAM_MTU_PAYLOAD, payload, plen);
+    } else {
+        if (s->have[v.frag_index]) return;    // duplicate
+        s->have[v.frag_index] = 1;
+        memcpy(s->buf + off, payload, plen);
+        s->got++;
+        g = s->fec_n ? v.frag_index / s->fec_n : 0;
+    }
     s->t_last = kl_stream_now();
+    if (s->fec_n) klsc_fec_try(c, s, g);
     if (s->got == s->frag_count) klsc_complete(c, s);
 }
 
@@ -650,6 +754,14 @@ static void klsc_window(kl_stream_client *c, double now) {
     s->kbps = (float)(c->w_bytes * 8.0 / 1000.0 / dt);
     s->p2p_ms = c->w_p2p_n ? (float)(c->w_p2p_ms / c->w_p2p_n) : 0;
     s->rtt_ms = c->rtt_ms;
+    if (c->w_iv_n) {
+        double m = c->w_iv_sum / c->w_iv_n, var = c->w_iv_sq / c->w_iv_n - m * m;
+        s->interval_ms = (float)m;
+        s->interval_sd_ms = (float)(var > 0 ? sqrt(var) : 0);
+    } else {
+        s->interval_ms = s->interval_sd_ms = 0;
+    }
+    c->w_iv_sum = c->w_iv_sq = 0; c->w_iv_n = 0;
     c->w_decoded = 0; c->w_decode_ms = 0; c->w_bytes = 0;
     c->w_p2p_ms = 0; c->w_p2p_n = 0; c->w_start = now;
     uint32_t skipped = c->tot_skipped;
@@ -659,11 +771,13 @@ static void klsc_window(kl_stream_client *c, double now) {
     kl_stream_client_get_status(c, &now_s);
     char line[256];
     snprintf(line, sizeof line,
-             "[stream-client] %s: video %.1f fps, decode %.2f ms, lost %u, idr %u, "
+             "[stream-client] %s: video %.1f fps (interval %.1f sd %.1f ms), decode %.2f ms, "
+             "lost %u, idr %u, fec-fixed %u, "
              "pose->photon %.1f ms, %.1f Mbps, rtt %.1f ms, pose-miss %u, skipped %u, "
              "dec-err %u, poses %u",
              kl_stream_client_state_name(now_s.state), (double)now_s.video_fps,
-             (double)now_s.decode_ms, now_s.frames_lost, now_s.idr_requests,
+             (double)now_s.interval_ms, (double)now_s.interval_sd_ms,
+             (double)now_s.decode_ms, now_s.frames_lost, now_s.idr_requests, now_s.fec_fixed,
              (double)now_s.p2p_ms, (double)now_s.kbps / 1000.0, (double)now_s.rtt_ms,
              now_s.pose_misses, skipped, now_s.decode_errors, now_s.poses_sent);
     pthread_mutex_lock(&c->mu);
@@ -752,6 +866,7 @@ kl_stream_client *kl_stream_client_create(const char *host, int port) {
     c->running = 1;
     c->t_last_video = -1;
     c->last_idr = -1e9;
+    c->decode_bgra = kl_env_on("KL_STREAM_DECODE_BGRA", 0);
     if (pthread_create(&c->rx, NULL, klsc_rx_main, c) != 0) {
         klsc_log("[stream-client] cannot start the receive thread");
         close(fd);
@@ -777,7 +892,10 @@ void kl_stream_client_destroy(kl_stream_client *c) {
     klsc_drop_session(c);
     if (c->fmt) CFRelease(c->fmt);
     if (c->latest) CVPixelBufferRelease(c->latest);
-    for (int i = 0; i < KLSC_SLOTS; i++) { free(c->slots[i].buf); free(c->slots[i].have); }
+    for (int i = 0; i < KLSC_SLOTS; i++) {
+        free(c->slots[i].buf); free(c->slots[i].have);
+        free(c->slots[i].par); free(c->slots[i].par_have);
+    }
     pthread_mutex_destroy(&c->mu);
     pthread_mutex_destroy(&c->tx_mu);
     free(c);
@@ -833,6 +951,13 @@ void kl_stream_client_get_status(kl_stream_client *c, kl_stream_client_status *s
     s->decode_errors = c->tot_dec_err;
     s->pose_misses = c->tot_pose_miss;
     s->poses_sent = c->tot_poses;
+    s->fec_fixed = c->tot_fec_fixed;
+    s->decode_ms_mean = c->tot_decoded ? (float)(c->t_decode_ms / c->tot_decoded) : 0;
+    if (c->t_iv_n) {
+        double m = c->t_iv_sum / c->t_iv_n, var = c->t_iv_sq / c->t_iv_n - m * m;
+        s->interval_ms_mean = (float)m;
+        s->interval_sd_ms_all = (float)(var > 0 ? sqrt(var) : 0);
+    }
     if (c->ended)        s->state = KL_STREAM_CLIENT_ENDED;
     else if (c->refused) s->state = KL_STREAM_CLIENT_REFUSED;
     else if (!c->acked)  s->state = KL_STREAM_CLIENT_CONNECTING;
@@ -846,4 +971,53 @@ void kl_stream_client_get_status(kl_stream_client *c, kl_stream_client_status *s
                                              : KL_STREAM_CLIENT_WAITING;
     }
     pthread_mutex_unlock(&c->mu);
+}
+
+// ---------------------------------------------------------------------------
+// The eye split + YUV -> RGB shader (see kl_stream_client.h)
+
+static const char k_yuv_msl[] =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct KLSYOut { float4 pos [[position]]; };\n"
+"struct KLSYU { uint x0; uint eye_w; uint frame_w; uint frame_h;\n"
+"               float y_off; float y_scale; float c_off; float c_scale; };\n"
+"vertex KLSYOut kl_stream_yuv_v(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    KLSYOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+"}\n"
+"fragment float4 kl_stream_yuv_f(KLSYOut in [[stage_in]],\n"
+"        texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],\n"
+"        constant KLSYU &u [[buffer(0)]]) {\n"
+"    constexpr sampler ls(filter::linear, address::clamp_to_edge, coord::pixel);\n"
+"    uint2 px = uint2(in.pos.xy);\n"
+"    float y = ty.read(uint2(u.x0 + px.x, px.y)).r;\n"
+"    // Chroma bilinear in its own (half-size) grid, clamped inside this eye's\n"
+"    // half so the other eye never bleeds into the seam column.\n"
+"    float2 cp = (float2(float(u.x0) + in.pos.x, in.pos.y)) * 0.5;\n"
+"    float c0 = float(u.x0) * 0.5 + 0.5, c1 = float(u.x0 + u.eye_w) * 0.5 - 0.5;\n"
+"    cp.x = clamp(cp.x, c0, c1);\n"
+"    float2 c = tc.sample(ls, cp).rg;\n"
+"    y = (y - u.y_off) * u.y_scale;\n"
+"    c = (c - u.c_off) * u.c_scale;\n"
+"    float3 rgb = float3(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x);\n"
+"    // The stream carries sRGB-ENCODED values (the host's compose) and they are\n"
+"    // stored as they are: the target is a bgra8Unorm VIEW of the _srgb stage\n"
+"    // texture, so the bytes equal what a BGRA decode + blit leaves there and\n"
+"    // no transfer curve is computed per pixel.\n"
+"    return float4(saturate(rgb), 1.0);\n"
+"}\n";
+
+const char *kl_stream_yuv_msl(void) { return k_yuv_msl; }
+
+void kl_stream_yuv_params(OSType pixfmt, kl_stream_yuv_uniforms *u) {
+    memset(u, 0, sizeof *u);
+    if (pixfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
+        // 10 bits in the top of 16: read as unorm16, x/1023.98 ~ v10/1023.
+        u->y_off = 64.0f / 1023.0f;  u->y_scale = 1023.0f / 876.0f;
+        u->c_off = 512.0f / 1023.0f; u->c_scale = 1023.0f / 896.0f;
+    } else {
+        u->y_off = 16.0f / 255.0f;   u->y_scale = 255.0f / 219.0f;
+        u->c_off = 128.0f / 255.0f;  u->c_scale = 255.0f / 224.0f;
+    }
 }

@@ -282,6 +282,9 @@ static void on_video(const uint8_t *buf, size_t n) {
     if (n < sizeof(kl_stream_video)) return;
     kl_stream_video v;
     memcpy(&v, buf, sizeof v);
+    // v2 parity packets (FEC) are not used by this stand-in: it reassembles
+    // data fragments only (the headset client rebuilds from parity).
+    if (v.flags & KL_STREAM_VIDEO_PARITY) return;
     if (!v.frag_count || v.frag_index >= v.frag_count) return;
     if (g_last_complete && v.frame_id <= g_last_complete) return;   // late fragment of a done/abandoned frame
     slot *s = NULL, *spare = NULL;
