@@ -10,7 +10,7 @@ MVK_INC := -Ivendor-moltenvk/out/include
 # edits, and visionos/Sources/Klepton-Bridging-Header.h imports by bare name
 # too. One -I per source directory is what buys that; gen_xcodeproj.py carries
 # the same list as HEADER_SEARCH_PATHS.
-RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr \
+RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr -Iruntime/net \
                -Iruntime/media -Iruntime/guest -Iruntime/diag
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
@@ -68,7 +68,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c \
+           runtime/net/kl_stream_client.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -327,6 +328,47 @@ build/t_hevc: tests/t_hevc.c $(RUNTIME) $(RUNTIME_HDRS)
 
 hevc: build/t_hevc
 	./build/t_hevc
+
+# "Jugar desde el Mac" (runtime/net/kl_stream_proto.h). The headset client's C
+# half (kl_stream_client.c) is in the shipping runtime above; these are its
+# two Mac-side test tools:
+#
+#   build/kl_stream_testhost   a HOST with a synthetic world-locked scene
+#                              (HEVC over UDP, Bonjour) — point the hub at it
+#   build/kl_stream_harness    the CLIENT's C code, headless, against a host:
+#                              POSE at 90 Hz, reassembly, decode, ring-pose
+#                              check, PNGs in build/stream/
+#
+# `make streamtest` runs one against the other on loopback, clean and then with
+# 1% fragment loss (which must be recovered by IDR requests). Not in `make
+# check`: it needs the hardware HEVC encoder and a free UDP port.
+.PHONY: testhost streamtest
+build/kl_stream_testhost: tools/kl_stream_testhost.m runtime/net/kl_stream_proto.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O2 -fobjc-arc -o $@ tools/kl_stream_testhost.m \
+	  -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	  -framework CoreGraphics -framework CoreText -framework Foundation
+
+testhost: build/kl_stream_testhost
+
+build/kl_stream_harness: tools/kl_stream_harness.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/kl_stream_harness.c $(RUNTIME) $(LDLIBS) \
+	  -framework CoreGraphics -framework ImageIO
+
+STREAMTEST_PORT ?= 19944
+streamtest: build/kl_stream_testhost build/kl_stream_harness
+	@rm -rf build/stream && mkdir -p build/stream/clean build/stream/lossy
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_HAPTICS_S=2 ./build/kl_stream_testhost > build/stream/clean/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 \
+	    --out build/stream/clean > build/stream/clean/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness:|HELLO_ACK|decoder up' build/stream/clean/client.log; wait; exit $$rc
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_DROP=0.01 ./build/kl_stream_testhost > build/stream/lossy/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
+	    --out build/stream/lossy > build/stream/lossy/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy/client.log; wait; exit $$rc
 
 # The video TEXTURE gate: a natively-decoded biplanar frame through
 # CVMetalTextureCache + EGL_METAL_TEXTURE_ANGLE to sampled pixels, compared
