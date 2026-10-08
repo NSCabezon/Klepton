@@ -526,13 +526,79 @@ typedef struct {
     float    far_m;        // clamp and the "no depth" answer: KL_REPROJECT_DEPTH
     uint32_t conv;         // kl_reproject_depth_conv()
     uint32_t vis;          // kl_reproject_depth_vis()
+    float    min_m;        // KL_REPROJECT_DEPTH_MIN_M (0 = off): written distance floor
+    uint32_t smooth;       // 1 = the smooth pipeline (coarse grid), 0 = per pixel
+    // The smooth path's grid geometry, from kl_reproject_coarse_build: depth
+    // texture size / cell, i.e. uv * grid = position in cells. 0 when !smooth.
+    float    grid_x, grid_y;
     uint32_t pad0, pad1;
 } kl_reproject_depth_uniforms;
 
 // `projection` is the drawable's (reverse-Z, infinite far): its near plane is
-// read out of it.
+// read out of it. The smooth fields are left 0 — kl_reproject_coarse_build
+// fills them for the eye's depth texture.
 kl_reproject_depth_uniforms kl_reproject_depth_build(const kl_ovrp_render_pose *r,
                                                      int eye, simd_float4x4 projection);
+
+// ---- the halo knobs (all off by default: mode 2 is then exactly per pixel) ----
+//
+// Why there is a halo at all. visionOS reprojects the drawable per pixel from
+// the depth we write. Where a near surface (a hand at 0.5 m) sits in front of
+// a far one (a wall at 3 m), a head translation shifts the two by different
+// angles and uncovers a strip behind the hand that no pixel describes; the
+// system fills it by stretching its neighbours — the blurry halo. The strip's
+// width is the parallax DIFFERENCE, which is a step at the silhouette.
+//
+// KL_REPROJECT_DEPTH_SMOOTH=N — write a low-frequency depth field instead of the
+// per-pixel one: a grid of N x N (game pixel) cells, each reduced over its
+// bilinear SUPPORT (the 2N x 2N window centred on the cell, so every pixel's
+// four bilinear taps all saw that pixel), then bilinearly interpolated per
+// pixel in DISPARITY (1/d, the quantity image-space parallax is linear in).
+// The step becomes a ramp one to two cells wide: no hole, a smooth stretch.
+// 1 = 32 (the documented default), 2..512 = the cell in pixels, 0 = off.
+int kl_reproject_depth_smooth(void);
+// KL_REPROJECT_DEPTH_SMOOTH_PICK=near|far|mean — the per-cell reduction.
+//   near (default): the NEAREST surface in the support (max disparity). With
+//         the support window this guarantees no pixel is written farther than
+//         it is: a hand moves rigidly (the slip fix), and the ramp lies in
+//         the BACKGROUND around it, which is dragged a little with the hand.
+//   far:  the farthest — the background is never pulled forward; the hand's
+//         own silhouette takes the ramp (its edges lag, i.e. slip a little).
+//   mean: the mean disparity — the ramp straddles the edge.
+// Returns 0 near, 1 far, 2 mean.
+int kl_reproject_depth_smooth_pick(void);
+// KL_REPROJECT_DEPTH_MIN_M=x — floor the written distance at x metres (0 =
+// off). Content nearer than x is reprojected as if it were at x: the parallax
+// difference at a near silhouette, and so the halo's width, shrinks by
+// (1/x - 1/bg) / (1/d - 1/bg) — at the cost of that much residual slip.
+float kl_reproject_depth_min_m(void);
+// KL_REPROJECT_DEPTH_HALF=1 — the bridge keeps the game's depth at HALF
+// resolution (nearest-texel blit at Submit, a quarter of the bytes on the
+// guest's critical path) instead of a 1:1 copy. The compositor addresses it by
+// normalised uv either way; the smooth grid scales its cells to match.
+int kl_reproject_depth_half(void);
+
+// The coarse grid build (kernel kl_depth_coarse_k). Per eye, at buffer(0).
+typedef struct {
+    float    m22, m23;     // as kl_reproject_depth_uniforms
+    float    far_m;        // "no finite depth" answer and the far clamp
+    float    cell;         // cell size in DEPTH-TEXTURE texels (N, halved under HALF)
+    uint32_t conv;
+    uint32_t pick;         // kl_reproject_depth_smooth_pick()
+    uint32_t cols, rows;   // grid size = the output texture's
+} kl_reproject_coarse_uniforms;
+// For an eye whose depth texture is dw x dh: the kernel's uniforms, the grid
+// size (*cols x *rows, the R32Float texture to allocate) and the grid geometry
+// the draw needs (written into *du). Returns 0 when smoothing is off or the
+// texture is empty.
+int kl_reproject_coarse_build(const kl_ovrp_render_pose *r, int eye, int dw, int dh,
+                              kl_reproject_coarse_uniforms *cu,
+                              kl_reproject_depth_uniforms *du);
+// CPU twin of the per-pixel half of the smooth path, for the tests: the
+// disparity grid (rows x cols, row-major) bilinearly sampled at normalised uv
+// with the shader's addressing; returns the distance in metres.
+float kl_reproject_coarse_sample(const float *grid, int cols, int rows, float grid_x,
+                                 float grid_y, float u, float v);
 // The game's depth value -> metres along the view axis under `conv`; <= 0 means
 // no finite distance (sky, clear, or a value past the far plane).
 float kl_reproject_depth_linear(float d, float m22, float m23, int conv);
@@ -550,6 +616,13 @@ float kl_reproject_depth_linear(float d, float m22, float m23, int conv);
 //                                      attachment)
 //   kernel   kl_depth_probe_k        — KL_DEPTH_PROBE_SIDE^2 raw samples of a
 //                                      depth texture into a float buffer
+//   fragment kl_reproject_depth_smooth_f / kl_reproject_depthvis_smooth_f —
+//                                      the same two, reading the coarse
+//                                      DISPARITY grid (texture2d<float>, R32F)
+//                                      at texture(2)/(3) instead of the depth
+//   kernel   kl_depth_coarse_k       — builds that grid: depth2d at texture(0),
+//                                      the grid (write) at texture(1),
+//                                      kl_reproject_coarse_uniforms at buffer(0)
 const char *kl_reproject_depth_msl(void);
 #define KL_DEPTH_PROBE_SIDE 32
 

@@ -476,6 +476,15 @@ final class KleptonCompositor {
     private var anchorRingNext = 0
     private static let anchorRingSize = 32           // ~355 ms at 90 Hz
     private var depthPipeline: MTLRenderPipelineState?
+    // KL_REPROJECT_DEPTH_SMOOTH (kl_reproject.h): the coarse disparity grid
+    // per (eye, stage), rebuilt by a compute pass when that stage's frame
+    // serial changes (the guest files ~36 fps, the composite runs at 90), and
+    // the eye pass that interpolates it instead of reading the depth per pixel.
+    private let depthSmooth = Int(kl_reproject_depth_smooth())
+    private var smoothPipeline: MTLRenderPipelineState?
+    private var coarsePipeline: MTLComputePipelineState?
+    private var coarseGrids: [Int: (tex: MTLTexture, serial: UInt64, src: ObjectIdentifier)] = [:]
+    private var swimCoarseBuilds = 0
     private var depthProbePipeline: MTLComputePipelineState?
     private var depthProbeBuffers: [MTLBuffer] = []
     private var depthProbeN = 0
@@ -723,6 +732,58 @@ final class KleptonCompositor {
                                   levels: 0..<1, slices: 0..<1)
         if let v { depth2DViews[key] = v }
         return v
+    }
+
+    /// KL_REPROJECT_DEPTH_SMOOTH: (re)build the coarse disparity grid of each
+    /// eye of `stage` whose frame is new, in `cmd` BEFORE the composite's render
+    /// passes (same queue, so they see it). One R32Float texture per (eye,
+    /// stage): a stage's grid is rewritten only when the guest has filed a new
+    /// frame into that stage, i.e. never while an earlier composite of the
+    /// same frame could still be reading it.
+    private func prepareCoarse(_ cmd: MTLCommandBuffer, stage: Int,
+                               rendered: kl_ovrp_render_pose, haveRendered: Bool) {
+        guard depthMode == 2, depthSmooth > 0, let kp = coarsePipeline, haveRendered else { return }
+        for eye in 0...1 {
+            guard rendered.depth_valid & Int32(1 << eye) != 0,
+                  let d = eyeDepth(eye, stage) else { continue }
+            let key = eye * 16 + stage
+            let src = ObjectIdentifier(d)
+            if let g = coarseGrids[key], g.serial == rendered.serial, g.src == src { continue }
+            var cu = kl_reproject_coarse_uniforms()
+            let ok = withUnsafePointer(to: rendered) {
+                kl_reproject_coarse_build($0, Int32(eye), Int32(d.width), Int32(d.height), &cu, nil)
+            }
+            guard ok != 0 else { continue }
+            var tex = coarseGrids[key]?.tex
+            if tex == nil || tex!.width != Int(cu.cols) || tex!.height != Int(cu.rows) {
+                let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float,
+                                                                  width: Int(cu.cols),
+                                                                  height: Int(cu.rows),
+                                                                  mipmapped: false)
+                td.usage = [.shaderRead, .shaderWrite]
+                td.storageMode = .private
+                tex = device.makeTexture(descriptor: td)
+                tex?.label = "klepton depth grid e\(eye) s\(stage)"
+            }
+            guard let t = tex, let ce = cmd.makeComputeCommandEncoder() else { continue }
+            ce.label = "klepton depth grid"
+            ce.setComputePipelineState(kp)
+            ce.setTexture(d, index: 0)
+            ce.setTexture(t, index: 1)
+            ce.setBytes(&cu, length: MemoryLayout<kl_reproject_coarse_uniforms>.stride, index: 0)
+            ce.dispatchThreadgroups(MTLSize(width: (Int(cu.cols) + 7) / 8,
+                                            height: (Int(cu.rows) + 7) / 8, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            ce.endEncoding()
+            coarseGrids[key] = (t, rendered.serial, src)
+            swimCoarseBuilds += 1
+        }
+    }
+
+    /// The grid `prepareCoarse` built for this exact frame, or nil.
+    private func coarseGrid(_ eye: Int, _ stage: Int, serial: UInt64) -> MTLTexture? {
+        guard let g = coarseGrids[eye * 16 + stage], g.serial == serial else { return nil }
+        return g.tex
     }
 
     /// Once a second in depth mode 2: a 32x32 sample of eye 0's depth, read on
@@ -1020,6 +1081,15 @@ final class KleptonCompositor {
                     d.depthAttachmentPixelFormat = .depth32Float
                     d.maxVertexAmplificationCount = amplification
                     depthPipeline = try device.makeRenderPipelineState(descriptor: d)
+                    if depthSmooth > 0 {
+                        d.fragmentFunction = dlib.makeFunction(name: "kl_reproject_depth_smooth_f")
+                        smoothPipeline = try device.makeRenderPipelineState(descriptor: d)
+                        if let k = dlib.makeFunction(name: "kl_depth_coarse_k") {
+                            coarsePipeline = try device.makeComputePipelineState(function: k)
+                        }
+                        NSLog("[swim] smooth depth pass ready (\(depthSmooth) px cells, grid kernel "
+                              + "\(coarsePipeline != nil ? "on" : "MISSING — per-pixel depth instead"))")
+                    }
                     if let k = dlib.makeFunction(name: "kl_depth_probe_k") {
                         depthProbePipeline = try? device.makeComputePipelineState(function: k)
                     }
@@ -2212,6 +2282,8 @@ final class KleptonCompositor {
         // the composite is about to draw with.
         hud?.prepare(originFromHead: originFromHead)
 
+        prepareCoarse(cmd, stage: stage, rendered: rendered, haveRendered: haveRendered)
+
         var encoded = 0
         for drawable in drawables {
             // Per drawable, not once: each one is presented separately and each
@@ -2674,16 +2746,33 @@ final class KleptonCompositor {
                     depthEyes.append(t)
                 }
             }
+            // KL_REPROJECT_DEPTH_SMOOTH: the coarse grids of this frame, one per
+            // view, or none (then per pixel, as without the knob).
+            var grids: [MTLTexture] = []
+            if !depthEyes.isEmpty, smoothPipeline != nil {
+                for vi in viewIndices.prefix(2) {
+                    guard let g = coarseGrid(vi, stage, serial: rendered.serial) else { grids = []; break }
+                    grids.append(g)
+                }
+            }
             if let dp = depthPipeline, !depthEyes.isEmpty {
-                enc.setRenderPipelineState(dp)
+                let smooth = !grids.isEmpty
+                enc.setRenderPipelineState(smooth ? smoothPipeline! : dp)
                 // Slot 2 is amplification index 0's eye, slot 3 index 1's — the
                 // colour's own convention (`src`), so a one-view pass binds its
                 // single eye to both.
-                enc.setFragmentTexture(depthEyes[0], index: 2)
-                enc.setFragmentTexture(depthEyes.count > 1 ? depthEyes[1] : depthEyes[0], index: 3)
+                let bindD = smooth ? grids : depthEyes
+                enc.setFragmentTexture(bindD[0], index: 2)
+                enc.setFragmentTexture(bindD.count > 1 ? bindD[1] : bindD[0], index: 3)
                 var du = withUnsafePointer(to: rendered) { r in
-                    viewIndices.map { vi in
-                        kl_reproject_depth_build(r, Int32(vi), drawable.computeProjection(viewIndex: vi))
+                    viewIndices.enumerated().map { (n, vi) in
+                        var u = kl_reproject_depth_build(r, Int32(vi), drawable.computeProjection(viewIndex: vi))
+                        if smooth {
+                            let dt = depthEyes[min(n, depthEyes.count - 1)]
+                            _ = kl_reproject_coarse_build(r, Int32(vi), Int32(dt.width), Int32(dt.height),
+                                                          nil, &u)
+                        }
+                        return u
                     }
                 }
                 du.withUnsafeMutableBytes { buf in

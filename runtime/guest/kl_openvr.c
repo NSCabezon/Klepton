@@ -1678,26 +1678,51 @@ static int vk_record_depth(VkCommandBuffer cb, int eye, int stage, const ovr_dep
                     eye, (unsigned)fmt); }
         return 0;
     }
+    // KL_REPROJECT_DEPTH_HALF: keep a half-resolution depth — a NEAREST blit
+    // (depth is never filtered across an edge) into an image a quarter the
+    // size, so a quarter of the bytes on this submit's fence wait. Vulkan only
+    // blits depth between images of the SAME format, so the half image is
+    // D32S8 too. Needs BLIT_SRC/DST on the format (MoltenVK renders depth
+    // blits through a pass); without them, the 1:1 copy, said once.
+    static int half = -1;
+    if (half < 0) {
+        half = kl_reproject_depth_half();
+        if (half) {
+            PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)kl_vulkan_sym("vkGetInstanceProcAddr");
+            PFN_vkGetPhysicalDeviceFormatProperties gfp = gipa && dt->m_pInstance
+                ? (PFN_vkGetPhysicalDeviceFormatProperties)gipa((VkInstance)dt->m_pInstance,
+                                                               "vkGetPhysicalDeviceFormatProperties")
+                : NULL;
+            VkFormatProperties fp = { 0 };
+            if (gfp && dt->m_pPhysicalDevice) gfp((VkPhysicalDevice)dt->m_pPhysicalDevice, fmt, &fp);
+            VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+            if ((fp.optimalTilingFeatures & need) != need) half = 0;
+            fprintf(stderr, "  [swim] KL_REPROJECT_DEPTH_HALF=1: %s\n", half
+                    ? "depth kept at half resolution (nearest blit at Submit)"
+                    : "the depth format cannot be blitted here — full-size copy instead");
+        }
+    }
+    uint32_t cw = half ? (rw + 1) / 2 : rw, ch = half ? (rh + 1) / 2 : rh;
     __typeof__(V.depth[0][0]) *slot = &V.depth[eye][stage];
-    if (!slot->img || slot->w != rw || slot->h != rh || slot->fmt != (uint32_t)fmt) {
+    if (!slot->img || slot->w != cw || slot->h != ch || slot->fmt != (uint32_t)fmt) {
         // Re-created on a size change and the old one left allocated: the
         // compositor may be sampling it this instant (the colour path's
         // native images make the same choice). With a fixed fidelity level
         // there is one size for the whole run.
-        uint64_t im = kl_vulkan_xr_image(rw, rh, 1, 1, (long long)fmt, 2);
+        uint64_t im = kl_vulkan_xr_image(cw, ch, 1, 1, (long long)fmt, 2);
         void *mtl = im ? kl_vulkan_xr_image_mtl(im) : NULL;
         if (!im || !mtl) {
             if (said_skip < 4) { said_skip++;
                 fprintf(stderr, "  [swim] eye %d stage %d: could not create/export a %ux%u depth "
-                                "image (fmt %u)\n", eye, stage, rw, rh, (unsigned)fmt); }
+                                "image (fmt %u)\n", eye, stage, cw, ch, (unsigned)fmt); }
             return 0;
         }
-        slot->img = im; slot->mtl = mtl; slot->w = rw; slot->h = rh; slot->fmt = (uint32_t)fmt;
-        kl_glfb_note_eye_mtl_depth(eye, stage, mtl, (int)rw, (int)rh);
+        slot->img = im; slot->mtl = mtl; slot->w = cw; slot->h = ch; slot->fmt = (uint32_t)fmt;
+        kl_glfb_note_eye_mtl_depth(eye, stage, mtl, (int)cw, (int)ch);
         static int said;
         if (said < 2 * OVR_STAGES) { said++;
             fprintf(stderr, "  [swim] eye %d stage %d: depth copy %ux%u fmt %u (layer %u of the "
-                            "game's %ux%u depth)\n", eye, stage, rw, rh, (unsigned)fmt, ds->layer,
+                            "game's %ux%u depth)\n", eye, stage, cw, ch, (unsigned)fmt, ds->layer,
                     dt->m_nWidth, dt->m_nHeight); }
     }
     VkImage src = (VkImage)(uintptr_t)dt->m_nImage, dst = (VkImage)(uintptr_t)slot->img;
@@ -1716,12 +1741,21 @@ static int vk_record_depth(VkCommandBuffer cb, int eye, int stage, const ovr_dep
     };
     V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 0, NULL, 2, bar);
-    VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, ds->layer, 1 },
-                        .srcOffset = { x0, y0, 0 },
-                        .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-                        .extent = { rw, rh, 1 } };
-    V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    if (half) {
+        VkImageBlit reg = { .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, ds->layer, 1 },
+                            .srcOffsets = { { x0, y0, 0 }, { x1, y1, 1 } },
+                            .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                            .dstOffsets = { { 0, 0, 0 }, { (int32_t)cw, (int32_t)ch, 1 } } };
+        V.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg, VK_FILTER_NEAREST);
+    } else {
+        VkImageCopy reg = { .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, ds->layer, 1 },
+                            .srcOffset = { x0, y0, 0 },
+                            .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                            .extent = { rw, rh, 1 } };
+        V.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    }
     VkImageMemoryBarrier done = bar[1];
     done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1730,6 +1764,30 @@ static int vk_record_depth(VkCommandBuffer cb, int eye, int stage, const ovr_dep
     V.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 0, NULL, 0, NULL, 1, &done);
     return 1;
+}
+
+// KL_REPROJECT_DEPTH_MODE >= 1: what Submit's fence wait costs, per eye, every
+// 5 s. Eye 0's wait covers the game's own GPU work for the frame (both eyes are
+// layers of one image, drawn before the first Submit) plus eye 0's copy; by eye
+// 1's Submit that work is done, so eye 1's wait is ~its copy ALONE — colour, and
+// in mode 2 the depth with it. Mode 1 vs 2 (vs HALF) on the same scene is then
+// the depth copy's price on the critical path, measured where it is paid.
+static void copy_wait_note(int eye, double ms, int with_depth) {
+    static double sum[2], mx[2], t0;
+    static unsigned n[2], nd;
+    if ((unsigned)eye > 1) return;
+    sum[eye] += ms; n[eye]++;
+    if (ms > mx[eye]) mx[eye] = ms;
+    if (with_depth && eye == 1) nd++;
+    double now = now_s();
+    if (!t0) t0 = now;
+    if (now - t0 < 5.0 || !n[0] || !n[1]) return;
+    fprintf(stderr, "  [swim] Submit fence wait: eye0 %.2f ms avg (game GPU + copy, max %.1f), eye1 "
+                    "%.2f ms avg (copy only, max %.1f), depth %s on %u/%u%s\n",
+            sum[0] / n[0], mx[0], sum[1] / n[1], mx[1],
+            kl_reproject_depth_half() ? "half-res blit" : "1:1 copy", nd, n[1],
+            kl_reproject_depth_mode() == 2 ? "" : " (mode 1: no depth)");
+    sum[0] = sum[1] = mx[0] = mx[1] = 0; n[0] = n[1] = nd = 0; t0 = now;
 }
 
 static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const VRTextureBounds_t *b,
@@ -1863,7 +1921,9 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     V.QueueSubmit(V.q, 1, &si, V.fence[eye][stage]);
     // The compositor samples this image the moment the frame is filed, so it
     // has to be complete by then. One small copy; waiting is the honest answer.
+    double tw0 = kl_reproject_depth_mode() ? now_s() : 0;
     V.WaitForFences(V.dev, 1, &V.fence[eye][stage], VK_TRUE, UINT64_MAX);
+    if (tw0 > 0) copy_wait_note(eye, (now_s() - tw0) * 1000.0, ds && ds->ok);
     if (g_frames_for_dump == (unsigned long long)kl_env_int("KL_OPENVR_DUMP_AT", 300) && getenv("KL_OPENVR_DUMP")) {
         char nm[32];
         snprintf(nm, sizeof nm, "eye%d_src", eye);

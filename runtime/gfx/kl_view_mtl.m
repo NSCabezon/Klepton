@@ -52,6 +52,11 @@ static id<MTLRenderPipelineState> g_pipe_ov;   // the GUEST's layers, blended, K
 // here is the INSTRUMENT: the false-colour pass (KL_CP_DEPTH_VIS=1) and the
 // once-a-second probe behind the [swim] line — the same shaders the device runs.
 static id<MTLRenderPipelineState> g_pipe_dvis;
+// KL_REPROJECT_DEPTH_SMOOTH under KL_CP_DEPTH_VIS: the false colour of the
+// SMOOTHED field (what the device would write), from the same grid kernel.
+static id<MTLRenderPipelineState> g_pipe_dvis_smooth;
+static id<MTLComputePipelineState> g_depth_coarse;
+static struct { id<MTLTexture> tex; uint64_t serial; void *src; } g_coarse[2][KL_MTL_MAX_STAGES];
 static id<MTLComputePipelineState> g_depth_probe;
 static id<MTLBuffer>              g_depth_probe_buf[2];
 static unsigned                   g_depth_probe_n, g_depth_frames, g_swim_frames;
@@ -1110,6 +1115,15 @@ int kl_viewmtl_start(void *metal_layer) {
         if (dlib && kl_reproject_depth_vis())
             g_pipe_dvis = klvm_pipeline(kl_reproject_depth_msl(), "kl_reproject_depth_v",
                                         "kl_reproject_depthvis_f", "depth false-colour");
+        if (dlib && kl_reproject_depth_vis() && kl_reproject_depth_smooth()) {
+            g_pipe_dvis_smooth = klvm_pipeline(kl_reproject_depth_msl(), "kl_reproject_depth_v",
+                                               "kl_reproject_depthvis_smooth_f",
+                                               "smoothed depth false-colour");
+            id<MTLFunction> cf = [dlib newFunctionWithName:@"kl_depth_coarse_k"];
+            if (cf) g_depth_coarse = [g_dev newComputePipelineStateWithFunction:cf error:&derr];
+            fprintf(stderr, "  [swim] viewer: smoothed depth false-colour %s\n",
+                    g_pipe_dvis_smooth && g_depth_coarse ? "ON" : "OFF (failed to build)");
+        }
         id<MTLFunction> kf = [dlib newFunctionWithName:@"kl_depth_probe_k"];
         if (kf) g_depth_probe = [g_dev newComputePipelineStateWithFunction:kf error:&derr];
         for (int i = 0; i < 2 && g_depth_probe; i++)
@@ -1311,12 +1325,18 @@ static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye
             void *dp = kl_glfb_eye_mtl_depth(eye, stage);
             if (dp) dtex = (__bridge id<MTLTexture>)dp;
         }
+        id<MTLTexture> grid = nil;
+        if (dtex && g_pipe_dvis_smooth && stage >= 0 && stage < KL_MTL_MAX_STAGES &&
+            g_coarse[eye][stage].tex && g_coarse[eye][stage].serial == dr.serial &&
+            g_coarse[eye][stage].src == (__bridge void *)dtex)
+            grid = g_coarse[eye][stage].tex;
         if (dtex) {
             kl_reproject_depth_uniforms du = kl_reproject_depth_build(&dr, eye, u.projection);
-            [enc setRenderPipelineState:g_pipe_dvis];
+            if (grid) kl_reproject_coarse_build(&dr, eye, (int)dtex.width, (int)dtex.height, NULL, &du);
+            [enc setRenderPipelineState:grid ? g_pipe_dvis_smooth : g_pipe_dvis];
             [enc setVertexBytes:&du length:sizeof du atIndex:2];
-            [enc setFragmentTexture:dtex atIndex:2];
-            [enc setFragmentTexture:dtex atIndex:3];
+            [enc setFragmentTexture:grid ?: dtex atIndex:2];
+            [enc setFragmentTexture:grid ?: dtex atIndex:3];
             g_depth_frames++;
         } else {
             [enc setRenderPipelineState:g_pipe_rp];
@@ -1380,6 +1400,47 @@ static void klvm_draw_eye_rp(id<MTLRenderCommandEncoder> enc, int stage, int eye
         id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
         [enc setVertexBuffer:gbuf offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+}
+
+// KL_REPROJECT_DEPTH_SMOOTH + KL_CP_DEPTH_VIS: build each eye's coarse grid for
+// this stage's frame (once per frame serial), before the composite pass.
+static void klvm_prepare_coarse(id<MTLCommandBuffer> cmd, int stage) {
+    if (!g_depth_coarse || stage < 0 || stage >= KL_MTL_MAX_STAGES) return;
+    kl_ovrp_render_pose r;
+    if (!kl_ovrp_stage_render_pose(stage, &r)) return;
+    for (int eye = 0; eye < 2; eye++) {
+        if (!(r.depth_valid & (1 << eye))) continue;
+        void *dp = kl_glfb_eye_mtl_depth(eye, stage);
+        if (!dp) continue;
+        if (g_coarse[eye][stage].tex && g_coarse[eye][stage].serial == r.serial &&
+            g_coarse[eye][stage].src == dp) continue;
+        id<MTLTexture> d = (__bridge id<MTLTexture>)dp;
+        kl_reproject_coarse_uniforms cu;
+        if (!kl_reproject_coarse_build(&r, eye, (int)d.width, (int)d.height, &cu, NULL)) continue;
+        id<MTLTexture> t = g_coarse[eye][stage].tex;
+        if (!t || t.width != cu.cols || t.height != cu.rows) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:cu.cols
+                                            height:cu.rows mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            td.storageMode = MTLStorageModePrivate;
+            t = [g_dev newTextureWithDescriptor:td];
+            if (!t) continue;
+        }
+        id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+        if (!ce) continue;
+        ce.label = @"klepton depth grid";
+        [ce setComputePipelineState:g_depth_coarse];
+        [ce setTexture:d atIndex:0];
+        [ce setTexture:t atIndex:1];
+        [ce setBytes:&cu length:sizeof cu atIndex:0];
+        [ce dispatchThreadgroups:MTLSizeMake((cu.cols + 7) / 8, (cu.rows + 7) / 8, 1)
+           threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [ce endEncoding];
+        g_coarse[eye][stage].tex = t;
+        g_coarse[eye][stage].serial = r.serial;
+        g_coarse[eye][stage].src = dp;
+    }
 }
 
 // Once a second, in depth mode 2 or under KL_CP_DEPTH_VIS: sample eye 0's
@@ -1558,6 +1619,8 @@ int kl_viewmtl_present(int win_w, int win_h) {
                   r.tangents[1][2] + r.tangents[1][3] > 0;
         }
     }
+
+    klvm_prepare_coarse(cmd, stage);
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = drawable.texture;

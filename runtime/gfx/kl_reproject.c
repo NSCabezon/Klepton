@@ -1130,7 +1130,100 @@ kl_reproject_depth_uniforms kl_reproject_depth_build(const kl_ovrp_render_pose *
     u.far_m = s_depth > u.near_m ? s_depth : KL_REPROJECT_DEPTH;
     u.conv = (uint32_t)kl_reproject_depth_conv();
     u.vis = (uint32_t)kl_reproject_depth_vis();
+    u.min_m = kl_reproject_depth_min_m();
     return u;
+}
+
+// ---- the halo knobs (kl_reproject.h) ----------------------------------------
+
+int kl_reproject_depth_smooth(void) {
+    static int n = -1;
+    if (n < 0) {
+        int v = kl_env_int("KL_REPROJECT_DEPTH_SMOOTH", 0);
+        n = v == 1 ? 32 : (v >= 2 && v <= 512 ? v : 0);
+        if (n)
+            fprintf(stderr, "  [swim] KL_REPROJECT_DEPTH_SMOOTH=%d: depth written from a "
+                            "%dx%d px cell grid (pick %s), bilinear in disparity\n", v, n, n,
+                    (const char *[]){ "near", "far", "mean" }[kl_reproject_depth_smooth_pick()]);
+    }
+    return n;
+}
+
+int kl_reproject_depth_smooth_pick(void) {
+    static int p = -1;
+    if (p < 0) {
+        const char *e = kl_env_str("KL_REPROJECT_DEPTH_SMOOTH_PICK", NULL);
+        p = !e ? 0 : (e[0] == 'f' || e[0] == 'F') ? 1 : (e[0] == 'm' || e[0] == 'M') ? 2 : 0;
+    }
+    return p;
+}
+
+float kl_reproject_depth_min_m(void) {
+    static float m = -1.0f;
+    if (m < 0.0f) {
+        float v = kl_env_float("KL_REPROJECT_DEPTH_MIN_M", 0.0);
+        m = (v > 0.0f && v < 100.0f) ? v : 0.0f;
+        if (m > 0.0f)
+            fprintf(stderr, "  [swim] KL_REPROJECT_DEPTH_MIN_M=%.2f: nothing is reprojected as "
+                            "nearer than %.2f m\n", (double)m, (double)m);
+    }
+    return m;
+}
+
+int kl_reproject_depth_half(void) {
+    static int h = -1;
+    if (h < 0) h = kl_env_on("KL_REPROJECT_DEPTH_HALF", 0);
+    return h;
+}
+
+int kl_reproject_coarse_build(const kl_ovrp_render_pose *r, int eye, int dw, int dh,
+                              kl_reproject_coarse_uniforms *cu,
+                              kl_reproject_depth_uniforms *du) {
+    int n = kl_reproject_depth_smooth();
+    if (!n || dw <= 0 || dh <= 0) return 0;
+    if ((unsigned)eye > 1) eye = 0;
+    // N is in GAME pixels; under HALF the depth texture has half as many.
+    float cell = kl_reproject_depth_half() ? n * 0.5f : (float)n;
+    if (cell < 1.0f) cell = 1.0f;
+    kl_reproject_coarse_uniforms c;
+    memset(&c, 0, sizeof c);
+    c.m22 = r ? r->depth_m22[eye] : 0.0f;
+    c.m23 = r ? r->depth_m23[eye] : 0.0f;
+    if (s_depth == 0.0f) {
+        float v = kl_env_float("KL_REPROJECT_DEPTH", 0.0);
+        s_depth = (v > 0.0f) ? v : KL_REPROJECT_DEPTH;
+    }
+    c.far_m = s_depth;
+    c.cell = cell;
+    c.conv = (uint32_t)kl_reproject_depth_conv();
+    c.pick = (uint32_t)kl_reproject_depth_smooth_pick();
+    c.cols = (uint32_t)ceilf((float)dw / cell);
+    c.rows = (uint32_t)ceilf((float)dh / cell);
+    if (cu) *cu = c;
+    if (du) {
+        du->smooth = 1;
+        du->grid_x = (float)dw / cell;
+        du->grid_y = (float)dh / cell;
+    }
+    return 1;
+}
+
+float kl_reproject_coarse_sample(const float *grid, int cols, int rows, float grid_x,
+                                 float grid_y, float u, float v) {
+    if (!grid || cols <= 0 || rows <= 0) return -1.0f;
+    float px = u * grid_x - 0.5f, py = v * grid_y - 0.5f;
+    float fx0 = floorf(px), fy0 = floorf(py);
+    float fx = px - fx0, fy = py - fy0;
+    int x0 = (int)fx0, y0 = (int)fy0, x1 = x0 + 1, y1 = y0 + 1;
+#define KLR_CL(a, hi) ((a) < 0 ? 0 : (a) > (hi) ? (hi) : (a))
+    x0 = KLR_CL(x0, cols - 1); x1 = KLR_CL(x1, cols - 1);
+    y0 = KLR_CL(y0, rows - 1); y1 = KLR_CL(y1, rows - 1);
+#undef KLR_CL
+    float a = grid[y0 * cols + x0], b = grid[y0 * cols + x1];
+    float c = grid[y1 * cols + x0], d = grid[y1 * cols + x1];
+    float top = a + (b - a) * fx, bot = c + (d - c) * fx;
+    float disp = top + (bot - top) * fy;
+    return disp > 1e-9f ? 1.0f / disp : -1.0f;
 }
 
 // Appended to kl_msl_reproject (so it reuses that source's VOut helpers, the
@@ -1154,13 +1247,15 @@ kl_reproject_depth_uniforms kl_reproject_depth_build(const kl_ovrp_render_pose *
 static const char kl_msl_reproject_depth[] =
 "\n"
 "struct KLDepthU { float m22; float m23; float nearM; float farM;\n"
-"                  uint conv; uint vis; uint pad0; uint pad1; };\n"
+"                  uint conv; uint vis; float minM; uint smooth;\n"
+"                  float gridX; float gridY; uint pad0; uint pad1; };\n"
 "struct VOutD { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
 "               uint srgb [[flat]]; uint src [[flat]];\n"
 "               uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
 "               float2 chromaRange [[flat]];\n"
 "               float4 dirClip; float4 orgClip [[flat]];\n"
-"               float4 dparm [[flat]]; uint dflags [[flat]]; };\n"
+"               float4 dparm [[flat]]; uint dflags [[flat]];\n"
+"               float4 dsm [[flat]]; };\n"
 "\n"
 // kl_reproject_v, line for line, plus the three reconstruction varyings. A copy
 // rather than a shared helper so that kl_msl_reproject — mode 0's source — is
@@ -1199,6 +1294,7 @@ static const char kl_msl_reproject_depth[] =
 "    o.orgClip = pm * float4(0.0, 0.0, 0.0, 1.0);\n"
 "    o.dparm = float4(du.m22, du.m23, du.nearM, du.farM);\n"
 "    o.dflags = (du.conv & 1u) | ((du.vis & 1u) << 1);\n"
+"    o.dsm = float4(du.minM, float(du.smooth), du.gridX, du.gridY);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -1244,20 +1340,37 @@ static const char kl_msl_reproject_depth[] =
 "\n"
 "struct FOutD { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n"
 "\n"
-"fragment FOutD kl_reproject_depth_f(VOutD in [[stage_in]],\n"
-"                                    texture2d_array<float> tex [[texture(0)]],\n"
-"                                    texture2d_array<float> tex1 [[texture(1)]],\n"
-"                                    depth2d<float> dep0 [[texture(2)]],\n"
-"                                    depth2d<float> dep1 [[texture(3)]],\n"
-"                                    sampler samp [[sampler(0)]])\n"
+// KL_REPROJECT_DEPTH_MIN_M: nothing nearer than minM (0 = off). Applied to the
+// distance the reprojection will use, so the false colour shows it too.
+"static float kl_depth_floor(float dist, float minM)\n"
 "{\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
-"    bool band = c.r > 0.98 && c.g < 0.02 && c.b > 0.98;\n"
-"#if KL_MAGENTA_KEY\n"
-"    if (band) c = float4(0.0, 0.0, 0.0, 1.0);\n"
-"#endif\n"
+"    return (minM > 0.0 && dist > 0.0) ? max(dist, minM) : dist;\n"
+"}\n"
+"\n"
+// The smooth path's per-pixel half: bilinear in DISPARITY over the coarse grid
+// (kl_depth_coarse_k), cell centres at (i + 0.5) cells — uv * grid is the
+// position in cells. Read, not sampled: the addressing is ours, exactly, and
+// kl_reproject_coarse_sample is its CPU twin.
+"static float kl_coarse_dist(texture2d<float> g, float2 uv, float2 grid)\n"
+"{\n"
+"    int2 sz = int2(int(g.get_width()), int(g.get_height()));\n"
+"    float2 p = uv * grid - 0.5;\n"
+"    float2 f0 = floor(p);\n"
+"    float2 fr = p - f0;\n"
+"    int2 i0 = clamp(int2(f0), int2(0), sz - 1);\n"
+"    int2 i1 = clamp(int2(f0) + 1, int2(0), sz - 1);\n"
+"    float a = g.read(uint2(i0.x, i0.y)).r, b = g.read(uint2(i1.x, i0.y)).r;\n"
+"    float c = g.read(uint2(i0.x, i1.y)).r, d = g.read(uint2(i1.x, i1.y)).r;\n"
+"    float disp = mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);\n"
+"    return disp > 1e-9 ? 1.0 / disp : -1.0;\n"
+"}\n"
+"\n"
+// Everything after "how far is this pixel": the colour (or false colour) and
+// the written depth. Shared by the per-pixel and the smooth fragments.
+"static FOutD kl_depth_out(VOutD in, float4 c, bool band, float dist)\n"
+"{\n"
 "    float nearM = in.dparm.z, farM = in.dparm.w;\n"
-"    float dist = kl_depth_dist_at(in, dep0, dep1);\n"
+"    dist = kl_depth_floor(dist, in.dsm.x);\n"
 "    FOutD o;\n"
 "    o.color = (in.dflags & 2u) != 0u ? kl_depth_false_colour(band ? -1.0 : dist, nearM, farM)\n"
 "                                     : kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
@@ -1273,11 +1386,94 @@ static const char kl_msl_reproject_depth[] =
 "    return o;\n"
 "}\n"
 "\n"
+"static float4 kl_depth_colour(VOutD in, texture2d_array<float> tex, texture2d_array<float> tex1,\n"
+"                              sampler samp, thread bool &band)\n"
+"{\n"
+"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    band = c.r > 0.98 && c.g < 0.02 && c.b > 0.98;\n"
+"#if KL_MAGENTA_KEY\n"
+"    if (band) c = float4(0.0, 0.0, 0.0, 1.0);\n"
+"#endif\n"
+"    return c;\n"
+"}\n"
+"\n"
+"fragment FOutD kl_reproject_depth_f(VOutD in [[stage_in]],\n"
+"                                    texture2d_array<float> tex [[texture(0)]],\n"
+"                                    texture2d_array<float> tex1 [[texture(1)]],\n"
+"                                    depth2d<float> dep0 [[texture(2)]],\n"
+"                                    depth2d<float> dep1 [[texture(3)]],\n"
+"                                    sampler samp [[sampler(0)]])\n"
+"{\n"
+"    bool band;\n"
+"    float4 c = kl_depth_colour(in, tex, tex1, samp, band);\n"
+"    return kl_depth_out(in, c, band, kl_depth_dist_at(in, dep0, dep1));\n"
+"}\n"
+"\n"
+// KL_REPROJECT_DEPTH_SMOOTH: the same, from the coarse disparity grid.
+"fragment FOutD kl_reproject_depth_smooth_f(VOutD in [[stage_in]],\n"
+"                                           texture2d_array<float> tex [[texture(0)]],\n"
+"                                           texture2d_array<float> tex1 [[texture(1)]],\n"
+"                                           texture2d<float> g0 [[texture(2)]],\n"
+"                                           texture2d<float> g1 [[texture(3)]],\n"
+"                                           sampler samp [[sampler(0)]])\n"
+"{\n"
+"    bool band;\n"
+"    float4 c = kl_depth_colour(in, tex, tex1, samp, band);\n"
+"    float dist = in.src == 0u ? kl_coarse_dist(g0, in.uv, in.dsm.zw)\n"
+"                              : kl_coarse_dist(g1, in.uv, in.dsm.zw);\n"
+"    return kl_depth_out(in, c, band, dist);\n"
+"}\n"
+"\n"
 "fragment float4 kl_reproject_depthvis_f(VOutD in [[stage_in]],\n"
 "                                        depth2d<float> dep0 [[texture(2)]],\n"
 "                                        depth2d<float> dep1 [[texture(3)]])\n"
 "{\n"
-"    return kl_depth_false_colour(kl_depth_dist_at(in, dep0, dep1), in.dparm.z, in.dparm.w);\n"
+"    return kl_depth_false_colour(kl_depth_floor(kl_depth_dist_at(in, dep0, dep1), in.dsm.x),\n"
+"                                 in.dparm.z, in.dparm.w);\n"
+"}\n"
+"\n"
+"fragment float4 kl_reproject_depthvis_smooth_f(VOutD in [[stage_in]],\n"
+"                                               texture2d<float> g0 [[texture(2)]],\n"
+"                                               texture2d<float> g1 [[texture(3)]])\n"
+"{\n"
+"    float dist = in.src == 0u ? kl_coarse_dist(g0, in.uv, in.dsm.zw)\n"
+"                              : kl_coarse_dist(g1, in.uv, in.dsm.zw);\n"
+"    return kl_depth_false_colour(kl_depth_floor(dist, in.dsm.x), in.dparm.z, in.dparm.w);\n"
+"}\n"
+"\n"
+// The coarse grid: one thread per cell. The cell's value is reduced over its
+// bilinear SUPPORT — the 2 x 2 cell window centred on it — so that every pixel
+// the interpolation reaches from this cell was among the samples (with `near`,
+// no pixel is then ever written farther than it is). 16 x 16 taps, strided:
+// at 32 px cells that is every 4th texel of a 64 px window, fine enough for a
+// finger at arm's length (~20-40 px wide at Alyx's eye size). Output: DISPARITY
+// 1/d (d clamped to the far clamp; no finite depth = the far clamp).
+"struct KLCoarseU { float m22; float m23; float farM; float cell;\n"
+"                  uint conv; uint pick; uint cols; uint rows; };\n"
+"\n"
+"kernel void kl_depth_coarse_k(depth2d<float> d [[texture(0)]],\n"
+"                              texture2d<float, access::write> out [[texture(1)]],\n"
+"                              constant KLCoarseU &u [[buffer(0)]],\n"
+"                              uint2 gid [[thread_position_in_grid]])\n"
+"{\n"
+"    if (gid.x >= u.cols || gid.y >= u.rows) return;\n"
+"    const uint K = 16u;\n"
+"    float2 sz = float2(float(d.get_width()), float(d.get_height()));\n"
+"    float2 c = (float2(gid) + 0.5) * u.cell;\n"
+"    float step = 2.0 * u.cell / float(K);\n"
+"    float lo = 1e30, hi = 0.0, sum = 0.0;\n"
+"    for (uint j = 0u; j < K; j++) {\n"
+"        for (uint i = 0u; i < K; i++) {\n"
+"            float2 p = c - u.cell + (float2(float(i), float(j)) + 0.5) * step;\n"
+"            uint2 q = uint2(clamp(p, float2(0.0), sz - 1.0));\n"
+"            float dist = kl_depth_linear(d.read(q), u.m22, u.m23, u.conv);\n"
+"            dist = (dist > 0.0) ? min(dist, u.farM) : u.farM;\n"
+"            float disp = 1.0 / dist;\n"
+"            lo = min(lo, disp); hi = max(hi, disp); sum += disp;\n"
+"        }\n"
+"    }\n"
+"    float v = u.pick == 1u ? lo : (u.pick == 2u ? sum / float(K * K) : hi);\n"
+"    out.write(float4(v, 0.0, 0.0, 1.0), gid);\n"
 "}\n"
 "\n"
 "kernel void kl_depth_probe_k(depth2d<float> d [[texture(0)]],\n"
@@ -1385,9 +1581,21 @@ void kl_reproject_swim_log(int mode, unsigned frames, double age_mean_ms,
     }
     pthread_mutex_unlock(&g_dstat_mu);
     unsigned asked = ring_hits + query_hits + fallbacks;
-    fprintf(stderr, "  [swim] mode %d, %u composites: anchor age mean %.1f ms max %.1f ms, "
+    // The halo knobs in force, so a device log line says what it measured.
+    char knobs[128] = "";
+    if (mode == 2) {
+        int n = kl_reproject_depth_smooth();
+        float mm = kl_reproject_depth_min_m();
+        char sm[48] = "per-pixel", mn[32] = "";
+        if (n) snprintf(sm, sizeof sm, "smooth %d px %s", n,
+                        (const char *[]){ "near", "far", "mean" }[kl_reproject_depth_smooth_pick()]);
+        if (mm > 0) snprintf(mn, sizeof mn, ", min %.2f m", (double)mm);
+        snprintf(knobs, sizeof knobs, " [%s%s%s]", sm,
+                 kl_reproject_depth_half() ? ", half-res" : "", mn);
+    }
+    fprintf(stderr, "  [swim] mode %d%s, %u composites: anchor age mean %.1f ms max %.1f ms, "
                     "ring hit %u/%u, query %u, fallback %u, depth written on %u | %s "
                     "(-1 m = no finite depth)\n",
-            mode, frames, age_mean_ms, age_max_ms, ring_hits, asked, query_hits,
+            mode, knobs, frames, age_mean_ms, age_max_ms, ring_hits, asked, query_hits,
             fallbacks, depth_frames, dpart);
 }

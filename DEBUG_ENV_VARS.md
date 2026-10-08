@@ -1568,6 +1568,22 @@ The composite/timewarp pass — one file, compiled by both compositors
   (needs the depth copy, i.e. `KL_REPROJECT_DEPTH_MODE=2`) and on device in mode 2.
   `KL_OPENVR_DUMP` also writes `eyeN_depth.pfm` (raw game depth, quarter size)
   in mode 2.
+- Mode 2 halo knobs (all off by default = per-pixel depth). The halo is
+  visionOS stretching pixels into the strip a near silhouette uncovers on head
+  translation; these trade it for a smooth stretch or for residual slip:
+  - `KL_REPROJECT_DEPTH_SMOOTH=N` — write a low-frequency depth field: an N x N
+    game-pixel cell grid (1 = 32), each cell reduced over its 2N x 2N bilinear
+    support by a compute pass, bilinear in disparity per pixel. The step at a
+    hand's edge becomes a ~1-cell ramp. `KL_REPROJECT_DEPTH_SMOOTH_PICK=near`
+    (default: no pixel written farther than it is — hands move rigidly, the
+    background around them is dragged) `|far` (background never pulled
+    forward, hand edges lag) `|mean`. With `KL_CP_DEPTH_VIS=1` the false colour
+    shows the smoothed field.
+  - `KL_REPROJECT_DEPTH_MIN_M=x` — never reproject anything as nearer than x m.
+  - `KL_REPROJECT_DEPTH_HALF=1` — keep the depth at half resolution (nearest
+    blit at Submit, a quarter of the bytes on the fence wait).
+  - In modes 1/2 the bridge logs `[swim] Submit fence wait` every 5 s: eye 0 =
+    the game's GPU + copy, eye 1 = the copy alone (colour, + depth in mode 2).
 - `KL_CHROMA=1` — chroma-key the guest's picture so the room shows through
   wherever it drew the key colour. Ported from VisionOSALVRClient with its maths
   and defaults intact, so a value found in that client transfers. Off by

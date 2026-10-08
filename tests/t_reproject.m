@@ -1540,7 +1540,277 @@ static void check_depth(void) {
     ok(fabsf(z - 1.0f) < 1e-4f, "nearer than the drawable's near clamps to it (depth 1)");
 }
 
+// ---- KL_REPROJECT_DEPTH_SMOOTH / _MIN_M: the halo knobs, run ----------------
+//
+// A game depth with one hard silhouette — the left half a hand at 0.5 m, the
+// right half a wall at 3 m — goes through the real grid kernel at a 16 px cell,
+// and the per-pixel field the smooth pass would write is checked everywhere:
+//   near: no pixel is ever written FARTHER than it is (the hand moves rigidly),
+//   far:  no pixel is ever written NEARER (the wall never pulled forward),
+//   all:  the field is a ramp — no pixel-to-pixel disparity step bigger than a
+//         cell's worth — where the per-pixel field has the whole 1/0.5 - 1/3 in
+//         one pixel. Then the smooth fragment, run, writes what the CPU twin
+//         says, and MIN_M floors the written distance.
+#define KLS_W 128
+#define KLS_H 64
+static const float kls_m22 = -0.95006f, kls_m23 = -0.03749f;
+static float kls_raw(float dist) { return -kls_m22 + kls_m23 / dist; }   // matrix inverse
+static float kls_true(int x) { return x < KLS_W / 2 ? 0.5f : 3.0f; }
+
+static id<MTLTexture> kls_game_depth(id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    static const char *src =
+        "#include <metal_stdlib>\n using namespace metal;\n"
+        "struct V { float4 p [[position]]; };\n"
+        "vertex V kls_v(uint vid [[vertex_id]]) { V o; float2 c = float2((vid << 1) & 2, vid & 2);\n"
+        "  o.p = float4(c * 2.0 - 1.0, 0.0, 1.0); return o; }\n"
+        "struct F { float d [[depth(any)]]; };\n"
+        "fragment F kls_f(V in [[stage_in]], constant float2 &r [[buffer(0)]], constant float &half_w [[buffer(1)]]) {\n"
+        "  F o; o.d = in.p.x < half_w ? r.x : r.y; return o; }\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&err];
+    if (!lib) { printf("  %s\n", err.localizedDescription.UTF8String); return nil; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kls_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kls_f"];
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps) { printf("  %s\n", err.localizedDescription.UTF8String); return nil; }
+    MTLTextureDescriptor *gd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                     width:KLS_W height:KLS_H mipmapped:NO];
+    gd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    gd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> game = [dev newTextureWithDescriptor:gd];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = game;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.texture = game;
+    rp.stencilAttachment.loadAction = MTLLoadActionClear;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+    dsd.depthCompareFunction = MTLCompareFunctionAlways;
+    dsd.depthWriteEnabled = YES;
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:ps];
+    [e setDepthStencilState:[dev newDepthStencilStateWithDescriptor:dsd]];
+    simd_float2 r = { kls_raw(0.5f), kls_raw(3.0f) };
+    float hw = KLS_W / 2;
+    [e setFragmentBytes:&r length:sizeof r atIndex:0];
+    [e setFragmentBytes:&hw length:sizeof hw atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return game;
+}
+
+// The grid for `pick`, read back (rows x cols floats into out). Returns cols.
+static int kls_grid(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLComputePipelineState> k,
+                    id<MTLTexture> game, uint32_t pick, kl_reproject_coarse_uniforms *cu_out,
+                    kl_reproject_depth_uniforms *du_out, id<MTLTexture> __strong *tex_out, float *out) {
+    kl_ovrp_render_pose r; memset(&r, 0, sizeof r);
+    r.depth_m22[0] = r.depth_m22[1] = kls_m22; r.depth_m23[0] = r.depth_m23[1] = kls_m23;
+    kl_reproject_coarse_uniforms cu;
+    kl_reproject_depth_uniforms du; memset(&du, 0, sizeof du);
+    if (!kl_reproject_coarse_build(&r, 0, KLS_W, KLS_H, &cu, &du)) return 0;
+    cu.pick = pick;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:cu.cols height:cu.rows mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> g = [dev newTextureWithDescriptor:td];
+    id<MTLBuffer> rb = [dev newBufferWithLength:cu.cols * cu.rows * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
+    [ce setComputePipelineState:k];
+    [ce setTexture:game atIndex:0];
+    [ce setTexture:g atIndex:1];
+    [ce setBytes:&cu length:sizeof cu atIndex:0];
+    [ce dispatchThreadgroups:MTLSizeMake((cu.cols + 7) / 8, (cu.rows + 7) / 8, 1)
+       threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce endEncoding];
+    id<MTLBlitCommandEncoder> be = [cmd blitCommandEncoder];
+    [be copyFromTexture:g sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(cu.cols, cu.rows, 1) toBuffer:rb destinationOffset:0
+    destinationBytesPerRow:cu.cols * 4 destinationBytesPerImage:cu.cols * cu.rows * 4];
+    [be endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    memcpy(out, rb.contents, cu.cols * cu.rows * 4);
+    if (cu_out) *cu_out = cu;
+    if (du_out) *du_out = du;
+    if (tex_out) *tex_out = g;
+    return (int)cu.cols;
+}
+
+static void check_depth_smooth(void) {
+    printf("=== depth reprojection: smooth grid + min distance (the halo knobs) ===\n");
+    ok(kl_reproject_depth_smooth() == 16, "KL_REPROJECT_DEPTH_SMOOTH=16 latched as a 16 px cell");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_depth_msl()]
+                                           options:nil error:&err];
+    if (!lib) { printf("  %s\n", err.localizedDescription.UTF8String); ok(0, "depth library compiles"); return; }
+    id<MTLFunction> kf = [lib newFunctionWithName:@"kl_depth_coarse_k"];
+    id<MTLComputePipelineState> k = kf ? [dev newComputePipelineStateWithFunction:kf error:&err] : nil;
+    ok(k != nil, "grid kernel builds");
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_depth_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_depth_smooth_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps) printf("  %s\n", err.localizedDescription.UTF8String);
+    ok(ps != nil, "smooth depth pass links (Depth32Float)");
+    MTLRenderPipelineDescriptor *vd = [MTLRenderPipelineDescriptor new];
+    vd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_depth_v"];
+    vd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_depthvis_smooth_f"];
+    vd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    ok([dev newRenderPipelineStateWithDescriptor:vd error:&err] != nil,
+       "smooth false-colour pass links with no depth attachment");
+    if (!k || !ps) return;
+    id<MTLTexture> game = kls_game_depth(dev, q);
+    ok(game != nil, "a 0.5 m | 3 m silhouette rendered into a D32S8 game depth");
+    if (!game) return;
+
+    static float grid[3][KLS_W * KLS_H];
+    kl_reproject_coarse_uniforms cu; kl_reproject_depth_uniforms du;
+    id<MTLTexture> gtex[3] = { nil, nil, nil };
+    int cols = 0;
+    for (uint32_t pick = 0; pick < 3; pick++)
+        cols = kls_grid(dev, q, k, game, pick, &cu, &du, &gtex[pick], grid[pick]);
+    ok(cols == KLS_W / 16 && (int)cu.rows == KLS_H / 16 && fabsf(du.grid_x - 8.0f) < 1e-6f,
+       "grid is 8 x 4 cells of 16 px, uv * 8 = cell position");
+    // Per pixel: the CPU twin of the smooth fragment, and the checks.
+    int near_never_farther = 1, far_never_nearer = 1, ramps = 1, mean_between = 1;
+    float worst_step[3] = { 0, 0, 0 };
+    for (int pick = 0; pick < 3; pick++) {
+        for (int y = 0; y < KLS_H; y++) {
+            float prev = -1;
+            for (int x = 0; x < KLS_W; x++) {
+                float u = (x + 0.5f) / KLS_W, v = (y + 0.5f) / KLS_H;
+                float d = kl_reproject_coarse_sample(grid[pick], cols, (int)cu.rows, du.grid_x,
+                                                     du.grid_y, u, v);
+                float t = kls_true(x);
+                if (pick == 0 && d > t * 1.0005f) near_never_farther = 0;
+                if (pick == 1 && d < t * 0.9995f) far_never_nearer = 0;
+                if (pick == 2 && (d < 0.5f * 0.999f || d > 3.0f * 1.001f)) mean_between = 0;
+                float disp = 1.0f / d;
+                if (prev > 0 && fabsf(disp - prev) > worst_step[pick]) worst_step[pick] = fabsf(disp - prev);
+                prev = disp;
+            }
+        }
+    }
+    // The whole silhouette is 1/0.5 - 1/3 = 1.667 per metre of disparity in ONE
+    // pixel per-pixel; bilinear over 16 px cells spreads it over >= 16.
+    float full = 1.0f / 0.5f - 1.0f / 3.0f;
+    for (int pick = 0; pick < 3; pick++) if (worst_step[pick] > full / 16.0f * 1.01f) ramps = 0;
+    printf("  worst pixel-to-pixel disparity step: near %.4f, far %.4f, mean %.4f (per-pixel: %.4f)\n",
+           worst_step[0], worst_step[1], worst_step[2], full);
+    ok(near_never_farther, "near: no pixel written farther than it is (the hand moves rigidly)");
+    ok(far_never_nearer, "far: no pixel written nearer than it is (the wall stays put)");
+    ok(mean_between, "mean: every pixel between the two surfaces");
+    ok(ramps, "all three: the step became a ramp of at least one cell");
+    // Far from the edge the field IS the surface.
+    float dl = kl_reproject_coarse_sample(grid[0], cols, (int)cu.rows, du.grid_x, du.grid_y, 0.05f, 0.5f);
+    float dr = kl_reproject_coarse_sample(grid[0], cols, (int)cu.rows, du.grid_x, du.grid_y, 0.95f, 0.5f);
+    ok(fabsf(dl - 0.5f) < 1e-3f && fabsf(dr - 3.0f) < 1e-2f, "away from the edge: exactly 0.5 m and 3 m");
+
+    // The smooth fragment, run: written depth at each pixel = near / the CPU
+    // twin's distance (no pose delta, identity quad), and MIN_M floors it.
+    const float near = 0.1f;
+    for (int with_min = 0; with_min < 2; with_min++) {
+        kl_ovrp_render_pose r; memset(&r, 0, sizeof r);
+        r.serial = 1; r.qw = 1;
+        for (int e = 0; e < 2; e++) {
+            for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+            r.depth_m22[e] = kls_m22; r.depth_m23[e] = kls_m23;
+        }
+        r.depth_valid = 3;
+        simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, near);
+        kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                     matrix_identity_float4x4, P, 0, 0, 0);
+        kl_reproject_depth_uniforms d2 = kl_reproject_depth_build(&r, 0, P);
+        kl_reproject_coarse_build(&r, 0, KLS_W, KLS_H, NULL, &d2);
+        d2.min_m = with_min ? 0.8f : 0.0f;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+        td.textureType = MTLTextureType2DArray;
+        td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        td.width = 2; td.height = 2; td.arrayLength = 1;
+        td.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+        uint8_t px[16]; memset(px, 128, sizeof px);
+        [src replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 slice:0
+                 withBytes:px bytesPerRow:8 bytesPerImage:16];
+        MTLTextureDescriptor *od = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:KLS_W height:KLS_H mipmapped:NO];
+        od.usage = MTLTextureUsageRenderTarget;
+        od.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> outd = [dev newTextureWithDescriptor:od];
+        MTLTextureDescriptor *cd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:KLS_W height:KLS_H mipmapped:NO];
+        cd.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> outc = [dev newTextureWithDescriptor:cd];
+        id<MTLBuffer> rb = [dev newBufferWithLength:KLS_W * KLS_H * 4 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cmd = [q commandBuffer];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = outc;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+        rp.depthAttachment.texture = outd;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.depthAttachment.clearDepth = 0.0;
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+        dsd.depthCompareFunction = MTLCompareFunctionGreater;
+        dsd.depthWriteEnabled = YES;
+        [enc setDepthStencilState:[dev newDepthStencilStateWithDescriptor:dsd]];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]] atIndex:0];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentTexture:src atIndex:1];
+        [enc setFragmentTexture:gtex[0] atIndex:2];
+        [enc setFragmentTexture:gtex[0] atIndex:3];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setVertexBytes:&d2 length:sizeof d2 atIndex:2];
+        klr_draw(enc);
+        [enc endEncoding];
+        id<MTLBlitCommandEncoder> be = [cmd blitCommandEncoder];
+        [be copyFromTexture:outd sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake(KLS_W, KLS_H, 1) toBuffer:rb destinationOffset:0
+        destinationBytesPerRow:KLS_W * 4 destinationBytesPerImage:KLS_W * KLS_H * 4];
+        [be endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        const float *z = rb.contents;
+        float worst = 0;
+        for (int y = 0; y < KLS_H; y += 3)
+            for (int x = 0; x < KLS_W; x++) {
+                float want = kl_reproject_coarse_sample(grid[0], cols, (int)cu.rows, du.grid_x,
+                                                        du.grid_y, (x + 0.5f) / KLS_W, (y + 0.5f) / KLS_H);
+                if (with_min && want < 0.8f) want = 0.8f;
+                float got = near / z[y * KLS_W + x];
+                float rel = fabsf(got - want) / want;
+                if (rel > worst) worst = rel;
+            }
+        printf("  smooth pass%s: worst |written - CPU twin| = %.4f%%\n",
+               with_min ? " + MIN_M 0.8" : "", worst * 100.0f);
+        ok(worst < 2e-3f, with_min ? "MIN_M 0.8: the 0.5 m hand is written at 0.8 m, the rest as smooth"
+                                   : "the smooth fragment writes the CPU twin's field, pixel for pixel");
+    }
+}
+
 int main(void) {
+    // Latched knobs, set before anything reads them (check_depth's [swim] line
+    // does): a 16 px cell so the 128 px test silhouette has a few cells a side.
+    setenv("KL_REPROJECT_DEPTH_SMOOTH", "16", 1);
     @autoreleasepool {
         check_math();
         check_viewport();
@@ -1553,6 +1823,7 @@ int main(void) {
         check_overlay_math();
         check_overlay_pixels();
         check_depth();
+        check_depth_smooth();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "
