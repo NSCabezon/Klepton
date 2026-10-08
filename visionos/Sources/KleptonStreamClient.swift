@@ -123,7 +123,10 @@ enum KLStreamResolver {
                     if case let .hostPort(host, port)? = conn.currentPath?.remoteEndpoint {
                         let h: String
                         switch host {
-                        case .ipv4(let a): h = "\(a)"
+                        // From the bytes: an IPv4Address's description carries the
+                        // interface scope ("192.168.1.10%en0"), which the C client's
+                        // getaddrinfo refuses (device, 2026-10-08).
+                        case .ipv4(let a): h = a.rawValue.map { String($0) }.joined(separator: ".")
                         case .ipv6(let a): h = "\(a)"
                         case .name(let n, _): h = n
                         @unknown default: h = "\(host)"
