@@ -31,6 +31,9 @@
 /vampire/
 /zix/*
 /zix/
+# a SYMLINK to the main checkout's unpacked tree in worktrees, hence the bare form
+/ieytd
+/ieytd/
 /intotheradius/*
 /intotheradius/
 /cs1/*
