@@ -1568,6 +1568,14 @@ The composite/timewarp pass — one file, compiled by both compositors
   (needs the depth copy, i.e. `KL_REPROJECT_DEPTH_MODE=2`) and on device in mode 2.
   `KL_OPENVR_DUMP` also writes `eyeN_depth.pfm` (raw game depth, quarter size)
   in mode 2.
+- `KL_OPENVR_DUMP=<dir>` — write the guest's submitted image and our stage image
+  once, as quarter-size PPMs (`eyeN_src.ppm` / `eyeN_dst.ppm`), at submitted frame
+  `KL_OPENVR_DUMP_AT` (default 300) or, with `KL_OPENVR_DUMP_SEC=<s>`, at the first
+  frame s seconds after the first submit. The seconds form lands runs with different
+  frame rates on the same moment: Alyx's Mac script (`load autosave` at 40 s) sits
+  paused at its start gate by ~70 s with a latched head, so `KL_OPENVR_DUMP_SEC=120`
+  dumps the same static frame in every run — the MoltenVK A/B diff (stock vs the
+  fork vs merge: max channel difference 1).
 - `KL_CHROMA=1` — chroma-key the guest's picture so the room shows through
   wherever it drew the key colour. Ported from VisionOSALVRClient with its maths
   and defaults intact, so a value found in that client transfers. Off by
@@ -2630,6 +2638,69 @@ cleared/not stored and RESOLVED. Stock MoltenVK has no such extension. Two halve
   are not comparable; two phases of one run interleaved for minutes are. 10 is a
   good period. A suspended/resumed instance keeps the phase it began in.
 
+### One Metal encoder across suspend/resume (`mvk-patches/moltenvk-merge.patch`, fork only)
+
+Alyx's scene pass is one dynamic-rendering instance in FOUR segments (SUSPENDING /
+RESUMING, recorded in different VkCommandBuffers). Stock MoltenVK ends the Metal
+render encoder at every segment end and starts a new one at every resume, so each of
+the 3 boundaries STORES and re-LOADS the whole MSAA colour + D32S8. All default OFF;
+with all unset the fork renders exactly as the FDM fork did.
+
+- `KL_MVK_MERGE_SUSPEND=1` — a SUSPENDING segment leaves its Metal render encoder
+  open (no store actions, no endEncoding) and the RESUMING segment, later in the same
+  MTLCommandBuffer, continues in it. Handles what Alyx records between segments: a
+  GENERAL->GENERAL pipeline barrier on its MSAA colour (kept as an in-encoder barrier)
+  and a `vkCmdResetQueryPool` (the GPU fill is deferred until the merged encoder ends,
+  encoded before the pass's occlusion results are accumulated, and the held segments'
+  results for the reset queries are dropped), and occlusion queries in the resuming
+  command buffer (a suspending segment's encoder always gets the visibility result
+  buffer; its pending queries and copy fences move with the encoder). Falls back to
+  the stock store/load — never wrong, only slower — for: timestamp queries, prefilled
+  command buffers, a multiview pass split into several Metal passes, a resume in
+  another MTLCommandBuffer (the held encoder is then ended with plain store actions at
+  commit), or any other Metal work between the segments. Every 5 s:
+  `[mvk-merge] last 5.0 s: N segments left open, N resumed in the open encoder, N fell
+  back to store/load, N restarts in suspended instances`.
+  Note the restarts: Alyx's last segment reads its MSAA colour as an INPUT ATTACHMENT
+  (dynamic rendering local read: a BY_REGION barrier GENERAL ->
+  RENDERING_LOCAL_READ, COLOR_ATTACHMENT_WRITE -> INPUT_ATTACHMENT_READ), ~1.5 times a
+  frame. MoltenVK samples input attachments as textures (no framebuffer fetch), so it
+  must restart the Metal pass there (store + load), merged or not. Removing that last
+  store/load needs framebuffer-fetch input attachments in the fork (not done).
+- `KL_MVK_AREA_ENTIRE=1` — an MSAA render area anchored at the origin counts as the
+  entire attachment (Metal bounds the pass to renderTargetWidth/Height), so CLEAR is a
+  clear load action (not Load + a clearing draw) and DONT_CARE + resolve is a plain
+  resolve (not store-and-resolve). Alyx draws each eye into the top-left of a bigger
+  dynamic-resolution image, so without this every MSAA attachment is loaded and stored
+  once per frame even when merged. Contents OUTSIDE the render area are not preserved
+  (Vulkan says they should be; Alyx clears every frame).
+- `KL_MVK_MEMORYLESS_MSAA=1` — (needs `KL_MVK_MERGE_SUSPEND=1`; refused with
+  `KL_MVK_MERGE_AB`; implies `KL_MVK_AREA_ENTIRE`) MSAA colour/depth attachment images
+  whose usage never reads them back (no SAMPLED / STORAGE / INPUT_ATTACHMENT /
+  TRANSFER_SRC) get `MTLStorageModeMemoryless` textures; others stay in memory and say
+  so once (`stays in memory: its usage can read it back`). **For Alyx nothing
+  qualifies** (colour usage 0x97, depth 0xa7: both declare SAMPLED + INPUT_ATTACHMENT +
+  TRANSFER_SRC), so =1 is the merge + area-entire. `=2` forces every MSAA attachment
+  image memoryless — a diagnostic: in Alyx it corrupts the picture (the input-attachment
+  restart above loads don't-care; texture views of memoryless images fail,
+  `MVKImageViewPlane with a nil MTLTexture`).
+- `KL_MVK_MERGE_AB=<s>` — (implies `KL_MVK_GPU_TIME`) the in-process A/B of the
+  merge (+ `KL_MVK_AREA_ENTIRE` if set): ON / stock every s seconds, `[mvk-merge] A/B so
+  far: merged X GPU ms/frame ... | stock Y ... | ±Z% GPU time` (frames = resumed scene
+  instances). Not with `KL_FOVEATE_AB` (one subject per run: this one wins).
+  Mac (M1 Max, 2026-10-08, Alyx paused at the start gate, `KL_OPENVR_DUMP_SEC=120`):
+  0 fall-backs in game, ~1.5 local-read restarts a frame; the picture is the stock
+  picture (max channel difference 1 = the run-to-run noise between stock and the fork
+  with everything off) at fidelity 0 and 1, alone and with `KL_FOVEATE=1`. GPU time
+  in-game (`KL_MVK_MERGE_AB=10`, ~11k frames a phase): merge +4.1 % (level 0); merge +
+  area +2.4 % (level 0), −2.4 % (level 1) — no gain measurable on a 400 GB/s GPU. The
+  device (M2, ~100 GB/s) is the real test.
+- `KL_MVK_MERGE_STRICT=1` — also end the held encoder at a GENERAL -> GENERAL barrier
+  on its attachments (the stock-safe reading of that barrier).
+- `KL_MVK_MERGE_DEBUG=1|2` — who ended a held encoder, the barriers met between held
+  segments, and the in-pass barriers that restart a Metal pass (first few, with
+  backtraces); `2` also names every command encoded while an encoder is held.
+
 Which MoltenVK runs (stock or the fork). There is ONE slot, `vendor-moltenvk/out/`
 (`macos/libMoltenVK.dylib`, `xros|xrsim/MoltenVK.framework`); no runtime choice.
 `make mvk` fills it with the stock prebuilt; `make mvk-fdm` (tools/mvk_fdm_build.sh)
@@ -2642,6 +2713,12 @@ holds the fork SHIPS the fork; with `KL_FOVEATE` unset the spoof is off, Alyx ne
 sees the extension, no density-map pass exists and the fork's code is inert (verified
 on the Mac: same picture as stock). On the Mac, `KL_MVK_DYLIB=<path>` loads any
 other build for an A/B (e.g. the main checkout's stock dylib).
+The slot is per checkout (`vendor-moltenvk/` is gitignored, a real directory in each
+worktree), so `make mvk-fdm` in a worktree never touches another checkout's MoltenVK.
+The fork now carries the merge patch too (knobs above, all off by default). The build
+script takes the visionOS and simulator frameworks straight from Xcode's build
+products and refuses to stage a slice without the fork's markers: MoltenVK's own
+packaging re-used a stale visionOS framework after an incremental rebuild.
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 

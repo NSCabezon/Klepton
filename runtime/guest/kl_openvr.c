@@ -1864,7 +1864,21 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     // The compositor samples this image the moment the frame is filed, so it
     // has to be complete by then. One small copy; waiting is the honest answer.
     V.WaitForFences(V.dev, 1, &V.fence[eye][stage], VK_TRUE, UINT64_MAX);
-    if (g_frames_for_dump == (unsigned long long)kl_env_int("KL_OPENVR_DUMP_AT", 300) && getenv("KL_OPENVR_DUMP")) {
+    // KL_OPENVR_DUMP_SEC=<s>: dump instead at the first frame <s> seconds after the
+    // first submit (eye 0 picks the frame, eye 1 follows it) — a wall-clock point,
+    // so runs whose frame rates differ dump the same moment (e.g. Alyx paused at its
+    // start gate: a static picture to diff MoltenVK builds against each other).
+    static double dump_t0 = -1; static int dump_sec_state = 0;     // 0 waiting, 1 dumping this frame, 2 done
+    int dump_now = 0;
+    if (getenv("KL_OPENVR_DUMP_SEC")) {
+        if (dump_t0 < 0) dump_t0 = now_s();
+        if (dump_sec_state == 0 && eye == 0 && now_s() - dump_t0 >= atof(getenv("KL_OPENVR_DUMP_SEC"))) dump_sec_state = 1;
+        dump_now = dump_sec_state == 1;
+        if (dump_now && eye == 1) dump_sec_state = 2;
+    } else {
+        dump_now = g_frames_for_dump == (unsigned long long)kl_env_int("KL_OPENVR_DUMP_AT", 300);
+    }
+    if (dump_now && getenv("KL_OPENVR_DUMP")) {
         char nm[32];
         snprintf(nm, sizeof nm, "eye%d_src", eye);
         vk_dump(t, src, layer, t->m_nWidth, t->m_nHeight, nm);

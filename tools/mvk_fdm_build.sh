@@ -12,9 +12,14 @@
 # density map with a Metal rasterization rate map (MVKFoveation.{h,mm}, behind
 # KL_FOVEATE=1, default OFF — with it off the fork renders exactly as stock).
 #
-# Two patches, mirroring angle-patches/:
+# Three patches, mirroring angle-patches/:
 #   mvk-patches/moltenvk-fdm.patch     MoltenVK v1.4.2 (render pass, encoder,
 #                                      pipeline, implicit buffer, GPU timing)
+#   mvk-patches/moltenvk-merge.patch   on top of it: suspended/resumed dynamic
+#                                      rendering kept in ONE Metal render encoder
+#                                      (KL_MVK_MERGE_SUSPEND=1) and memoryless MSAA
+#                                      attachments (KL_MVK_MEMORYLESS_MSAA=1); both
+#                                      default OFF = the FDM fork as before
 #   mvk-patches/spirv-cross-fdm.patch  SPIRV-Cross at MoltenVK's pinned revision:
 #                                      the gl_FragCoord physical->screen remap
 #                                      (MSL option rasterization_rate_map_fragcoord)
@@ -37,6 +42,7 @@ ROOT="vendor-moltenvk-fdm"
 SRC="$ROOT/MoltenVK"
 SPC="$ROOT/SPIRV-Cross"
 PATCH_MVK="mvk-patches/moltenvk-fdm.patch"
+PATCH_MERGE="mvk-patches/moltenvk-merge.patch"
 PATCH_SPC="mvk-patches/spirv-cross-fdm.patch"
 SLICES="${MVK_FDM_SLICES:-macos visionos visionossim}"
 mkdir -p "$ROOT"
@@ -64,7 +70,14 @@ apply_patch() {
   fi
 }
 apply_patch "$SPC" "$PATCH_SPC"
-apply_patch "$SRC" "$PATCH_MVK"
+# The merge patch sits on top of the FDM one: when it is in place the FDM patch
+# no longer reverse-applies on its own (shared files), so check the top first.
+if git -C "$SRC" apply --reverse --check "$PWD/$PATCH_MERGE" 2>/dev/null; then
+  echo "  [mvk-fdm] $PATCH_MVK + $PATCH_MERGE already applied"
+else
+  apply_patch "$SRC" "$PATCH_MVK"
+  apply_patch "$SRC" "$PATCH_MERGE"
+fi
 
 # ---- external dependencies (SPIRV-Cross, SPIRV-Tools, ...) ------------------
 # Rebuilt only when missing or when the SPIRV-Cross patch changed. NOT
@@ -110,7 +123,28 @@ DIST="vendor-moltenvk/dist/MoltenVK/MoltenVK"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 cp -R "$PKG/dynamic" "$PKG/include" "$DIST/"
+# MoltenVK's packaging builds its dynamic xcframework from a STAGING copy in Xcode's
+# DerivedData that an incremental build does not refresh for visionOS and the
+# simulator (measured: after a source change Release-xros held the new framework while
+# Package/.../xros-arm64 still held the old one — a hub would have shipped stale code).
+# Take those two frameworks straight from this build's products instead.
+for dd in "$HOME"/Library/Developer/Xcode/DerivedData/MoltenVKPackaging-*; do
+  [ "$(plutil -extract WorkspacePath raw "$dd/info.plist" 2>/dev/null)" = "$PWD/$SRC/MoltenVKPackaging.xcodeproj" ] || continue
+  for pair in "Release-xros:xros-arm64" "Release-xrsimulator:xros-arm64_x86_64-simulator"; do
+    from="$dd/Build/Products/${pair%%:*}/MoltenVK.framework"
+    to="$DIST/dynamic/MoltenVK.xcframework/${pair##*:}/MoltenVK.framework"
+    if [ -f "$from/MoltenVK" ] && [ -d "$to" ]; then rm -rf "$to"; cp -R "$from" "$to"; fi
+  done
+done
 touch "vendor-moltenvk/.klepton-fetched-$MVK_VERSION"
 git -C "$SRC" rev-parse HEAD > vendor-moltenvk/.klepton-fdm
 ./tools/mvk_retarget.sh
+# Every staged slice must be THIS build (see the staging note above): the foveation
+# ABI symbol and the merge patch's knob string in each binary.
+for f in vendor-moltenvk/out/macos/libMoltenVK.dylib vendor-moltenvk/out/xros/MoltenVK.framework/MoltenVK \
+         vendor-moltenvk/out/xrsim/MoltenVK.framework/MoltenVK; do
+  SYMS="$(nm -gU "$f" 2>/dev/null || true)"; STRS="$(strings -a "$f" 2>/dev/null || true)"
+  case "$SYMS" in *klMVKFoveationABI*) ;; *) echo "  !! $f has no klMVKFoveationABI — stale slice"; exit 1 ;; esac
+  case "$STRS" in *KL_MVK_MERGE_SUSPEND*) ;; *) echo "  !! $f has no merge patch (KL_MVK_MERGE_SUSPEND) — stale slice"; exit 1 ;; esac
+done
 echo "  [mvk-fdm] foveating MoltenVK staged in vendor-moltenvk/out (KL_FOVEATE=1 to use it)"
