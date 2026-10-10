@@ -7,4 +7,7 @@
 #ifndef KL_OPENVR_H
 #define KL_OPENVR_H
 void *kl_openvr_lookup(const char *name);
+// WaitGetPoses blocks in `wait` before latching the frame's poses (the frame
+// pacer, KL_GUEST_PACE_HZ / KL_GUEST_PACE_DIV). NULL, the default, never waits.
+void kl_openvr_set_frame_pacer(void (*wait)(void));
 #endif
