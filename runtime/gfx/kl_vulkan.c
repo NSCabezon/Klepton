@@ -116,6 +116,7 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 #define VK_USE_PLATFORM_METAL_EXT 1
 #include <vulkan/vulkan.h>
 #include "kl_glfb.h"
+#include "kl_vk_pipe_hooks.h"   // pipeline recorder/replayer add-on (kl_fossilize.cpp)
 
 #include <zlib.h>
 
@@ -168,6 +169,20 @@ static PFN_vkGetDeviceProcAddr   real_gdpa;
 static int g_init_done, g_avail;
 
 static void *mvk_sym(const char *n) { return g_mvk ? dlsym(g_mvk, n) : NULL; }
+
+// Pipeline-object hooks (kl_vk_pipe_hooks.h): an add-on records every sampler, layout, module,
+// render pass and pipeline the guest creates (KL_FOZ_RECORD) and replays them on its own
+// threads (KL_FOZ_REPLAY). NULL unless one of those knobs is set, so the hot path is a single
+// branch. Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+static const klvk_pipe_hooks *g_pipe_hooks;
+static _Thread_local int t_pipe_replay;
+void klvk_set_pipe_hooks(const klvk_pipe_hooks *h) { g_pipe_hooks = h; }
+void klvk_set_replay_thread(int on) { t_pipe_replay = on; }
+#define PIPE_HOOK(fn, ...) do { if (g_pipe_hooks && g_pipe_hooks->fn && !t_pipe_replay) \
+                                    g_pipe_hooks->fn(__VA_ARGS__); } while (0)
+// No Fossilize linked (it is fetched by `make fossilize`, and only m_boot links it): no hooks.
+__attribute__((weak)) void kl_fossilize_install(void) {}
+static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev, const char *name);
 
 static void vk_init(void) {
     if (g_init_done) return;
@@ -235,6 +250,7 @@ static void vk_init(void) {
     // MVK_CONFIG_USE_MTLHEAP explicitly if wanted.)
 
     g_mvk = mvk_open();
+    if (g_mvk) kl_fossilize_install();   // KL_FOZ_RECORD / KL_FOZ_REPLAY; no-op when unset
     if (!g_mvk) {
         VKI("MoltenVK could not be loaded — run 'make mvk' (BUILDING.md).\n");
         return;
@@ -742,6 +758,8 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     // NULL physicalDevice (its GPU select left it null), and MoltenVK would make
     // a device on nothing. Give it the real GPU so it gets a working VkDevice.
     phys = KLVK_PHYS_OR_SUB(phys, "CreateDevice");
+    // as the guest asked, before anything below edits it
+    if (ci && g_pipe_hooks && g_pipe_hooks->device_info) g_pipe_hooks->device_info(ci);
 
     uint32_t nhave = 0;
     VkExtensionProperties *have = NULL;
@@ -813,6 +831,8 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     pthread_mutex_unlock(&g_lock);
 
     VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
+    if (g_pipe_hooks && g_pipe_hooks->device_created)
+        g_pipe_hooks->device_created(d->dev, klvk_GetDeviceProcAddr);
     return VK_SUCCESS;
 }
 
@@ -3496,19 +3516,34 @@ static VkResult VKAPI_CALL klvk_CreateImageView(VkDevice dev,
 // Gated on nothing: it is one fprintf per ~50 pipelines, negligible against a
 // compile measured in tens of milliseconds.
 static unsigned long long g_pipe_gfx, g_pipe_comp, g_pipe_ns;
+// Stalls: guest pipeline-create calls over KL_VK_STALL_MS (default 50 ms), each one a frame the
+// guest's render thread lost. Logged one line each with the running count and total, which is
+// what the KL_FOZ_REPLAY A/B measures. Replay threads are not counted (t_pipe_replay).
+static unsigned long long g_stall_n;
+static double g_stall_ms;
 static double kl_pipe_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
+    if (t_pipe_replay) return;
+    static double thr = -1;
+    if (thr < 0) { const char *e = getenv("KL_VK_STALL_MS"); thr = e && *e ? atof(e) : 50.0; }
+    if (thr > 0 && dt_ms >= thr) {
+        g_stall_n++; g_stall_ms += dt_ms;
+        VKI("pipeline stall: %s batch of %u took %.0f ms (stalls so far: %llu, %.0f ms total)\n",
+            kind, n, dt_ms, g_stall_n, g_stall_ms);
+    }
     g_pipe_ns += (unsigned long long)(dt_ms * 1e6);
     unsigned long long tot = g_pipe_gfx + g_pipe_comp;
     static unsigned long long last;
     if (tot - last >= 50 || dt_ms > 250.0) {
         last = tot;
         VKI("pipeline warmup: %llu graphics + %llu compute = %llu compiled, "
-            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms)\n",
-            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms);
+            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms; "
+            "%llu stalls, %.0f ms)\n",
+            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms,
+            g_stall_n, g_stall_ms);
     }
 }
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
@@ -3591,8 +3626,11 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
         VKI("CreateGraphicsPipelines: forced primitiveRestartEnable=TRUE on %d "
             "strip pipeline(s) MoltenVK would otherwise reject (invisible "
             "geometry)\n", fixed); } }
-    g_pipe_gfx += n;
+    if (!t_pipe_replay) g_pipe_gfx += n;
     kl_pipe_report("gfx", n, kl_pipe_ms() - t0);
+    // the guest's own create infos (not the fixed-up copy): a replay goes through this wrapper again
+    if (g_pipe_hooks && ci && out)
+        for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(graphics_pipeline, out[i], &ci[i]);
     return r;
 }
 static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
@@ -3604,8 +3642,66 @@ static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
     double t0 = kl_pipe_ms();
     VkResult r = real ? real(dev, cache, n, ci, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
-    g_pipe_comp += n;
+    if (!t_pipe_replay) g_pipe_comp += n;
     kl_pipe_report("compute", n, kl_pipe_ms() - t0);
+    if (g_pipe_hooks && ci && out)
+        for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(compute_pipeline, out[i], &ci[i]);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-object recording seam (kl_vk_pipe_hooks.h). Each wrapper hands the GUEST's create
+// info to the recorder after a successful create; whatever the inner wrapper rewrites is
+// redone on replay, which comes back through these same entry points. Adapted from Glovebox
+// (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+// ---------------------------------------------------------------------------
+static VkResult VKAPI_CALL klvk_CreateShaderModule_inner(VkDevice, const VkShaderModuleCreateInfo *,
+        const VkAllocationCallbacks *, VkShaderModule *);
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout_inner(VkDevice,
+        const VkDescriptorSetLayoutCreateInfo *, const VkAllocationCallbacks *, VkDescriptorSetLayout *);
+static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice, const VkRenderPassCreateInfo *,
+        const VkAllocationCallbacks *, VkRenderPass *);
+static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice, const VkRenderPassCreateInfo2 *,
+        const VkAllocationCallbacks *, VkRenderPass *);
+static VkResult VKAPI_CALL klvk_CreateSampler(VkDevice dev, const VkSamplerCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkSampler *out) {
+    static PFN_vkCreateSampler real;
+    if (!real && real_gdpa) real = (PFN_vkCreateSampler)real_gdpa(dev, "vkCreateSampler");
+    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(sampler, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreatePipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkPipelineLayout *out) {
+    static PFN_vkCreatePipelineLayout real;
+    if (!real && real_gdpa) real = (PFN_vkCreatePipelineLayout)real_gdpa(dev, "vkCreatePipelineLayout");
+    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(pipeline_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkShaderModule *out) {
+    VkResult r = klvk_CreateShaderModule_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(shader_module, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev,
+        const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a,
+        VkDescriptorSetLayout *out) {
+    VkResult r = klvk_CreateDescriptorSetLayout_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(set_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    VkResult r = klvk_CreateRenderPass_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev, const VkRenderPassCreateInfo2 *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    VkResult r = klvk_CreateRenderPass2_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass2, *out, ci);
     return r;
 }
 
@@ -3769,7 +3865,7 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
 // not found"); this shows whether the passes that DO get built use input
 // attachments / multiple subpasses (the MoltenVK-thorny shapes) and whether any
 // creation fails outright.
-static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice dev,
         const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass real;
@@ -3798,7 +3894,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
     }
     return r;
 }
-static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice dev,
         const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass2 real;
@@ -5728,7 +5824,7 @@ static uint32_t *klvk_spirv_mirror_rewrite(const uint32_t *in, size_t nwords,
 // vkCreateShaderModule — gated SPIR-V rewrite. emu_on() false, or a module with
 // no texel-buffer image, is EXACT passthrough. A rewrite MoltenVK rejects falls
 // back to the original module (buggy but never a hard failure).
-static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateShaderModule_inner(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
     static PFN_vkCreateShaderModule real;
@@ -5760,7 +5856,7 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
 
 // vkCreateDescriptorSetLayout — UNIFORM_TEXEL_BUFFER bindings become SAMPLED_IMAGE
 // so the layout matches the rewritten shader. Exact passthrough when emu off.
-static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout_inner(VkDevice dev,
         const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkDescriptorSetLayout *out) {
     static PFN_vkCreateDescriptorSetLayout real;
@@ -6413,6 +6509,7 @@ static const entry g_ours[] = {
     E(CmdBindPipeline), E(CmdBindDescriptorSets),
     E(GetImageMemoryRequirements), E(CreateBufferView),
     E(CreateShaderModule), E(CreateDescriptorSetLayout), E(CreateDescriptorPool),
+    E(CreateSampler), E(CreatePipelineLayout),
     E(UpdateDescriptorSets),
     E(CreateDescriptorUpdateTemplate), E(UpdateDescriptorSetWithTemplate),
     { "vkCreateDescriptorUpdateTemplateKHR", (PFN_vkVoidFunction)klvk_CreateDescriptorUpdateTemplate },
