@@ -91,7 +91,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest x18casp glibcipc
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -459,6 +459,15 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The casp pair veneer (KLX_HZ_CASP), EXECUTED, under preemption pressure. Same
+# shape as t_ctr: the decoder and emitter alone, no loader.
+build/t_x18_casp: tests/t_x18_casp.c tests/t_x18_casp.S runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18_casp.c tests/t_x18_casp.S runtime/kl_x18.c runtime/kl_env.c
+
+x18casp: build/t_x18_casp
+	./build/t_x18_casp
+
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
@@ -469,6 +478,15 @@ build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 
 bcast: build/t_bcast
 	./build/t_bcast
+
+# The glibc personality's in-process SysV semaphores and fault-signal masks,
+# through the same kl_glibc_lookup entry points a glibc guest binds.
+build/t_glibc_ipc: tests/t_glibc_ipc.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_glibc_ipc.c $(RUNTIME) $(LDLIBS)
+
+glibcipc: build/t_glibc_ipc
+	./build/t_glibc_ipc
 
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
@@ -550,7 +568,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_x18_casp build/t_bcast build/t_glibc_ipc build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
@@ -564,8 +582,12 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/softinput.log && tail -1 build/softinput.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
+	@./build/t_x18_casp > build/x18casp.log 2>&1 || { cat build/x18casp.log; exit 1; }
+	@head -1 build/x18casp.log && tail -1 build/x18casp.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
 	@head -1 build/bcast.log && tail -1 build/bcast.log
+	@./build/t_glibc_ipc > build/glibcipc.log 2>&1 || { cat build/glibcipc.log; exit 1; }
+	@head -1 build/glibcipc.log && tail -1 build/glibcipc.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@$(MAKE) -s ovrpabi

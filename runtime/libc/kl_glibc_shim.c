@@ -59,7 +59,6 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
-#include <sys/sem.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -494,9 +493,31 @@ static int klg_sigaction(int sig, const klg_sigaction_t *in, klg_sigaction_t *ol
     }
     return r;
 }
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
+// runtime/linux/kl_glibc.c (unblock_fatal).
+//
+// A synchronous fault raised in a thread that has its signal BLOCKED is not
+// queued: the kernel kills the process outright, with no handler and so no
+// report from kl_fault.c. Engine worker threads routinely block "all signals"
+// (sigfillset + pthread_sigmask) — Source 2's job threads, SDL's, V8's — so a
+// fault in one used to end the run silently. Keep the fault signals deliverable
+// whatever the guest asks: SIGILL 4, SIGTRAP 5, SIGABRT 6, SIGBUS 7, SIGFPE 8,
+// SIGSEGV 11 (Linux numbering, bit signo-1 of the first word). One more bit,
+// and it is ours rather than Glovebox's: klb_pthread_sigmask hands the word to
+// Darwin WITHOUT renumbering, and Darwin's SIGBUS is 10 — the bit a guest sets
+// for Linux SIGUSR1, and the one sigfillset sets anyway — while Darwin raises
+// SIGBUS for most bad accesses. So bit 9 is cleared too; a guest that really
+// blocks Linux SIGUSR1 loses that block (it was blocking Darwin SIGBUS).
+// SIG_UNBLOCK (Linux 1) cannot block anything and passes through untouched.
+// The old mask handed back is what is really in force. glibc personality only;
+// Android guests keep the raw klb_pthread_sigmask.
+#define KLG_FATAL_SIGS ((1ull << (4 - 1)) | (1ull << (5 - 1)) | (1ull << (6 - 1)) | \
+                        (1ull << (7 - 1)) | (1ull << (8 - 1)) | (1ull << (11 - 1)) | \
+                        (1ull << (10 - 1)) /* Darwin SIGBUS, see above */)
 static int klg_pthread_sigmask(int how, const klg_sigset *s, klg_sigset *o) {
-    uint64_t ow = 0;
-    int r = klb_pthread_sigmask(how, s ? &s->w[0] : NULL, o ? &ow : NULL);
+    uint64_t ow = 0, w0 = 0;
+    if (s) { w0 = s->w[0]; if (how != 1) w0 &= ~KLG_FATAL_SIGS; }
+    int r = klb_pthread_sigmask(how, s ? &w0 : NULL, o ? &ow : NULL);
     if (!r && o) { memset(o, 0, sizeof *o); o->w[0] = ow; }
     return r;
 }
@@ -835,38 +856,214 @@ static void *klg_plat_virtualalloc(void *addr, size_t size, uint32_t type, uint3
 }
 
 // ---------- SysV semaphores ----------
-// semget/semop forward as they are (struct sembuf is the same 6 bytes), but
-// semctl cannot: glibc numbers the commands GETPID 11 ... SETALL 17 where Darwin
-// has 3 ... 9, and the fourth argument is VARIADIC — the guest passes it in x3,
-// Darwin's semctl reads it from the stack. tier0's process-shared semaphores
-// called semctl(GETNCNT) and friends, and Darwin's IPC_STAT path wrote a
-// semid_ds through whatever pointer it found there: the guest's frame record,
-// and a return to 0x14000001f5 later.
-union klg_semun { int val; void *buf; unsigned short *array; };
-static int klg_semctl(int id, int num, int cmd, uintptr_t arg) {
-    union klg_semun u;
-    memset(&u, 0, sizeof u);
-    int d;
-    switch (cmd) {
-    case 0:  d = IPC_RMID; break;
-    case 11: d = GETPID; break;
-    case 12: d = GETVAL; break;
-    case 13: d = GETALL; u.array = (unsigned short *)arg; break;
-    case 14: d = GETNCNT; break;
-    case 15: d = GETZCNT; break;
-    case 16: d = SETVAL; u.val = (int)arg; break;
-    case 17: d = SETALL; u.array = (unsigned short *)arg; break;
-    default: {
-        // IPC_STAT / IPC_SET / IPC_INFO and friends: the structs differ in
-        // layout, and nothing here needs them answered.
-        static int said;
-        if (!said++) fprintf(stderr, "  [glibc] semctl cmd %d not translated -> EINVAL\n", cmd);
-        errno = EINVAL;
-        return -1;
-    }
-    }
-    return semctl(id, num, d, u);
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
+// runtime/linux/kl_glibc.c (g_semget/g_semctl/g_semtimedop).
+//
+// tier0's CThreadSyncObject (and libvideo) build named semaphores on
+// semget/semctl/semop. These used to forward to Darwin, with semctl translated
+// command by command — glibc numbers GETPID 11 ... SETALL 17 where Darwin has
+// 3 ... 9, and the fourth argument is VARIADIC (the guest passes it in x3,
+// Darwin's semctl reads it from the stack, so Darwin's IPC_STAT once wrote a
+// semid_ds through the guest's frame record). IPC_STAT itself could not be
+// answered (the structs differ) and came back EINVAL. Forwarding is also wrong
+// on the device: the visionOS sandbox does not grant SysV IPC at all.
+//
+// So the glibc personality gets an in-process implementation with Linux
+// semantics, layouts and command numbers. Android guests are unaffected: their
+// semget/semctl/semop still go through kl_libc_table.h. Within one process
+// "system-wide" and "process-wide" are the same thing, which is all a guest
+// that never forks can observe. SEM_UNDO is accepted and ignored (it only acts
+// at process exit).
+#define KLG_IPC_CREAT   01000
+#define KLG_IPC_EXCL    02000
+#define KLG_IPC_NOWAIT  04000
+#define KLG_SEMVMX      32767
+#define KLG_SEMMSL      64
+#define KLG_SEMMNI      256
+typedef struct {
+    int used, key, nsems, mode;
+    unsigned gen;                         // bumps on IPC_RMID: wakes waiters with EIDRM
+    long otime, ctime;
+    unsigned short vals[KLG_SEMMSL];
+    int pids[KLG_SEMMSL];
+    unsigned short ncnt[KLG_SEMMSL], zcnt[KLG_SEMMSL];
+} klg_semset;
+static klg_semset g_sems[KLG_SEMMNI];
+static pthread_mutex_t g_sem_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_sem_cond = PTHREAD_COND_INITIALIZER;
+
+static klg_semset *klg_sem_get(int id) {
+    return (id >= 0 && id < KLG_SEMMNI && g_sems[id].used) ? &g_sems[id] : NULL;
 }
+
+static int klg_semget(int key, int nsems, int flags) {
+    if (nsems < 0 || nsems > KLG_SEMMSL) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&g_sem_lock);
+    int id = -1;
+    for (int i = 0; key != 0 && i < KLG_SEMMNI; i++)        // key 0 = IPC_PRIVATE
+        if (g_sems[i].used && g_sems[i].key == key) { id = i; break; }
+    if (id >= 0) {
+        int e = 0;
+        if ((flags & KLG_IPC_CREAT) && (flags & KLG_IPC_EXCL)) e = EEXIST;
+        else if (nsems > g_sems[id].nsems) e = EINVAL;
+        pthread_mutex_unlock(&g_sem_lock);
+        if (e) { errno = e; return -1; }
+        return id;
+    }
+    if (key != 0 && !(flags & KLG_IPC_CREAT)) { pthread_mutex_unlock(&g_sem_lock); errno = ENOENT; return -1; }
+    if (nsems == 0) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
+    for (int i = 0; i < KLG_SEMMNI; i++) if (!g_sems[i].used) { id = i; break; }
+    if (id < 0) { pthread_mutex_unlock(&g_sem_lock); errno = ENOSPC; return -1; }
+    unsigned gen = g_sems[id].gen;
+    memset(&g_sems[id], 0, sizeof g_sems[id]);
+    g_sems[id].used = 1; g_sems[id].key = key; g_sems[id].nsems = nsems;
+    g_sems[id].mode = flags & 0777; g_sems[id].gen = gen + 1;
+    g_sems[id].ctime = (long)time(NULL);
+    pthread_mutex_unlock(&g_sem_lock);
+    return id;
+}
+
+// glibc/aarch64 struct semid_ds (asm-generic semid64_ds): ipc_perm is 48 bytes,
+// then otime, ctime, nsems and two reserved words — 88 in all.
+typedef struct {
+    int32_t key; uint32_t uid, gid, cuid, cgid, mode;
+    uint16_t seq, pad2; uint64_t res1, res2;
+    int64_t otime, ctime; uint64_t nsems, res3, res4;
+} klg_semid_ds;
+_Static_assert(sizeof(klg_semid_ds) == 88, "glibc aarch64 struct semid_ds");
+
+// arg is the union semun, which the guest passes by value in x3.
+static int klg_semctl(int id, int num, int cmd, uintptr_t arg) {
+    cmd &= ~0x100;                                   // IPC_64 means nothing here
+    pthread_mutex_lock(&g_sem_lock);
+    klg_semset *S = klg_sem_get(id);
+    if (!S) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
+    int r = 0, e = 0;
+    int in_range = num >= 0 && num < S->nsems;
+    switch (cmd) {
+    case 0:                                          // IPC_RMID
+        S->used = 0; S->gen++;
+        pthread_cond_broadcast(&g_sem_cond);
+        break;
+    case 1: {                                        // IPC_SET: mode only
+        const klg_semid_ds *d = (const klg_semid_ds *)arg;
+        if (!d) { e = EFAULT; break; }
+        S->mode = (int)(d->mode & 0777); S->ctime = (long)time(NULL);
+        break;
+    }
+    case 2: {                                        // IPC_STAT
+        klg_semid_ds *d = (klg_semid_ds *)arg;
+        if (!d) { e = EFAULT; break; }
+        memset(d, 0, sizeof *d);
+        d->key = S->key;
+        d->uid = d->cuid = (uint32_t)getuid();
+        d->gid = d->cgid = (uint32_t)getgid();
+        d->mode = (uint32_t)S->mode;
+        d->otime = S->otime; d->ctime = S->ctime;
+        d->nsems = (uint64_t)S->nsems;
+        break;
+    }
+    case 11: if (in_range) r = S->pids[num]; else e = EINVAL; break;   // GETPID
+    case 12: if (in_range) r = S->vals[num]; else e = EINVAL; break;   // GETVAL
+    case 13: {                                                         // GETALL
+        unsigned short *a = (unsigned short *)arg;
+        if (!a) { e = EFAULT; break; }
+        memcpy(a, S->vals, (size_t)S->nsems * sizeof *a);
+        break;
+    }
+    case 14: if (in_range) r = S->ncnt[num]; else e = EINVAL; break;   // GETNCNT
+    case 15: if (in_range) r = S->zcnt[num]; else e = EINVAL; break;   // GETZCNT
+    case 16: {                                                         // SETVAL
+        int v = (int)(uint32_t)arg;                  // semun.val: the low word of x3
+        if (!in_range) { e = EINVAL; break; }
+        if (v < 0 || v > KLG_SEMVMX) { e = ERANGE; break; }
+        S->vals[num] = (unsigned short)v; S->pids[num] = 0;
+        S->ctime = (long)time(NULL);
+        pthread_cond_broadcast(&g_sem_cond);
+        break;
+    }
+    case 17: {                                                         // SETALL
+        const unsigned short *a = (const unsigned short *)arg;
+        if (!a) { e = EFAULT; break; }
+        for (int i = 0; i < S->nsems; i++) if (a[i] > KLG_SEMVMX) e = ERANGE;
+        if (e) break;
+        memcpy(S->vals, a, (size_t)S->nsems * sizeof *a);
+        memset(S->pids, 0, sizeof S->pids);
+        S->ctime = (long)time(NULL);
+        pthread_cond_broadcast(&g_sem_cond);
+        break;
+    }
+    default: {
+        // IPC_INFO / SEM_INFO / SEM_STAT: nothing in the corpus asks.
+        static int said;
+        if (!said++) fprintf(stderr, "  [glibc] semctl cmd %d not implemented -> EINVAL\n", cmd);
+        e = EINVAL;
+    }
+    }
+    pthread_mutex_unlock(&g_sem_lock);
+    if (e) { errno = e; return -1; }
+    return r;
+}
+
+// Linux struct sembuf: sem_num, sem_op, sem_flg — 6 bytes.
+typedef struct { unsigned short num; short op; short flg; } klg_sembuf;
+
+static int klg_semtimedop(int id, klg_sembuf *ops, size_t n, const struct timespec *to) {
+    if (n == 0) { errno = EINVAL; return -1; }
+    if (n > 500) { errno = E2BIG; return -1; }       // SEMOPM
+    if (!ops) { errno = EFAULT; return -1; }
+    struct timespec deadline;
+    if (to) {
+        if (to->tv_sec < 0 || to->tv_nsec < 0 || to->tv_nsec >= 1000000000L) { errno = EINVAL; return -1; }
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += to->tv_sec; deadline.tv_nsec += to->tv_nsec;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+    pthread_mutex_lock(&g_sem_lock);
+    klg_semset *S = klg_sem_get(id);
+    if (!S) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
+    unsigned gen = S->gen;
+    for (size_t i = 0; i < n; i++)
+        if (ops[i].num >= S->nsems) { pthread_mutex_unlock(&g_sem_lock); errno = EFBIG; return -1; }
+    for (;;) {
+        if (!S->used || S->gen != gen) { pthread_mutex_unlock(&g_sem_lock); errno = EIDRM; return -1; }
+        // All or nothing, as Linux does. Applied to a scratch copy so an op
+        // list naming the same semaphore twice is judged in order.
+        unsigned short v[KLG_SEMMSL];
+        memcpy(v, S->vals, sizeof v);
+        size_t blk = n;                              // the op that would block
+        int range = 0;
+        for (size_t i = 0; i < n && blk == n; i++) {
+            int cur = v[ops[i].num], op = ops[i].op;
+            if (op < 0 && cur + op < 0) blk = i;
+            else if (op == 0 && cur != 0) blk = i;
+            else if (cur + op > KLG_SEMVMX) { range = 1; break; }
+            else v[ops[i].num] = (unsigned short)(cur + op);
+        }
+        if (range) { pthread_mutex_unlock(&g_sem_lock); errno = ERANGE; return -1; }
+        if (blk == n) {
+            memcpy(S->vals, v, sizeof v);
+            for (size_t i = 0; i < n; i++) S->pids[ops[i].num] = getpid();
+            S->otime = (long)time(NULL);
+            pthread_cond_broadcast(&g_sem_cond);
+            pthread_mutex_unlock(&g_sem_lock);
+            return 0;
+        }
+        if (ops[blk].flg & KLG_IPC_NOWAIT) { pthread_mutex_unlock(&g_sem_lock); errno = EAGAIN; return -1; }
+        unsigned short *cnt = ops[blk].op ? &S->ncnt[ops[blk].num] : &S->zcnt[ops[blk].num];
+        (*cnt)++;
+        int w = to ? pthread_cond_timedwait(&g_sem_cond, &g_sem_lock, &deadline)
+                   : pthread_cond_wait(&g_sem_cond, &g_sem_lock);
+        if (S->gen == gen) (*cnt)--;                 // a removed set was zeroed on reuse
+        if (w == ETIMEDOUT) {
+            int gone = !S->used || S->gen != gen;
+            pthread_mutex_unlock(&g_sem_lock);
+            errno = gone ? EIDRM : EAGAIN;
+            return -1;
+        }
+    }
+}
+static int klg_semop(int id, klg_sembuf *ops, size_t n) { return klg_semtimedop(id, ops, n, NULL); }
 
 // ---------- the table ----------
 enum { DIRECT = 0, ALIAS, STUB_M1, STUB_NULL, STUB_ERR, STUB_ZERO };
@@ -895,7 +1092,8 @@ static const klg_entry g_glibc[] = {
     D("__fpending", klg___fpending), D("__sysconf", klg___sysconf),
     D("sysconf", klg_sysconf),
     D("readlink", klg_readlink),
-    D("semctl", klg_semctl),
+    D("semget", klg_semget), D("semctl", klg_semctl),
+    D("semop", klg_semop), D("semtimedop", klg_semtimedop),
     D("Plat_VirtualAlloc", klg_plat_virtualalloc),
     D("eventfd", klg_eventfd), D("eventfd_read", klg_eventfd_read),
     D("eventfd_write", klg_eventfd_write),
