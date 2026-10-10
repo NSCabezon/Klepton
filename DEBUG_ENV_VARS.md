@@ -2556,6 +2556,37 @@ vendored the whole path refuses by name and none of these do anything.
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
 
+### Pipeline record / replay (`runtime/gfx/kl_fossilize.cpp`, needs `make fossilize`)
+
+Source 2 creates pipelines lazily; through MoltenVK each one the Metal
+compiler has not seen costs 300-1000 ms on the render thread. Adapted from
+Glovebox (MIT). Both unset: no hooks installed, one NULL-pointer branch per
+create call.
+
+- `KL_FOZ_RECORD=<file.foz>` — append every sampler, set/pipeline layout,
+  shader module, render pass and pipeline the guest creates (its own create
+  infos, before our fix-ups) to a Fossilize stream archive. Flushed per record;
+  `KL_FOZ_RECORD_SYNC=0` uses Fossilize's background writer instead.
+- `KL_FOZ_REPLAY=<file.foz|dir>[:...]` — at the guest's first vkCreateDevice,
+  replay those archives through the layer's own entry points (same fix-ups,
+  same MSL) on `KL_FOZ_THREADS` threads (default 4), destroying each pipeline
+  at once: only Metal's compiler cache stays warm. Logs `[foz] replay ...:
+  N pipelines (failed, unparsed) in X s; Y s of compiles, Z over 100 ms`.
+- `KL_FOZ_REPLAY_BLOCK=1` — hold vkCreateDevice until the replay is done
+  (load time instead of racing the guest). Default: background, utility QoS.
+- `KL_VK_STALL_MS=<ms>` — (kl_vulkan.c, always on) a guest
+  vkCreate*Pipelines call at or over this (default 50; 0 = off) logs
+  `pipeline stall: ... (stalls so far: N, T ms total)`; the running totals
+  also ride on the `pipeline warmup` line. Replay threads are not counted.
+- Measuring cold vs warm without wiping the shared Metal cache: any MoltenVK
+  option that changes the MSL or compile options is a fresh cache key
+  (`MVK_CONFIG_FAST_MATH_ENABLED=0`, `MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=0`,
+  `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`, and their combinations) — one
+  cold run per combination.
+- Two Alyx instances at once collide: the second exits on its
+  `source_engine_*.lock` in `$TMPDIR` (give it its own `TMPDIR`), and even then
+  can hang at Steam Audio init right after `semctl cmd 2 not translated`.
+
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
 The Vulkan side of BONELAB. Not part of the runtime yet —

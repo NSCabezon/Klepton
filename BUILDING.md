@@ -46,6 +46,7 @@ where a version is load-bearing it says so.
 | apktool | 2.11.1 | unpacking the guest APKs | `brew install apktool` |
 | ANGLE (vendored, patched) | ANGLE `25e7211`, depot_tools `6afa997` | any real-GL path | `make angle-all` |
 | MoltenVK (vendored, prebuilt) | `v1.4.2` | any Vulkan path (BONELAB, Open Brush, RE4) | `make mvk` |
+| Fossilize (vendored source) | `556da9f` | Alyx pipeline record/replay (**optional**, host `m_boot`) | `make fossilize` |
 | Android NDK | r25c (`25.2.9519653`) | `make guest` only (**optional**) | Android Studio SDK Manager |
 | Vision Pro + Apple Developer account | — | device runs only | — |
 
@@ -150,6 +151,32 @@ source checkout and build intermediates:
 ```bash
 make mvk             # pull the pinned prebuilt + stage all three slices
 ```
+
+## Fossilize (Half-Life: Alyx pipeline warmup)
+
+```bash
+make fossilize       # clone ValveSoftware/Fossilize (MIT) at the pinned rev into vendor-fossilize/
+make build/m_boot    # links runtime/gfx/kl_fossilize.cpp + Fossilize when vendor-fossilize/ exists
+```
+
+Optional: without the checkout `m_boot` links as before and `KL_FOZ_RECORD` /
+`KL_FOZ_REPLAY` do nothing (DEBUG_ENV_VARS.md, Vulkan section). The pipeline
+list itself is game-derived and never goes in git. Rebuild it from your own
+copy of the game with a recipe (offsets + SHA-256 of the game's own SPIR-V,
+no shader code):
+
+```bash
+# Glovebox's recipe (MIT): packages/alyx/pipelines/alyx.recipe in
+# github.com/glovebox-vr/glovebox — for Steam build 25487405
+# (manifests 546561=1436897171613240821, 546564=9198205754520568813)
+python3 tools/alyx_pipelines.py check alyx.recipe
+python3 tools/alyx_pipelines.py build alyx.recipe ../../game/content/game alyx.foz
+# your own recordings (KL_FOZ_RECORD) -> a recipe you may share
+python3 tools/alyx_pipelines.py make mine.recipe ../../game/content/game recorded.foz
+```
+
+Worktrees can share the main checkout's dependencies by symlink:
+`vendor/out -> ../../Klepton/vendor/out`, `vendor-moltenvk -> ../Klepton/vendor-moltenvk`.
 
 ---
 
