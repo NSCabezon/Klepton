@@ -63,7 +63,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_driver.c \
            runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gpu_time.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \

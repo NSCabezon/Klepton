@@ -1,6 +1,7 @@
 // See kl_app.h.
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>              // ceil — the pacer's divider (KL_GUEST_PACE_HZ)
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
 #include <pthread.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@
 #include "kl_audio.h"     // kl_audio_set_latency_ms — streamed audio needs a deeper buffer
 #include "kl_ovrp.h"      // kl_ovrp_set_frame_pacer — the OVRPlugin frame clock
 #include "kl_openxr.h"    // kl_openxr_set_frame_pacer — the OpenXR one
+#include "kl_openvr.h"    // kl_openvr_set_frame_pacer — the OpenVR one (opt-in)
 #include "kl_slink.h"
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
@@ -1072,12 +1074,82 @@ static void guest_finished(void) {
 // render against the last pose it had, not wedge it. A wedged guest is
 // indistinguishable from a crashed one in a device log, and this is exactly the
 // path a backgrounded app takes.
+//
+// KL_GUEST_PACE_DIV=N starts a guest frame only once N poses have been
+// published since the last one: a fixed 1/N of the display rate (45 fps on a
+// 90 Hz panel with N=2) that the compositor reprojects, instead of an uneven
+// 35-45. A guest already N behind is not held.
+//
+// KL_GUEST_PACE_HZ=F instead picks N from the rate poses actually arrive at, so a
+// panel visionOS moves between 90 and 96/100 Hz keeps the guest at or under F
+// (N = ceil(rate / F), at least 1). The rate is measured over ~1 s of
+// publishes, a new N takes effect after two windows agree, and every change of
+// N is logged.
+//
+// Both unset (the default): N = 1, and the wait below is exactly the
+// "published == consumed" one it always was. Alyx (OpenVR) only gets this
+// pacer at all when one of them is set; see kl_app_guest_start.
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) visionos/Sources/kl_app.c
+// guest_pace_wait — without its pace governor and KL_GUEST_PACE_SWITCH.
+static int guest_pace_knobs(unsigned *div, double *hz) {
+    static int read;
+    static unsigned d = 1;
+    static double h;
+    if (!read) {
+        read = 1;
+        d = kl_env_uint("KL_GUEST_PACE_DIV", 1);
+        if (d < 1) d = 1;
+        const char *e = getenv("KL_GUEST_PACE_HZ");
+        h = e && *e ? atof(e) : 0;
+        if (h < 0) h = 0;
+        if (h > 0) printf("[guest] frames paced to ~%.0f fps from the measured display rate (KL_GUEST_PACE_HZ)\n", h);
+        else if (d > 1) printf("[guest] frames paced at 1/%u of the display rate (KL_GUEST_PACE_DIV)\n", d);
+    }
+    if (div) *div = d;
+    if (hz) *hz = h;
+    return h > 0 || d > 1;
+}
+
 static void guest_pace_wait(void) {
+    static unsigned div;
+    static double pace_hz, win_t0;
+    static uint64_t win_p0;
+    if (!div) guest_pace_knobs(&div, &pace_hz);
+    if (pace_hz > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double t = now.tv_sec + now.tv_nsec * 1e-9;
+        pthread_mutex_lock(&g_guest.mu);
+        uint64_t p = g_guest.published;
+        pthread_mutex_unlock(&g_guest.mu);
+        if (!win_t0) { win_t0 = t; win_p0 = p; }
+        else if (t - win_t0 >= 1.0) {
+            double rate = (double)(p - win_p0) / (t - win_t0);
+            unsigned want = (unsigned)ceil(rate / pace_hz - 0.05);
+            if (want < 1) want = 1;
+            // Hysteresis: a new N must hold for two windows in a row, so one
+            // window short of publishes (a hitch, a pose gap) does not flip it.
+            static unsigned pending, seen;
+            if (rate > 20 && want != div) {
+                seen = want == pending ? seen + 1 : 1;
+                pending = want;
+                if (seen >= 2) {
+                    printf("[guest] display %.1f Hz: pacing 1/%u (was 1/%u) -> %.1f fps\n", rate, want, div, rate / want);
+                    fflush(stdout);
+                    div = want;
+                    seen = 0;
+                }
+            } else {
+                seen = 0;
+            }
+            win_t0 = t; win_p0 = p;
+        }
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
     pthread_mutex_lock(&g_guest.mu);
-    while (!g_guest.stop && g_guest.published == g_guest.consumed)
+    while (!g_guest.stop && g_guest.published - g_guest.consumed < div)
         if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
@@ -1201,6 +1273,14 @@ int kl_app_guest_start(void) {
     // frame this driver already initiated, so a pacer there would be the
     // compositor waiting on itself.
     if (g_target->kind == KL_GUEST_UE4) kl_ovrp_set_frame_pacer(guest_pace_wait);
+    // ...and OpenVR's WaitGetPoses for Alyx, but ONLY when a pace knob is set:
+    // unpaced, Alyx's WaitGetPoses has never waited for a publish and still
+    // does not. Paced, the frame's pose is latched after the wait, so the
+    // drawable still carries the anchor the game rendered with
+    // (KL_REPROJECT_DEPTH_MODE=1) and the compositor reprojects the frames
+    // in between.
+    if (g_target->kind == KL_GUEST_GLIBC && guest_pace_knobs(NULL, NULL))
+        kl_openvr_set_frame_pacer(guest_pace_wait);
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the
