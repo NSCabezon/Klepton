@@ -157,6 +157,28 @@ static int ldst(uint32_t w, klx_info *o) {
         if (post) addfld(o, w, KLX_RM, KLX_R);   // Rm == 31 selects the immediate form
         return 1;
     }
+    // Compare-and-swap PAIR: casp{,a,l,al} Rs, Rs+1, Rt, Rt+1, [Rn]. Both pairs
+    // are even-based and each names TWO registers, so x18 appears as the base
+    // of the x18:x19 pair. The Rs pair receives the old memory value; the Rt
+    // pair is only read. The odd partners go into gp_used so scratch never
+    // collides with them. Before this, casp fell into the exclusive class
+    // below, which saw only the base registers (and, for the acquire forms,
+    // not Rs at all), so a pair site got a single-register substitution: an odd
+    // scratch is an unallocated encoding, an even one pairs with the wrong odd.
+    // Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) runtime/kl_x18.c.
+    if ((w & 0xBFA07C00u) == 0x08207C00u) {
+        // Only a PAIR naming x18 needs the pair veneer; x18 as the base
+        // address (Rn) is an ordinary single-register substitution.
+        if (((w >> 16) & 31) == 18 || (w & 31) == 18) o->hazard = KLX_HZ_CASP;
+        addfld(o, w, KLX_RN, KLX_R);
+        addfld(o, w, KLX_RM, KLX_R | KLX_W);
+        addfld(o, w, KLX_RD, KLX_R);
+        unsigned rs = (w >> 16) & 31, rt = w & 31;
+        if (rs != 31) o->gp_used |= 1u << (rs + 1);
+        if (rt != 31) o->gp_used |= 1u << (rt + 1);
+        if (rs & 1 || rt & 1) return 0;          // odd base is unallocated
+        return 1;
+    }
     // Load/store exclusive
     if ((w & 0x3F000000) == 0x08000000) {
         unsigned L = (w >> 22) & 1, o2 = (w >> 23) & 1;
@@ -335,7 +357,10 @@ int klx_decode(uint32_t w, klx_info *o) {
 uint32_t klx_substitute(uint32_t w, const klx_info *info, unsigned reg) {
     for (unsigned i = 0; i < info->nfields; i++) {
         unsigned sh = info->x18[i].shift;
-        w = (w & ~(31u << sh)) | ((reg & 31u) << sh);
+        unsigned r = reg;
+        // A casp pair base must stay even: the whole x18:x19 pair moves.
+        if (info->hazard == KLX_HZ_CASP && sh != KLX_RN) r &= ~1u;
+        w = (w & ~(31u << sh)) | ((r & 31u) << sh);
     }
     return w;
 }
@@ -601,6 +626,15 @@ static uint32_t enc_str(unsigned t, unsigned n, unsigned off) {
     return 0xF9000000u | ((off / 8) << 10) | (n << 5) | t;
 }
 static uint32_t enc_mrs_tpidrro(unsigned t) { return 0xD53BD060u | t; }
+static uint32_t enc_stur(unsigned t, int off) {       // stur xT, [sp, #off]
+    return 0xF8000000u | (((uint32_t)off & 0x1ffu) << 12) | (31u << 5) | t;
+}
+static uint32_t enc_ldur(unsigned t, int off) {       // ldur xT, [sp, #off]
+    return 0xF8400000u | (((uint32_t)off & 0x1ffu) << 12) | (31u << 5) | t;
+}
+static uint32_t enc_mov_reg(unsigned d, unsigned m) { // orr xD, xzr, xM
+    return 0xAA0003E0u | (m << 16) | d;
+}
 static uint32_t enc_movz(unsigned t, uint16_t imm, unsigned shift16) {  // movz xT, #imm, lsl #(16*s)
     return 0xD2800000u | ((uint32_t)shift16 << 21) | ((uint32_t)imm << 5) | t;
 }
@@ -947,6 +981,69 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
                     continue;
                 }
             }
+        }
+
+        // casp with x18:x19 as its Rs or Rt pair. Move that pair into a free
+        // even pair p:p+1 (x18's value from the slot, x19 copied), run the casp
+        // on it, and for Rs (which receives the old memory value) write both
+        // halves back. Needs three scratch registers, so `a` spills separately,
+        // below the pair, in the same red zone the general veneer uses.
+        // Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) runtime/kl_x18.c.
+        //
+        //      stp  p, p+1, [sp, #-16]
+        //      stur a, [sp, #-24]
+        //      mrs  a, tpidrro_el0
+        //      ldr  p, [a, #slot*8]
+        //      mov  p+1, x19
+        //      casp ..., p, p+1, ...
+        //      str  p, [a, #slot*8]   ; Rs pair only
+        //      mov  x19, p+1          ; Rs pair only
+        //      ldur a, [sp, #-24]
+        //      ldp  p, p+1, [sp, #-16]
+        //      b    site+4
+        if (in.hazard == KLX_HZ_CASP) {
+            unsigned rs = (word >> 16) & 31, rt = word & 31, rn = (word >> 5) & 31;
+            int rs18 = rs == 18, rt18 = rt == 18;
+            if (rn == 18 || (rs18 && rt18) || out + VEN_MAX_INSN > pool_end) {
+                note_refusal(word); st->refused++; continue;
+            }
+            uint32_t used = in.gp_used | (1u << 18) | (1u << 19);
+            static const unsigned pairs[] = {8, 10, 12, 14, 16, 6, 4, 2, 0};
+            static const unsigned singles[] = {17, 9, 11, 13, 15, 16, 10, 12, 14, 7, 5, 3, 1};
+            unsigned p = 99, a = 99;
+            for (unsigned j = 0; j < sizeof pairs / sizeof pairs[0] && p == 99; j++)
+                if (!(used & (3u << pairs[j]))) p = pairs[j];
+            if (p != 99) used |= 3u << p;
+            for (unsigned j = 0; j < sizeof singles / sizeof singles[0] && a == 99; j++)
+                if (!(used & (1u << singles[j]))) a = singles[j];
+            if (p == 99 || a == 99) { note_refusal(word); st->refused++; continue; }
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            body[k++] = enc_stp(p, p + 1, -16);
+            body[k++] = enc_stur(a, -24);
+            body[k++] = enc_mrs_tpidrro(a);
+            body[k++] = enc_ldr(p, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_mov_reg(p + 1, 19);
+            body[k++] = klx_substitute(word, &in, p);
+            if (rs18) {
+                body[k++] = enc_str(p, a, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_mov_reg(19, p + 1);
+            }
+            body[k++] = enc_ldur(a, -24);
+            body[k++] = enc_ldp(p, p + 1, -16);
+            ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
         }
 
         // `adr x18, label`: the general veneer with the adr rebuilt as an
