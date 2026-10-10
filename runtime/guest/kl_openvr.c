@@ -56,6 +56,7 @@
 #include "kl_vulkan.h"
 #include "kl_openvr.h"
 #include "kl_reproject.h"
+#include "kl_gpu_time.h"     // KL_GPU_TIME: the frame close and GetFrameTiming
 
 #if __has_include(<vulkan/vulkan.h>)
 #define VK_NO_PROTOTYPES
@@ -953,7 +954,10 @@ static int co_frame_timing(void *s, uint8_t *t, uint32_t frames_ago) {
     memcpy(t + 16, &dropped, 4);
     memcpy(t + 24, &f->t_submit, 8);
     memcpy(t + 32, &work, 4);            // PreSubmitGpuMs
-    memcpy(t + 40, &work, 4);            // TotalRenderGpuMs
+    // KL_GPU_TIME=2: the GPU's own time for the frame (kl_gpu_time.m) instead
+    // of the CPU work, once one is known. Any other value leaves it as it was.
+    float gpu = kl_gpu_time_mode() == 2 ? kl_gpu_time_frame_ms(frames_ago) : 0;
+    memcpy(t + 40, gpu > 0 ? &gpu : &work, 4);   // TotalRenderGpuMs
     memcpy(t + 56, &interval, 4);        // ClientFrameIntervalMs
     if (size >= 96 + sizeof(TrackedDevicePose_t)) memcpy(t + 96, &g_last[0], sizeof(TrackedDevicePose_t));
     return 1;
@@ -1215,9 +1219,20 @@ static void hand_trace_frame(void) {
     t0 = now;
 }
 
+// The guest frame pacer (KL_GUEST_PACE_HZ / KL_GUEST_PACE_DIV): the visionOS
+// app installs one only when a knob is set, and it blocks here until the
+// compositor has published enough poses. NULL — the default, and always on the
+// host — and WaitGetPoses returns at once, as it always has. Before ft_wait, so
+// the time spent held is neither "frame work" (which the head prediction reads
+// as how far ahead the frame is seen) nor anything the frame's pose was taken
+// before: the latch below is the head after the wait.
+static void (*g_frame_pacer)(void);
+void kl_openvr_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
+    if (g_frame_pacer) g_frame_pacer();
     ovr_pipeline_report();
     ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
@@ -2040,6 +2055,7 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         kl_ovrp_frame_end_external(g_stage, g_frame_pose, g_frame_tan);
         pose_trace_report(g_frame_pose);
         ft_submitted();
+        kl_gpu_time_frame_end();            // KL_GPU_TIME; returns at once when unset
 #ifdef KLOVR_VULKAN
         g_frames_for_dump++;
 #endif

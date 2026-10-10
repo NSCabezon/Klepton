@@ -2313,6 +2313,7 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 // so a wakeup cannot slip through the gap.
 #define KL_SYS_futex 98                 // aarch64 Linux
 #define KL_SYS_getrandom 278            // ...and the other one a guest depends on
+#define KL_SYS_tkill 130                // KL_TKILL_PROBE only; see klb_syscall
 #define KL_SYS_tgkill 131
 #define KL_SYS_gettid 178               // ...and the third, via libc++'s guards
 
@@ -2666,6 +2667,15 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         if (a3 == 0 && a1 == (long)getpid() && a2 > 0) return 0;
         errno = ENOSYS;
         return -1;
+    }
+    // tkill(tid, 0) — the same liveness probe without the pid. Adapted from Glovebox (MIT,
+    // github.com/glovebox-vr/glovebox) runtime/linux/kl_glibc.c g_syscall.
+    // Opt-in (KL_TKILL_PROBE=1): unset, it stays on the refused path below and
+    // nothing changes. A real signal (sig != 0) is refused either way.
+    if (n == KL_SYS_tkill) {
+        static int probe = -1;
+        if (probe < 0) { const char *e = getenv("KL_TKILL_PROBE"); probe = e && *e && *e != '0'; }
+        if (probe && a2 == 0 && a1 > 0) return 0;
     }
 
     syscall_warn_once(n, __builtin_return_address(0));

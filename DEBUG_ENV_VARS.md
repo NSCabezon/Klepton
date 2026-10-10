@@ -2478,6 +2478,34 @@ nothing, and prints the unresolved imports grouped by category.
   register, so a genuine call through a NULL pointer looks the same, and
   recovering it turns a named crash into a silent spin — this is how the
   libpangoft2 dependency-dlsym gap was found.
+- `KL_ALYX_PROFILE=glovebox` — (`runtime/guest/kl_glibc.c`) append Glovebox's
+  validated Alyx render convars (adapted from its MIT
+  `packages/alyx/defaults`: DEMO.txt, video2-visionpro-demo.txt,
+  vr_fidelity_fixed_1.0.csv) after `KL_GLIBC_ARGS`, on host and device alike:
+  `r_texture_stream_throttle_count 6`, `r_texture_stream_throttle_amount 20`,
+  `r_texture_stream_max_resolution 2048`,
+  `r_texture_stream_resolution_bias_min 0.8`, `r_texturefilteringquality 4`,
+  `gpu_mem_level 1`, `vr_aoproxy_enable 0`, `vr_depth_prepass 0`,
+  `vr_stencil_hidden_pixels 1`, `vr_hidden_pixels_use_depth 1`,
+  `r_high_quality_shadows 0`, `sc_disable_spotlight_shadows 1`,
+  `vr_single_light_fast_path_sun_cascade_0_texels_per_world 3`,
+  `vr_single_light_fast_path_sun_cascade_1_texels_per_world 0`,
+  `vr_enable_cached_lights 1`, `vr_fast_hologram 1`, `volume_fog_width 128`,
+  `volume_fog_height 128`, `volume_fog_depth 64`,
+  `r_particle_max_detail_level 1`, `cl_particle_fallback_base 1`,
+  `cl_particle_fallback_multiplier 2`, `g_ragdoll_maxcount 5`. Convar names and
+  values only — no Valve file. Left OUT on purpose: resolution, `vr_msaa`,
+  `vr_render_target_scale`, `vr_symmetric_fov` and the fidelity level (we stay
+  level 0 / 2x MSAA on M2), plus their `r_ssao 1` / `r_post_bloom 1` (they
+  raise cost) and the Steam Audio CPU convars. Any other value is logged and
+  ignored; unset appends nothing. Pairs with an A/B of `KL_CP_QUALITY=0.40`
+  (Glovebox's compositor quality; ours defaults to 1.0) and with
+  `KL_GUEST_PACE_HZ=45`.
+- `KL_TKILL_PROBE=1` — (`runtime/libc/kl_libc.c`) answer the raw
+  `tkill(tid, 0)` liveness probe (aarch64 syscall 130) "alive", the way
+  `tgkill(getpid(), tid, 0)` already is for libvideo; a real signal is still
+  refused. Unset, tkill stays on the refused-and-warned-once path. Adapted from
+  Glovebox's `g_syscall`.
 
 ## Spikes (`spikes/`)
 
@@ -2555,6 +2583,19 @@ vendored the whole path refuses by name and none of these do anything.
 - `KL_MVK_DIR=<dir>` — where to load MoltenVK from (default
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
+- `KL_GPU_TIME=1|2` — (`runtime/gfx/kl_gpu_time.m`, adapted from Glovebox's)
+  the GPU's own time per guest frame. Each queue the guest submits on is
+  exported to its MTLCommandQueue, and `-[MTLCommandBuffer commit]` of that
+  queue's buffer class is swizzled to add a completed handler; a frame's GPU
+  time is the union of its buffers' `[GPUStartTime, GPUEndTime]`, closed when
+  OpenVR's second eye is submitted. `1` logs
+  `[perf] gpu time over N frames: A ms avg / W ms worst per frame` (the GPU
+  half of the `[perf] frame seam` line); `2` also reports it to the game as
+  `GetFrameTiming`'s `m_flTotalRenderGpuMs` instead of the CPU work
+  (WaitGetPoses -> Submit) it gets otherwise. Unset or `0`: the swizzle is
+  never installed and nothing is exported. Other queues (compositor, ANGLE)
+  are not timed.
+- `KL_GPU_TIME_LOG=<s>` — the `[perf] gpu time` interval (default 1 s).
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
@@ -2847,7 +2888,24 @@ its next launch; Reset returns to the environment/defaults and forgets it.
   foveation).
 - `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
   ceiling costs memory and per-frame GPU time; the *running* quality is set
-  separately by the render loop.
+  separately by the render loop. For Alyx, A/B try `KL_CP_QUALITY=0.40`
+  (Glovebox's validated value) against the default.
+- `KL_GUEST_PACE_HZ=<fps>` — (`kl_app.c` guest_pace_wait, adapted from
+  Glovebox's) pace the guest to at most `<fps>`: it starts a frame only once N
+  compositor poses have been published since the last one, N =
+  ceil(display rate / fps) measured over ~1 s windows (a new N needs two
+  windows in a row; each change is logged as `[guest] display … Hz: pacing
+  1/N`). `45` on the M2's 90 Hz is 1/2: a fixed 45 fps the compositor
+  reprojects. For Alyx this installs a pacer in OpenVR's `WaitGetPoses`
+  (`kl_openvr_set_frame_pacer`), BEFORE the pose latch and `ft_wait`, so the
+  frame is still declared with the head it rendered from (mode 1 reprojection
+  is unaffected) and the time held is not counted as frame work. Unset, Alyx's
+  `WaitGetPoses` does not wait at all (the old behaviour) and the OpenXR/
+  OVRPlugin guests' pacer waits for one publish as before.
+- `KL_GUEST_PACE_DIV=N` — the fixed form: every Nth published pose (`2` = 45
+  fps at 90 Hz) whatever the display rate. With both set, `KL_GUEST_PACE_HZ`
+  takes over from this N once the display rate has been measured (~2 s). Each wait still gives up after 1 s, so a compositor that stops
+  publishing cannot wedge the guest.
 
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 

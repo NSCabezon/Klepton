@@ -116,6 +116,7 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 #define VK_USE_PLATFORM_METAL_EXT 1
 #include <vulkan/vulkan.h>
 #include "kl_glfb.h"
+#include "kl_gpu_time.h"
 
 #include <zlib.h>
 
@@ -4495,6 +4496,39 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
             info->flags, (int)r, r != VK_SUCCESS ? "  <== UNSUPPORTED" : "");
     return r;
 }
+// KL_GPU_TIME: hand kl_gpu_time.m the MTLCommandQueue behind each queue the
+// guest submits on, once per queue. Never called with the knob unset.
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) runtime/gfx/kl_vulkan.c klvk_gpu_watch.
+static void klvk_gpu_watch(VkQueue q) {
+    static VkQueue seen[8];
+    static _Atomic int nseen;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    int n = nseen;
+    for (int i = 0; i < n; i++) if (seen[i] == q) return;
+    pthread_mutex_lock(&mu);
+    int have = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == q) have = 1;
+    if (!have && nseen < 8) {
+        klvk_device *d = dev_of_queue(q);
+        PFN_vkExportMetalObjectsEXT export_ext = d && real_gdpa
+            ? (PFN_vkExportMetalObjectsEXT)real_gdpa(d->dev, "vkExportMetalObjectsEXT") : NULL;
+        VkExportMetalCommandQueueInfoEXT cq = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT,
+            .queue = q,
+        };
+        VkExportMetalObjectsInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+            .pNext = &cq,
+        };
+        if (export_ext) export_ext(d->dev, &info);
+        if (cq.mtlCommandQueue) kl_gpu_time_watch((void *)cq.mtlCommandQueue);
+        else VKI("no MTLCommandQueue behind guest queue %p; its GPU time is not measured (KL_GPU_TIME)\n", (void *)q);
+        seen[nseen] = q;
+        nseen = nseen + 1;
+    }
+    pthread_mutex_unlock(&mu);
+}
+
 // KL_TRACE: which thread submits guest work. Compared with [thr] createRT this
 // shows whether Unity creates its temp render targets on the same thread that
 // records/submits the frame, or a different one (the temp-RT race hypothesis).
@@ -4510,6 +4544,7 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
                 klvk_tid(), n, cb, fence != VK_NULL_HANDLE);
         }
     }
+    if (kl_gpu_time_mode()) klvk_gpu_watch(q);     // KL_GPU_TIME
     double pf_t0 = pf_on() ? pf_now() : 0;           // [perf-audit] KL_PERF_FRAME
     VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
     if (pf_t0 > 0) {
