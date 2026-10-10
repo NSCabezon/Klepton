@@ -398,12 +398,43 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
+# Valve's Fossilize (ValveSoftware/Fossilize, MIT), fetched by `make fossilize` into
+# vendor-fossilize/ (gitignored) at a pinned revision: the pipeline recorder/replayer behind
+# runtime/gfx/kl_fossilize.cpp (KL_FOZ_RECORD / KL_FOZ_REPLAY). Optional like ANGLE and
+# MoltenVK: with no checkout m_boot links without it and kl_vulkan.c's weak
+# kl_fossilize_install keeps the hooks off. Rules adapted from Glovebox (MIT,
+# github.com/glovebox-vr/glovebox) klepton/Makefile.
+FZ_DIR ?= vendor-fossilize
+FZ_REV := 556da9f
+FZ_SRC := $(FZ_DIR)/fossilize.cpp $(FZ_DIR)/fossilize_db.cpp $(FZ_DIR)/varint.cpp $(FZ_DIR)/path.cpp \
+          $(FZ_DIR)/fossilize_application_filter.cpp
+FZ_INC := -I$(FZ_DIR) -I$(FZ_DIR)/rapidjson/include -I$(FZ_DIR)/khronos -I$(FZ_DIR)/miniz -Iruntime/gfx
+FZ_CXX := clang++ -std=c++17 -g -O2 -arch arm64 -fno-exceptions -Wno-unused-parameter $(FZ_INC)
+ifneq ($(wildcard $(FZ_DIR)/fossilize.hpp),)
+FZ_OBJ := $(patsubst $(FZ_DIR)/%.cpp,build/fz/%.o,$(FZ_SRC)) build/fz/miniz.o build/fz/kl_fossilize.o
+FZ_LIBS := -lc++
+endif
+build/fz/%.o: $(FZ_DIR)/%.cpp
+	@mkdir -p build/fz
+	$(FZ_CXX) -c -o $@ $<
+build/fz/miniz.o: $(FZ_DIR)/miniz/miniz.c
+	@mkdir -p build/fz
+	clang -g -O2 -arch arm64 -c -o $@ $<
+build/fz/kl_fossilize.o: runtime/gfx/kl_fossilize.cpp runtime/gfx/kl_vk_pipe_hooks.h
+	@mkdir -p build/fz
+	$(FZ_CXX) -Wall -c -o $@ $<
+.PHONY: fossilize
+fossilize:
+	@[ -d $(FZ_DIR)/.git ] || git clone -q https://github.com/ValveSoftware/Fossilize.git $(FZ_DIR)
+	git -C $(FZ_DIR) checkout -q $(FZ_REV) && git -C $(FZ_DIR) submodule -q update --init --recursive
+	@echo "Fossilize $(FZ_REV) in $(FZ_DIR); rebuild m_boot to link it"
+
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
+              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS) $(FZ_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-	  runtime/gfx/kl_view_mtl.m \
+	  runtime/gfx/kl_view_mtl.m $(FZ_OBJ) $(FZ_LIBS) \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  -framework CoreText -framework CoreGraphics -framework ImageIO \
 	  $(shell pkg-config --libs sdl3)
