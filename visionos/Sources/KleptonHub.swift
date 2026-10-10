@@ -538,6 +538,10 @@ struct HubGameSettingsView: View {
                     }
                 }
 
+                #if canImport(SteamDepot)
+                KLCloudSaveSection(target: game.target)
+                #endif
+
                 sessionsSection
 
                 Section {
@@ -760,6 +764,10 @@ struct HubAppSettingsView: View {
 struct HubLibraryView: View {
     let onPlay: (String) -> Void
     @StateObject private var model = HubLibraryModel()
+    #if canImport(SteamDepot)
+    @ObservedObject private var cloud = KLCloudSaveModel.shared
+    @MainActor private static var openedOnce = false
+    #endif
     @State private var detail: String?
     /// The game whose settings sheet is open.
     @State private var settingsFor: KLHubGameRow?
@@ -779,14 +787,29 @@ struct HubLibraryView: View {
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
-        .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
+        .onAppear {
+            Lifecycle.keepAlive = true; model.checkUpdates()
+            #if canImport(SteamDepot)
+            // Once per app open: a game session ends by closing Klepton, so this is "after quit" —
+            // where a two-way sync sends that session's saves up.
+            if !Self.openedOnce { Self.openedOnce = true; KLCloudSaveModel.shared.syncAll(why: "app open") }
+            #endif
+        }
         .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
     }
 
     private func play(_ target: String) {
         detail = nil          // back to the card, where a refusal is shown
+        #if canImport(SteamDepot)
+        // Steam Cloud saves (off unless turned on for this game): pulled in before the game's
+        // files are prepared, bounded, and finished or cancelled before boot (KleptonCloudSaves.swift).
+        model.checkOwnership(target) {
+            KLCloudSaveModel.shared.syncBeforePlay(target) { model.prepare(target) { onPlay(target) } }
+        }
+        #else
         model.checkOwnership(target) { model.prepare(target) { onPlay(target) } }
+        #endif
     }
 
     private var library: some View {
@@ -843,13 +866,18 @@ struct HubLibraryView: View {
             } else if model.preparing == g.target {
                 HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Preparing the game's files…").font(.callout) }
             }
+            #if canImport(SteamDepot)
+            if let c = klCloudSaveCardLine(g.target) {
+                Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1)
+            }
+            #endif
             if !g.bundled {
                 Text("This build carries no game code (library-only build).").font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 12) {
                 Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil)
+                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil || cloudBusy(g.target))
                 #if canImport(SteamDepot)
                 if model.content[g.target] != nil {
                     Button(manageTitle(st)) { detail = g.target }
@@ -869,6 +897,15 @@ struct HubLibraryView: View {
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    /// A cloud-save sync for this game is running (Play waits for it).
+    private func cloudBusy(_ target: String) -> Bool {
+        #if canImport(SteamDepot)
+        return cloud.running.contains(target)
+        #else
+        return false
+        #endif
     }
 
     private func manageTitle(_ st: HubLibraryModel.Status) -> String {
