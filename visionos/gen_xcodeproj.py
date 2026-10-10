@@ -290,6 +290,8 @@ if IS_HUB:
     # Derives what an APK game's runtime reads (<game>.apk, <tree>/assets, the
     # metadata below) from the data the headset downloaded, before boot.
     swift.append({"name": "KleptonHubPrep.swift", "ref": _fixed("HUBPREPF"), "bld": _fixed("HUBPREPB")})
+    # Steam Cloud saves per game (experimental, off by default); compiled out without SteamDepot.
+    swift.append({"name": "KleptonCloudSaves.swift", "ref": _fixed("HUBCLOUDF"), "bld": _fixed("HUBCLOUDB")})
     swift.append({"name": "../" + HUB_MANIFEST_REL, "ref": _fixed("HUBMANF"), "bld": _fixed("HUBMANB")})
 # Per-session performance summary (the compositor measures, the hub shows it).
 # Every target: the compositor calls it. Fixed ids, so the numbering above is kept.
