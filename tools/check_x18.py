@@ -135,6 +135,13 @@ def check(t_x18, lib):
                 bad_subst.append((addr, word, subst, orig, got))
                 continue
             want = X18.sub(lambda m: f"{m.group(1)}{TEST_REG}", orig)
+            if orig.split()[0].startswith("casp") and re.search(r"\b[xw]18, [xw]19\b", orig):
+                # casp substitutes the whole x18:x19 pair with the even pair
+                # below TEST_REG (see KLX_HZ_CASP). Adapted from Glovebox (MIT,
+                # github.com/glovebox-vr/glovebox) tools/check_x18.py.
+                base = TEST_REG & ~1
+                want = re.sub(r"\b([xw])18, \1(19)\b",
+                              lambda m: f"{m.group(1)}{base}, {m.group(1)}{base+1}", orig)
             if got != want:
                 bad_subst.append((addr, word, subst, want, got))
 
