@@ -70,6 +70,13 @@ typedef struct {
 // into the veneer, and ret is a return-predictor hint whose register is x30's
 // business, not x18's.
 #define KLX_HZ_TERMBR   3
+// casp/caspa/caspl/caspal with x18 as the base of one of its even/odd register
+// PAIRS (x18:x19). A single-register substitution cannot express that — the
+// pair base must stay even, and the odd half is x19, not scratch+1 — so the
+// emitter moves the whole pair into a free even pair, carrying x19 along.
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
+// runtime/kl_x18.h (KLX_HZ_CASP). 14 such sites in the Alyx corpus.
+#define KLX_HZ_CASP     4
 
 // System registers that need translating, which is a different job from x18 but
 // the same machinery: the site is rewritten in place to a branch into a stub
@@ -161,8 +168,9 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 uint64_t kl_x18_ctr_value(void);
 
 // Longest veneer, in instructions. Public because klepton-ld sizes its pool from
-// the site count before it emits anything.
-#define KLX_VEN_MAX_INSN 8
+// the site count before it emits anything. 12 since the casp pair veneer
+// (KLX_HZ_CASP), which is 11 with its branch back.
+#define KLX_VEN_MAX_INSN 12
 
 typedef struct {
     unsigned sites;     // instructions found naming x18
