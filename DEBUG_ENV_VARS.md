@@ -3561,8 +3561,41 @@ parity packets; host and hub must both be v2 (a v1 hub is refused at HELLO).
   - `KL_STREAM_MAX_EYE=<px>` — cap on the longest side per eye (0 = none).
   Alyx submits (HELLO eye 3072x2465): fidelity 0 → 2304x1920/eye (encoded
   4100x1708 under the 7 MP cap), 3 → 2688x2208, 5 → 3072x2400.
-- `KL_STREAM_PACE_MS=8` — spread each frame's packets over this long instead of
-  one burst (0 = burst). A newer frame waiting sends the rest at once.
+- Sender (frame drops / keyframe storms, 2026-10). Root cause of the periodic
+  "33 encoded frames dropped: the sender queue was full" + every frame a
+  keyframe: an UNconnected `sendto()` costs ~0.13-0.16 ms per datagram on this
+  Mac (route + NECP lookup with VPN/network extensions installed) = a ~6-8k
+  packets/s (~50-80 Mbit/s) ceiling; a head turn hit it, an encoded P-frame was
+  dropped, the keyframe that cost was 5-10x bigger, and it snowballed. Now:
+  - video goes out on a second socket on the same port, `connect()`ed to the
+    client (>200k packets/s). `KL_STREAM_CONNECTED_TX=0` = the old sendto.
+    `KL_STREAM_SNDBUF` (8 MiB).
+  - `KL_STREAM_TXQ_MAX=2` — while the sender has this many frames queued or in
+    flight, a new guest frame is NOT encoded ("busy skip"; the reference chain
+    stays whole, the headset reprojects). Encoded frames are dropped only when
+    the 8-slot queue is full (last resort).
+  - `KL_STREAM_IDR_MIN_MS=500` — at most one forced keyframe per this long;
+    requests in between fold into it ("IDR asked/forced/held" in the 1 s line).
+  - Adaptive bitrate, `KL_STREAM_ABR=1`: a congested second (busy skips, queue
+    drops, ENOBUFS) cuts the encoder target x`KL_STREAM_ABR_DOWN` (0.7) or
+    straight to 85% of what the sender got out; 2+ IDR requests (loss) x
+    `KL_STREAM_ABR_LOSS_DOWN` (0.85); +5% of the ceiling per
+    `KL_STREAM_ABR_UP_S` (2) clean seconds. Floor `KL_STREAM_MIN_KBPS` (15% of
+    the ceiling, >= 8000). Retargets the live session (no keyframe), with
+    `DataRateLimits` = `KL_STREAM_RATE_CAP` (1.5) x target over
+    `KL_STREAM_RATE_WIN_S` (0.5 s); `KL_STREAM_RATE_CAP=0` = AverageBitRate only.
+  - Pacing: each frame at `KL_STREAM_PACE_MBPS` (300) but over at most
+    `KL_STREAM_PACE_FRAC` (0.75) of the frame interval (a P-frame leaves in a
+    few ms; a keyframe is spread over ~17 ms at 45 fps). `KL_STREAM_PACE_MS=<ms>`
+    fixes the spread instead (0 = burst). A newer frame waiting sends the rest
+    at once.
+  - `KL_STREAM_TEST_LINK_MBPS=<n>` — the sender blocks as on a link of about
+    this rate (loopback tests of the busy skip + ABR; approximate).
+  - The 1 s line gains `sender: Mbit/s, P n avg/max KB, key n avg/max KB, queue
+    max, busy skips, queue drops, IDR asked/forced/held, pace ms, bitrate`.
+  Real Alyx, loopback, harness `--yaw 20` (a full turn per 18 s), 100 Mbit/s,
+  ~110 s: before p10 19.8 fps / min 12, 29 s under 40 fps, 642 frames lost,
+  304 keyframes; after p10 44.5 / min 43.9, 0 s under 40, 0 lost, 1 keyframe.
 - `KL_STREAM_FEC=10` — one XOR parity packet per N fragments (overhead 1/N);
   any one lost fragment per group is rebuilt on the headset with no keyframe.
   0 = off. Real Alyx, loopback, 1% simulated loss, 100 s: FEC 0 → 274 IDR

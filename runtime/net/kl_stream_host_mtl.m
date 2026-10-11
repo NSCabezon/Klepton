@@ -260,6 +260,25 @@ void kl_stream_enc_close(void) {
     }
 }
 
+// The bitrate: AverageBitRate alone is a long-run target — in a fast head
+// turn the low-latency rate control overshoots it 3-6x for a second or more,
+// which is exactly when the link is tightest. DataRateLimits adds a hard cap:
+// at most KL_STREAM_RATE_CAP (1.5) x the target over any KL_STREAM_RATE_WIN_S
+// (0.5 s). KL_STREAM_RATE_CAP=0: no hard cap.
+static void set_rate(int kbps) {
+    set_num(kVTCompressionPropertyKey_AverageBitRate, (double)kbps * 1000.0);
+    double cap = kl_env_float("KL_STREAM_RATE_CAP", 1.5f);
+    double win = kl_env_float("KL_STREAM_RATE_WIN_S", 0.5f);
+    if (cap <= 0 || win <= 0) return;
+    double bytes = (double)kbps * 1000.0 / 8.0 * cap * win;
+    NSArray *lim = @[ @(bytes), @(win) ];
+    OSStatus s = VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_DataRateLimits,
+                                      (__bridge CFArrayRef)lim);
+    static int said;
+    if (s != noErr && !said++)
+        fprintf(stderr, SH "DataRateLimits refused (%d) — AverageBitRate only\n", (int)s);
+}
+
 static int enc_open(int w, int h, int kbps, float fps) {
     kl_stream_enc_close();
     NSDictionary *pba = @{
@@ -303,7 +322,7 @@ static int enc_open(int w, int h, int kbps, float fps) {
     set_bool(kVTCompressionPropertyKey_AllowFrameReordering, false);
     VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ProfileLevel,
                          kVTProfileLevel_HEVC_Main_AutoLevel);
-    set_num(kVTCompressionPropertyKey_AverageBitRate, (double)kbps * 1000.0);
+    set_rate(kbps);
     set_num(kVTCompressionPropertyKey_ExpectedFrameRate, fps);
     set_num(kVTCompressionPropertyKey_MaxKeyFrameInterval, 1000000);
     set_num(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 100000);
@@ -331,9 +350,14 @@ int kl_stream_enc_frame(int stage, int w, int h, int kbps, float fps, int force_
         id<MTLTexture> src[2] = { (__bridge id<MTLTexture>)tp[0],
                                   tp[1] ? (__bridge id<MTLTexture>)tp[1] : nil };
         if (!metal_up(src[0].device)) return -1;
-        if (!g_vt || w != g_w || h != g_h || kbps != g_kbps || fps != g_fps) {
+        if (!g_vt || w != g_w || h != g_h || fps != g_fps) {
             if (enc_open(w, h, kbps, fps) != 0) return -1;
             force_idr = 1;
+        } else if (kbps != g_kbps) {
+            // The adaptive bitrate: retarget the live session. A new session
+            // would cost a keyframe — the very thing a congested link can't take.
+            set_rate(kbps);
+            g_kbps = kbps;
         }
         // A bounded queue: if the encoder already holds this many frames it is
         // not keeping up, and queueing more only adds latency — skip this one.

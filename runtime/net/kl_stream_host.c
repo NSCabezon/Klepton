@@ -27,9 +27,20 @@
 //   KL_STREAM_MAX_EYE=0          cap on the auto eye size's longest side (0 = none)
 //   KL_STREAM_MAX_MPIX=7.0       cap on the auto frame's megapixels, both eyes (0 = none):
 //                                the encoder's 45 fps budget (~2.4 ms/MP on M1 Max)
-//   KL_STREAM_PACE_MS=8          spread each frame's packets over this long (0 = burst)
+//   KL_STREAM_PACE_MBPS=300      pace each frame's packets at this rate...
+//   KL_STREAM_PACE_FRAC=0.75     ...but over at most this fraction of the frame interval
+//   KL_STREAM_PACE_MS=<unset>    set: a fixed spread per frame instead (0 = burst)
+//   KL_STREAM_TXQ_MAX=2          frames queued/sending before a guest frame is not
+//                                encoded (busy skip; never drop an encoded frame)
+//   KL_STREAM_IDR_MIN_MS=500     at most one forced keyframe per this long
+//   KL_STREAM_ABR=1              adaptive bitrate (stats_tick): down x KL_STREAM_ABR_DOWN
+//                                (0.7) on a congested second (x0.85 on 2+ IDR asks), up 5% per
+//                                KL_STREAM_ABR_UP_S (2) clean ones, floor KL_STREAM_MIN_KBPS
+//   KL_STREAM_CONNECTED_TX=1     send video on a connect()ed socket (0 = sendto, slow)
+//   KL_STREAM_SNDBUF=8388608     SO_SNDBUF of the sockets
 //   KL_STREAM_FEC=10             one XOR parity packet per N fragments (0 = off)
 //   KL_STREAM_TEST_DROP=0        drop this fraction of VIDEO packets (loss tests)
+//   KL_STREAM_TEST_LINK_MBPS=0   the sender blocks as on a link this fast (loopback tests)
 //   KL_STREAM_WAIT=1             wait for the first HELLO before booting the guest
 //                                (0 = boot now with the built-in Vision Pro defaults)
 //   KL_STREAM_TIMEOUT_MS=2000    no POSE for this long = client gone
@@ -106,7 +117,20 @@ static struct {
     float    tan[2][4];
 } C;
 static int g_guest_running;        // set once the guest thread exists
-static volatile int g_idr;         // force a keyframe on the next frame
+static volatile int g_idr;         // a keyframe is wanted (granted at most every KL_STREAM_IDR_MIN_MS)
+static double g_last_key_t = -1e9; // host time the last keyframe was handed to the encoder
+// The video socket: a second socket on the same port, connect()ed to the
+// client. An UNconnected sendto() costs a route + NECP policy lookup per
+// datagram — measured ~0.13-0.16 ms each on a Mac with VPN/network extensions
+// installed, i.e. a ceiling of ~6-8k packets/s (~60-80 Mbit/s) that a 6K
+// keyframe hits at once. A connected socket skips that: >200k packets/s.
+// SO_REUSEPORT on both; the connected one is the more specific match, so the
+// client's own packets arrive on it (the net thread reads both). Never
+// closed — a new client re-connect()s it — so a send racing a reconnect
+// cannot hit a recycled descriptor.
+static int g_tx_fd = -1;
+static int g_tx_fd_ok;             // connected to C.addr
+static int g_sndbuf;               // what SO_SNDBUF was granted
 static uint32_t g_seq[16];         // per-type send sequence
 static uint32_t g_frame_id;
 static double g_pace_period, g_pace_next;   // KL_STREAM_LOCK_FPS (pace_wait)
@@ -137,7 +161,26 @@ static struct {
     double   enc_sum, enc_sq, enc_max;
     unsigned enc_n;
     unsigned audio_pkts, audio_frames;   // AUDIO sent this window
+    // the sender, per window (KL_STREAM_HOST_TXLOG line)
+    unsigned p_n, k_n;                   // P / key frames sent
+    uint64_t p_bytes, k_bytes;
+    size_t   p_max, k_max;
+    unsigned q_max;                      // deepest the sender queue got
+    unsigned busy_skips;                 // guest frames not encoded: the sender was behind
+    unsigned idr_req, idr_forced, idr_deferred;   // client asks / keyframes forced / asks held back
+    double   pace_ms;
 } S;
+
+// ---- adaptive bitrate ----------------------------------------------------------
+// The encoder's AverageBitRate follows the link: down by KL_STREAM_ABR_DOWN
+// (x0.7) on a second with pressure — the sender fell behind (busy skips, queue
+// drops), the client lost frames (IDR_REQUEST), the socket refused (ENOBUFS) —
+// and back up by 5% of the ceiling per KL_STREAM_ABR_UP_S (2) clean seconds.
+// The ceiling is the session's C.kbps; the floor KL_STREAM_MIN_KBPS (15% of
+// it, at least 8000). A change is a property set on the live session, never a
+// new encoder (which would cost a keyframe). KL_STREAM_ABR=0 holds C.kbps.
+static volatile int g_abr_kbps;      // current target; 0 = not started
+static int g_abr_clean;              // consecutive seconds without pressure
 
 static void hdr_init(kl_stream_hdr *h, uint16_t type) {
     h->magic = KL_STREAM_MAGIC;
@@ -162,9 +205,35 @@ static const char *addr_str(const struct sockaddr_storage *a, char *buf, size_t 
     return buf;
 }
 
+// Address + port as IPv6 (an IPv4 address as its v4-mapped form): the
+// listening socket reports a v4 peer as ::ffff:a.b.c.d, the connected video
+// socket's recvfrom as a plain sockaddr_in — the same client either way.
+static int addr_norm(const struct sockaddr_storage *a, socklen_t al,
+                     struct in6_addr *ip, uint16_t *port, uint32_t *scope) {
+    if (a->ss_family == AF_INET6 && al >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)a;
+        *ip = s6->sin6_addr; *port = s6->sin6_port; *scope = s6->sin6_scope_id;
+        return 1;
+    }
+    if (a->ss_family == AF_INET && al >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)a;
+        memset(ip, 0, sizeof *ip);
+        ip->s6_addr[10] = ip->s6_addr[11] = 0xff;
+        memcpy(&ip->s6_addr[12], &s4->sin_addr, 4);
+        *port = s4->sin_port; *scope = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static int addr_eq(const struct sockaddr_storage *a, socklen_t al,
                    const struct sockaddr_storage *b, socklen_t bl) {
-    return al == bl && memcmp(a, b, al) == 0;
+    struct in6_addr ia, ib;
+    uint16_t pa, pb;
+    uint32_t sa, sb;
+    if (!addr_norm(a, al, &ia, &pa, &sa) || !addr_norm(b, bl, &ib, &pb, &sb))
+        return al == bl && memcmp(a, b, al) == 0;
+    return pa == pb && sa == sb && memcmp(&ia, &ib, sizeof ia) == 0;
 }
 
 // Send to the current client. From any thread: sendto on one UDP socket is
@@ -177,10 +246,13 @@ static int send_client(const void *buf, size_t n) {
     pthread_mutex_lock(&g_mu);
     int on = C.active;
     a = C.addr; al = C.addr_len;
+    int cfd = g_tx_fd_ok ? g_tx_fd : -1;
     pthread_mutex_unlock(&g_mu);
     if (!on || g_fd < 0) return -1;
     for (int tries = 0; tries < 200; tries++) {
-        if (sendto(g_fd, buf, n, 0, (const struct sockaddr *)&a, al) == (ssize_t)n) return 0;
+        ssize_t r = cfd >= 0 ? send(cfd, buf, n, 0)
+                             : sendto(g_fd, buf, n, 0, (const struct sockaddr *)&a, al);
+        if (r == (ssize_t)n) return 0;
         if (errno != ENOBUFS && errno != EAGAIN) break;
         S.retries++;
         usleep(50);
@@ -192,6 +264,60 @@ static int send_client(const void *buf, size_t n) {
 static void send_to(const struct sockaddr_storage *a, socklen_t al, const void *buf, size_t n) {
     sendto(g_fd, buf, n, 0, (const struct sockaddr *)a, al);
 }
+
+static int bind_port_socket(int reuseport) {
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int off = 0, one = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (reuseport) setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+    int big = kl_env_int("KL_STREAM_SNDBUF", 8 << 20);
+    while (big > (256 << 10) && setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof big) != 0) big /= 2;
+    big = 4 << 20;
+    while (big > (256 << 10) && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &big, sizeof big) != 0) big /= 2;
+    struct sockaddr_in6 a;
+    memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    a.sin6_len = sizeof a;
+    a.sin6_port = htons((uint16_t)g_port);
+    a.sin6_addr = in6addr_any;
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+// Point the video socket at the (new) client. Net thread, g_mu held.
+static void tx_fd_connect_locked(void) {
+    g_tx_fd_ok = 0;
+    if (!kl_env_on("KL_STREAM_CONNECTED_TX", 1)) return;
+    if (g_tx_fd < 0) {
+        g_tx_fd = bind_port_socket(1);
+        if (g_tx_fd < 0) {
+            fprintf(stderr, SH "video socket: bind :%d failed (%s) — sending with sendto, slower\n",
+                    g_port, strerror(errno));
+            return;
+        }
+        socklen_t l = sizeof g_sndbuf;
+        getsockopt(g_tx_fd, SOL_SOCKET, SO_SNDBUF, &g_sndbuf, &l);
+    }
+    if (connect(g_tx_fd, (const struct sockaddr *)&C.addr, C.addr_len) != 0) {
+        fprintf(stderr, SH "video socket: connect failed (%s) — sending with sendto, slower\n",
+                strerror(errno));
+        return;
+    }
+    g_tx_fd_ok = 1;
+    fprintf(stderr, SH "video socket connected to the client (SO_SNDBUF %d KiB)\n", g_sndbuf >> 10);
+}
+
+// A keyframe is wanted (the client lost a frame, or the sender had to drop
+// one). Granted by the frame thread at most every KL_STREAM_IDR_MIN_MS, so a
+// burst of requests is ONE keyframe, never a storm of them.
+static void want_idr(void) { g_idr = 1; }
 
 // ---- display description -> kl_ovrp ------------------------------------------
 
@@ -318,10 +444,14 @@ static void on_hello(const kl_stream_hello *m, size_t n,
         C.fps = kl_env_float("KL_STREAM_FPS", lock_fps() > 0 ? lock_fps() : 60.0f);
         C.addr = *from; C.addr_len = fl;
         C.active = 1;
+        tx_fd_connect_locked();
+        g_abr_kbps = kbps;
+        g_abr_clean = 0;
         // A new session numbers its poses from scratch, so a pose_id the guest
         // rendered with in a previous session must not be echoed as one of
         // this client's: frames until its first POSE is drawn go out with 0.
         memset(g_pose_ring, 0, sizeof g_pose_ring);
+        g_last_key_t = -1e9;   // the new client's first frame is a keyframe, now
         g_idr = 1;
         fprintf(stderr, SH "client %s connected: streaming %s%dx%d HEVC at %d kbit/s, %.0f fps target%s\n",
                 who, auto_size() ? "(until the guest submits) " : "", C.frame_w, C.frame_h, C.kbps,
@@ -376,9 +506,24 @@ static void on_pose(const kl_stream_pose *m, size_t n,
     }
 }
 
-static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storage *from,
+static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storage *from_in,
                       socklen_t fl) {
     if (n < sizeof(kl_stream_hdr)) return;
+    // Everything downstream (C.addr, replies through the dual-stack listening
+    // socket, connect()) wants the IPv6 form; the video socket reports a v4
+    // peer as AF_INET.
+    struct sockaddr_storage f6;
+    const struct sockaddr_storage *from = from_in;
+    if (from_in->ss_family == AF_INET) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&f6;
+        uint32_t scope;
+        memset(&f6, 0, sizeof f6);
+        s6->sin6_family = AF_INET6;
+        s6->sin6_len = sizeof *s6;
+        addr_norm(from_in, fl, &s6->sin6_addr, &s6->sin6_port, &scope);
+        from = &f6;
+        fl = sizeof *s6;
+    }
     kl_stream_hdr h;
     memcpy(&h, buf, sizeof h);
     if (h.magic != KL_STREAM_MAGIC) return;
@@ -389,8 +534,8 @@ static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storag
         on_pose((const kl_stream_pose *)buf, n, from, fl);
         break;
     case KL_STREAM_IDR_REQUEST:
-        g_idr = 1;
-        fprintf(stderr, SH "IDR requested by the client\n");
+        want_idr();
+        S.idr_req++;   // counted in the 1 s line, and a loss signal for the ABR
         break;
     case KL_STREAM_PING:
         if (n >= sizeof(kl_stream_ping)) {
@@ -466,6 +611,51 @@ static void stats_tick(double dt) {
     if (S.queue_drops) fprintf(stderr, SH "  %u encoded frames dropped: the sender queue was full\n",
                                S.queue_drops);
     if (S.retries) fprintf(stderr, SH "  %u sends retried on a full interface queue (ENOBUFS)\n", S.retries);
+    // The adaptive bitrate's step, then the sender's line.
+    // Congestion (the sender itself fell behind or was refused) cuts hard;
+    // loss alone (the client asked for keyframes more than once) gently —
+    // Wi-Fi drops packets without being full, and FEC + one keyframe cover it.
+    int congested = S.busy_skips > 1 || S.queue_drops || S.retries > 20 || S.send_err;
+    int lossy = S.idr_req >= 2;
+    int pressure = congested || lossy;
+    int kmax = C.kbps, kprev = g_abr_kbps;
+    if (on && kmax > 0 && kl_env_on("KL_STREAM_ABR", 1)) {
+        int kmin = kl_env_int("KL_STREAM_MIN_KBPS", kmax * 15 / 100 > 8000 ? kmax * 15 / 100 : 8000);
+        if (kmin > kmax) kmin = kmax;
+        int k = kprev > 0 ? kprev : kmax;
+        if (pressure) {
+            k = (int)(k * (congested ? kl_env_float("KL_STREAM_ABR_DOWN", 0.7f)
+                                     : kl_env_float("KL_STREAM_ABR_LOSS_DOWN", 0.85f)));
+            // A congested sender was busy all second: what it got out IS the
+            // link's rate. Go straight under it rather than in 0.7x steps
+            // (100 -> 70 -> 49 -> 34 Mbit/s was 3-4 s of low fps per turn).
+            int sent_kbps = (int)((double)S.bytes * 8.0 / 1000.0 / dt);
+            if (congested && S.busy_skips > 5 && sent_kbps * 85 / 100 < k) k = sent_kbps * 85 / 100;
+            g_abr_clean = 0;
+        } else if (++g_abr_clean >= kl_env_int("KL_STREAM_ABR_UP_S", 2)) {
+            k += kmax / 20;
+            g_abr_clean = 0;
+        }
+        if (k < kmin) k = kmin;
+        if (k > kmax) k = kmax;
+        g_abr_kbps = k;
+    } else if (on) {
+        g_abr_kbps = kmax;
+    }
+    if (f || S.busy_skips || S.queue_drops) {
+        fprintf(stderr, SH "  sender: %.1f Mbit/s, P %u avg %.0f max %.0f KB, key %u avg %.0f max %.0f KB, "
+                           "queue max %u, busy skips %u, queue drops %u, IDR asked %u forced %u held %u, "
+                           "pace %.1f ms, bitrate %d kbit/s%s%s\n",
+                (double)S.bytes * 8.0 / 1e6 / dt, S.p_n, S.p_n ? S.p_bytes / 1024.0 / S.p_n : 0.0,
+                S.p_max / 1024.0, S.k_n, S.k_n ? S.k_bytes / 1024.0 / S.k_n : 0.0, S.k_max / 1024.0,
+                S.q_max, S.busy_skips, S.queue_drops, S.idr_req, S.idr_forced, S.idr_deferred,
+                f ? S.pace_ms / f : 0.0, kprev,
+                g_abr_kbps != kprev ? (g_abr_kbps < kprev ? " -> down" : " -> up") : "",
+                g_tx_fd_ok ? "" : " (unconnected sendto)");
+    }
+    S.p_n = S.k_n = 0; S.p_bytes = S.k_bytes = 0; S.p_max = S.k_max = 0;
+    S.q_max = S.busy_skips = S.idr_req = S.idr_forced = S.idr_deferred = 0;
+    S.pace_ms = 0;
     if (f) fprintf(stderr, SH "  pose tag check: frame head vs echoed POSE head differ by %.3f deg "
                            "at worst%s\n", (double)S.tag_err_deg,
                    S.untagged ? " (some frames rendered before this client's first POSE: sent as pose_id 0)" : "");
@@ -490,21 +680,29 @@ static void *net_thread(void *arg) {
     double t_stats = kl_stream_host_now(), t_ping = t_stats;
     double timeout = kl_env_int("KL_STREAM_TIMEOUT_MS", 2000) / 1000.0;
     for (;;) {
-        struct pollfd pf[2] = { { g_fd, POLLIN, 0 }, { -1, POLLIN, 0 } };
-        int np = 1;
-        if (g_dns) { pf[1].fd = DNSServiceRefSockFD(g_dns); np = 2; }
-        int r = poll(pf, (nfds_t)np, 10);
-        if (r > 0 && (pf[0].revents & POLLIN)) {
+        // [0] the listening socket, [1] the video socket (the connected
+        // client's own packets land there), [2] Bonjour.
+        struct pollfd pf[3] = { { g_fd, POLLIN, 0 }, { g_tx_fd, POLLIN, 0 }, { -1, POLLIN, 0 } };
+        if (g_dns) pf[2].fd = DNSServiceRefSockFD(g_dns);
+        int r = poll(pf, 3, 10);
+        for (int k = 0; k < 2 && r > 0; k++) {
+            if (pf[k].fd >= 0 && (pf[k].revents & POLLERR)) {
+                // A connected socket reports the peer's ICMP unreachable here;
+                // reading SO_ERROR clears it (else poll spins on it).
+                int e = 0; socklen_t el = sizeof e;
+                getsockopt(pf[k].fd, SOL_SOCKET, SO_ERROR, &e, &el);
+            }
+            if (pf[k].fd < 0 || !(pf[k].revents & POLLIN)) continue;
             for (;;) {
                 struct sockaddr_storage from;
                 socklen_t fl = sizeof from;
-                ssize_t n = recvfrom(g_fd, buf, sizeof buf, MSG_DONTWAIT,
+                ssize_t n = recvfrom(pf[k].fd, buf, sizeof buf, MSG_DONTWAIT,
                                      (struct sockaddr *)&from, &fl);
                 if (n <= 0) break;
                 on_packet(buf, (size_t)n, &from, fl);
             }
         }
-        if (r > 0 && np == 2 && (pf[1].revents & POLLIN)) DNSServiceProcessResult(g_dns);
+        if (r > 0 && pf[2].fd >= 0 && (pf[2].revents & POLLIN)) DNSServiceProcessResult(g_dns);
         double now = kl_stream_host_now();
         pthread_mutex_lock(&g_mu);
         int gone = C.active && now - C.last_heard > timeout;
@@ -608,26 +806,17 @@ int kl_stream_host_start(const char *guest) {
     g_port = kl_env_int("KL_STREAM_PORT", KL_STREAM_PORT_DEFAULT);
     // One dual-stack socket: the headset may reach the Mac over IPv6
     // link-local as easily as over IPv4.
-    g_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (g_fd < 0) { perror(SH "socket"); return -1; }
-    int off = 0, big = 8 << 20, one = 1;
-    setsockopt(g_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
-    setsockopt(g_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    while (big > (256 << 10) &&
-           setsockopt(g_fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof big) != 0) big /= 2;
-    big = 4 << 20;
-    while (big > (256 << 10) &&
-           setsockopt(g_fd, SOL_SOCKET, SO_RCVBUF, &big, sizeof big) != 0) big /= 2;
-    struct sockaddr_in6 a;
-    memset(&a, 0, sizeof a);
-    a.sin6_family = AF_INET6;
-    a.sin6_len = sizeof a;
-    a.sin6_port = htons((uint16_t)g_port);
-    a.sin6_addr = in6addr_any;
-    if (bind(g_fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    // Bound WITHOUT SO_REUSEPORT, so a second host on this port still fails
+    // here; the option is set after the bind, for the video socket's sake
+    // (tx_fd_connect_locked), which only checks it at its own bind.
+    g_fd = bind_port_socket(0);
+    if (g_fd < 0) {
         fprintf(stderr, SH "bind :%d failed: %s\n", g_port, strerror(errno));
-        close(g_fd); g_fd = -1;
         return -1;
+    }
+    {
+        int one = 1;
+        setsockopt(g_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
     }
     if (!kl_env_on("KL_STREAM_BONJOUR", 1)) {
         fprintf(stderr, SH "Bonjour off (KL_STREAM_BONJOUR=0): reachable by address only\n");
@@ -680,12 +869,20 @@ int kl_stream_host_wait_hello(double timeout_s, const volatile int *quit) {
 
 // ---- frame out ---------------------------------------------------------------------
 
-// The encoder's output goes through a small queue to the sender thread, which
-// paces each frame's packets over KL_STREAM_PACE_MS (kl_stream_tx.c) without
-// holding VideoToolbox's callback thread. When a newer frame is already
-// waiting the current one is sent out at once (`hurry`), so pacing never adds
-// a frame of latency.
-#define TXQ 4
+// The encoder's output goes through a queue to the sender thread, which paces
+// each frame's packets (kl_stream_tx.c) without holding VideoToolbox's
+// callback thread. When a newer frame is already waiting the current one is
+// sent out at once (`hurry`), so pacing never adds a frame of latency.
+//
+// Congestion is handled BEFORE the encoder, never after it: the frame thread
+// does not encode a guest frame while the sender still has KL_STREAM_TXQ_MAX
+// (2) frames queued or in flight (a "busy skip" — the reference chain stays
+// intact, the headset reprojects the last picture). Dropping an ENCODED
+// P-frame breaks every later frame and costs a keyframe, 5-10x the size of a
+// P-frame, which is what used to snowball into a keyframe on every frame
+// ("33 encoded frames dropped: the sender queue was full" each second). The
+// queue below is sized so that a drop is a last resort (TXQ slots).
+#define TXQ 8
 static struct {
     kl_stream_frame_meta m;
     uint8_t *au;
@@ -693,10 +890,18 @@ static struct {
     int      key;
     float    ms_encode;
 } g_txq[TXQ];
-static unsigned g_txq_head, g_txq_tail;      // head = next to send
+static unsigned g_txq_head, g_txq_tail;      // head = next to send (or being sent)
 static pthread_mutex_t g_txq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_txq_cv = PTHREAD_COND_INITIALIZER;
 static volatile int g_tx_hurry;
+
+// Frames queued or being sent.
+static unsigned txq_depth(void) {
+    pthread_mutex_lock(&g_txq_mu);
+    unsigned d = g_txq_tail - g_txq_head;
+    pthread_mutex_unlock(&g_txq_mu);
+    return d;
+}
 
 static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t n,
                        int keyframe, float ms_encode) {
@@ -705,19 +910,23 @@ static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
     memcpy(copy, au, n);
     pthread_mutex_lock(&g_txq_mu);
     if (g_txq_tail - g_txq_head >= TXQ) {
-        // The link is not keeping up: drop this frame and ask for a keyframe,
-        // since every later P-frame would reference it.
+        // Last resort (the frame thread's busy skip should have prevented it):
+        // drop it and ask for ONE keyframe, since every later P-frame would
+        // reference this one. want_idr is rate-limited, so this cannot storm.
         pthread_mutex_unlock(&g_txq_mu);
         free(copy);
         S.queue_drops++;
-        g_idr = 1;
+        want_idr();
         return;
     }
+    if (keyframe) g_last_key_t = kl_stream_host_now();   // also the encoder's own (re-created session)
     unsigned i = g_txq_tail % TXQ;
     g_txq[i].m = *m; g_txq[i].au = copy; g_txq[i].n = n;
     g_txq[i].key = keyframe; g_txq[i].ms_encode = ms_encode;
     g_txq_tail++;
-    g_tx_hurry = g_txq_tail - g_txq_head > 1;
+    unsigned d = g_txq_tail - g_txq_head;
+    if (d > S.q_max) S.q_max = d;
+    g_tx_hurry = d > 1;
     pthread_cond_signal(&g_txq_cv);
     pthread_mutex_unlock(&g_txq_mu);
 }
@@ -725,7 +934,44 @@ static void on_encoded(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
 static int tx_send(void *ctx, void *pkt, size_t n) {
     (void)ctx;
     hdr_init((kl_stream_hdr *)pkt, KL_STREAM_VIDEO);
+    // KL_STREAM_TEST_LINK_MBPS: the sender blocks as if the interface drained
+    // at this rate — a slow link on loopback, for testing the busy skip and
+    // the adaptive bitrate (0 = off).
+    static double link_bps = -1, t_free;
+    if (link_bps < 0) link_bps = kl_env_float("KL_STREAM_TEST_LINK_MBPS", 0.0f) * 1e6;
+    if (link_bps > 0) {
+        double now = kl_stream_host_now();
+        if (t_free < now - 0.002) t_free = now;   // idle: no credit; else absorb sleep overshoot
+        t_free += (double)n * 8.0 / link_bps;
+        double d = t_free - now;
+        if (d > 0.0002) {
+            struct timespec ts = { (time_t)d, (long)((d - (double)(time_t)d) * 1e9) };
+            nanosleep(&ts, NULL);
+        }
+    }
     return send_client(pkt, n);
+}
+
+// How long to spread this frame's packets over. KL_STREAM_PACE_MS set: that,
+// fixed (0 = burst). Unset: at KL_STREAM_PACE_MBPS (300 Mbit/s) — a P-frame
+// leaves in a few ms, no added latency — capped at KL_STREAM_PACE_FRAC (0.75)
+// of the frame interval, so a keyframe is spread over most of its slot
+// instead of hitting the access point as one 400-packet burst.
+static double pace_for(size_t n, float fps) {
+    static int fixed = -1;
+    static double fixed_s, mbps, frac;
+    if (fixed < 0) {
+        const char *e = getenv("KL_STREAM_PACE_MS");
+        fixed = e && *e;
+        fixed_s = kl_env_float("KL_STREAM_PACE_MS", 0.0f) / 1000.0;
+        mbps = kl_env_float("KL_STREAM_PACE_MBPS", 300.0f);
+        frac = kl_env_float("KL_STREAM_PACE_FRAC", 0.75f);
+    }
+    if (fixed) return fixed_s;
+    if (mbps <= 0) return 0;
+    double s = (double)n * 8.0 / (mbps * 1e6);
+    double cap = fps > 0 ? frac / fps : 0.012;
+    return s < cap ? s : cap;
 }
 
 static void send_frame(const kl_stream_frame_meta *m, const uint8_t *au, size_t n,
@@ -740,26 +986,46 @@ static void send_frame(const kl_stream_frame_meta *m, const uint8_t *au, size_t 
     v.host_ms_render = m->ms_render;
     v.host_ms_encode = ms_encode;
     static int fec = -1;
-    static double pace_s, drop;
+    static double drop;
     if (fec < 0) {
         fec = kl_env_int("KL_STREAM_FEC", 10);
-        pace_s = kl_env_float("KL_STREAM_PACE_MS", 8.0f) / 1000.0;
         drop = kl_env_float("KL_STREAM_TEST_DROP", 0.0f);
-        fprintf(stderr, SH "sender: FEC %d (1 XOR parity packet per N fragments, 0 = off), "
-                        "pace %.1f ms per frame (0 = burst), test drop %.3f\n",
-                fec, pace_s * 1000.0, drop);
+        const char *pe = getenv("KL_STREAM_PACE_MS");
+        if (pe && *pe)
+            fprintf(stderr, SH "sender: FEC %d (1 XOR parity packet per N fragments, 0 = off), "
+                            "pace %.1f ms per frame (KL_STREAM_PACE_MS; 0 = burst), test drop %.3f\n",
+                    fec, (double)kl_env_float("KL_STREAM_PACE_MS", 0.0f), drop);
+        else
+            fprintf(stderr, SH "sender: FEC %d (1 XOR parity packet per N fragments, 0 = off), "
+                            "paced at %.0f Mbit/s up to %.0f%% of the frame interval "
+                            "(KL_STREAM_PACE_MBPS / _FRAC; KL_STREAM_PACE_MS=x fixes it), "
+                            "at most %d frames queued (KL_STREAM_TXQ_MAX), test drop %.3f\n",
+                    fec, (double)kl_env_float("KL_STREAM_PACE_MBPS", 300.0f),
+                    100.0 * kl_env_float("KL_STREAM_PACE_FRAC", 0.75f),
+                    kl_env_int("KL_STREAM_TXQ_MAX", 2), drop);
     }
+    pthread_mutex_lock(&g_mu);
+    float fps = C.fps;
+    pthread_mutex_unlock(&g_mu);
+    double pace_s = pace_for(n, fps);
     kl_stream_tx_result r;
     double t_send0 = kl_stream_host_now();
     if (kl_stream_tx_frame(&v, au, n, fec, pace_s, &g_tx_hurry, drop, tx_send, NULL, &r) != 0) {
         fprintf(stderr, SH "frame %u is %zu bytes — more fragments than the protocol can "
                         "number; dropped (lower KL_STREAM_BITRATE_KBPS)\n", m->frame_id, n);
+        want_idr();
         return;
     }
     S.send_ms += (kl_stream_host_now() - t_send0) * 1000.0;
+    S.pace_ms += pace_s * 1000.0;
     S.frames++;
     S.total_frames++;
-    if (keyframe) { S.keyframes++; S.total_key++; }
+    if (keyframe) {
+        S.keyframes++; S.total_key++;
+        S.k_n++; S.k_bytes += n; if (n > S.k_max) S.k_max = n;
+    } else {
+        S.p_n++; S.p_bytes += n; if (n > S.p_max) S.p_max = n;
+    }
     S.packets += r.sent;
     S.parity += r.parity;
     S.dropped += r.dropped;
@@ -1020,9 +1286,30 @@ static void *frame_thread(void *arg) {
             S.untagged++;
         }
         m.frame_id = g_frame_id + 1;
-        int idr = __atomic_exchange_n(&g_idr, 0, __ATOMIC_ACQ_REL);
+        // Busy skip: the sender is still on earlier frames, so this guest frame
+        // is not encoded at all (see "frame out"). Nothing breaks: the next
+        // encoded frame references the last one sent.
+        static int txq_max = -1;
+        if (txq_max < 0) txq_max = kl_env_int("KL_STREAM_TXQ_MAX", 2);
+        if (txq_max > 0 && txq_depth() >= (unsigned)txq_max) { S.busy_skips++; continue; }
+        // The adaptive bitrate (stats_tick), under the session's ceiling.
+        int abr = g_abr_kbps;
+        if (abr > 0 && abr < kbps) kbps = abr;
+        // One keyframe per KL_STREAM_IDR_MIN_MS (500) at most: requests in
+        // between (the client re-asking while the last keyframe is still in
+        // flight, a burst of losses) are folded into the one already sent.
+        static double idr_min = -1;
+        if (idr_min < 0) idr_min = kl_env_int("KL_STREAM_IDR_MIN_MS", 500) / 1000.0;
+        int idr = 0;
+        if (g_idr) {
+            if (kl_stream_host_now() - g_last_key_t >= idr_min)
+                idr = __atomic_exchange_n(&g_idr, 0, __ATOMIC_ACQ_REL);
+            else
+                S.idr_deferred++;
+        }
         int rc = kl_stream_enc_frame(stage, fw, fh, kbps, fps, idr, &m, on_encoded);
         if (rc == -2) S.skipped++;
+        if (rc == 0 && idr) { g_last_key_t = kl_stream_host_now(); S.idr_forced++; }
         if (rc == 0) {
             static double t_prev_enc;
             double tn = kl_stream_host_now();

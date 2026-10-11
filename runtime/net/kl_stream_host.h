@@ -67,7 +67,8 @@ typedef void (*kl_stream_enc_out_fn)(const kl_stream_frame_meta *m,
                                      float ms_encode);
 
 // Compose `stage`'s two eyes side by side into a w x h frame and encode it.
-// (Re)configures the encoder when w/h/kbps/fps change. Returns 0 when a frame
+// (Re)creates the encoder when w/h/fps change; a kbps change retargets the live
+// session (AverageBitRate, no keyframe). Returns 0 when a frame
 // was handed to the encoder, -1 if there was nothing to compose yet, -2 when
 // it was skipped because the encoder already holds KL_STREAM_MAX_INFLIGHT.
 int  kl_stream_enc_frame(int stage, int w, int h, int kbps, float fps,
