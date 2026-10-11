@@ -40,6 +40,12 @@ void klvk_retire_device(VkInstance inst, VkDevice dev);
 // as guest compiles in the "pipeline warmup" / stall report.
 void klvk_set_replay_thread(int on);
 
+// 1 when the guest's density-map pass is foveated by the MoltenVK fork (KL_FOVEATE=1 and the
+// fork's ABI): a replayer then also compiles each scene-pass pipeline with
+// VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT, the variant the game
+// asks for in that mode (different MSL). Call after MoltenVK is loaded (a device exists).
+int klvk_fdm_pipeline_variants(void);
+
 // Weak no-op in kl_vulkan.c; the strong one is kl_fossilize.cpp's, linked only where
 // Fossilize is vendored (make fossilize). Reads the knobs and installs the hooks.
 void kl_fossilize_install(void);

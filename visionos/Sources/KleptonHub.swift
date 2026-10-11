@@ -735,12 +735,14 @@ struct HubGameSettingsView: View {
                         Text("Lower render scale = faster and blurrier. The overscan margin renders "
                              + "past the edge of the view so fast head turns show picture instead of "
                              + "black; extra pixels keep the centre sharp at a GPU cost.\n\n"
-                             + klL("Antialiasing 4× looks smoother but costs ~5 ms of GPU per frame "
-                                   + "(about 30 fps instead of 45 on M2). Foveated rendering keeps the "
-                                   + "centre sharp and lowers the resolution at the edges, saving GPU.",
-                                   "Antialiasing 4× se ve más suave pero cuesta ~5 ms de GPU por imagen "
-                                   + "(unos 30 fps en vez de 45 en M2). El renderizado foveado mantiene "
-                                   + "nítido el centro y baja la resolución en los bordes, ahorrando GPU."))
+                             + klL("Default: antialiasing 4× with foveated rendering. Foveation keeps the "
+                                   + "centre sharp and lowers the resolution at the edges: on M2 it cut GPU "
+                                   + "time by about a third at 4× (18 ms per frame instead of 29). 2× is "
+                                   + "lighter still; without foveation 4× runs at about 30 fps instead of 45.",
+                                   "Por defecto: antialiasing 4× con renderizado foveado. El foveado mantiene "
+                                   + "nítido el centro y baja la resolución en los bordes: en M2 recortó un "
+                                   + "tercio del tiempo de GPU a 4× (18 ms por imagen en vez de 29). 2× es "
+                                   + "aún más ligero; sin foveado, 4× va a unos 30 fps en vez de 45."))
                     }
                 }
 
