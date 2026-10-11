@@ -175,6 +175,31 @@ python3 tools/alyx_pipelines.py build alyx.recipe ../../game/content/game alyx.f
 python3 tools/alyx_pipelines.py make mine.recipe ../../game/content/game recorded.foz
 ```
 
+`make xros` compiles the same files into each visionOS slice of the runtime
+archive when `vendor-fossilize/` exists (kl_vulkan.c then built with
+`-DKL_HAVE_FOSSILIZE`; the app links `-lc++`). On the headset the hub's
+per-game setting "Precompilar gráficos" (Alyx; default off) replays the list
+before the game boots (`KL_FOZ_PREWARM`, DEBUG_ENV_VARS.md) with a
+"Preparando gráficos… n/N" line in the game's window. The list is made on the
+Mac and copied into the hub's container (the hub creates nothing; devicectl
+makes the folders):
+
+```bash
+xcrun devicectl device copy to --device <udid> \
+  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
+  --source alyx.foz --destination Documents/games/alyx/klfz/alyx.foz
+# optional, only for the very first launch: the Mac's record of the game's device.
+# The headset writes its own there on every launch with the setting on, and the
+# prewarm needs one; without it that launch replays on the game's own device.
+xcrun devicectl device copy to --device <udid> \
+  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
+  --source device-info.json --destination Documents/games/alyx/klfz/device-info.json
+```
+
+(`KL_VK_DEVICE_INFO=$PWD/device-info.json ./build/m_boot alyx` writes the Mac's.)
+A single-game build (no hub) keeps its data at `Documents/`, so there the path
+is `Documents/klfz/alyx.foz`.
+
 Worktrees can share the main checkout's dependencies by symlink:
 `vendor/out -> ../../Klepton/vendor/out`, `vendor-moltenvk -> ../Klepton/vendor-moltenvk`.
 

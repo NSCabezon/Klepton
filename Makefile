@@ -821,21 +821,46 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+# Fossilize in the visionOS runtime, when vendored (make fossilize), as on the host: the
+# pipeline recorder/replayer and KL_FOZ_PREWARM (runtime/gfx/kl_fossilize.cpp) compiled per
+# slice into the archive. kl_vulkan.c gets -DKL_HAVE_FOSSILIZE so it carries no weak stubs:
+# from a static archive a weak definition satisfies the reference and kl_fossilize.o would
+# never be pulled in. The app links -lc++ (gen_xcodeproj.py). Without the checkout nothing
+# changes. Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/Makefile.
+XR_TARGET_xros  := -target arm64-apple-xros1.0 -isysroot $(XROS_SDK)
+XR_TARGET_xrsim := -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK)
+XROS_FZ_DEF := $(if $(FZ_OBJ),-DKL_HAVE_FOSSILIZE)
+XROS_FZ_LIBS := $(if $(FZ_OBJ),-lc++)
+define XROS_FZ_RULE
+XROS_FZ_OBJ_$(1) := $(if $(FZ_OBJ),$(patsubst $(FZ_DIR)/%.cpp,build/$(1)/fz_%.o,$(FZ_SRC)) \
+                    build/$(1)/fz_miniz.o build/$(1)/fz_kl_fossilize.o)
+build/$(1)/fz_%.o: $(FZ_DIR)/%.cpp
+	@mkdir -p build/$(1)
+	@$(FZ_CXX) $(XR_TARGET_$(1)) -c -o $$@ $$<
+build/$(1)/fz_miniz.o: $(FZ_DIR)/miniz/miniz.c
+	@mkdir -p build/$(1)
+	@clang -g -O2 -arch arm64 $(XR_TARGET_$(1)) -c -o $$@ $$<
+build/$(1)/fz_kl_fossilize.o: runtime/gfx/kl_fossilize.cpp runtime/gfx/kl_vk_pipe_hooks.h
+	@mkdir -p build/$(1)
+	@$(FZ_CXX) -Wall $(XR_TARGET_$(1)) -c -o $$@ $$<
+endef
+$(foreach p,xros xrsim,$(eval $(call XROS_FZ_RULE,$(p))))
+
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(XROS_FZ_OBJ_xros)
 	@mkdir -p build/xros
-	@rm -f $@
+	@rm -f $@ $(if $(FZ_OBJ),,build/xros/fz_*.o)
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
+	  $(CC) $(XROS_CFLAGS) $(XROS_FZ_DEF) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(XROS_FZ_OBJ_xrsim)
 	@mkdir -p build/xrsim
-	@rm -f $@
+	@rm -f $@ $(if $(FZ_OBJ),,build/xrsim/fz_*.o)
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
+	  $(CC) $(XROS_CFLAGS) $(XROS_FZ_DEF) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xrsim/*.o
 
@@ -844,14 +869,14 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz $(XROS_FZ_LIBS) -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz $(XROS_FZ_LIBS) -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib

@@ -231,4 +231,17 @@ void *kl_vulkan_xr_image_mtl(unsigned long long image);
 // render system insists on one being listed. Off by default.
 void kl_vulkan_advertise_linux_wsi(int on);
 
+// Pipeline prewarm (runtime/gfx/kl_fossilize.cpp, linked only where Fossilize is
+// vendored: `make fossilize`; without it these are stubs that do nothing).
+//
+// kl_foz_prewarm_env: KL_FOZ_PREWARM=<file.foz> — before the guest boots, make a
+// device as the game makes its own (KL_FOZ_DEVICE_INFO, default device-info.json
+// beside the .foz, written by KL_VK_DEVICE_INFO), replay the .foz on it through
+// the layer, destroy it. Blocks. 0 replayed; 1 knob unset; -1 could not; -2 no
+// usable device info (then the game's own vkCreateDevice replays it, blocking).
+int kl_foz_prewarm_env(void);
+// Replay progress for a loading line: 0 no replay this run, 1 replaying, 2 done.
+// `done`/`total`: pipelines compiled / listed so far; `elapsed` seconds.
+int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed);
+
 #endif
