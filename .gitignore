@@ -114,3 +114,5 @@ tools/__pycache__/
 # the start picture from the owner's own copy of the game at build time.
 visionos/Assets.xcassets/AppIcon-*.solidimagestack/
 visionos/Assets.xcassets/StartHero-*.imageset/
+/batman
+/batman/
