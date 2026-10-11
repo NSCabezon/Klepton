@@ -84,6 +84,10 @@ STYLE.md
 # vendored ANGLE toolchain + build, and MoltenVK
 vendor/
 vendor-moltenvk/
+# worktrees symlink it from the main checkout
+/vendor-moltenvk
+# Fossilize (make fossilize)
+/vendor-fossilize/
 fbo_dump/
 tex_dump/
 metal_workload.trace/
