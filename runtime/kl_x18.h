@@ -77,6 +77,7 @@ typedef struct {
 // Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
 // runtime/kl_x18.h (KLX_HZ_CASP). 14 such sites in the Alyx corpus.
 #define KLX_HZ_CASP     4
+#define KLX_HZ_PAIR     KLX_HZ_CASP   // avp-play's name for the same hazard
 
 // System registers that need translating, which is a different job from x18 but
 // the same machinery: the site is rewritten in place to a branch into a stub
@@ -270,6 +271,11 @@ typedef struct {
 // Encodings that were refused, with counts — the work list for extending the
 // decoder. Prints nothing when there are none.
 void kl_x18_report(FILE *f);
+// ...and forget it, for a caller that emits the same image a second time
+// (klepton-ld does when the first pool placement left sites out of reach): the
+// list would otherwise name every refused encoding twice.
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/kl_x18.h.
+void kl_x18_report_reset(void);
 
 // ---------------------------------------------------- data inside code
 //

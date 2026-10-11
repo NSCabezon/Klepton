@@ -251,6 +251,17 @@ static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_net.c
+// System.loadLibrary(name) itself, called straight from managed code through
+// AndroidJavaClass("java.lang.System") rather than through one of the wrappers
+// (Max Mustard does this after its platform init). Same resolution and the same
+// JNI_OnLoad as UnityPlayer.loadLibrary; the boolean is dropped because the
+// Java method returns void.
+static klj_val klj_System_loadLibrary(void *env, void *self, const klj_val *a, int n) {
+    klj_UnityPlayer_loadLibrary(env, self, a, n);
+    return (klj_val){.l = NULL};
+}
+
 // Epic Online Services' own loader: com.epicgames.mobile.eossdk.LibraryLoader
 // .load() is a no-arg System.loadLibrary("EOSSDK") wrapper (ZIX ships
 // libEOSSDK.so). It aborted as an unimplemented Java method; route it through
@@ -265,6 +276,52 @@ static klj_val klj_EOS_LibraryLoader_load(void *env, void *self, const klj_val *
     KLJ_LOG("eossdk LibraryLoader.load() -> %s", h ? "loaded" : "failed");
     klj_run_jni_onload(h, "EOSSDK");
     return (klj_val){.l = NULL};
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_net.c
+// The static EOSSDK helpers libEOSSDK calls back into during
+// EOS_Platform_Create (Cave Crave). verifyPlatformsOptions checks that the APK
+// carries the EOS login redirect setup for the given client — an unmodified
+// APK does, so on a Quest it is true. GetOSVersion answers from the same
+// Build.VERSION.RELEASE the guest reads directly, so the two cannot disagree.
+static klj_val klj_EOS_true(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+static klj_val klj_EOS_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_EOS_GetOSVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *rel = kl_jni_build_string("RELEASE");
+    return (klj_val){.l = kl_jni_new_string(rel ? rel : "10")};
+}
+// The rest are read out of EOSSDK's own bytecode in the state it is in here:
+// init() is a no-op, so mCustomTabsSession/mSharedPreferences are null and no
+// browser resolves. PrewarmURL's null-session arm returns
+// LaunchUrlResult.CUSTOM_TAB_EXCEPTION.Value(), LaunchURL's no-browser arm
+// RESOLVE_ACTIVITY_EXCEPTION (the enum's values equal its ordinals); the
+// keychain without preferences reads "" and refuses writes; the sales market
+// is GetInstallerSourceName(), which maps the null installer
+// PackageManager reports here to "Unknown".
+enum { KLJ_EOS_RESOLVE_ACTIVITY_EXCEPTION = 2, KLJ_EOS_CUSTOM_TAB_EXCEPTION = 4 };
+static klj_val klj_EOS_PrewarmURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_EOS_CUSTOM_TAB_EXCEPTION};
+}
+static klj_val klj_EOS_LaunchURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)n;
+    KLJ_LOG("EOSSDK.LaunchURL(%s) — no browser on this host", klj_str(a[0].l));
+    return (klj_val){.j = KLJ_EOS_RESOLVE_ACTIVITY_EXCEPTION};
+}
+static klj_val klj_EOS_Keychain_ReadValue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+static klj_val klj_EOS_GetSalesMarketIdentifier(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("Unknown")};
 }
 
 // The output devices AudioManager knows about. Answered as an empty array, which
@@ -476,6 +533,7 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getResources",
      "()Landroid/content/res/Resources;", klj_Context_getResources},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    {"java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", klj_System_loadLibrary},
     {"com/epicgames/mobile/eossdk/LibraryLoader", "load", "()V", klj_EOS_LibraryLoader_load},
     // EOSSDK.init(activity) — EOS bring-up after the loader ran. Online/account
     // services; a no-op lets the game boot offline (the platform SDKs are all
@@ -484,6 +542,30 @@ const klj_binding klj_bind_net[] = {
      "(Landroid/app/Activity;)V", klj_void_noop},
     {"com/epicgames/mobile/eossdk/EOSSDK", "init",
      "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_void_noop},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_net.c
+    {"com/epicgames/mobile/eossdk/EOSSDK", "verifyPlatformsOptions",
+     "(Ljava/lang/String;)Z", klj_EOS_true},
+    // The user agent is only stored for the overlay's WebView, which is not here.
+    {"com/epicgames/mobile/eossdk/EOSSDK", "setUserAgent",
+     "(Ljava/lang/String;)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "GetOSVersion",
+     "()Ljava/lang/String;", klj_EOS_GetOSVersion},
+    // Surface.ROTATION_0: a headset is never rotated.
+    {"com/epicgames/mobile/eossdk/EOSSDK", "getDeviceOrientation", "()I", klj_EOS_false},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "PrewarmURL", "(Ljava/lang/String;)J", klj_EOS_PrewarmURL},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "LaunchURL",  "(Ljava/lang/String;)J", klj_EOS_LaunchURL},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "Keychain_ReadValue",
+     "(Ljava/lang/String;)Ljava/lang/String;", klj_EOS_Keychain_ReadValue},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "Keychain_WriteValue",
+     "(Ljava/lang/String;Ljava/lang/String;)Z", klj_EOS_false},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "GetSalesMarketIdentifier",
+     "()Ljava/lang/String;", klj_EOS_GetSalesMarketIdentifier},
+    // The web overlay (a WebView) does not exist here, so it is never enabled.
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "GetEnabledForNextLaunch", "()Z", klj_EOS_false},
+    // ...and its settings have nowhere to go: no WebView to enable or restrict.
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "SetEnabledForNextLaunch", "(Z)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "SetValidDomains",
+     "([Ljava/lang/String;)V", klj_void_noop},
     // Meta Horizon platform client config ctor (ZIX). Meta platform SDK, like
     // the Oculus platform — construct the object (NewObject makes it) and let
     // the ctor be a no-op; the game boots without Horizon platform services.

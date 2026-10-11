@@ -232,3 +232,14 @@ make angle-save      # export vendor/'s delta -> angle-patches/klepton.patch
 make angle-status    # pin, HEAD, local delta, whether the patch is current
 make angle-sync      # force the DEPS re-resolve that angle-fetch skips
 ```
+
+## Notes for visionOS 27+ / Beat Saber 1.40 (from avp-play)
+
+Adapted from avp-play (MIT, github.com/myMartek/avp-play) BUILDING.md.
+
+1. If `make angle-all` fails, run `./update_depot_tools` in `vendor/depot_tools`
+   before retrying.
+2. To avoid being stuck on Beat Saber's interactive first-run screens (language
+   selection / explicit content) on a device, stage the local save profile
+   explicitly:
+   `KLEPTON_TARGET=beatsaber KLT_STAGE_FILES="files" visionos/stage_assets.sh <device-udid>`

@@ -287,6 +287,19 @@ static klj_val klj_SDLA_setWindowStyle(void *env, void *self, const klj_val *a, 
     return (klj_val){.j = 0};
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_sdl.c
+// SDLActivity.setBackButtonTrapEnabled(boolean): whether SDL swallows the
+// Android hardware BACK key instead of letting it finish the activity. Steam
+// Link's shell sets it during startup. There is no hardware back button on
+// visionOS, so nothing is trapped and nothing escapes — a recorded no-op, the
+// same shape as setWindowStyle.
+static klj_val klj_SDLA_setBackButtonTrapEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("setBackButtonTrapEnabled(%d) recorded, not applied (no hardware back button here)",
+            n > 0 ? (int)(int64_t)a[0].j : 0);
+    return (klj_val){.j = 0};
+}
+
 // No haptic devices are presented, so a poll finds no changes — the same answer
 // the real one gives with nothing connected. (The guest already logged "no
 // rumble capable system haptic device found" off the back of this.)
@@ -344,6 +357,7 @@ const klj_binding klj_bind_sdl[] = {
     {"org/libsdl/app/SDL", "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "setActivityTitle", "(Ljava/lang/String;)Z", klj_SDLA_setActivityTitle},
     {KLJ_SDLA, "setWindowStyle", "(Z)V", klj_SDLA_setWindowStyle},
+    {KLJ_SDLA, "setBackButtonTrapEnabled", "(Z)V", klj_SDLA_setBackButtonTrapEnabled},
     {KLJ_SDLA, "getDeviceFormFactor", "()Ljava/lang/String;", klj_SDLA_formFactor},
     {KLJ_SDLA, "isChromebook", "()Z", klj_SDLA_false},
     {KLJ_SDLA, "isDeXMode", "()Z", klj_SDLA_false},
@@ -423,5 +437,20 @@ const klj_binding klj_bind_sdl[] = {
     // the visibility this waits on is a second view we do not have.
     {"com/valvesoftware/steamlink/SteamLink", "showOverlaySurface", "()V", klj_SDLA_null},
     {"com/valvesoftware/steamlink/SteamLink", "hideOverlaySurface", "()V", klj_SDLA_null},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_sdl.c
+    // Device-environment setup the shell does at startup, none of which exists
+    // on visionOS: there is no USB networking, no Android Wi-Fi lock to hold,
+    // and no system Wi-Fi settings screen to open. All inert (void), the same
+    // recorded-no-op shape as the overlay pair above. trySetupUsbNetwork was
+    // the call the Steam Link shell aborted on after setBackButtonTrapEnabled.
+    {"com/valvesoftware/steamlink/SteamLink", "trySetupUsbNetwork", "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "enableWiFiLock",     "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "disableWiFiLock",    "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "openWifiSettings",   "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "setLowLatencyAudio", "(Z)V", klj_SDLA_null},
+    // The audio path here is CoreAudio at a fixed low-latency config, so the
+    // guest's own low-latency toggles have nothing to switch; false keeps it
+    // on the plain path rather than claiming a capability we do not expose.
+    {"com/valvesoftware/steamlink/SteamLink", "shouldEnableLowLatencyOptions", "()Z", klj_SDLA_false},
     {0}
 };

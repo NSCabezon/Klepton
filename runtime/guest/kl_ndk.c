@@ -468,9 +468,23 @@ static void *kl_AAssetManager_openDir(void *mgr, const char *dirname) {
     char path[1200];
     snprintf(path, sizeof path, "%s/%s", g_asset_root, dirname && *dirname ? dirname : ".");
     DIR *d = opendir(path);
-    if (!d) return NULL;
+    if (!d) {
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_ndk.c
+        // Android never answers NULL for a directory the APK does not hold: it
+        // hands back an AAssetDir with no files in it. AC Nexus's Wwise build
+        // (2019.2) leans on that — its SetBasePath "validates" the path with
+        // AAssetManager_openDir even when it is a storage path
+        // (/sdcard/Android/obb/<package>), so a NULL here reads as
+        // AK_PathNotFound, the game logs "Package path couldn't be set" and
+        // never loads Master.pck: every sound bank is missing after that.
+        // Tied to the one target it was seen on; the empty handle below is
+        // already what getNextFileName and close expect (d == NULL).
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t || strcmp(t, "x5812519008825194") != 0) return NULL;
+    }
     kl_assetdir *ad = calloc(1, sizeof *ad);
-    if (!ad) { closedir(d); return NULL; }
+    if (!ad) { if (d) closedir(d); return NULL; }
     ad->d = d;
     return ad;
 }
@@ -679,6 +693,16 @@ static void kl_ANativeActivity_showSoftInput(void *act, unsigned flags) {
     fprintf(stderr, "  [ndk] ANativeActivity_showSoftInput(0x%x) — no soft "
                     "keyboard here\n", flags);
 }
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_ndk.c
+// Window flags (keep-screen-on, fullscreen, ...) have no window manager to go
+// to here. Tea For God sets them at start-up; a no-op is what it needs.
+static void kl_ANativeActivity_setWindowFlags(void *act, unsigned add, unsigned remove) {
+    (void)act; (void)add; (void)remove;
+}
+// The 32-bit off_t spelling of AAsset_seek64; Tea For God imports this one.
+static long kl_AAsset_seek(kl_asset *a, long off, int whence) {
+    return (long)kl_AAsset_seek64(a, off, whence);
+}
 
 // ================================================================== dispatch
 static const struct { const char *name; void *fn; } g_ndk[] = {
@@ -708,6 +732,7 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("AAsset_read",            kl_AAsset_read),
     N("AAsset_getLength64",     kl_AAsset_getLength64),
     N("AAsset_seek64",          kl_AAsset_seek64),
+    N("AAsset_seek",            kl_AAsset_seek),
     N("AAsset_close",           kl_AAsset_close),
     N("AAsset_getLength",       kl_AAsset_getLength),
     N("AAsset_getBuffer",       kl_AAsset_getBuffer),
@@ -742,6 +767,7 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("ANativeActivity_finish",        kl_ANativeActivity_finish),
     N("ANativeActivity_setWindowFormat", kl_ANativeActivity_setWindowFormat),
     N("ANativeActivity_showSoftInput", kl_ANativeActivity_showSoftInput),
+    N("ANativeActivity_setWindowFlags", kl_ANativeActivity_setWindowFlags),
 #undef N
 };
 

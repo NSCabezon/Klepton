@@ -35,6 +35,7 @@
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_audio.h"
+#include "kl_aaudio.h"
 #include "kl_opensl.h"
 
 typedef uint32_t SLuint32;
@@ -210,6 +211,8 @@ typedef struct kl_sl_player {
 
     unsigned rate, channels, bits;          // from the PCM format
     int      mixes;                          // 1: feed kl_audio; 0: usleep-pace only
+    int      heard;                          // has handed over a non-silent buffer
+    int      yielded;                        // silent, standing aside (silent_yield)
     unsigned long consumed;
 } kl_sl_player;
 
@@ -269,6 +272,11 @@ static kl_sl_recorder g_recorder;
 static kl_sl_player g_players[KL_SL_MAX_PLAYERS];
 static int          g_audio_users;     // players that opened kl_audio (refcount)
 static unsigned     g_device_rate;     // the rate the device was opened at (first player)
+
+// A silently paced player that turns out to be the one with sound takes the
+// device — defined with the rest of the device arbitration, near the end.
+static int  pcm_has_sound(const void *pcm, size_t bytes);
+static void take_device(kl_sl_player *p);
 static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long g_buffers_consumed;
 
@@ -300,6 +308,60 @@ static void player_stop(kl_sl_player *p);
 static void player_wait_cb(kl_sl_player *p);   // caller must hold p->lock
 static void recorder_stop(kl_sl_recorder *r);
 static void *rec_feeder(void *arg);
+
+// ---- a silent player stands aside for one that is heard ----
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_opensl.c
+// In this fork KL_SL_SILENT_YIELD defaults ON only for Max Mustard
+// (x5269080709783454), the title it was measured on, and OFF elsewhere so
+// existing targets (Beat Saber, SUPERHOT...) keep the old mixing.
+//
+// Two players at the SAME rate both mix into kl_audio, and kl_audio_write_src
+// serialises its producers on one lock that a writer holds while it waits for
+// room. Max Mustard (Unity 2022.3 + FMOD): Unity's own OpenSL output only ever
+// carries silence, but it writes back-to-back and keeps winning that lock, so
+// FMOD's feeder — the one with the game's sound — got a write in only now and
+// then, fell behind the reader, and was resynced each time: choppy, mostly
+// silent audio with 0 underruns, because the silent stream kept the ring full.
+// Adding silence changes nothing, so a player that has never produced a sample
+// stops writing while another player that HAS is playing; it paces itself with
+// usleep (the short-write path) and releases its mix slot. The first non-silent
+// buffer it hands over puts it back. KL_SL_SILENT_YIELD=0/1 is the A/B.
+static int sl_target_is(const char *name) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    return t && strcmp(t, name) == 0;
+}
+static int another_player_heard(const kl_sl_player *p) {
+    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++) {
+        const kl_sl_player *q = &g_players[i];
+        if (q != p && q->started && q->mixes && q->heard &&
+            q->state == SL_PLAYSTATE_PLAYING) return 1;
+    }
+    return 0;
+}
+static int silent_yield(kl_sl_player *p, const void *buf, SLuint32 size) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_SL_SILENT_YIELD", sl_target_is("x5269080709783454"));
+    if (p->heard || p->bits != 16) return 0;
+    if (pcm_has_sound(buf, size)) {
+        p->heard = 1;
+        if (p->yielded) {
+            p->yielded = 0;
+            fprintf(stderr, "  [sl] player #%d has sound now — mixing again\n",
+                    (int)(p - g_players));
+        }
+        return 0;
+    }
+    if (!on || !another_player_heard(p)) return 0;
+    if (!p->yielded) {
+        p->yielded = 1;
+        kl_audio_src_release(p);
+        fprintf(stderr, "  [sl] player #%d has carried only silence while another "
+                        "is heard — it stops writing to the device\n",
+                (int)(p - g_players));
+    }
+    return 1;
+}
 
 // ---- the feeder ----
 //
@@ -349,7 +411,18 @@ static void *feeder(void *arg) {
         // draining) leaves the remainder to be paced the old way. That keeps one
         // code path for both cases: with no audio, `played` is 0 and this is
         // byte-for-byte the usleep loop it replaced.
-        size_t played = (buf && p->mixes) ? kl_audio_write_src(p, buf, size) : 0;
+        // ...unless this player is paced silently while it is the one with
+        // something to say. See take_device.
+        // KL_SL_TAKE_DEVICE: default ON only for Deadpool VR (x3240283705987790);
+        // elsewhere the first player keeps fixing the rate, as before.
+        static int take_on = -1;
+        if (take_on < 0) take_on = kl_env_on("KL_SL_TAKE_DEVICE", sl_target_is("x3240283705987790"));
+        if (take_on && buf && !p->mixes && p->bits == 16 && kl_audio_peak() == 0 &&
+            !kl_aaudio_output_rate() && pcm_has_sound(buf, size))
+            take_device(p);
+
+        int quiet = buf && p->mixes && silent_yield(p, buf, size);
+        size_t played = (buf && p->mixes && !quiet) ? kl_audio_write_src(p, buf, size) : 0;
         if (played < size) {
             uint64_t rem = ((uint64_t)size - played) / frame;
             useconds_t us = (useconds_t)(rem * 1000000ull / rate);
@@ -412,7 +485,13 @@ static SLresult obj_Realize(SLObjectItf self, SLboolean async) {
         // mismatched-rate player does NOT feed kl_audio; it paces with usleep and
         // stays silent to the device, which is correct when it is the secondary,
         // near-silent output (UE4's here). Same-rate players mix as before.
-        if (g_audio_users == 0) {
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_opensl.c
+        if (g_audio_users == 0 && kl_aaudio_output_rate()) {
+            // The device already belongs to an AAudio stream (see
+            // kl_opensl_yield_device): join it at its rate or stay silent.
+            g_device_rate = kl_aaudio_output_rate();
+            p->mixes = (p->rate == g_device_rate);
+        } else if (g_audio_users == 0) {
             kl_audio_open(p->rate, p->channels, p->bits);
             g_device_rate = p->rate;
             p->mixes = 1;
@@ -598,8 +677,11 @@ static void player_stop(kl_sl_player *p) {
     // others remain, un-pause it so their feeders resume (the pause above hit
     // every feeder, not just this one's).
     if (g_audio_users > 0) g_audio_users--;
-    if (g_audio_users == 0) kl_audio_close();   // only after the join: feeder is the producer
-    else if (any_player_playing()) kl_audio_play();
+    kl_audio_src_release(p);
+    // Only after the join: the feeder is the producer. And not while an AAudio
+    // stream is playing through the same device.
+    if (g_audio_users == 0 && !kl_aaudio_output_rate()) kl_audio_close();
+    else if (g_audio_users && any_player_playing()) kl_audio_play();
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->cb_done);
@@ -1084,4 +1166,79 @@ void kl_opensl_report(FILE *f) {
     kl_audio_report(f);
     for (unsigned i = 0; i < g_nsl; i++)
         fprintf(f, "    unimplemented: %-32s x%u\n", g_sl[i].name, g_sl[i].calls);
+}
+
+// --- two players, one device: the one that is heard keeps it ----------------
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_opensl.c
+// (take_device is gated by KL_SL_TAKE_DEVICE in the feeder; see there.)
+//
+// "The first player fixes the rate" is right when the first player is the real
+// one (vampire: FMOD at 48 kHz, then UE4's near-silent 44.1 kHz output). Marvel's
+// Deadpool VR has it the other way round, and within OpenSL: Unreal's own audio
+// device opens the first player at 44.1 kHz and only ever feeds it silence, and
+// THEN Wwise opens a second OpenSL player at 48 kHz for everything the game
+// plays. That second player was paced silently, so the game had no sound at all
+// (2026-10-09) — the same shape as Moss, where the real stream is AAudio and
+// kl_opensl_yield_device below settles it.
+//
+// Order cannot tell the two cases apart, and neither can the moment a player is
+// realized (nothing has played yet). What can is the PCM itself: when a silently
+// paced player hands over samples that are not silence while the device has
+// carried nothing but silence since it was opened, that player is the one to
+// hear. It takes the device at its own rate, and the players at another rate
+// stop feeding it — they keep their own clock, exactly as before. Once anything
+// audible has gone out, the device stays where it is.
+static int pcm_has_sound(const void *pcm, size_t bytes) {
+    const int16_t *s = (const int16_t *)pcm;
+    for (size_t i = 0, n = bytes / 2; i < n; i++)
+        if (s[i]) return 1;
+    return 0;
+}
+
+static void take_device(kl_sl_player *p) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!p->mixes && kl_audio_peak() == 0) {
+        unsigned was = g_device_rate;
+        if (kl_audio_open(p->rate, p->channels, p->bits) == 0) {
+            kl_opensl_yield_device(p->rate);
+            p->mixes = 1;
+            kl_audio_play();
+            fprintf(stderr, "  [sl] player #%d at %u Hz is the one with sound; the device, "
+                            "opened at %u Hz, has carried only silence — it takes the "
+                            "device\n", (int)(p - g_players), p->rate, was);
+        }
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+// --- two APIs, one device ---------------------------------------------------
+//
+// kl_audio is ONE output at ONE input rate. Within OpenSL that is arbitrated
+// above (the first player fixes the rate, a later mismatched one paces
+// silently). Across APIs nothing arbitrated it, and Moss needs it: Unreal's own
+// audio device opens an OpenSL player at 44.1 kHz that only ever carries
+// silence, and THEN Wwise opens an AAudio stream at 48 kHz for everything the
+// game actually plays. The AAudio open re-created the device at 48 kHz under
+// the OpenSL feeder, which went on writing 44.1 kHz frames into it as a second
+// mix source; Wwise's stream starved, and Wwise answered by closing and
+// reopening it for ever — each close pulling the device from under OpenSL in
+// turn. On device: no sound at all.
+//
+// The later, real stream wins. When AAudio takes the device, every OpenSL
+// player at another rate stops feeding it (it keeps its own clock, exactly as
+// a mismatched second OpenSL player already does).
+int kl_opensl_audio_users(void) { return g_audio_users; }
+void kl_opensl_yield_device(unsigned rate) {
+    if (!g_audio_users || !rate) return;
+    g_device_rate = rate;
+    for (unsigned i = 0; i < sizeof g_players / sizeof g_players[0]; i++) {
+        kl_sl_player *p = &g_players[i];
+        if (!p->started || !p->mixes || p->rate == rate) continue;
+        p->mixes = 0;
+        kl_audio_src_release(p);
+        fprintf(stderr, "  [sl] player #%u at %u Hz yields the device to an AAudio "
+                        "stream at %u Hz — pacing silently from here\n",
+                i, p->rate, rate);
+    }
 }

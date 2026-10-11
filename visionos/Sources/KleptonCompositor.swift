@@ -217,6 +217,9 @@ final class KleptonCompositor {
     private var queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState!
     private var depthState: MTLDepthStencilState?
+    /// The guest's quad layers in the order it submitted them: no test, and
+    /// depth still written. See `overlaysInSubmitOrder`.
+    private var overlayOrderState: MTLDepthStencilState?
     /// Always-pass, no write — for coplanar draws after the first. See where
     /// `depthState` is built for why the two cannot be one.
     private var depthPassState: MTLDepthStencilState?
@@ -508,6 +511,17 @@ final class KleptonCompositor {
     private var cmdCommitted = 0
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
+    // (avp-play, MIT, github.com/myMartek/avp-play) Where a composite
+    // buffer's time on the GPU goes, under cmdLock. "0 past
+    // deadline" only says the ENCODE was on time; a buffer that then sits
+    // behind the guest's rendering on a GPU that does not preempt reaches the
+    // display late all the same, and the system answers by showing every frame
+    // twice (cadence 2.00). `queued` is commit -> the GPU starting it, `ran` is
+    // the pass itself: a long queue with a short run is the guest's load, a
+    // long run is this pass's own cost. Reported with the cadence.
+    private var gpuTimedN = 0
+    private var gpuQueuedSum = 0.0, gpuQueuedMax = 0.0
+    private var gpuRanSum = 0.0, gpuRanMax = 0.0
     private var cmdError: Error?
     // Startup diagnostics for the signal-9 wall: what the last renderFrame saw,
     // surfaced into the alive report, plus a short per-frame trace of the first
@@ -1033,6 +1047,10 @@ final class KleptonCompositor {
                 ods.isDepthWriteEnabled = true
                 overSceneDepthState = device.makeDepthStencilState(descriptor: ods)
             }
+            let dsdOrder = MTLDepthStencilDescriptor()
+            dsdOrder.depthCompareFunction = .always
+            dsdOrder.isDepthWriteEnabled = true
+            overlayOrderState = device.makeDepthStencilState(descriptor: dsdOrder)
 
             // The overlay pass — the guest's non-eye layers, which are the whole
             // of an Unreal title's UI. See encodeOverlays.
@@ -1239,6 +1257,34 @@ final class KleptonCompositor {
             }
         }
         guard sampled > 0 else { return }
+        // ...and the envelope's valleys are filled. The two eyes' dense regions
+        // sit inboard of centre, mirrored, so their per-zone maximum has TWO
+        // peaks with a dip between them — 1.00 either side and 0.83 in the two
+        // middle zones, measured on device — and that dip is in the exact centre
+        // of the guest's picture, where both eyes look. It read as a vertical
+        // crease down the middle of the view, like the fold of a folding screen
+        // (owner, Doom 3, 2026-10-08). Nothing wants fewer samples there: it is
+        // an artefact of combining two curves, not either display's request. So
+        // each zone takes the lower of "the most seen so far from the left" and
+        // "from the right", which leaves a single plateau and only ever adds
+        // samples.
+        func filled(_ q: [Float]) -> [Float] {
+            guard q.count > 2 else { return q }
+            var fromLeft = q, fromRight = q
+            for i in 1..<q.count { fromLeft[i] = max(fromLeft[i - 1], q[i]) }
+            for i in stride(from: q.count - 2, through: 0, by: -1) {
+                fromRight[i] = max(fromRight[i + 1], q[i])
+            }
+            return zip(fromLeft, fromRight).map { min($0, $1) }
+        }
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+        // visionos/Sources/KleptonCompositor.swift. KL_VRR_FILL: default on only
+        // for avp-play's targets (klAvpPlayTarget), so the existing GL targets'
+        // rate maps stay exactly as they were measured.
+        if klEnvOn("KL_VRR_FILL", default: klAvpPlayTarget()) {
+            qx = filled(qx)
+            qy = filled(qy)
+        }
         displayQualityX = qx
         displayQualityY = qy
         // BOTH curves, and y is not decoration: the horizontal one is an
@@ -1291,7 +1337,12 @@ final class KleptonCompositor {
         guard kl_glfb_foveation_wanted(&zones, &edge) != 0 else { return }
         if guestRateMap != nil, guestRateW == w, guestRateH == h { return }
         guard !guestRateRefused else { return }
-        guard device.supportsRasterizationRateMap(layerCount: 1) else {
+        // (avp-play) One layer per slice the guest rasterizes in a pass: a mirrored guest
+        // that draws both eyes at once (OVR_multiview, a layered pass) needs two.
+        // They are the same curve — the compositor unwarps both eyes through
+        // layer 0, so a second layer shaped differently would be unwarped wrong.
+        let layers = max(1, Int(kl_glfb_rate_map_layers()))
+        guard device.supportsRasterizationRateMap(layerCount: layers) else {
             // Said once: this is a property of the GPU, so it will not become
             // true later in the run.
             guestRateRefused = true
@@ -1310,17 +1361,19 @@ final class KleptonCompositor {
         }
         // `__sampleCount:` is the pointer-taking initializer as Swift imports
         // it; the array-taking spelling does not exist here.
-        let layer = qx.withUnsafeBufferPointer { hp in
-            qy.withUnsafeBufferPointer { vp in
-                MTLRasterizationRateLayerDescriptor(
-                    __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
-                    horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+        func makeLayer() -> MTLRasterizationRateLayerDescriptor {
+            qx.withUnsafeBufferPointer { hp in
+                qy.withUnsafeBufferPointer { vp in
+                    MTLRasterizationRateLayerDescriptor(
+                        __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
+                        horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+                }
             }
         }
         let desc = MTLRasterizationRateMapDescriptor()
         desc.screenSize = MTLSize(width: w, height: h, depth: 0)
         desc.label = "klepton guest foveation"
-        desc.setLayer(layer, at: 0)
+        for i in 0..<layers { desc.setLayer(makeLayer(), at: i) }
         guard let map = device.makeRasterizationRateMap(descriptor: desc) else {
             guestRateRefused = true
             NSLog("[cp] makeRasterizationRateMap \(w)x\(h) failed — KL_VRR ignored")
@@ -1334,7 +1387,7 @@ final class KleptonCompositor {
         NSLog("%@", "[cp] guest foveation: screen \(w)x\(h) -> physical "
               + "\(phys.width)x\(phys.height) "
               + "(\(String(format: "%.1f", 100.0 * Double(phys.width * phys.height) / Double(w * h)))% "
-              + "of the fragments, \(qx.count)x\(qy.count) zones, \(source))")
+              + "of the fragments, \(qx.count)x\(qy.count) zones, \(layers) layer(s), \(source))")
         // Held by this property, which is what keeps it alive: kl_glfb takes an
         // unmanaged pointer and never retains, exactly as it does not retain the
         // eye textures.
@@ -2245,10 +2298,20 @@ final class KleptonCompositor {
         // here. Counted, with the first error printed, because "committed but
         // never completed" is otherwise indistinguishable from "completed and
         // drew black".
+        // When this buffer was handed to Metal, on the clock gpuStartTime and
+        // gpuEndTime are expressed in — see gpuQueuedSum.
+        let committedAt = CACurrentMediaTime()
         cmd.addCompletedHandler { [weak self] b in
             guard let self else { return }
             self.cmdLock.lock()
             self.cmdCompleted += 1
+            if b.gpuEndTime > 0 && b.gpuStartTime >= committedAt {
+                let queued = b.gpuStartTime - committedAt
+                let ran = b.gpuEndTime - b.gpuStartTime
+                self.gpuTimedN += 1
+                self.gpuQueuedSum += queued; self.gpuQueuedMax = max(self.gpuQueuedMax, queued)
+                self.gpuRanSum += ran;       self.gpuRanMax = max(self.gpuRanMax, ran)
+            }
             let n = self.cmdCompleted
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
@@ -2776,7 +2839,6 @@ final class KleptonCompositor {
                                   originFromHead: simd_float4x4,
                                   count: Int) -> Int {
         guard let pipeline, let sampler else { return 0 }
-        let grid = identityGrid()
         var drawn = 0
         for i in 0..<min(count, projLayers.count) {
             let pl = projLayers[i]
@@ -2841,6 +2903,31 @@ final class KleptonCompositor {
             if let d = drawn == 0 ? depthState : depthPassState {
                 enc.setDepthStencilState(d)
             }
+            // ...unless the layer's picture was rasterized through a rate map.
+            // Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+            // visionos/Sources/KleptonCompositor.swift, as is the layer grid
+            // below (kl_proj_layer_grid: the identity for a full-texture rect).
+            // A mirrored guest's eyes can be (kl_glfb.c, klfb_mirror_vrr): the
+            // guest then draws into the PHYSICAL part of its swapchain image, the
+            // copy brings that across texel for texel, and this pass has to undo
+            // the squeeze exactly as the eye pass does — or the picture is a
+            // small warped rectangle in one corner of a black view (on device,
+            // 2026-10-08). The map says which textures: only one of its own
+            // screen size was drawn through it. A layer that is also cropped is
+            // not handled here; none of the mirrored guests does both.
+            var foveated = false
+            if let mp = kl_glfb_eye_rate_map(),
+               let rm = Unmanaged<AnyObject>.fromOpaque(mp).takeUnretainedValue()
+                   as? MTLRasterizationRateMap {
+                foveated = rm.screenSize.width == bind0.width
+                    && rm.screenSize.height == bind0.height
+            }
+            // The unwarp grid is ONE block shared by both eyes, where this pass's
+            // uniforms were built for the layer grid's block per eye: left as it
+            // was, eye 1 indexes past the end of the grid and draws nothing.
+            if foveated {
+                for n in uniforms.indices { uniforms[n].grid_eye = 0 }
+            }
             enc.setRenderPipelineState(pipeline)
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
@@ -2848,9 +2935,40 @@ final class KleptonCompositor {
             uniforms.withUnsafeBytes { buf in
                 enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
             }
-            enc.setVertexBuffer(grid, offset: 0, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            // The layer's own grid, not the identity: the picture may be only
+            // part of the texture (kl_ovrp_proj_layer.rect — Source 2's dynamic
+            // resolution), and each eye's part is a block of its own.
+            var layerGrid = [SIMD2<Float>](repeating: .zero,
+                                           count: Int(KL_PROJ_LAYER_GRID_ENTRIES))
+            withUnsafePointer(to: pl) { p in
+                layerGrid.withUnsafeMutableBufferPointer { kl_proj_layer_grid(p, $0.baseAddress) }
+            }
+            if foveated {
+                let (gridBuf, gridVerts, _) =
+                    unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero)
+                // Said once per size: what the grid actually holds, because "the
+                // unwarp ran" and "the unwarp did something" are different claims.
+                if let gridBuf, loggedLayerUnwarp != bind0.width {
+                    loggedLayerUnwarp = bind0.width
+                    let g = gridBuf.contents().bindMemory(to: SIMD2<Float>.self,
+                                                          capacity: gridBuf.length / 8)
+                    let nx = Int(g[0].x), ny = Int(g[0].y)
+                    func at(_ x: Int, _ y: Int) -> SIMD2<Float> { g[1 + y * (nx + 1) + x] }
+                    NSLog("%@", "[cp] layer unwarp: grid \(nx)x\(ny), \(gridVerts) vertices, "
+                          + "uv(0,0)=\(at(0, 0)) uv(mid)=\(at(nx / 2, ny / 2)) "
+                          + "uv(max)=\(at(nx, ny)); texture \(bind0.width)x\(bind0.height) "
+                          + "slices \(bind0.arrayLength); grid_eye "
+                          + "\(uniforms.map { $0.grid_eye }), visible \(uniforms.map { $0.visible })")
+                }
+                enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
+            } else {
+                layerGrid.withUnsafeBytes { buf in
+                    enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 1)
+                }
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            }
             drawn += 1
         }
         // What each layer is ACTUALLY being placed with, said when it CHANGES —
@@ -2892,6 +3010,7 @@ final class KleptonCompositor {
     private var projLayerCount = 0
     nonisolated(unsafe) static var headLockTraceN = 0
     private var identityGridBuffer: MTLBuffer?
+    private var loggedLayerUnwarp = -1
     private var loggedProjMiss = Set<Int>()
     private var lastProjShape = ""
 
@@ -3051,6 +3170,11 @@ final class KleptonCompositor {
             // its behind-everything compare; restore the quad's before drawing.
             if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
             else if depthWrittenThisPass, let s = overSceneDepthState { enc.setDepthStencilState(s) }
+            // ...or, where asked for, the state that lets each quad land over
+            // the ones before it whatever their distances.
+            if Self.overlaysInSubmitOrder, let overlayOrderState {
+                enc.setDepthStencilState(overlayOrderState)
+            }
             enc.setRenderPipelineState(pipe)
             enc.setFragmentTexture(texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
@@ -3070,6 +3194,7 @@ final class KleptonCompositor {
         }
         return drawn
     }
+
     /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:
     /// two float4x4 then four uint, 144 bytes, 16-aligned. One per amplified
     /// view, indexed by [[amplification_id]].
@@ -3099,6 +3224,20 @@ final class KleptonCompositor {
     /// V flips and sRGB decode differ by how the guest authored the panorama;
     /// both are one device run to settle, so they are env-switchable.
     private static let skipHeadLockedOverlays = klEnvOn("KL_OVERLAY_SKIP_HEADLOCKED", default: false)
+    /// Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+    /// visionos/Sources/KleptonCompositor.swift.
+    /// KL_OVERLAY_SUBMIT_ORDER: quad layers are composited in the order the
+    /// guest submitted them, which is what a Quest's compositor does, instead of
+    /// being depth-tested against each other. The eye pass leaves `.greater`
+    /// with writes on in force, so without this a quad stamps its distance over
+    /// its whole rectangle, transparent parts included, and a quad submitted
+    /// after it that lies farther away is cut off along the nearer one's edge —
+    /// where that edge falls moving with the head. Alien: Rogue Incursion's
+    /// interaction labels lost a side that way behind the invisible margin of a
+    /// panel held in the hand (2026-10-09). Default on for that title only.
+    private static let overlaysInSubmitOrder =
+        klEnvOn("KL_OVERLAY_SUBMIT_ORDER",
+                default: ["x24882487241367228", "x5812519008825194"].contains(klTargetName()))
     private static let drawEquirectOverlays = klEnvOn("KL_OVERLAY_EQ", default: true)
     private static let eqFlipY = klEnvOn("KL_EQ_FLIP", default: false)
     private static let eqSrgbDecode = klEnvOn("KL_EQ_SRGB", default: false)
@@ -3162,7 +3301,10 @@ final class KleptonCompositor {
             u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
             u.visible = 1
             u.test = Self.eqTest
-            u.hscale = Self.eqHScale
+            // A layer that states how much of the turn it spans (an OpenXR
+            // equirect layer does) is drawn as stated; the default is for the
+            // ones that cannot say.
+            u.hscale = ov.eq_hscale > 0 ? ov.eq_hscale : Self.eqHScale
             uniforms.append(u)
         }
         enc.setRenderPipelineState(pipe)
@@ -3356,6 +3498,19 @@ final class KleptonCompositor {
     /// here that is known to print, on a wall clock, whatever else has failed.
     /// Reported there rather than on a sample count of its own so that "the
     /// cadence line is missing" can only ever mean "no frames were presented".
+    /// The composite buffers' GPU timing since the last report, and a reset.
+    private func gpuSummary() -> String {
+        cmdLock.lock()
+        let n = gpuTimedN
+        let q = gpuQueuedSum, qm = gpuQueuedMax, r = gpuRanSum, rm = gpuRanMax
+        gpuTimedN = 0; gpuQueuedSum = 0; gpuQueuedMax = 0; gpuRanSum = 0; gpuRanMax = 0
+        cmdLock.unlock()
+        guard n > 0 else { return "" }
+        return String(format: ", composite GPU queued %.1f ms mean / %.1f max, "
+                              + "ran %.1f / %.1f",
+                      q / Double(n) * 1000, qm * 1000, r / Double(n) * 1000, rm * 1000)
+    }
+
     private func cadenceSummary() -> String {
         guard cadenceN > 0 else { return "cadence n/a (no presents yet)" }
         let meanS = cadenceSum / Double(cadenceN)
@@ -3365,6 +3520,7 @@ final class KleptonCompositor {
             + (displayPeriod > 0 ? String(format: " = %.2f periods", periods) : "")
             + ", \(cadenceRepeats)/\(cadenceN) held >=1.5, "
             + "\(missedDeadline) past deadline"
+            + gpuSummary()
             // Only when it has happened: a permanently-zero clause on the one
             // line known to print is noise, and a NON-zero one here is the
             // tracker refusing the instant the composite asked about — which is

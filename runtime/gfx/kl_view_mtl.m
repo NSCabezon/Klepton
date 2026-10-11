@@ -332,23 +332,6 @@ static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
     return v ?: src;
 }
 
-// The identity unwarp grid, built once. The projection-layer pass below binds
-// this rather than klvm_grid_buffer's: a layer's picture is a whole guest
-// swapchain image copied as it is, so there is no rate map to undo and no
-// render viewport smaller than the texture — and the cached grid belongs to the
-// single-eye path, which would thrash between the two shapes.
-static id<MTLBuffer> g_grid_id;
-static id<MTLBuffer> klvm_identity_grid(void) {
-    if (!g_grid_id) {
-        simd_float2 tmp[8];
-        kl_reproject_grid_identity(tmp);
-        g_grid_id = [g_dev newBufferWithBytes:tmp
-                                       length:kl_reproject_grid_entries(1, 1) * sizeof *tmp
-                                      options:MTLResourceStorageModeShared];
-    }
-    return g_grid_id;
-}
-
 // The guest's PROJECTION layers, each drawn as its own quad with its own
 // frustum, in submission order — see kl_ovrp.h. Returns how many were drawn.
 //
@@ -369,8 +352,6 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
     simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
-    id<MTLBuffer> gbuf = klvm_identity_grid();
-    uint32_t gverts = kl_reproject_grid_vertices(1, 1);
     int drawn = 0;
     for (int i = 0; i < n; i++) {
         kl_ovrp_proj_layer pl = list[i];
@@ -401,11 +382,17 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_view_mtl.m.
+        // The layer's own grid, not the identity: the picture may be only part
+        // of the texture (kl_ovrp_proj_layer.rect).
+        simd_float2 lgrid[KL_PROJ_LAYER_GRID_ENTRIES];
+        kl_proj_layer_grid(&pl, lgrid);
+        [enc setVertexBytes:lgrid length:sizeof lgrid atIndex:1];
         [enc setFragmentTexture:t atIndex:0];
         [enc setFragmentTexture:t atIndex:1];
         [enc setFragmentSamplerState:g_samp atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                vertexCount:kl_reproject_grid_vertices(1, 1)];
         drawn++;
     }
     return drawn;
