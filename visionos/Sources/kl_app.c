@@ -434,6 +434,14 @@ int kl_app_configure(const char *resources, const char *container) {
         // with zeros it never fires (device, 2026-10-11). The tremble they were
         // dropped for was the Sense controllers being disconnected.
         setenv("KL_OPENVR_HAND_VEL", "1", 0);
+        // ...and the Touch raw frame on too, which M1 also turned off: with it
+        // off Alyx hangs its hand off the published hilt pose, ~10 cm down
+        // the handle and 16 deg nose-down of the Touch's tracked origin, and
+        // with the controllers converging (any two-handed reach) that puts
+        // the wrists 6-8 cm further apart than the real hands (device,
+        // 2026-10-11: magazine release unreachable). KL_OPENVR_TOUCH_FRAME=0
+        // for the old pose.
+        setenv("KL_OPENVR_TOUCH_FRAME", "1", 0);
         // Steady 45 fps (half the panel) plus Glovebox's render convars: the
         // device test of 2026-10-11 had a median frame of 22.4 ms and peaked at
         // 4.6 GB, against an uneven 40-42 fps and ~7 GB before.

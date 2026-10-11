@@ -281,11 +281,18 @@ static void pred_apply(const head_delta *d, float p[3], float q[4]) {
 // (KL_XR_GRIP_PITCH, confirmed by eye against the Quest 2 model SteamVR itself
 // draws through Steam Link), and the render model states the Touch's tracked
 // origin in that grip's frame (tools/rendermodel_frames.py on
-// oculus_quest2_controller_*.json, the same numbers kl_ovrp's
-// KLOVRP_TOUCH_TRACKED_* carry): 9.6 cm forward along the grip's -Z, 3.4 cm
-// down its -Y, 0.7 cm out, and pitched 20.6 degrees nose-down. So
+// oculus_quest2_controller_*.json): 9.6 cm forward along the grip's -Z, 3.4 cm
+// down its -Y, 0.7 cm IN (toward the other hand), and pitched 20.6 degrees
+// nose-down. So, for the right hand (X mirrored for the left)
 //
-//     raw = P · Rx(+37) · [T(HAND_POS) · R(HAND_ROT)] · T(0.007, -0.0342, -0.0961) · Rx(-20.6)
+//     raw = P · Rx(+37) · [T(HAND_POS) · R(HAND_ROT)] · T(-0.007, -0.0342, -0.0961) · Rx(-20.6)
+//
+// The X term is INWARD: the right model's `openxr_grip` sits at x = +0.007 in
+// the tracked frame, so the tracked origin is at -0.007 in the grip's — the
+// inverse Glovebox's klvr_core.cpp make_raw_from_grip() takes, which plays
+// Alyx on these same Sense controllers. This bridge had it OUTWARD (as kl_ovrp's
+// KLOVRP_TOUCH_TRACKED_X still does): 1.4 cm per hand, 2.8 cm too wide between
+// hands held parallel. KL_OPENVR_TOUCH_X_OUT=1 restores the outward sign.
 //
 // Handing P over as the raw pose (what this bridge did) puts the Touch's origin
 // at the grip — about 10 cm back down the handle, which on a held controller
@@ -300,7 +307,7 @@ static void pred_apply(const head_delta *d, float p[3], float q[4]) {
 // does. KL_OPENVR_TOUCH_FRAME=0 hands the published pose over unchanged (the
 // old behaviour, the A/B). OVRPlugin and OpenXR guests never come through here.
 #define KLOVR_HILT_UNDO_DEG   37.0f       // = -KLSenseTune.hiltPitch's default
-#define KLOVR_TOUCH_X         0.007000f   // tracked origin in the Touch's OpenXR grip
+#define KLOVR_TOUCH_X        (-0.007000f) // tracked origin in the RIGHT Touch's OpenXR grip (inward)
 #define KLOVR_TOUCH_Y        (-0.034157f)
 #define KLOVR_TOUCH_Z        (-0.096073f)
 #define KLOVR_TOUCH_PITCH_DEG (-20.60f)
@@ -342,6 +349,7 @@ static const touch_frame *touch_frame_for(int hand) {
     pthread_mutex_lock(&mu);
     if (!init) {
         int on = ovr_stage("KL_OPENVR_TOUCH_FRAME", 1);
+        float xs = kl_env_on("KL_OPENVR_TOUCH_X_OUT", 0) ? -1.0f : 1.0f;
         for (int h = 0; h < 2; h++) {
             touch_frame *t = &tf[h];
             t->on = on;
@@ -354,7 +362,7 @@ static const touch_frame *touch_frame_for(int hand) {
             hand_triple("KL_OPENVR_HAND_ROT", h, 1, rot);
             quat_euler_xyz(rot, qr);
             quat_mul(qu, qr, t->pre);
-            float pos[3] = { 0, 0, 0 }, tr[3] = { mx * KLOVR_TOUCH_X, KLOVR_TOUCH_Y, KLOVR_TOUCH_Z };
+            float pos[3] = { 0, 0, 0 }, tr[3] = { xs * mx * KLOVR_TOUCH_X, KLOVR_TOUCH_Y, KLOVR_TOUCH_Z };
             hand_triple("KL_OPENVR_HAND_POS", h, 0, pos);
             // offset from P's origin, in P's frame:
             //   Rx(37)·pos + Rx(37)·R(rot)·tracked
@@ -366,9 +374,11 @@ static const touch_frame *touch_frame_for(int hand) {
             quat_euler_xyz(pitch, qp);
             quat_mul(t->pre, qp, t->post);           // P-relative orientation of raw
         }
-        fprintf(stderr, "  [openvr] controller pose: %s (KL_OPENVR_TOUCH_FRAME); right hand raw = P + "
+        fprintf(stderr, "  [openvr] controller pose: %s (KL_OPENVR_TOUCH_FRAME), tracked origin %s "
+                        "(KL_OPENVR_TOUCH_X_OUT); right hand raw = P + "
                         "(%.4f, %.4f, %.4f) m in P's frame, turned (%.4f, %.4f, %.4f, %.4f)\n",
                 on ? "Oculus Touch raw (tracked origin) from the published hilt" : "published pose unchanged",
+                xs > 0 ? "0.7 cm inward (render model, Glovebox)" : "0.7 cm OUTWARD (old sign)",
                 (double)tf[1].off[0], (double)tf[1].off[1], (double)tf[1].off[2],
                 (double)tf[1].post[0], (double)tf[1].post[1], (double)tf[1].post[2], (double)tf[1].post[3]);
         init = 1;
