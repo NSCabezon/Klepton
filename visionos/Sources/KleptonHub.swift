@@ -41,6 +41,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// container root, for <tree>/assets, the metadata beside it, and the APK.
     let tree: String
     let apk: String
+    /// targets.py's "render_scale" for this game: what the "Render resolution"
+    /// setting means until the player moves it (KleptonRendering.apply).
+    let renderScale: Double
     /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
     /// for a guest that has none). Written beside <tree>/assets by HubPrep.
     let meta: [String: String]
@@ -1639,9 +1642,11 @@ struct HubLibraryView: View {
         #endif
     }
 
-    /// Which games the Mac can run for the headset. The host side exists for
-    /// Alyx only (the OpenVR guest); the card shows nothing new for the rest.
-    static func streamable(_ g: KLHubGameRow) -> Bool { g.target == "alyx" }
+    /// Which games the Mac can run for the headset: Alyx (the OpenVR guest) and
+    /// Metro Awakening (OpenXR on Vulkan — the stream host takes its frames at
+    /// kl_vulkan_frame_done and paces its xrWaitFrame). The card shows nothing
+    /// new for the rest.
+    static func streamable(_ g: KLHubGameRow) -> Bool { ["alyx", "metro"].contains(g.target) }
 
     /// The second way to play: the game runs on the Mac and streams here. It
     /// needs no game data on the headset, so it ignores the card's download
@@ -1654,7 +1659,9 @@ struct HubLibraryView: View {
     }
 
     @ViewBuilder private func playFromMacButton(_ g: KLHubGameRow) -> some View {
-        let found = macs.macs
+        // Only the Macs hosting THIS game (the host's Bonjour TXT "guest"; a Mac
+        // that does not say is offered everywhere, as before).
+        let found = macs.macs.filter { $0.serves(g.target) }
         let busy = model.verifying != nil || model.preparing != nil
         let title = klL("Play from Mac", "Jugar desde el Mac")
         HStack(spacing: 10) {
