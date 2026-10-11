@@ -52,6 +52,10 @@ void *kl_aaudio_dlopen(const char *soname);
 int   kl_aaudio_is_handle(const void *h);
 void *kl_aaudio_sym(const char *name);
 
+// The rate the open output stream(s) took the device at, 0 with none open —
+// what an OpenSL player asks before opening the device itself.
+unsigned kl_aaudio_output_rate(void);
+
 void kl_aaudio_report(FILE *f);
 
 #endif

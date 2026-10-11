@@ -80,6 +80,11 @@ int kl_vulkan_guest_active(void);
 // a GLES guest, where the adapter id must stay empty.
 int kl_vulkan_display_luid(uint8_t out[8]);
 
+// The same GPU as the VkPhysicalDevice the guest's most recent instance
+// enumerates, or NULL when there has been no Vulkan instance. For the OVRPlugin
+// generation that hands the handle itself back from ovrp_GetDisplayAdapterId2.
+void *kl_vulkan_display_phys(void);
+
 // Create (or return) the eye image for a swapchain stage and eye. The returned
 // value is the VkImage handle widened to 64 bits, which is exactly what
 // ovrp_GetLayerTexture2's out-parameter carries.
@@ -110,6 +115,15 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 #define KLVK_EYE_LAYER (-1)
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int srgb, int layers);
+
+// The two extra images an eye layer carries when the guest asked for
+// Application SpaceWarp: motion vectors (RGBA16F) and their depth. Nothing on
+// this host consumes them — reprojection here is the visionOS compositor's —
+// but a provider that asked for them treats their absence as "the eye textures
+// could not be created" and stops its display, so they have to EXIST. One pair
+// per stage, re-allocated when the shape asked for changes. 0 on failure.
+unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
+                                             unsigned w, unsigned h, int layers);
 
 // ...and the MTLTexture behind one of those, for a compositor that has to draw
 // the layer. The eye layer is deliberately NOT reachable here: its textures go
@@ -225,6 +239,12 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
 // ...and the MTLTexture behind one, for the compositor seam. NULL when it cannot
 // be exported.
 void *kl_vulkan_xr_image_mtl(unsigned long long image);
+// KL_VK_OUT: write one array layer of an image from kl_vulkan_xr_image to
+// <dir>/xr_f<frame>_layer<n>_eye<e>.png, every KL_VK_OUT_EVERY-th frame. A no-op
+// without KL_VK_OUT.
+void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h,
+                                long long vk_format, unsigned array_layer,
+                                unsigned frame, int eye, int layer);
 
 // Advertise the Linux WSI instance extensions (xlib/xcb/wayland) and swap any
 // the guest enables for VK_EXT_metal_surface — for a Linux (glibc) guest whose

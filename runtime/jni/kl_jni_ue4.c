@@ -194,6 +194,22 @@ void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
 // back later, and here it runs on the caller. The engine's own code is what
 // runs either way, and running it late is the failure that has no symptom — the
 // module list is consumed by the very next thing the game thread does.
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_ue4.c
+// ---- UE4's GetIntentExtras* family ----
+// The extras of the Intent the activity was started with: getIntent().getExtras()
+// and then a typed read, each with a null check around it. A launcher starts a
+// game with no extras, and so do we, so these are the answers Android itself
+// computes for an absent key — false, false, 0 and null — not a refusal.
+// Marvel's Deadpool VR asks for a string extra in its main init, without first
+// asking whether the key exists, and with no answer it stopped in
+// GameActivity.onResume (2026-10-09). UE turns the null into an empty FString.
+static klj_val klj_GA_intentExtraAbsent(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("intent extra \"%s\": the activity was started without extras", k ? k : "");
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_GA_initHMDs(void *env, void *self, const klj_val *a, int n) {
     (void)a; (void)n;
     // UE5 renamed the package and the exported-native prefix in the same release
@@ -389,6 +405,24 @@ static klj_val klj_GA_getNativeDisplayRefreshRate(void *env, void *self, const k
 static klj_val klj_GA_getDeviceOrientation(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 3};   // EDeviceScreenOrientation::LandscapeLeft
+}
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_ue4.c
+// AndroidThunkJava_GetDeviceRotation()I — UE5's GameActivity answers it from
+// getCurrentDeviceRotationDegree(): Display.getRotation() turned into degrees
+// (0, 90, 180, 270) away from the panel's natural orientation. A headset's
+// display is never rotated, so a Quest answers 0, and so do we. Alien: Rogue
+// Incursion (UE 5.3) calls it while the RHI comes up, and with no row here that
+// was a fatal "no host implementation" before the first frame.
+static klj_val klj_GA_getDeviceRotation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};   // Surface.ROTATION_0 — 0 degrees
+}
+// AndroidThunkJava_GetConfigurationOrientation()I is the same question asked of
+// Configuration.orientation (1 portrait, 2 landscape) and is resolved alongside
+// it; answered to agree with klj_GA_getDeviceOrientation's fixed landscape.
+static klj_val klj_GA_getConfigurationOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 2};   // Configuration.ORIENTATION_LANDSCAPE
 }
 static klj_val klj_GA_setNativeDisplayRefreshRate(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -925,6 +959,15 @@ const klj_binding klj_bind_ue4[] = {
      "(Ljava/lang/String;)F", klj_GA_getMetaDataFloat},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetMetaDataString",
      "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_getMetaDataString},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_ue4.c
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasIntentExtrasKey",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasBoolean",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasInt",
+     "(Ljava/lang/String;)I", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasString",
+     "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_intentExtraAbsent},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitHMDs", "()V", klj_GA_initHMDs},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ForceQuit", "()V", klj_GA_forceQuit},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetDesiredViewSize", "(II)V",
@@ -933,6 +976,10 @@ const klj_binding klj_bind_ue4[] = {
      "()I", klj_GA_getNativeDisplayRefreshRate},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetDeviceOrientation",
      "()I", klj_GA_getDeviceOrientation},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetDeviceRotation",
+     "()I", klj_GA_getDeviceRotation},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetConfigurationOrientation",
+     "()I", klj_GA_getConfigurationOrientation},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetNativeDisplayRefreshRate",
      "(I)Z", klj_GA_setNativeDisplayRefreshRate},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSupportedNativeDisplayRefreshRates",
@@ -947,6 +994,11 @@ const klj_binding klj_bind_ue4[] = {
      "()Z", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_EnableMotion",
      "(Z)V", klj_GA_void_noop},
+    // The Backtrace crash reporter's Unreal plugin: the activity is handed the
+    // attributes and attachment paths to start its Java client with. There is
+    // no such client here to start, and nothing is reported back to the engine.
+    {"com/epicgames/ue4/GameActivity", "initializeBacktraceClient",
+     "(Ljava/util/Map;Ljava/util/List;)V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSharedPreferenceString",
      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
      klj_GA_getSharedPreferenceString},

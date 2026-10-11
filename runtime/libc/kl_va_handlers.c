@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <wchar.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include "kl_va.h"
@@ -180,6 +181,30 @@ int klh_warnx(const char *fmt, kl_va *va) {
     int n = vfprintf(stderr, fmt, _ap);
     fputc('\n', stderr);
     return n;
+}
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_va_handlers.c
+// Wide printf. The marshaller reads a narrow format; the conversion specs it
+// needs are ASCII, so a byte-per-wchar copy of the format describes the same
+// argument list (%s / %ls are both one pointer). Darwin's vswprintf then does
+// the formatting. Tea For God (x6323807174332876) builds its strings this way;
+// the old stub returned "" for every one of them.
+static int kl_wfmt_narrow(const wchar_t *f, char *out, size_t cap) {
+    size_t i = 0;
+    for (; f && f[i]; i++) {
+        if (i + 1 >= cap) return -1;
+        out[i] = (f[i] > 0 && f[i] < 0x80) ? (char)f[i] : '?';
+    }
+    out[i] = 0;
+    return 0;
+}
+int kl_vswprintf_g(wchar_t *s, size_t n, const wchar_t *f, kl_va *va) {
+    char nf[1024];
+    if (!f || kl_wfmt_narrow(f, nf, sizeof nf) != 0) { if (s && n) s[0] = 0; return -1; }
+    KL_MARSHAL(nf, va, KL_VA_PRINTF);
+    return vswprintf(s, n, f, _ap);
+}
+int klh_swprintf(wchar_t *s, size_t n, const wchar_t *f, kl_va *va) {
+    return kl_vswprintf_g(s, n, f, va);
 }
 int klh_sscanf(const char *s, const char *fmt, kl_va *va) {
     KL_MARSHAL(fmt, va, KL_VA_SCANF);

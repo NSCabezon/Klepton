@@ -228,7 +228,56 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # always defined so expansion never leaves a literal
                         # "$(...)" in the bundle; the placeholder names no stack
                         # and behaves exactly like the old no-icon build.
-                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
+                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n"
+                        # Per-target defaults (targets.py), adapted from avp-play
+                        # (MIT, github.com/myMartek/avp-play) visionos/gen_xcodeproj.py.
+                        # A hub build bakes the hub row's (neutral) values; its
+                        # games' own defaults come from KLGameSettings.
+                        # Same route for the target's hand-matting default
+                        # (targets.py "hand_matting"): Info.plist's
+                        # KLHandMattingDefault is $(KL_HAND_MATTING_DEFAULT).
+                        + f"\t\t\t\tKL_HAND_MATTING_DEFAULT = {1 if KLT['hand_matting'] else 0};\n"
+                        # The target's gamepad face-button layout (targets.py
+                        # "gamepad_map"), KLGamepadMap in Info.plist. Quoted: the
+                        # value carries '=' and ','.
+                        + f"\t\t\t\tKL_GAMEPAD_MAP = \"{KLT['gamepad_map']}\";\n"
+                        # ...and its render-scale default (targets.py
+                        # "render_scale"), KLRenderScaleDefault in Info.plist.
+                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {float(KLT['render_scale']):.2f};\n"
+                        # ...and whether in-game video is tried by default
+                        # (targets.py "video"), KLVideoDefault in Info.plist.
+                        + f"\t\t\t\tKL_VIDEO_DEFAULT = {1 if KLT['video'] else 0};\n"
+                        # ...whether the guest boots by itself or waits for the
+                        # Start button (targets.py "autoboot"), and what the
+                        # foveated-rendering setting starts at ("foveation").
+                        + f"\t\t\t\tKL_AUTOBOOT_DEFAULT = {1 if KLT['autoboot'] else 0};\n"
+                        + f"\t\t\t\tKL_FOVEATION_DEFAULT = {1 if KLT['foveation'] else 0};\n")
+
+# The privacy strings, as BUILD SETTINGS and from here. Adapted from avp-play
+# (MIT, github.com/myMartek/avp-play) visionos/gen_xcodeproj.py.
+#
+# They used to live only in Info.plist, and that is not a safe place for them:
+# open the generated project in Xcode, touch the target's Info tab, and Xcode
+# MOVES every usage description it recognises out of the plist and into the
+# project file as INFOPLIST_KEY_* (it is consolidating them where
+# GENERATE_INFOPLIST_FILE reads them). The plist is left without them — and the
+# project file is rewritten by this script on the next build. So the strings
+# vanish from both, nothing fails, and the app is killed by TCC two seconds
+# after launch the moment it asks for accessory tracking (twice now: Beat Saber
+# 1.40, then batman). Emitted here, they are in every project this writes,
+# wherever else they do or do not survive. visionos/run.sh checks the product.
+USAGE_DESCRIPTIONS = {
+    "NSMicrophoneUsageDescription": "Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.",
+    "NSWorldSensingUsageDescription": "Klepton reads the headset's own pose, which is the head pose the guest renders from.",
+    "NSHandsTrackingUsageDescription": "Klepton maps your hands onto the guest's two Touch controllers.",
+    "NSAccessoryTrackingUsageDescription": "Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.",
+    "NSBluetoothAlwaysUsageDescription": "Klepton connects to spatial controllers that are not visible to the system as standard game controllers.",
+    "NSLocalNetworkUsageDescription": "Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.",
+}
+_usage_settings = "".join(
+    '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
+    for k, v in USAGE_DESCRIPTIONS.items())
+ASSETCATALOG_SETTING += _usage_settings
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -460,10 +509,24 @@ _conds = (["KL_CUSTOM_LAUNCHER"] if _launcher_on else []) + (["KL_HUB"] if IS_HU
 LAUNCHER_COND = (f'\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "{" ".join(_conds)} $(inherited)";\n'
                  if _conds else "")
 
+# What the installed app says about itself (adapted from avp-play, MIT,
+# github.com/myMartek/avp-play visionos/gen_xcodeproj.py): CFBundleShortVersionString and
+# CFBundleVersion. An installer sets these (KLEPTON_APP_VERSION — the guest's own
+# version — and KLEPTON_APP_BUILD — which build of it this is), because the app
+# list of a headset is the only place a Mac can ask what is installed, and "1.0
+# (1)" for every guest answers nothing. Up to three dot-separated integers each,
+# which is all the two keys take; anything else keeps the old constant.
+import re as _re
+def _plist_version(env, dflt):
+    v = os.environ.get(env, "")
+    return v if _re.fullmatch(r"\d{1,9}(\.\d{1,9}){0,2}", v) else dflt
+APP_VERSION = _plist_version("KLEPTON_APP_VERSION", "1.0")
+APP_BUILD = _plist_version("KLEPTON_APP_BUILD", "1")
+
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = {APP_BUILD};
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -519,7 +582,7 @@ COMMON = f"""
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = {APP_VERSION};
 				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because

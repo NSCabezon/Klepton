@@ -46,51 +46,10 @@
 //   pthread_mutex_t    40 B / 4    (int32_t[10])
 //   pthread_cond_t     48 B / 4    (int32_t[12])
 //   pthread_rwlock_t   56 B / 4    (int32_t[14])
-#define KL_MAX_SYNC 65536
-// Table slots recycle: with the JNI pool leak fixed, long runs otherwise die
-// here — Unity creates and destroys a mutex or two per frame, and a leaked
-// slot per destroy is 65536 creates at ~frame 40k (observed). The kind object
-// behind a recycled slot is replaced, not shared; the old one leaks (a
-// destroy is the guest saying nobody holds it).
-#define SYNC_TABLE(kind, tab, count, init_expr)                                  \
-    static kind *tab[KL_MAX_SYNC];                                               \
-    static _Atomic uint32_t count = 1;              /* 0 means uninitialised */  \
-    static uint32_t tab##_free[KL_MAX_SYNC];                                     \
-    static _Atomic uint32_t tab##_nfree;                                         \
-    static kind *tab##_get(void *g) {                                            \
-        _Atomic uint32_t *slot = (_Atomic uint32_t *)(g);                        \
-        uint32_t idx = atomic_load(slot);                                        \
-        if (idx) return tab[idx];                                                \
-        kind *fresh = malloc(sizeof *fresh);                                     \
-        init_expr;                                                               \
-        uint32_t mine;                                                           \
-        uint32_t nf = atomic_load(&tab##_nfree);                                 \
-        if (nf && atomic_compare_exchange_strong(&tab##_nfree, &nf, nf - 1))     \
-            mine = tab##_free[nf - 1];                                           \
-        else {                                                                   \
-            mine = atomic_fetch_add(&count, 1);                                  \
-            if (mine >= KL_MAX_SYNC) abort();                                    \
-        }                                                                        \
-        tab[mine] = fresh;                                                       \
-        uint32_t expect = 0;                                                     \
-        if (!atomic_compare_exchange_strong(slot, &expect, mine)) {              \
-            /* lost the race; leak this slot rather than free a live object */   \
-            return tab[expect];                                                  \
-        }                                                                        \
-        return fresh;                                                            \
-    }                                                                            \
-    static void tab##_recycle(void *g) {                                         \
-        _Atomic uint32_t *slot = (_Atomic uint32_t *)(g);                        \
-        uint32_t idx = atomic_exchange(slot, 0);                                 \
-        if (!idx || idx >= count) return;                                        \
-        uint32_t nf = atomic_fetch_add(&tab##_nfree, 1);                         \
-        if (nf < KL_MAX_SYNC) tab##_free[nf] = idx;                              \
-    }
-
-SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 
 // ---------- mutexes: address-keyed map ----------
-// The slot-in-guest-storage design (shared SYNC_TABLE above) aliases two
+// The slot-in-guest-storage design (described above; nothing uses it any more
+// — the rwlocks were the last, see rwl_entry_for) aliases two
 // logical mutexes onto one host object whenever guest storage carries a
 // stale slot index — memory freed without pthread_mutex_destroy and reused,
 // or a live 40-byte bionic mutex memcpy'd into a moved struct. Both were
@@ -308,7 +267,79 @@ static mtx_entry *mtx_find(void *g) {
     }
 }
 
-static pthread_rwlock_t *rwl(void *g) { return g_rwl_get(g); }
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_pthread.c
+// ---------- rwlocks: address-keyed, for the mutex map's reason ----------
+// These kept a slot index in the guest's own storage long after the mutexes and
+// condition variables stopped, and it was worse here than the aliasing the
+// mutex map's note describes: pthread_rwlock_init "recycled" whatever index the
+// storage happened to hold. Unreal constructs an FRWLock in memory nothing has
+// zeroed, so that index was the leftover of whatever lived there before — a
+// lock that was moved or freed without a destroy, or any small integer — and
+// the slot of some unrelated LIVE lock went onto the free list, to be handed to
+// the lock being initialised with a fresh host object put in its place. Two
+// guest locks then shared one host lock (and one of them had lost its state):
+// a thread that read-locked the one and write-locked the other waited for
+// itself. Alien: Rogue Incursion's level load stopped that way, at a different
+// point every run — the game thread in pthread_rwlock_wrlock with every other
+// thread idle (2026-10-09).
+//
+// Same shape as the mutex map: find-or-create by guest address, guest storage
+// never read or written. Entries are never removed, so a probe chain cannot be
+// broken under a lookup; a destroyed lock's host object stays for the next lock
+// at that address.
+typedef struct {
+    _Atomic(uintptr_t)          key;
+    _Atomic(pthread_rwlock_t *) l;
+} rwl_entry;
+static rwl_entry g_rwl_map[MTX_MAP_SIZE];
+static rwl_entry g_rwl_overflow;
+
+static pthread_rwlock_t *rwl_make(void) {
+    pthread_rwlock_t *fresh = malloc(sizeof *fresh);
+    if (fresh) pthread_rwlock_init(fresh, NULL);
+    return fresh;
+}
+static rwl_entry *rwl_entry_for(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    pthread_rwlock_t *fresh = NULL;
+    unsigned probes = 0;
+    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+        uintptr_t k = atomic_load(&g_rwl_map[i].key);
+        if (k == want) {
+            if (fresh) { pthread_rwlock_destroy(fresh); free(fresh); }
+            return &g_rwl_map[i];
+        }
+        if (k) {
+            // A full table degrades to one shared lock rather than probing forever.
+            if (++probes >= MTX_MAP_SIZE) {
+                pthread_rwlock_t *expect_l = NULL;
+                if (!fresh) fresh = rwl_make();
+                if (!atomic_compare_exchange_strong(&g_rwl_overflow.l, &expect_l, fresh) && fresh)
+                    { pthread_rwlock_destroy(fresh); free(fresh); }
+                static _Atomic int said;
+                if (atomic_fetch_add(&said, 1) == 0)
+                    fprintf(stderr, "  [klb] rwlock table FULL (%d slots) — sharing one fallback "
+                                    "lock; sync correctness degraded\n", MTX_MAP_SIZE);
+                return &g_rwl_overflow;
+            }
+            continue;
+        }
+        // empty: build the lock first, so the entry is complete soon after the
+        // key is claimed (rwl() waits out the instructions in between).
+        if (!fresh) fresh = rwl_make();
+        uintptr_t expect = 0;
+        if (!atomic_compare_exchange_strong(&g_rwl_map[i].key, &expect, want))
+            { i--; continue; }          // lost the race; re-read this slot
+        atomic_store(&g_rwl_map[i].l, fresh);
+        return &g_rwl_map[i];
+    }
+}
+static pthread_rwlock_t *rwl(void *g) {
+    rwl_entry *e = rwl_entry_for(g);
+    pthread_rwlock_t *l = atomic_load(&e->l);
+    while (!l) { sched_yield(); l = atomic_load(&e->l); }
+    return l;
+}
 
 // KL_TRACE_MUTEX=1: lifecycle of translated mutexes — init, destroy, and
 // lazy creation — so aliasing (two guest addresses, one host object) can be
@@ -905,8 +936,21 @@ int klb_pthread_condattr_destroy(long *a)              { (void)a; return 0; }
 int klb_pthread_condattr_setclock(long *a, int clk)    { (void)a; (void)clk; return 0; }
 
 // ---------- rwlock ----------
-int klb_pthread_rwlock_init(void *l, const void *a) { (void)a; g_rwl_recycle(l); rwl(l); return 0; }
-int klb_pthread_rwlock_destroy(void *p) { g_rwl_recycle(p); return 0; }
+// init: an address met before keeps its host lock, as a mutex does — unless that
+// lock is still held, which can only be the leftover of a lock that was moved
+// or freed while locked; a new lock must not start out stuck behind it.
+int klb_pthread_rwlock_init(void *l, const void *a) {
+    (void)a;
+    rwl_entry *e = rwl_entry_for(l);
+    pthread_rwlock_t *h = rwl(l);
+    if (pthread_rwlock_trywrlock(h) == 0) pthread_rwlock_unlock(h);
+    else if (e != &g_rwl_overflow) {
+        pthread_rwlock_t *fresh = rwl_make();
+        if (fresh) atomic_store(&e->l, fresh);      // the held one leaks
+    }
+    return 0;
+}
+int klb_pthread_rwlock_destroy(void *p) { (void)p; return 0; }
 int klb_pthread_rwlock_rdlock(void *l) { return px(pthread_rwlock_rdlock(rwl(l))); }
 int klb_pthread_rwlock_wrlock(void *l) { return px(pthread_rwlock_wrlock(rwl(l))); }
 int klb_pthread_rwlock_unlock(void *l) { return px(pthread_rwlock_unlock(rwl(l))); }
@@ -1392,8 +1436,10 @@ static int      g_sem_free[KL_MAX_SEMS];
 static int      g_sem_nfree;
 static pthread_mutex_t g_sem_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void sem_trace_prime(void);   // see klb_sem_post
 int klb_sem_init(int *s, int pshared, unsigned value) {
     (void)pshared;
+    sem_trace_prime();
     int i = 0;
     pthread_mutex_lock(&g_sem_lock);
     if (g_sem_nfree) i = g_sem_free[--g_sem_nfree];
@@ -1449,10 +1495,26 @@ int klb_sem_destroy(int *s) {
     return 0;
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_pthread.c
+// sem_post is on POSIX's async-signal-safe list and guests hold it to that:
+// IL2CPP's GC suspends a thread by signalling it, and the handler's whole body is
+// a sem_post back to the collector. getenv is NOT on that list — it takes the
+// environ lock — so reading the trace knob here deadlocked the moment the signal
+// landed on a thread that was itself inside getenv (Walkabout, on device: a
+// threadpool worker in mktime -> tzset -> getenv, then "BUG IN CLIENT OF
+// LIBPLATFORM: Trying to recursively lock an os_unfair_lock" and SIGKILL). So the
+// knob is read where a semaphore is CREATED, which is never a signal handler,
+// and sem_post only loads the answer.
+static _Atomic int g_sem_trace = -1;
+static void sem_trace_prime(void) {
+    if (atomic_load(&g_sem_trace) < 0)
+        atomic_store(&g_sem_trace, kl_env_on("KL_TRACE_SIG", 0));
+}
+
 int klb_sem_post(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
-    if (kl_env_on("KL_TRACE_SIG", 0)) {
+    if (atomic_load(&g_sem_trace) > 0) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 12)
             fprintf(stderr, "  [sig] sem_post slot %d (count now %d)\n",

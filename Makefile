@@ -68,7 +68,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c \
+           runtime/guest/kl_songs.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -498,6 +499,17 @@ build/t_x18_casp: tests/t_x18_casp.c tests/t_x18_casp.S runtime/kl_x18.c runtime
 
 x18casp: build/t_x18_casp
 	./build/t_x18_casp
+
+# CASP with x18:x19 as one of its register pairs, EXECUTED (KLX_HZ_PAIR).
+# Adapted from avp-play (MIT, github.com/myMartek/avp-play) Makefile. Keep only
+# while tests/t_casp.c is kept (decided with the runtime/kl_x18.c port).
+build/t_casp: tests/t_casp.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_casp.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: casp
+casp: build/t_casp
+	./build/t_casp
 
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams

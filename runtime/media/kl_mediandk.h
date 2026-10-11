@@ -52,6 +52,11 @@ void *kl_mediandk_lookup(const char *name);
 // along do not have to include CoreVideo.
 void *kl_mediandk_buffer_pixels(const void *ahardwarebuffer);
 
+// The frontend's stored "try video anyway" choice: 1 turns the container
+// demuxer on even for a guest where it defaults off (a Vulkan one — see
+// klm_extractor_enabled), anything else leaves the default alone. Before boot.
+void kl_mediandk_set_video_default(int on);
+
 void kl_mediandk_report(FILE *f);
 
 #endif

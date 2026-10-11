@@ -388,6 +388,11 @@ typedef struct {
     // here, not into the swapchain image we handed out via GetLayerTexture2 — so
     // the compositor resolves THIS to an MTLTexture, or every panel is empty.
     unsigned long long tex;
+    // Equirect only: how much of the full turn the picture's width spans, as
+    // 2*pi over that angle (1 = the whole 360 degrees). 0 leaves it to the
+    // compositor's own default, which is what every layer filed before this
+    // field existed gets.
+    float eq_hscale;
 } kl_ovrp_overlay;
 
 // How many non-eye layers the guest submitted with its most recent frame, and
@@ -503,6 +508,18 @@ typedef struct {
     // 1 when row 0 of the picture is its TOP — Vulkan and Metal — and 0 for one
     // GL drew. Same meaning and polarity as kl_ovrp_overlay.origin_top_left.
     int   origin_top_left;
+    // Which part of the texture IS the picture, per eye: {x0, y0, x1, y1} as
+    // fractions of the texture, measured from the picture's row 0 (the top for
+    // origin_top_left, the bottom otherwise). All zero means the whole texture.
+    // (Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/xr/kl_ovrp.h.)
+    //
+    // OpenXR states it as subImage.imageRect and a guest is free to change it
+    // every frame. Source 2 (avp-play's Linux Alyx) does: its dynamic resolution renders into a corner
+    // of a fixed-size texture and names that corner (2688x2208 of 3648x2880 on
+    // a loaded frame), so a composite that reads the whole texture shows the
+    // picture squeezed into that corner with stale frames around it. A fraction
+    // rather than pixels for kl_ovrp_render_pose.viewport_of's reason.
+    float rect[2][4];
 } kl_ovrp_proj_layer;
 
 // How many projection layers the guest's most recent frame submitted, and what
@@ -677,7 +694,28 @@ float kl_ovrp_display_frequency(void);
 // it is one fewer rebuild, and each one used to leak a whole generation
 //.
 void kl_ovrp_set_eye_texture_size(int w, int h);
+// The fraction of that size the guest is actually told, 0.4..1.0, applied after
+// the cap. Call before kl_ovrp_set_eye_texture_size; KL_OVRP_RENDER_SCALE
+// overrides it.
+void kl_ovrp_set_render_scale_default(float s);
 void kl_ovrp_eye_texture_size(int *w, int *h);
+// The same size reshaped for the cone the guest is actually TOLD. They differ
+// only under KL_OVRP_UNIFY_FRUSTUM, where both eyes get the union of the two
+// cones: that cone is wider than the one the display sized its texture for
+// (120 degrees against 105 on a Vision Pro), and the same width spread over it
+// is a picture ~27% coarser across than down. The area is kept — it is the
+// memory and the fill cost — and the shape follows the cone, so the pixels come
+// out square again. Identical to kl_ovrp_eye_texture_size when nothing is
+// unified.
+void kl_ovrp_eye_texture_size_for_cone(int *w, int *h);
+// The cone the DISPLAY has for this eye — left, right, top, bottom tangents, all
+// positive — as against the one the guest is told (kl_ovrp_eye_view), which is
+// wider under KL_OVRP_UNIFY_FRUSTUM. The difference is the part of the guest's
+// picture nobody can see: XR_KHR_visibility_mask is built from it.
+void kl_ovrp_eye_display_tangents(int eye, float tan[4]);
+// ...and the cone the GUEST is told for it, after KL_OVRP_UNIFY_FRUSTUM and
+// KL_OVRP_EYE_TAN_MAX — what its picture is rendered with. Same order.
+void kl_ovrp_eye_told_tangents(int eye, float tan[4]);
 
 // Do we tell the guest the two eyes may be ARRAY LAYERS of one texture rendered
 // in a single pass — Unity's Single Pass Instanced / Multiview? This is the one
@@ -867,5 +905,12 @@ int   kl_ovrp_fade_color(float rgba[4]);
 // changes on every set or clear, so a frontend rebuilds its panel only then.
 void     kl_ovrp_set_prompt(const char *text);
 unsigned kl_ovrp_prompt(char *buf, int n);
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/xr/kl_ovrp.c:
+// 1 when the running target is one of the titles avp-play's fork tuned (wrath2,
+// batman, moss, walkabout, doom3quest, beatsaber140, the x<store id> rows...).
+// Generic changes ported from that fork that would alter an existing title's
+// behaviour default ON only where this says so; each keeps its own env knob.
+int kl_ovrp_avpplay_title(void);
 
 #endif

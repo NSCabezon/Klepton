@@ -45,6 +45,11 @@ typedef struct kl_vtdec kl_vtdec;
 // serve that codec — the caller reports it, because the guest's own error path
 // for "no decoder for this type" is better than anything we could invent.
 kl_vtdec *kl_vtdec_create(const char *mime);
+// Ask for frames a CPU can read: plain 8-bit bi-planar 4:2:0 (NV12) rather than
+// whatever the decoder prefers, which on a headset is a compressed format only
+// a GPU can sample. For a codec with no output surface, whose client reads the
+// bytes. Call before the first kl_vtdec_submit.
+void kl_vtdec_want_nv12(kl_vtdec *d, int on);
 void      kl_vtdec_destroy(kl_vtdec *d);
 
 // Feed one access unit, Annex-B, with or without parameter sets in front of it.

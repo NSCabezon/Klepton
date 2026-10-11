@@ -31,6 +31,18 @@ func klEnvFloat(_ name: String, _ dflt: Float) -> Float {
     return f
 }
 
+/// Whether the running target is one of the rows ported from avp-play
+/// (targets.py: beatsaber140, beatsaber128, walkabout, batman, wrath2, moss,
+/// doom3quest, or a Meta store row `x<digits>`). Behaviour changes that came
+/// with that port and would alter an EXISTING target default ON only here, and
+/// each stays reachable everywhere through its own KL_* knob.
+func klAvpPlayTarget() -> Bool {
+    let t = klTargetName()
+    if ["beatsaber140", "beatsaber128", "walkabout", "batman", "wrath2",
+        "moss", "doom3quest"].contains(t) { return true }
+    return t.count > 1 && t.first == "x" && t.dropFirst().allSatisfy(\.isNumber)
+}
+
 enum Immersive {
     static let id = "KleptonImmersive"
     // Default ON for Beat Saber, OFF for Steam Link, and the difference is not a
@@ -390,6 +402,12 @@ struct BootView: View {
     // the fallback is inert (no such bookmark) for the runtime-debugging targets.
     @ObservedObject private var files = klActiveFiles() ?? LauncherFiles(bookmarkKey: "none", expected: "")
     private var isLauncher: Bool { klIsLauncher() }
+    /// Whether this target boots as soon as the window is up (targets.py
+    /// "autoboot", baked into Info.plist as KLAutoBootDefault; missing = yes).
+    /// Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+    /// visionos/Sources/KleptonApp.swift.
+    private static let targetAutoBoot: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLAutoBootDefault") as? String) != "0"
     // The microphone dial only appears where voice is actually used: Steam Link's
     // stream and the Xash titles that name a local server. Every other build hides it.
     private var showMic: Bool {
@@ -567,6 +585,11 @@ struct BootView: View {
             DisclosureGroup("Matting") { ChromaView() }
                 .font(.callout)
 
+            // ...and the rendering preferences (foveation, render scale, in-game
+            // video), read once at boot (KleptonTuning.swift, from avp-play).
+            DisclosureGroup("Rendering") { RenderingView() }
+                .font(.callout)
+
             // ...and the microphone opt-in, same window, collapsed by default.
             // Off unless a person turns it on: it is the one dial that opens a
             // privacy surface and changes the audio session out from under the
@@ -579,7 +602,7 @@ struct BootView: View {
             }
 
             HStack(spacing: 16) {
-                Button(running ? "Running…" : "Boot") {
+                Button(running ? "Running…" : (Self.targetAutoBoot ? "Boot" : "Start")) {
                     // A game build gathers its settings first: fold them into env
                     // (+ commandline.txt for hl1), and only boot if the chosen
                     // folder is ready.
@@ -637,7 +660,9 @@ struct BootView: View {
             // KL_AUTOBOOT=1 for scripted launches — because it must let the player
             // choose the game folder, set options, and press "Boot" first.
             // Only the runtime-debugging targets honour KL_AUTOBOOT (default on).
-            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: true) {
+            // ...and a target can ask to wait for the button too (targets.py
+            // "autoboot" False — only avp-play's rows do).
+            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: Self.targetAutoBoot) {
                 boot()
             }
         }
@@ -712,6 +737,8 @@ struct BootView: View {
             }
             RunLoop.current.add(poll, forMode: .common)
 
+            // The stored rendering preferences, before the runtime reads them.
+            KleptonRendering.shared.apply()
             var result = kl_app_boot()
 
             // The audio session, and the placement is deliberate on both sides.
@@ -796,9 +823,21 @@ struct BootView: View {
                     // compositor, which is indistinguishable in the log from a
                     // compositor that came up and died — and those want
                     // completely different next moves.
+                    // `.error` is retried, because it is not always final: a
+                    // launch that follows a reinstall over a running instance
+                    // got it once, nine seconds in, and the very next launch
+                    // of the same binary opened. `.userCancelled` is an answer,
+                    // not a failure, and is not asked again. Adapted from
+                    // avp-play (MIT, github.com/myMartek/avp-play)
+                    // visionos/Sources/KleptonApp.swift.
                     Task {
-                        let r = await openImmersiveSpace(id: Immersive.id)
-                        NSLog("[cp] openImmersiveSpace -> \(r)")
+                        for attempt in 1...3 {
+                            let r = await openImmersiveSpace(id: Immersive.id)
+                            NSLog("[cp] openImmersiveSpace -> \(r)"
+                                  + (attempt > 1 ? " (attempt \(attempt))" : ""))
+                            guard case .error = r, attempt < 3 else { break }
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        }
                     }
                 }
             }

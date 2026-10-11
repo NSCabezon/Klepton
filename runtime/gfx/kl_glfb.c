@@ -1349,6 +1349,83 @@ static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     // emulate as a 2D texture (host half in klfb_TexBuffer).
     if (klfb_rewrite_texel_buffers(buf, cap)) changed = 1;
 
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+    // (this and the fma() fixup below; the leading-whitespace trim in
+    // klfb_ShaderSource). KL_GLFB_ESSL_COMPAT=0 turns all three off — they only
+    // touch shaders ANGLE would otherwise refuse to compile.
+    int essl_compat = kl_env_on("KL_GLFB_ESSL_COMPAT", 1);
+
+    // gl_ClipDistance through GL_EXT_clip_cull_distance: ANGLE on Metal does
+    // not expose that extension, but does expose GL_APPLE_clip_distance, which
+    // provides the same gl_ClipDistance (redeclarable, up to 8). Tea For God's
+    // vertex shaders enable the EXT one and clip with six planes; every one of
+    // them failed to compile ("GL_APPLE_clip_distance : extension is disabled")
+    // and the game's library load then crashed on a missing store. Only when
+    // the shader does not use gl_CullDistance, which APPLE has no equivalent
+    // for. Same length after padding, so the rewrite is in place.
+    if (essl_compat && !strstr(buf, "gl_CullDistance")) {
+        static const char from[] = "GL_EXT_clip_cull_distance";
+        static const char to[]   = "GL_APPLE_clip_distance   ";
+        int n = 0;
+        for (p = buf; (p = strstr(p, from)); p += sizeof from - 1) {
+            memcpy(p, to, sizeof to - 1);
+            n++;
+        }
+        if (n) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [glfb] shader enables GL_EXT_clip_cull_distance "
+                                "— served as GL_APPLE_clip_distance (clip only)\n");
+            }
+            changed = 1;
+        }
+    }
+
+    // fma() is ESSL 3.20 / GL_EXT_gpu_shader5; a "#version 300 es" shader that
+    // calls it compiles on Adreno and not on ANGLE ("'fma' : no matching
+    // overloaded function found"). Tea For God's material shaders all do, so
+    // every material failed and the game went black after its splash. Define
+    // it as the unfused multiply-add right after the #version line — it is a
+    // precision hint, not a semantic difference.
+    if (essl_compat && strncmp(buf, "#version 300 es", 15) == 0 &&
+        !strstr(buf, "gpu_shader5")) {
+        int uses = 0;
+        for (p = buf; (p = strstr(p, "fma")); p += 3) {
+            char before = p == buf ? 0 : p[-1];
+            const char *q = p + 3;
+            while (*q == ' ' || *q == '\t') q++;
+            if (KLFB_IDENT(before) || *q != '(') continue;
+            // A shader that DEFINES its own fma() (a "float fma(" fallback,
+            // which compiles on ANGLE as it is) must be left alone: the macro
+            // would mangle the definition. A declaration has a type name just
+            // before it; a call has an operator, a bracket, or `return`.
+            const char *b = p;
+            while (b > buf && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            if (b > buf && KLFB_IDENT(b[-1])) {
+                const char *w = b;
+                while (w > buf && KLFB_IDENT(w[-1])) w--;
+                if (!(b - w == 6 && strncmp(w, "return", 6) == 0)) { uses = 0; break; }
+            }
+            uses = 1;
+        }
+        static const char def[] = "#define fma(a, b, c) ((a) * (b) + (c))\n";
+        char *nl = strchr(buf, '\n');
+        size_t len = strlen(buf);
+        if (uses && nl && len + sizeof def <= cap) {
+            nl++;
+            memmove(nl + sizeof def - 1, nl, strlen(nl) + 1);
+            memcpy(nl, def, sizeof def - 1);
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [glfb] ESSL 3.00 shader calls fma() — defined "
+                                "as a*b+c (ESSL 3.20 built-in)\n");
+            }
+            changed = 1;
+        }
+    }
+
     return changed ? buf : NULL;
 }
 
@@ -1376,7 +1453,65 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
                 if (strings[i] && len) { memcpy(buf + off, strings[i], len); off += len; }
             }
             buf[off] = 0;
-            int dbg_modified = 0;
+            // `#version` must be the FIRST thing in the source: ANGLE rejects a
+            // shader that opens with a blank line ("#version directive must occur
+            // on the first line"), where the Android drivers these guests were
+            // written against skip leading whitespace. Doom3Quest's programs all
+            // start "\n#version 300 es". Drop only whitespace, and only when the
+            // directive is what follows it.
+            int trimmed = 0;
+            if (kl_env_on("KL_GLFB_ESSL_COMPAT", 1)) {
+                size_t ws = 0;
+                while (buf[ws] == ' ' || buf[ws] == '\t' || buf[ws] == '\r' || buf[ws] == '\n') ws++;
+                if (ws && strncmp(buf + ws, "#version", 8) == 0) {
+                    memmove(buf, buf + ws, off - ws + 1);
+                    off -= ws;
+                    trimmed = 1;
+                }
+            }
+            // Either flag sends `buf` to ANGLE instead of the guest's strings.
+            int dbg_modified = trimmed;
+            // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+            // `invariant gl_Position;` for an engine that renders in passes that
+            // must agree on depth to the last bit. id Tech 4 fills depth with one
+            // program and then lights with others under GL_EQUAL. On Metal a
+            // vertex function is compiled with fast-math unless it declares
+            // invariance, and an Apple GPU runs the position computation of a
+            // deferred-shaded tile separately from the binning one — so two
+            // programs, or two evaluations of one, can differ in the last bit of
+            // z. Seen as whole 32x32 TILES of the world going black (every
+            // fragment in them failing EQUAL) plus a stipple where they nearly
+            // agree. Declaring it makes ANGLE emit [[invariant]] and compile with
+            // preserveInvariance. Vertex shaders only, and only for the guest
+            // that needs it; KL_GLFB_INVARIANT=0/1 is the A/B.
+            {
+                static int inv = -1;
+                if (inv < 0) {
+                    extern const char *kl_driver_target_name(void);
+                    const char *t = kl_driver_target_name();
+                    inv = kl_env_on("KL_GLFB_INVARIANT", t && strcmp(t, "doom3quest") == 0);
+                }
+                if (inv && klfb_shader_type(shader) == 0x8B31 /* GL_VERTEX_SHADER */ &&
+                    strncmp(buf, "#version 3", 10) == 0 && !strstr(buf, "invariant gl_Position")) {
+                    static const char decl[] = "invariant gl_Position;\n";
+                    // After the last #extension line, or else after #version:
+                    // the declaration must follow every directive and precede
+                    // any use of gl_Position.
+                    char *at = buf, *q = buf;
+                    while ((q = strstr(q, "#extension")) != NULL) {
+                        char *nl = strchr(q, '\n');
+                        if (!nl) break;
+                        at = nl + 1; q = nl + 1;
+                    }
+                    if (at == buf) { char *nl = strchr(buf, '\n'); at = nl ? nl + 1 : NULL; }
+                    if (at && off + sizeof decl < cap) {
+                        memmove(at + sizeof decl - 1, at, off - (size_t)(at - buf) + 1);
+                        memcpy(at, decl, sizeof decl - 1);
+                        off += sizeof decl - 1;
+                        dbg_modified = 1;
+                    }
+                }
+            }
             // KL_HL2_DEBUG_AMBIENT=1: for the VertexLitGeneric model PS, force the output
             // to the ambient-cube constant so we can see whether pc[5..10] reach the METAL
             // shader (glGetUniformfv only proves ANGLE's CPU cache). Prop turns grey =>
@@ -2405,6 +2540,32 @@ static uint32_t g_bindlog_err[KLFB_BINDLOG];
 static __thread unsigned g_bindlog_slot;
 static int glfb_errscan(void);
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+// (multiview FBO tracking, the doom3quest 2D-target stand-in, mirrored-guest
+// foveation: all inert unless KL_GLFB_MV_SHADOW / KL_VRR_MIRROR, default on
+// only for doom3quest, and only meaningful with an ANGLE built with the
+// OVR_multiview patch).
+static void klfb_resync_fbo(uint32_t fb);   // below, with the rate map
+static void klfb_rate_rule_for_fbo(uint32_t fb);
+#define KLFB_RESYNC_FBOS 1024
+// Which guest FBOs render both eyes at once (glFramebufferTextureMultiviewOVR
+// with more than one view). On a mirrored guest these are the eye swapchain's,
+// and the only framebuffers the rate map is meant for.
+static uint8_t g_fbo_multiview[KLFB_RESYNC_FBOS];
+static void (*g_real_FramebufferTextureMultiviewOVR)(uint32_t, uint32_t, uint32_t, int32_t,
+                                                      int32_t, int32_t);
+static void klfb_FramebufferTextureMultiviewOVR(uint32_t target, uint32_t attachment,
+                                                uint32_t texture, int32_t level,
+                                                int32_t base_view, int32_t num_views) {
+    if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */ && g_draw_fb < KLFB_RESYNC_FBOS &&
+        target != 0x8CA8 /* READ_FRAMEBUFFER */) {
+        g_fbo_multiview[g_draw_fb] = texture && num_views > 1;
+        klfb_rate_rule_for_fbo(g_draw_fb);
+    }
+    if (g_real_FramebufferTextureMultiviewOVR)
+        g_real_FramebufferTextureMultiviewOVR(target, attachment, texture, level, base_view,
+                                              num_views);
+}
 static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     if (klfb_trace_fbo())
         fprintf(stderr, "  [glfb] t%llu glBindFramebuffer(0x%x, %u) <- %s\n",
@@ -2431,6 +2592,7 @@ static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
         klfb_note_render_stage(klfb_stage_of_fbo(fb));
     }
     if (g_real_BindFramebuffer) g_real_BindFramebuffer(target, fb);
+    if (klfb_is_draw_target(target)) { klfb_rate_rule_for_fbo(fb); klfb_resync_fbo(fb); }
     // Did GL take the name? Only asked when ERRSCAN is already draining the
     // error queue every call — otherwise this would eat exactly the errors the
     // guest's own glGetError is looking for.
@@ -2439,6 +2601,132 @@ static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
         g_bindlog_err[i] = a_glGetError();
     }
 }
+// ---- a 2D framebuffer the guest draws into with MULTIVIEW programs ----
+//
+// Doom3Quest compiles every shader it has with `layout(num_views = 2)`, and
+// then draws its HUD and its PDA with them into a plain 2D framebuffer of its
+// own (neo/renderer/framebuffer.cpp: a GL_TEXTURE_2D colour attachment and a
+// depth-stencil renderbuffer), from which idImage::CopyFramebuffer lifts a
+// square with glCopyTexImage2D. OVR_multiview says a draw whose program and
+// framebuffer disagree about the number of views is INVALID_OPERATION; the
+// Quest's driver draws anyway, ANGLE does not (validationES.cpp,
+// kMultiviewMismatch), and every one of those draws is dropped. On device,
+// 2026-10-08: KL_GLFB_ERRSCAN names glDrawElements with 0x502, and the PDA is a
+// black rectangle with a lit frame — the cleared framebuffer, copied faithfully.
+//
+// So such a framebuffer is given what the programs want. When the guest
+// attaches a 2D texture as colour 0 of one of its framebuffers, a two-slice
+// array of the same size is attached in its place with
+// glFramebufferTextureMultiviewOVR, and a two-slice depth-stencil array where
+// it attaches its renderbuffer; the guest's draws are then legal and land in
+// both slices. Reading is the other half: a multiview framebuffer cannot be
+// read at all, so glCopyTexImage2D / glCopyTexSubImage2D are served from slice
+// 0 through a read framebuffer of our own. The guest's 2D texture itself is
+// never written — nothing in this guest samples it, it only copies out.
+//
+// KL_GLFB_MV_SHADOW, on for doom3quest only: a guest that renders ordinary
+// programs into its 2D framebuffers must be left exactly as it is.
+static int klfb_mv_shadow_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_MV_SHADOW", t && strcmp(t, "doom3quest") == 0);
+    }
+    return on;
+}
+typedef struct { uint32_t fbo, color, depth; int w, h; } klfb_mvs;
+#define KLFB_MVS_MAX 8
+static klfb_mvs g_mvs[KLFB_MVS_MAX];
+static klfb_mvs *klfb_mvs_find(uint32_t fbo) {
+    if (!fbo) return NULL;
+    for (int i = 0; i < KLFB_MVS_MAX; i++)
+        if (g_mvs[i].fbo == fbo) return &g_mvs[i];
+    return NULL;
+}
+static klfb_mvs *klfb_mvs_make(uint32_t fbo, int w, int h) {
+    klfb_mvs *m = klfb_mvs_find(fbo);
+    if (m && m->w == w && m->h == h) return m;
+    static void (*gen)(int32_t, uint32_t *);
+    static void (*del)(int32_t, const uint32_t *);
+    static void (*bind)(uint32_t, uint32_t);
+    if (!gen)  gen  = asym("glGenTextures");
+    if (!del)  del  = asym("glDeleteTextures");
+    if (!bind) bind = asym("glBindTexture");
+    if (!gen || !del || !bind || !g_real_TexStorage3D || !a_glGetIntegerv) return NULL;
+    if (!m) {
+        for (int i = 0; i < KLFB_MVS_MAX && !m; i++)
+            if (!g_mvs[i].fbo) m = &g_mvs[i];
+        if (!m) return NULL;
+    } else {
+        uint32_t old[2] = { m->color, m->depth };
+        del(2, old);
+    }
+    int32_t save = 0;
+    a_glGetIntegerv(0x8C1D /* TEXTURE_BINDING_2D_ARRAY */, &save);
+    uint32_t t[2] = { 0, 0 };
+    gen(2, t);
+    bind(0x8C1A, t[0]);
+    g_real_TexStorage3D(0x8C1A, 1, 0x8058 /* RGBA8 */, w, h, 2);
+    bind(0x8C1A, t[1]);
+    g_real_TexStorage3D(0x8C1A, 1, 0x88F0 /* DEPTH24_STENCIL8 */, w, h, 2);
+    bind(0x8C1A, (uint32_t)save);
+    m->fbo = fbo; m->color = t[0]; m->depth = t[1]; m->w = w; m->h = h;
+    fprintf(stderr, "  [glfb] framebuffer %u is a 2D target the guest draws into with "
+                    "multiview programs: %dx%d two-slice colour and depth-stencil "
+                    "arrays stand in for its attachments (KL_GLFB_MV_SHADOW=0 leaves "
+                    "it alone)\n", fbo, w, h);
+    return m;
+}
+static void (*g_real_FramebufferRenderbuffer)(uint32_t, uint32_t, uint32_t, uint32_t);
+static void klfb_FramebufferRenderbuffer(uint32_t target, uint32_t attachment,
+                                         uint32_t rbtarget, uint32_t rb) {
+    klfb_mvs *m = (klfb_mv_shadow_on() && klfb_is_draw_target(target))
+                      ? klfb_mvs_find(g_draw_fb) : NULL;
+    if (m && rb && g_real_FramebufferTextureMultiviewOVR &&
+        (attachment == 0x8D00 /* DEPTH */ || attachment == 0x8D20 /* STENCIL */ ||
+         attachment == 0x821A /* DEPTH_STENCIL */)) {
+        g_real_FramebufferTextureMultiviewOVR(target, attachment, m->depth, 0, 0, 2);
+        return;
+    }
+    if (g_real_FramebufferRenderbuffer)
+        g_real_FramebufferRenderbuffer(target, attachment, rbtarget, rb);
+}
+// Slice 0 of a stand-in, bound for reading; returns whether it was.
+static int klfb_mvs_read_begin(int32_t *saved) {
+    klfb_mvs *m = klfb_mv_shadow_on() ? klfb_mvs_find(g_read_fb) : NULL;
+    if (!m || !g_real_BindFramebuffer || !a_glGetIntegerv) return 0;
+    static void (*genfb)(int32_t, uint32_t *);
+    static void (*layer)(uint32_t, uint32_t, uint32_t, int32_t, int32_t);
+    static uint32_t rfb;
+    if (!genfb) genfb = asym("glGenFramebuffers");
+    if (!layer) layer = asym("glFramebufferTextureLayer");
+    if (!genfb || !layer) return 0;
+    if (!rfb) genfb(1, &rfb);
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, saved);
+    g_real_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, rfb);
+    layer(0x8CA8, 0x8CE0, m->color, 0, 0);
+    return 1;
+}
+static void (*g_real_CopyTexImage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t,
+                                     int32_t, int32_t, int32_t);
+static void klfb_CopyTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t x,
+                                int32_t y, int32_t w, int32_t h, int32_t border) {
+    int32_t saved = 0;
+    int redirected = klfb_mvs_read_begin(&saved);
+    if (g_real_CopyTexImage2D) g_real_CopyTexImage2D(target, level, ifmt, x, y, w, h, border);
+    if (redirected) g_real_BindFramebuffer(0x8CA8, (uint32_t)saved);
+}
+static void (*g_real_CopyTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
+                                        int32_t, int32_t, int32_t);
+static void klfb_CopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo,
+                                   int32_t x, int32_t y, int32_t w, int32_t h) {
+    int32_t saved = 0;
+    int redirected = klfb_mvs_read_begin(&saved);
+    if (g_real_CopyTexSubImage2D) g_real_CopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+    if (redirected) g_real_BindFramebuffer(0x8CA8, (uint32_t)saved);
+}
+
 static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
                                       uint32_t textarget, uint32_t texture,
                                       int32_t level) {
@@ -2461,6 +2749,19 @@ static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
         int st = klfb_stage_of_tex(texture);
         klfb_note_eye_fbo(st >= 0 ? g_draw_fb : 0, g_draw_fb);
         klfb_note_render_stage(st);
+    }
+    // The stand-in for a 2D colour target drawn into with multiview programs
+    // (klfb_mv_shadow_on, above).
+    if (klfb_mv_shadow_on() && klfb_is_draw_target(target) && attachment == 0x8CE0 &&
+        textarget == 0x0DE1 /* TEXTURE_2D */ && texture && g_draw_fb &&
+        g_real_FramebufferTextureMultiviewOVR) {
+        uint32_t f = 0; int32_t tw = 0, th = 0;
+        klfb_tex_info(texture, &f, &tw, &th);
+        klfb_mvs *m = (tw > 0 && th > 0) ? klfb_mvs_make(g_draw_fb, tw, th) : NULL;
+        if (m) {
+            g_real_FramebufferTextureMultiviewOVR(target, attachment, m->color, 0, 0, 2);
+            return;
+        }
     }
     if (g_real_FramebufferTexture2D)
         g_real_FramebufferTexture2D(target, attachment, textarget, texture, level);
@@ -3073,8 +3374,21 @@ void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y) {
 // diagnostic readback — KL_GLFB_OUT and t_mtl_provider's lit-pixel count — and
 // those show the squeeze on purpose, as the cheapest confirmation it engaged.
 // KL_VRR=0 is the A/B.
+//
+// ...and the default is a variable rather than a literal, because the headset
+// app carries it as a SETTING (KleptonRendering, off unless a person turns it
+// on): the map is fixed for a session, sampled once before the guest boots, so
+// the sharp region stays where it was put while the eyes move away from it —
+// which reads as a blurry picture, not as a cheaper one. Hosts never call the
+// setter and keep foveating, so the measurements above stay what they were.
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+// Default stays 1 (our KL_VRR default): an app that never calls the setter, or
+// calls it with 1, foveates exactly as before.
+static int g_foveation_default = 1;
+void kl_glfb_set_foveation_default(int on) { g_foveation_default = on ? 1 : 0; }
+
 int kl_glfb_foveation_wanted(int *zones, float *edge) {
-    if (!kl_env_on("KL_VRR", 1)) return 0;
+    if (!kl_env_on("KL_VRR", g_foveation_default)) return 0;
     int z = kl_env_int("KL_VRR_ZONES", 16);
     if (z < 1) z = 1;
     if (z > KL_FOVEATION_MAX_ZONES) z = KL_FOVEATION_MAX_ZONES;
@@ -3101,8 +3415,101 @@ void kl_glfb_foveation_quality(float *q, int n, float edge) {
 }
 
 // Set once the array-mirror path (kl_glfb_mirror_eye_layer) owns an eye. See
-// kl_glfb_set_eye_rate_map for why it forbids foveation.
+// kl_glfb_set_eye_rate_map for why it forbids foveation — unless the guest's own
+// swapchain is given the map too (klfb_mirror_vrr).
 static int g_eye_mirroring;
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+// Foveation for a guest whose eyes reach the compositor by copy.
+//
+// The refusal in kl_glfb_set_eye_rate_map is about a map on the COPY ONLY. The
+// alternative it does not consider is putting the map on the guest's own
+// swapchain as well: ANGLE's size rule (ANGLEMetalSetRasterizationRateMapForSize)
+// with a minimum of ONE sample matches every colour target of the eye size, the
+// guest's array swapchain included, so its scene is rasterized through the map;
+// the copy is then between two targets carrying the same map, which the patched
+// blit performs texel for texel; and the compositor unwarps what arrives exactly
+// as it does for a provider-backed eye.
+//
+// What that costs is the caveat the size rule was given `minSamples` for: any
+// OTHER colour target the guest renders at the eye size is foveated too, and one
+// it then samples with screen coordinates comes out warped. Doom3Quest draws its
+// scene straight into the swapchain, so it is on for that target and off
+// elsewhere; KL_VRR_MIRROR is the A/B. Measured for it on device, 2026-10-08:
+// 4400x4400 per eye is 32% of the fragments through the display's own map, and
+// without the map that size took the game from 55 frames a second to 33.
+static int klfb_mirror_vrr(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VRR_MIRROR", t && strcmp(t, "doom3quest") == 0);
+    }
+    return on;
+}
+// The sample floor the size rule was installed with, so it is retired with the same.
+static int g_eye_rate_min = KL_RATE_MIN_SAMPLES;
+
+// Making a map reach framebuffers the guest has ALREADY drawn into.
+//
+// ANGLE's Metal framebuffer keeps the render pass descriptor it built and
+// rebuilds it only when the GL framebuffer's own state is synced, so a map
+// registered after a framebuffer's first pass is never picked up by it. A
+// provider-backed eye gets its map before the guest can draw; a mirrored one
+// cannot — which swapchain is an eye is only known at the first xrEndFrame that
+// submits it (Doom3Quest's menu quad is a two-slice array as well), and by then
+// the guest has drawn a frame into one of the swapchain's per-image FBOs. Left
+// alone that FBO stays unfoveated while its siblings pick the map up, and the
+// compositor unwarps every third frame of a picture that was never warped.
+//
+// So a change of map bumps a generation, and the next time the guest binds an
+// FBO of an older one its draw buffers are set again to what they already are:
+// a no-op to the guest, and a dirty bit to ANGLE, whose sync rebuilds the pass.
+static unsigned g_rate_gen = 1;
+static unsigned g_fbo_rate_gen[KLFB_RESYNC_FBOS];
+// The size rule is for the eye swapchain and for nothing else of that size.
+//
+// ANGLE can only be told "every colour target of these dimensions", and a guest
+// has others: Doom3Quest draws its HUD and its PDA into a plain 2D framebuffer
+// of exactly the eye size every frame (neo/renderer/framebuffer.cpp) and copies
+// a square out of it with glCopyTexImage2D — through the map that would be a
+// warped HUD read back at unwarped coordinates. The two are told apart by how
+// they were attached (g_fbo_multiview), so the rule is switched as the guest
+// binds: on for a multiview framebuffer, off for any other. That works because
+// of the same caching klfb_resync_fbo has to defeat — a framebuffer keeps the
+// descriptor it was synced with, and the plain one re-attaches (and so re-syncs)
+// each frame while the rule is off.
+static int g_rate_rule_on;
+static void klfb_rate_rule(int on) {
+    if (!g_eye_rate_map || !g_eye_rate_w || !a_SetRateMapForSize) return;
+    on = on ? 1 : 0;
+    if (on == g_rate_rule_on) return;
+    a_SetRateMapForSize((uint32_t)g_eye_rate_w, (uint32_t)g_eye_rate_h,
+                        (uint32_t)g_eye_rate_min, on ? g_eye_rate_map : NULL);
+    g_rate_rule_on = on;
+}
+static void klfb_rate_rule_for_fbo(uint32_t fb) {
+    if (!g_eye_mirroring || !klfb_mirror_vrr()) return;
+    klfb_rate_rule(fb < KLFB_RESYNC_FBOS && g_fbo_multiview[fb]);
+}
+static void (*a_glDrawBuffers)(int32_t, const uint32_t *);
+static void klfb_resync_fbo(uint32_t fb) {
+    if (!g_eye_mirroring || !klfb_mirror_vrr() || !fb || fb >= KLFB_RESYNC_FBOS ||
+        !g_fbo_multiview[fb]) return;
+    if (g_fbo_rate_gen[fb] == g_rate_gen) return;
+    g_fbo_rate_gen[fb] = g_rate_gen;
+    if (!a_glDrawBuffers) a_glDrawBuffers = asym("glDrawBuffers");
+    if (!a_glDrawBuffers || !a_glGetIntegerv) return;
+    int32_t cur = 0;
+    a_glGetIntegerv(0x8825 /* GL_DRAW_BUFFER0 */, &cur);
+    if (cur != 0x8CE0 /* COLOR_ATTACHMENT0 */) return;   // not a plain colour FBO: leave it
+    uint32_t buf = (uint32_t)cur;
+    a_glDrawBuffers(1, &buf);
+}
+
+// How many layers a guest rate map needs: a mirrored guest that renders both
+// eyes in one layered pass (OVR_multiview) needs one per slice.
+int kl_glfb_rate_map_layers(void) { return g_eye_mirroring && klfb_mirror_vrr() ? 2 : 1; }
 
 void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map) {
     if (!kl_glfb_init() || !mtl_resolve()) return;
@@ -3121,7 +3528,7 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
     // for. Refused rather than left to
     // the frontends, because both of them build a map from the display and
     // neither can know which guest is underneath.
-    if (g_eye_mirroring && rate_map) {
+    if (g_eye_mirroring && rate_map && !klfb_mirror_vrr()) {
         static int said;
         if (!said++)
             fprintf(stderr, "  [glfb] foveation is not available for this guest: its "
@@ -3138,9 +3545,11 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
     // Retire the previous size rule before installing another: the eye size
     // changes under us when Unity re-creates its swapchain, and a rule left
     // behind on the old size would foveate a target nothing unwarps.
-    if (g_eye_rate_w && (g_eye_rate_w != w || g_eye_rate_h != h || !rate_map))
+    int min_samples = g_eye_mirroring && klfb_mirror_vrr() ? 1 : KL_RATE_MIN_SAMPLES;
+    if (g_eye_rate_w && (g_eye_rate_w != w || g_eye_rate_h != h || !rate_map ||
+                         g_eye_rate_min != min_samples))
         a_SetRateMapForSize((uint32_t)g_eye_rate_w, (uint32_t)g_eye_rate_h,
-                            KL_RATE_MIN_SAMPLES, NULL);
+                            (uint32_t)g_eye_rate_min, NULL);
 
     g_eye_rate_map = rate_map;
     g_eye_rate_w   = rate_map ? w : 0;
@@ -3148,8 +3557,11 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
     g_eye_rate_zx  = rate_map ? zones_x : 0;
     g_eye_rate_zy  = rate_map ? zones_y : 0;
 
+    g_eye_rate_min = min_samples;
+    g_rate_rule_on = rate_map ? 1 : 0;
+    g_rate_gen++;           // framebuffers drawn into before this must be re-synced
     if (rate_map)
-        a_SetRateMapForSize((uint32_t)w, (uint32_t)h, KL_RATE_MIN_SAMPLES, rate_map);
+        a_SetRateMapForSize((uint32_t)w, (uint32_t)h, (uint32_t)min_samples, rate_map);
 
     // Eye textures already bound do not come back through the bind path, so
     // re-register (or clear) each of them here — but only those the map was
@@ -3169,9 +3581,10 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
                         e, s, g_eye_mtl[e][s].w, g_eye_mtl[e][s].h, w, h);
         }
 
-    fprintf(stderr, "  [glfb] eye rate map %p for %dx%d, %dx%d zones (multisampled "
-                    "targets of that size, plus every bound eye texture)\n",
-            rate_map, w, h, zones_x, zones_y);
+    fprintf(stderr, "  [glfb] eye rate map %p for %dx%d, %dx%d zones (%s targets of "
+                    "that size, plus every bound eye texture)\n",
+            rate_map, w, h, zones_x, zones_y,
+            min_samples > 1 ? "multisampled" : "ALL colour");
 }
 
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {
@@ -4446,6 +4859,69 @@ void kl_glfb_forget_eye_source(uint32_t source) {
                 source, freed);
 }
 
+// The compositor-side destination for one (eye, slot) of a mirrored swapchain:
+// found, or (re)allocated.
+static __typeof__(g_eye_mirror[0][0]) *klfb_mirror_dest(int eye, int slot, uint32_t source,
+                                                         int stage, uint32_t src_tex,
+                                                         int src_layer, int w, int h,
+                                                         uint32_t internal_fmt) {
+    // The destination is allocated at the SCALED size (see klfb_eye_scaled): for
+    // a foveated guest it is larger than the source eye so the centre inset laid
+    // over it later keeps its detail. The base is upscaled into it here.
+    int mw, mh;
+    klfb_eye_scaled(w, h, &mw, &mh);
+
+    // (Re)allocate the destination. A size or format change means the guest
+    // rebuilt its swapchain, and the old destination describes a picture that no
+    // longer exists — release it rather than blit a mismatch, which the blit
+    // would happily scale.
+    __typeof__(g_eye_mirror[0][0]) *m = &g_eye_mirror[eye][slot];
+    // ...and the eye table is the authority on whether our name still exists.
+    // kl_glfb_release_eye_texture deletes it, and it has callers that know
+    // nothing about this record — a swapchain teardown, a re-bind backstop — so
+    // a destination remembered here and gone there would be a blit into a
+    // deleted name: GL_INVALID_OPERATION, once, and a black eye for the rest of
+    // the run.
+    if (m->tex && g_eye_mtl[eye][slot].gl_tex != m->tex) *m = (__typeof__(*m)){0};
+    if (m->tex && (m->w != mw || m->h != mh || m->fmt != internal_fmt)) {
+        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x (guest tex "
+                        "%u) -> %dx%d fmt 0x%x (guest tex %u), reallocating — the "
+                        "guest rebuilt this swapchain\n",
+                eye, slot, m->w, m->h, m->fmt, m->src, mw, mh, internal_fmt, src_tex);
+        kl_glfb_release_eye_texture(eye, slot);   // drops the EGLImage AND our name
+        *m = (__typeof__(*m)){0};
+    }
+    if (!m->tex) {
+        uint32_t t = 0;
+        r_GenTextures(1, &t);
+        if (!t) return NULL;
+        // kl_glfb_bind_eye_mtl_texture leaves GL_TEXTURE_2D bound to whatever it
+        // was given, which is fine where it is normally called from (the guest's
+        // own graphics setup, in ovrp_SetupEyeTexture2) and is not fine here:
+        // this runs inside the guest's frame, between its calls. Six times a run
+        // rather than every frame, and the failure would be a texture binding
+        // the guest never asked for surviving into its next draw.
+        int32_t save_tex = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
+        int ok = kl_glfb_bind_eye_mtl_texture(eye, slot, t, mw, mh, internal_fmt);
+        if (a_glBindTexture_mtl) a_glBindTexture_mtl(0x0DE1, (uint32_t)save_tex);
+        if (!ok) {
+            // The provider declined, so the name is ours and nothing else took a
+            // reference to it. kl_glfb_bind_eye_mtl_texture has already said why.
+            if (r_DeleteTextures) r_DeleteTextures(1, &t);
+            return NULL;
+        }
+        m->tex = t; m->w = mw; m->h = mh; m->fmt = internal_fmt; m->src = src_tex;
+        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x <- swapchain "
+                        "%u image %d (guest tex %u layer %d) %s(one blit a frame; "
+                        "the array swapchain cannot be re-pointed)\n",
+                eye, slot, mw, mh, internal_fmt, source, stage, src_tex, src_layer,
+                (mw != w || mh != h) ? "UPSCALED from source " : "");
+    }
+
+    return m;
+}
+
 int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t source,
                              uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt) {
@@ -4513,59 +4989,10 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t source,
 
     if (!klfb_mirror_resolve(src_layer >= 0)) return -1;
 
-    // The destination is allocated at the SCALED size (see klfb_eye_scaled): for
-    // a foveated guest it is larger than the source eye so the centre inset laid
-    // over it later keeps its detail. The base is upscaled into it here.
-    int mw, mh;
-    klfb_eye_scaled(w, h, &mw, &mh);
-
-    // (Re)allocate the destination. A size or format change means the guest
-    // rebuilt its swapchain, and the old destination describes a picture that no
-    // longer exists — release it rather than blit a mismatch, which the blit
-    // would happily scale.
-    __typeof__(g_eye_mirror[0][0]) *m = &g_eye_mirror[eye][slot];
-    // ...and the eye table is the authority on whether our name still exists.
-    // kl_glfb_release_eye_texture deletes it, and it has callers that know
-    // nothing about this record — a swapchain teardown, a re-bind backstop — so
-    // a destination remembered here and gone there would be a blit into a
-    // deleted name: GL_INVALID_OPERATION, once, and a black eye for the rest of
-    // the run.
-    if (m->tex && g_eye_mtl[eye][slot].gl_tex != m->tex) *m = (__typeof__(*m)){0};
-    if (m->tex && (m->w != mw || m->h != mh || m->fmt != internal_fmt)) {
-        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x (guest tex "
-                        "%u) -> %dx%d fmt 0x%x (guest tex %u), reallocating — the "
-                        "guest rebuilt this swapchain\n",
-                eye, slot, m->w, m->h, m->fmt, m->src, mw, mh, internal_fmt, src_tex);
-        kl_glfb_release_eye_texture(eye, slot);   // drops the EGLImage AND our name
-        *m = (__typeof__(*m)){0};
-    }
-    if (!m->tex) {
-        uint32_t t = 0;
-        r_GenTextures(1, &t);
-        if (!t) return -1;
-        // kl_glfb_bind_eye_mtl_texture leaves GL_TEXTURE_2D bound to whatever it
-        // was given, which is fine where it is normally called from (the guest's
-        // own graphics setup, in ovrp_SetupEyeTexture2) and is not fine here:
-        // this runs inside the guest's frame, between its calls. Six times a run
-        // rather than every frame, and the failure would be a texture binding
-        // the guest never asked for surviving into its next draw.
-        int32_t save_tex = 0;
-        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
-        int ok = kl_glfb_bind_eye_mtl_texture(eye, slot, t, mw, mh, internal_fmt);
-        if (a_glBindTexture_mtl) a_glBindTexture_mtl(0x0DE1, (uint32_t)save_tex);
-        if (!ok) {
-            // The provider declined, so the name is ours and nothing else took a
-            // reference to it. kl_glfb_bind_eye_mtl_texture has already said why.
-            if (r_DeleteTextures) r_DeleteTextures(1, &t);
-            return -1;
-        }
-        m->tex = t; m->w = mw; m->h = mh; m->fmt = internal_fmt; m->src = src_tex;
-        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x <- swapchain "
-                        "%u image %d (guest tex %u layer %d) %s(one blit a frame; "
-                        "the array swapchain cannot be re-pointed)\n",
-                eye, slot, mw, mh, internal_fmt, source, stage, src_tex, src_layer,
-                (mw != w || mh != h) ? "UPSCALED from source " : "");
-    }
+    __typeof__(g_eye_mirror[0][0]) *m =
+        klfb_mirror_dest(eye, slot, source, stage, src_tex, src_layer, w, h, internal_fmt);
+    if (!m) return -1;
+    int mw = m->w, mh = m->h;
 
     // KL_GLFB_PROBE_VIDEO: read the guest's rendered EYE texture just before we
     // copy it to the compositor. Bright here => the guest DID render the video,
@@ -4575,9 +5002,33 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t source,
 
     // Identity copy at 1:1 (NEAREST, exact); an upscale into a larger eye
     // texture goes through the LINEAR sub-rect blit, filling it whole.
+    // A foveated mirror copies WARPED texels, and the copy itself must not go
+    // through the map. The patched blit's texel-for-texel mode would be the
+    // tool, and it does not cover this case: it is implemented for a 2D source
+    // only, and this source is a slice of an array, so with the map on both
+    // sides ANGLE resamples the warped picture through the map a second time
+    // (on device, 2026-10-08: the eye's picture squeezed into the corner of the
+    // corner — 65% x 49% of the view after the compositor's unwarp, exactly the
+    // physical fraction once more). So for the duration of the copy the
+    // destination is taken out of the registry, by texture and by size: the pass
+    // ANGLE builds for it is then an ordinary one, and an unscaled NEAREST blit
+    // between equal rectangles is an identity on texels whatever they hold. The
+    // guest's own framebuffers are not touched by this — their descriptors are
+    // cached, and nothing else runs on this context in between.
+    int unmap = g_eye_rate_map && klfb_mirror_vrr() && a_SetRateMapForSize && a_SetRateMap &&
+                g_eye_rate_w == mw && g_eye_rate_h == mh;
+    int rule_was = g_rate_rule_on;
+    if (unmap) {
+        klfb_rate_rule(0);
+        if (g_eye_mtl[eye][slot].tex) a_SetRateMap(g_eye_mtl[eye][slot].tex, NULL);
+    }
     uint32_t e = (mw == w && mh == h)
         ? klfb_mirror_blit(src_tex, src_layer, m->tex, w, h)
         : klfb_blit_subrect(src_tex, src_layer, m->tex, w, h, 0, 0, mw, mh);
+    if (unmap) {
+        klfb_rate_rule(rule_was);
+        if (g_eye_mtl[eye][slot].tex) a_SetRateMap(g_eye_mtl[eye][slot].tex, g_eye_rate_map);
+    }
     if (e) {
         static int said;
         if (!said++)
@@ -5316,6 +5767,126 @@ static void klfb_RenderbufferStorage(uint32_t target, uint32_t fmt,
     if (g_real_RenderbufferStorage) g_real_RenderbufferStorage(target, fmt, w, h);
 }
 
+// An MSAA resolve into a destination of a DIFFERENT format. ES 3.0 forbids it
+// (GL_INVALID_OPERATION, and the blit does nothing); the Quest's driver does it.
+// Keep Talking and Nobody Explodes renders its scene into an RGBA8 multisample
+// renderbuffer and resolves it straight into the SRGB8_ALPHA8 eye texture, so on
+// ANGLE every eye resolve failed, the eye texture was never written, and both
+// eyes showed whatever the storage held — solid pink. Called only after the
+// guest's own blit has failed with 0x502 and only for a multisampled
+// renderbuffer source: resolve into a same-format staging texture (legal), then
+// blit that single-sampled copy to the guest's destination, where a format
+// conversion is legal. KL_GLFB_RESOLVE_STAGE=0 turns it off.
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_glfb.c
+static int klfb_resolve_stage_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_RESOLVE_STAGE", 1);
+    return on;
+}
+static int klfb_resolve_via_stage(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
+                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
+                                  uint32_t mask, uint32_t filter) {
+    if (!klfb_resolve_stage_on() || !(mask & 0x4000 /* COLOR_BUFFER_BIT */) || !a_glGetIntegerv ||
+        !g_real_BlitFramebuffer)
+        return 0;
+    static void (*bindfb)(uint32_t, uint32_t);
+    static void (*getfap)(uint32_t, uint32_t, uint32_t, int32_t *);
+    static void (*bindrb)(uint32_t, uint32_t);
+    static void (*getrbp)(uint32_t, uint32_t, int32_t *);
+    static void (*gentex)(int32_t, uint32_t *);
+    static void (*deltex)(int32_t, const uint32_t *);
+    static void (*bindtex)(uint32_t, uint32_t);
+    static void (*texstorage)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+    static void (*genfb)(int32_t, uint32_t *);
+    static void (*fbtex)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    if (!bindfb) {
+        bindfb     = asym("glBindFramebuffer");
+        getfap     = asym("glGetFramebufferAttachmentParameteriv");
+        bindrb     = asym("glBindRenderbuffer");
+        getrbp     = asym("glGetRenderbufferParameteriv");
+        gentex     = asym("glGenTextures");
+        deltex     = asym("glDeleteTextures");
+        bindtex    = asym("glBindTexture");
+        texstorage = asym("glTexStorage2D");
+        genfb      = asym("glGenFramebuffers");
+        fbtex      = asym("glFramebufferTexture2D");
+    }
+    if (!bindfb || !getfap || !bindrb || !getrbp || !gentex || !deltex ||
+        !bindtex || !texstorage || !genfb || !fbtex)
+        return 0;
+    int32_t rfb = 0, dfb = 0, rbuf = 0;
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rfb);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &dfb);
+    a_glGetIntegerv(0x0C02 /* READ_BUFFER */, &rbuf);
+    if (rfb <= 0 || rbuf == 0 /* NONE */) return 0;
+    int32_t otype = 0, oname = 0;
+    getfap(0x8CA8 /* READ_FRAMEBUFFER */, (uint32_t)rbuf, 0x8CD0 /* OBJECT_TYPE */, &otype);
+    if (otype != 0x8D41 /* RENDERBUFFER */) return 0;
+    getfap(0x8CA8, (uint32_t)rbuf, 0x8CD1 /* OBJECT_NAME */, &oname);
+    int32_t save_rb = 0, fmt = 0, samples = 0, w = 0, h = 0;
+    a_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &save_rb);
+    bindrb(0x8D41, (uint32_t)oname);
+    getrbp(0x8D41, 0x8D44 /* INTERNAL_FORMAT */, &fmt);
+    getrbp(0x8D41, 0x8CAB /* SAMPLES */, &samples);
+    getrbp(0x8D41, 0x8D42 /* WIDTH */, &w);
+    getrbp(0x8D41, 0x8D43 /* HEIGHT */, &h);
+    bindrb(0x8D41, (uint32_t)save_rb);
+    if (samples <= 0 || w <= 0 || h <= 0) return 0;
+
+    static uint32_t stex, sfb;
+    static int32_t sfmt, sw, sh;
+    if (!sfb) genfb(1, &sfb);
+    if (!sfb) return 0;
+    if (!stex || sfmt != fmt || sw != w || sh != h) {
+        if (stex) deltex(1, &stex);
+        stex = 0;
+        gentex(1, &stex);
+        if (!stex) return 0;
+        int32_t save_tex = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
+        bindtex(0x0DE1 /* TEXTURE_2D */, stex);
+        texstorage(0x0DE1, 1, (uint32_t)fmt, w, h);
+        bindtex(0x0DE1, (uint32_t)save_tex);
+        bindfb(0x8CA9 /* DRAW_FRAMEBUFFER */, sfb);
+        fbtex(0x8CA9, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, stex, 0);
+        sfmt = fmt; sw = w; sh = h;
+        fprintf(stderr, "  [glfb] MSAA resolve across formats refused by GL — "
+                        "resolving through a staging 0x%x %dx%d texture instead\n",
+                fmt, w, h);
+    }
+    // The source is foveated by the size rule (multisampled, eye-sized) and so
+    // is the eye texture; the staging texture is single-sampled and would not
+    // be. Patched ANGLE copies texel for texel only between targets carrying
+    // the SAME map and otherwise resamples through screen space — which
+    // warped the picture twice: squeezed into the lower part of the view and
+    // stretching as the head moved. So for these two blits the rule's sample
+    // floor drops to 1, which puts the staging texture under the same map.
+    int vrr = g_eye_rate_map && a_SetRateMapForSize && g_rate_rule_on &&
+              w == g_eye_rate_w && h == g_eye_rate_h;
+    if (vrr) a_SetRateMapForSize((uint32_t)w, (uint32_t)h, 1, g_eye_rate_map);
+    // 1: the resolve, same format and same rectangle on both sides.
+    bindfb(0x8CA9, sfb);
+    // Re-attached so ANGLE re-syncs the framebuffer and builds its pass with
+    // the map now in force (see klfb_resync_fbo for the caching this defeats).
+    if (vrr) fbtex(0x8CA9, 0x8CE0, 0x0DE1, stex, 0);
+    g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, sx0, sy0, sx1, sy1,
+                           0x4000, 0x2600 /* NEAREST */);
+    // 2: the guest's blit, from the single-sampled copy.
+    bindfb(0x8CA8, sfb);
+    bindfb(0x8CA9, (uint32_t)dfb);
+    g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, 0x4000, filter);
+    if (vrr)
+        a_SetRateMapForSize((uint32_t)w, (uint32_t)h, (uint32_t)g_eye_rate_min,
+                            g_eye_rate_map);
+    bindfb(0x8CA8, (uint32_t)rfb);
+    // Depth/stencil were refused along with the colour; their formats were not
+    // the problem, so they go as the guest asked.
+    if (mask & ~0x4000u)
+        g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                               mask & ~0x4000u, filter);
+    return 1;
+}
+
 static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
                                  int64_t mask, int64_t filter) {
@@ -5564,9 +6135,18 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
             }
         }
     }
-    if (g_real_BlitFramebuffer)
+    if (g_real_BlitFramebuffer) {
+        // Drained first so a 0x502 after the blit is provably the blit's own.
+        // Only while the staged resolve is enabled: KL_GLFB_RESOLVE_STAGE=0 is
+        // the blit exactly as before, with nothing drained.
+        int check = a_glGetError && (mask & 0x4000) && klfb_resolve_stage_on();
+        if (check) while (a_glGetError()) {}
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
+        if (check && a_glGetError() == 0x502 /* INVALID_OPERATION */)
+            klfb_resolve_via_stage(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                                   (uint32_t)mask, (uint32_t)filter);
+    }
     // Did the redirected eye-copy actually land the lit source into the swapchain dest?
     // Read the DRAW (swapchain) fbo's centre. Lit here but black on-screen = the per-eye
     // layer we fill is not the one submitted (a deeper submission-path problem, not a blit
@@ -7399,6 +7979,12 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glTexParameteri", (void *)klfb_TexParameteri, (void **)&g_real_TexParameteri},
     {"glGenFramebuffers", (void *)klfb_GenFramebuffers, (void **)&g_real_GenFramebuffers},
     {"glBindFramebuffer", (void *)klfb_BindFramebuffer, (void **)&g_real_BindFramebuffer},
+    {"glFramebufferTextureMultiviewOVR", (void *)klfb_FramebufferTextureMultiviewOVR,
+     (void **)&g_real_FramebufferTextureMultiviewOVR},
+    {"glFramebufferRenderbuffer", (void *)klfb_FramebufferRenderbuffer,
+     (void **)&g_real_FramebufferRenderbuffer},
+    {"glCopyTexImage2D", (void *)klfb_CopyTexImage2D, (void **)&g_real_CopyTexImage2D},
+    {"glCopyTexSubImage2D", (void *)klfb_CopyTexSubImage2D, (void **)&g_real_CopyTexSubImage2D},
     // the object census — every gen/delete pair, so a class that never shrinks
     // names itself (KL_GL_CENSUS)
     {"glDeleteFramebuffers", (void *)klfb_DeleteFramebuffers, (void **)&g_real_DeleteFramebuffers},

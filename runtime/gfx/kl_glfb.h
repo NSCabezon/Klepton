@@ -325,6 +325,8 @@ void *kl_glfb_eye_mtl_depth(int eye, int stage);
 // per-swapchain value will do; 0 means "unknown" and then `image` IS the slot,
 // which is the OVRPlugin path's direct keying and what a caller with nothing to
 // give still gets.
+// How many layers a guest rate map needs (two for a mirrored multiview guest).
+int kl_glfb_rate_map_layers(void);
 int kl_glfb_mirror_eye_layer(int eye, int image, uint32_t source,
                              uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt);
@@ -527,6 +529,10 @@ void *kl_glfb_eye_rate_map(void);
 // the border (`KL_VRR_EDGE`, default 0.35); both are clamped to what a rate map
 // will accept. Either pointer may be NULL.
 int kl_glfb_foveation_wanted(int *zones, float *edge);
+// What `KL_VRR` defaults to when the environment does not say: 1 until this is
+// called. The visionOS app calls it with its stored setting before the guest
+// boots; an explicit `KL_VRR` still overrides either way.
+void kl_glfb_set_foveation_default(int on);
 
 // The rate layer's per-zone quality along one axis: 1.0 at the centre falling
 // linearly to `edge` at the border, `n` entries. Both axes get the same curve,

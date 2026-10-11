@@ -63,6 +63,8 @@ typedef struct { CVPixelBufferRef pb; int64_t pts_us; } klvt_frame;
 
 struct kl_vtdec {
     int codec;
+    int nv12;                   // sessions request plain 8-bit NV12 — see
+                                // kl_vtdec_want_nv12
     int bgra;                   // sessions request 32BGRA (KL_VTDEC_BGRA=1, or
                                 // the Simulator); 0 = decoder's native format
 
@@ -294,6 +296,17 @@ static int klvt_rebuild(kl_vtdec *d) {
                                                    &kCFTypeDictionaryValueCallBacks);
         CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, empty);
         CFRelease(empty);
+    } else if (d->nv12) {
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_vtdec.c
+        // A reader that is going to LOCK the buffer and read its planes. Asked
+        // for nothing, an Apple-silicon headset's decoder answers with its
+        // lossless-compressed biplanar format ('&8v0'), which a GPU can sample
+        // and a CPU cannot read as rows of bytes. Naming the format costs the
+        // decompression the caller needed anyway.
+        int32_t pf = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        CFNumberRef pfn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
+        CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pfn);
+        CFRelease(pfn);
     } else {
         // Keeps the decoder from stalling on buffer churn while frames sit in
         // our ring; the count is the reference client's.
@@ -334,7 +347,8 @@ static int klvt_rebuild(kl_vtdec *d) {
 
     fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> %s%s\n",
             d->codec == KLVT_HEVC ? "HEVC" : "H.264", dim.width, dim.height,
-            d->bgra ? "BGRA" : "native format (none requested)",
+            d->bgra ? "BGRA" : d->nv12 ? "8-bit NV12 (CPU-readable)"
+                                       : "native format (none requested)",
             d->n_sess_created > 1 ? " (session rebuilt — reference frames lost)" : "");
     d->width = dim.width; d->height = dim.height;
     return 0;
@@ -644,4 +658,11 @@ void kl_vtdec_report(FILE *f) {
     if (d->dump)
         fprintf(f, "  %u access units dumped to KL_VTDEC_DUMP\n", d->dump_n);
     pthread_mutex_unlock(&d->lock);
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_vtdec.c
+// See kl_vtdec.h. Takes effect at the next session build, which is the first
+// submit — so calling it at configure time, before any access unit, is enough.
+void kl_vtdec_want_nv12(kl_vtdec *d, int on) {
+    if (d) d->nv12 = on ? 1 : 0;
 }

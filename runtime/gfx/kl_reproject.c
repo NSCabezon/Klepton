@@ -921,15 +921,42 @@ kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
     r.qz = pl ? pl->pose[5] : 0.0f;
     r.qw = pl ? pl->pose[6] : 1.0f;
     if (pl) memcpy(r.tangents, pl->tangents, sizeof r.tangents);
-    // grid_per_eye = 0: this path binds the identity grid. A layer's picture is
-    // the guest's own swapchain image copied whole, so there is no rate map to
-    // undo and no render viewport smaller than the texture.
+    // grid_per_eye = 1: this path binds kl_proj_layer_grid's two blocks. There
+    // is no rate map to undo — a layer's picture is the guest's own swapchain
+    // image — but the picture may be only PART of that image (the layer's
+    // `rect`), and the two eyes' parts need not be the same.
     kl_reproject_uniforms u =
         kl_reproject_build(pl ? &r : NULL, eye, origin_from_device,
                            device_from_view, projection, slice,
-                           pl ? pl->origin_top_left : 0, 0);
+                           pl ? pl->origin_top_left : 0, 1);
     if (!pl || pl->slot[eye] < 0) u.visible = 0;
     return u;
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_reproject.c
+// (with the grid_per_eye = 1 above): identical to the identity grid for a
+// full-texture rect, so only a guest that names a partial imageRect is affected.
+void kl_proj_layer_grid(const kl_ovrp_proj_layer *pl, simd_float2 *out) {
+    if (!out) return;
+    out[0] = simd_make_float2(1.0f, 1.0f);      // 1 x 1 cells, one block per eye
+    for (int e = 0; e < 2; e++) {
+        float x0 = 0.0f, y0 = 0.0f, x1 = 1.0f, y1 = 1.0f;
+        if (pl && pl->rect[e][2] > pl->rect[e][0] && pl->rect[e][3] > pl->rect[e][1]) {
+            x0 = pl->rect[e][0]; y0 = pl->rect[e][1];
+            x1 = pl->rect[e][2]; y1 = pl->rect[e][3];
+        }
+        // The grid is in the reprojection pass's own space, where v = 0 is the
+        // BOTTOM of the picture, and the shader flips v afterwards for a picture
+        // whose row 0 is its top. The rect is measured from row 0 either way, so
+        // for such a picture it is mirrored here and comes out right there.
+        float v0 = y0, v1 = y1;
+        if (pl && pl->origin_top_left) { v0 = 1.0f - y1; v1 = 1.0f - y0; }
+        simd_float2 *b = out + 1 + 4 * e;
+        b[0] = simd_make_float2(x0, v0);
+        b[1] = simd_make_float2(x1, v0);
+        b[2] = simd_make_float2(x0, v1);
+        b[3] = simd_make_float2(x1, v1);
+    }
 }
 
 kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,

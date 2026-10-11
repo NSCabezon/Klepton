@@ -28,6 +28,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <zlib.h>
+#include "guest/kl_driver.h"   // target name, for the per-target GL identity
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_egl.h"
@@ -359,9 +360,14 @@ static int klgl_want_multiview(void) {
     if (!t) return 0;
     // ieytd/ieytd2/ieytd-<n> (Unity), and the HL2Q3VR Source-VR family (hl2, portal
     // — both liblauncher) whose single-pass stereo is baked around GL_OVR_multiview.
+    // doom3quest (id Tech 4 / d3es): its GLSL is written for multiview outright —
+    // (adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_egl.c)
+    // every program opens with `layout(num_views=2) in;` and the VR framebuffer is
+    // attached with glFramebufferTextureMultiviewOVR, with no per-eye fallback.
     return strncmp(t, "ieytd", 5) == 0 ||
            strcmp(t, "hl2") == 0 ||
-           strcmp(t, "portal") == 0;
+           strcmp(t, "portal") == 0 ||
+           strcmp(t, "doom3quest") == 0;
 }
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
@@ -376,6 +382,24 @@ static int klgl_ext_count(void) {
     return n;
 }
 
+// The GL identity, per target. An Unreal guest creates a throwaway GLES context
+// before it has chosen an RHI, purely to read GL_RENDERER, and matches its
+// DEVICE PROFILE on the answer — and the profile is what turns Vulkan on. Moss
+// (UE 4.27) ships exactly two profiles that clear r.Android.DisableVulkanSupport,
+// both gated on `SRC_GpuFamily` matching "Adreno \(TM\) 6[0-9][0-9]" (plus the
+// make, an Android version >= 9 and Vulkan being available); anything else
+// falls to the base Android profile, Vulkan stays disabled, and a title packaged
+// without ES 3.1 stops at "This device does not support Vulkan". So for that
+// target the renderer is the Quest 2's, to go with the Quest 2 that
+// android.os.Build already describes. Read out of the game's own
+// DefaultDeviceProfiles.ini / BaseDeviceProfiles.ini, not guessed.
+static const char *klgl_identity(int renderer) {
+    const char *t = kl_driver_target_name();
+    if (t && strcmp(t, "moss") == 0)
+        return renderer ? "Adreno (TM) 650" : "Qualcomm";
+    return renderer ? "Klepton GLES" : "Klepton";
+}
+
 static const char *klgl_GetString(uint32_t name) {
     static char ver[64], glsl[64], exts[256];
     switch (name) {
@@ -386,14 +410,16 @@ static const char *klgl_GetString(uint32_t name) {
     // GLES" and falls back to the GLES RHI, which needs ES 3.2 features ANGLE
     // does not have (glTexBuffer). The Steam Frame is an Adreno 750. Measured:
     // "Adreno (TM) 750" alone did NOT flip Metro back to Vulkan, so this is a
-    // diagnostic knob, not a fix; nothing sets it by default.
+    // diagnostic knob, not a fix. Unset/empty gives the per-target default
+    // (klgl_identity: "Klepton"/"Klepton GLES" for every target except moss).
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_egl.c
     case GL_VENDOR: {
         const char *v = getenv("KL_GL_VENDOR");
-        return v && *v ? v : "Klepton";
+        return v && *v ? v : klgl_identity(0);
     }
     case GL_RENDERER: {
         const char *r = getenv("KL_GL_RENDERER");
-        return r && *r ? r : "Klepton GLES";
+        return r && *r ? r : klgl_identity(1);
     }
     // Unity parses this to decide the GLES level it drives, so the shape matters
     // as much as the number: it expects "OpenGL ES <major>.<minor> <vendor>".
@@ -1789,6 +1815,18 @@ static int32_t klegl_GetError(void) {
 // The gateway. Never fails, never aborts — see the header comment.
 void *kl_egl_sym(const char *name) {
     if (!name) return NULL;
+    // OVR_multiview_multisampled_render_to_texture is NOT offered (ANGLE's Metal
+    // backend has no implicit-resolve layered pass), and for an absent extension
+    // eglGetProcAddress answers NULL. That is what a guest tests: Doom3Quest takes
+    // glFramebufferTextureMultiviewOVR when this one is missing, where ANGLE's
+    // exported-but-disabled entry point would raise INVALID_OPERATION and leave
+    // its eye framebuffer incomplete.
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_egl.c
+    // Only for the targets offered OVR_multiview at all (klgl_want_multiview):
+    // every other target resolves this name exactly as before.
+    if (strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") == 0 &&
+        klgl_want_multiview())
+        return NULL;
     void *own = kl_egl_lookup(name);              // eglXxx resolved through here too
     if (own) return own;
     // With KL_GLFB=1 the host's real GL answers everything except the capability

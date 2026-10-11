@@ -42,3 +42,8 @@
 // the user's real Steam account through a backend the app registers
 // (KleptonSteamBridge.swift), and the app says "playing off" on teardown.
 #import "kl_steam_bridge.h"
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) visionos/Sources/Klepton-Bridging-Header.h.
+// One call, declared here rather than importing kl_mediandk.h: that header is
+// the guest-facing media table and wants <stdio.h> and CoreVideo context the
+// Swift side has no other use for.
+void kl_mediandk_set_video_default(int on);

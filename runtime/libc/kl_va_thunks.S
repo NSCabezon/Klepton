@@ -65,6 +65,8 @@ KL_VTHUNK klv___sprintf_chk,      klb___vsprintf_chk,    4
 // __snprintf_chk(dst, n, flag, cap, fmt, ...) — one more named arg; forwards to
 // klb___snprintf_chk (see kl_libc_slink.c).
 KL_VTHUNK klv___snprintf_chk,     klb___snprintf_chk,    5
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_va_thunks.S
+KL_VTHUNK klv_swprintf,           klh_swprintf,          3
 KL_VTHUNK klv_syslog,             klh_syslog,            2
 KL_VTHUNK klv_warnx,              klh_warnx,             1
 KL_VTHUNK klv_android_log_print,  klh_android_log_print, 3

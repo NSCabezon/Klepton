@@ -364,9 +364,16 @@ enum KLGameSettingsStore {
         #if KL_HUB
         return false
         #else
-        return target != "alyx"
+        return target != "alyx" && targetHandMatting
         #endif
     }
+    /// A single-game build's own default (targets.py "hand_matting", baked into
+    /// Info.plist as KLHandMattingDefault). Anything but "0" is on, so every row
+    /// that does not state it keeps the old default; avp-play's rows whose games
+    /// draw their own hands say False. Adapted from avp-play (MIT,
+    /// github.com/myMartek/avp-play) visionos/Sources/KleptonChroma.swift.
+    static let targetHandMatting: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLHandMattingDefault") as? String) != "0"
 
     /// Environment (KL_FULL, for debugging) > saved > default.
     static func fullImmersion(for target: String) -> Bool {

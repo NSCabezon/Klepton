@@ -193,6 +193,269 @@ static void probe_dump_enum(const char *spec) {
     }
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/diag/kl_mprobe.c:
+// KL_PROBE_METHODS / KL_PROBE_FIELDS / KL_PROBE_XFORM (diagnostics, env-gated) and
+// kl_mprobe_nexus_frame_budget (AC Nexus only, KL_NEXUS_FRAME_BUDGET).
+//
+// ---- KL_PROBE_METHODS: which methods of a class SURVIVED stripping ---------
+//
+// IL2CPP's managed stripping removes methods nothing in the build calls, and
+// the metadata's string table cannot say which: a name there may belong to a
+// field, a property or another class. The runtime can — il2cpp_class_get_methods
+// walks exactly what this build compiled. Asked for the custom-level classes,
+// whose shells are in the Quest build while their disk-reading half is not.
+//
+//   KL_PROBE_METHODS="CustomLevelLoader,BeatmapLevelsModel"
+//
+// Same spelling and same tick as KL_PROBE_ENUM. `ptr` is the methodPointer (a
+// MethodInfo's first field), NULL for an abstract or generic-definition method.
+static void probe_dump_methods_of(const char *spec) {
+    char ns[128] = "", name[128] = "";
+    const char *dot = strrchr(spec, '.');
+    if (dot) {
+        size_t nl = (size_t)(dot - spec);
+        if (nl >= sizeof ns) nl = sizeof ns - 1;
+        memcpy(ns, spec, nl); ns[nl] = 0;
+        snprintf(name, sizeof name, "%s", dot + 1);
+    } else {
+        snprintf(name, sizeof name, "%s", spec);
+    }
+    kl_image *img = kl_find_image("libil2cpp.so");
+    Il2CppClass *k = find_class(ns, name);
+    if (!img || !k) { fprintf(stderr, "  [mprobe] methods %s: no such class\n", spec); return; }
+    typedef const MethodInfo *(*get_methods_fn)(Il2CppClass *, void **);
+    typedef const char *(*m_name_fn)(const MethodInfo *);
+    typedef uint32_t (*m_argc_fn)(const MethodInfo *);
+    typedef const void *(*m_param_fn)(const MethodInfo *, uint32_t);
+    typedef char *(*t_name_fn)(const void *);
+    typedef void *(*get_fields_fn)(Il2CppClass *, void **);
+    typedef const char *(*f_name_fn)(void *);
+    typedef const void *(*f_type_fn)(void *);
+    typedef size_t (*f_off_fn)(void *);
+    get_methods_fn get_methods = (get_methods_fn)kl_sym(img, "il2cpp_class_get_methods");
+    m_name_fn      m_name      = (m_name_fn)kl_sym(img, "il2cpp_method_get_name");
+    m_argc_fn      m_argc      = (m_argc_fn)kl_sym(img, "il2cpp_method_get_param_count");
+    m_param_fn     m_param     = (m_param_fn)kl_sym(img, "il2cpp_method_get_param");
+    t_name_fn      t_name      = (t_name_fn)kl_sym(img, "il2cpp_type_get_name");
+    get_fields_fn  get_fields  = (get_fields_fn)kl_sym(img, "il2cpp_class_get_fields");
+    f_name_fn      f_name      = (f_name_fn)kl_sym(img, "il2cpp_field_get_name");
+    f_type_fn      f_type      = (f_type_fn)kl_sym(img, "il2cpp_field_get_type");
+    f_off_fn       f_off       = (f_off_fn)kl_sym(img, "il2cpp_field_get_offset");
+    if (!get_methods || !m_name) return;
+    fprintf(stderr, "  [mprobe] methods of %s:\n", spec);
+    void *it = NULL; unsigned n = 0;
+    for (const MethodInfo *m; (m = get_methods(k, &it)) != NULL; n++) {
+        void *ptr; memcpy(&ptr, m, sizeof ptr);
+        unsigned argc = m_argc ? (unsigned)m_argc(m) : 0u;
+        fprintf(stderr, "  [mprobe]   %-58s /%u ptr=%p\n", m_name(m), argc, ptr);
+        // The parameter TYPES, which is what a caller building the argument
+        // array by hand needs and what the name alone cannot give.
+        if (m_param && t_name)
+            for (unsigned i = 0; i < argc; i++) {
+                const void *t = m_param(m, i);
+                fprintf(stderr, "  [mprobe]       arg%-2u %s\n", i, t ? t_name(t) : "?");
+            }
+    }
+    fprintf(stderr, "  [mprobe]   (%u method(s))\n", n);
+    // ...and the fields, with offsets: the half of a class that reflection by
+    // method name cannot reach when the accessor was stripped.
+    if (get_fields && f_name && f_type && f_off && t_name) {
+        fprintf(stderr, "  [mprobe] fields of %s:\n", spec);
+        void *fit = NULL;
+        for (void *f; (f = get_fields(k, &fit)) != NULL; ) {
+            const void *t = f_type(f);
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-44s %s\n", f_off(f), f_name(f),
+                    t ? t_name(t) : "?");
+        }
+    }
+}
+
+static void probe_dump_methods(void) {
+    const char *spec = kl_env_str("KL_PROBE_METHODS", NULL);
+    if (!spec || !*spec) return;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *p = buf, *tok; (tok = strsep(&p, ",")) != NULL; )
+        if (*tok) probe_dump_methods_of(tok);
+}
+
+// ---- KL_PROBE_FIELDS: the instance fields of a live component --------------
+//
+// KL_PROBE_XFORM says WHICH transform went NaN; the component that writes it
+// keeps the inputs of that arithmetic in private fields no accessor exposes
+// (a calibrated height, a weight, a cached pose). Take the component off the
+// scene object that carries it and print its value-typed fields raw, by offset.
+// Object.FindObjectOfType would spare the path, but stripping took it.
+//
+//   KL_PROBE_FIELDS="PlayerController(Clone)/TrackingOffset=Camouflaj.XRFramework.Tracking.OffsetTracker"
+//
+// Same cadence as KL_PROBE_XFORM, at most KL_PROBE_FIELDS_MAX (8) times.
+static void probe_fields_of(unsigned frame, const char *item) {
+    char path[256];
+    snprintf(path, sizeof path, "%s", item);
+    char *eq = strchr(path, '=');
+    if (!eq) { fprintf(stderr, "  [mprobe] fields %s: want <scene path>=<Namespace.Class>\n", item); return; }
+    *eq = 0;
+    const char *spec = eq + 1;
+    char ns[128] = "", name[128] = "";
+    const char *dot = strrchr(spec, '.');
+    if (dot) {
+        size_t nl = (size_t)(dot - spec);
+        if (nl >= sizeof ns) nl = sizeof ns - 1;
+        memcpy(ns, spec, nl); ns[nl] = 0;
+        snprintf(name, sizeof name, "%s", dot + 1);
+    } else {
+        snprintf(name, sizeof name, "%s", spec);
+    }
+    kl_image *img = kl_find_image("libil2cpp.so");
+    Il2CppClass *k = find_class(ns, name);
+    if (!img || !k) { fprintf(stderr, "  [mprobe] fields %s: no such class\n", spec); return; }
+    typedef char *(*t_name_fn)(const void *);
+    typedef void *(*get_fields_fn)(Il2CppClass *, void **);
+    typedef const char *(*f_name_fn)(void *);
+    typedef const void *(*f_type_fn)(void *);
+    typedef size_t (*f_off_fn)(void *);
+    typedef int (*f_flags_fn)(void *);
+    t_name_fn      t_name     = (t_name_fn)kl_sym(img, "il2cpp_type_get_name");
+    get_fields_fn  get_fields = (get_fields_fn)kl_sym(img, "il2cpp_class_get_fields");
+    f_name_fn      f_name     = (f_name_fn)kl_sym(img, "il2cpp_field_get_name");
+    f_type_fn      f_type     = (f_type_fn)kl_sym(img, "il2cpp_field_get_type");
+    f_off_fn       f_off      = (f_off_fn)kl_sym(img, "il2cpp_field_get_offset");
+    f_flags_fn     f_flags    = (f_flags_fn)kl_sym(img, "il2cpp_field_get_flags");
+    if (!t_name || !get_fields || !f_name || !f_type || !f_off || !f_flags) return;
+    // GetComponent has a (Type) and a (String) overload with the same arity;
+    // the by-name lookup returns whichever comes first. Pick by parameter type.
+    typedef const MethodInfo *(*get_methods_fn)(Il2CppClass *, void **);
+    typedef const char *(*m_name_fn)(const MethodInfo *);
+    typedef uint32_t (*m_argc_fn)(const MethodInfo *);
+    typedef const void *(*m_param_fn)(const MethodInfo *, uint32_t);
+    static const MethodInfo *m_find, *m_getc;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        m_find = find_method("UnityEngine", "GameObject", "Find", 1);
+        get_methods_fn get_methods = (get_methods_fn)kl_sym(img, "il2cpp_class_get_methods");
+        m_name_fn      m_name      = (m_name_fn)kl_sym(img, "il2cpp_method_get_name");
+        m_argc_fn      m_argc      = (m_argc_fn)kl_sym(img, "il2cpp_method_get_param_count");
+        m_param_fn     m_param     = (m_param_fn)kl_sym(img, "il2cpp_method_get_param");
+        Il2CppClass *gok = find_class("UnityEngine", "GameObject");
+        void *it = NULL;
+        if (gok && get_methods && m_name && m_argc && m_param)
+            for (const MethodInfo *m; (m = get_methods(gok, &it)) != NULL; ) {
+                if (strcmp(m_name(m), "GetComponent") || m_argc(m) != 1) continue;
+                const void *t = m_param(m, 0);
+                if (t && !strcmp(t_name(t), "System.Type")) { m_getc = m; break; }
+            }
+        if (!m_getc) fprintf(stderr, "  [mprobe] GameObject has no GetComponent(Type)\n");
+    }
+    if (!m_find || !m_getc) return;
+    void *a0[1] = { il.string_new(path) };
+    Il2CppObject *go = invoke(m_find, a0, "GameObject.Find");
+    if (!go) return;                                  // not spawned yet: stay quiet
+    void *a1[1] = { il.type_get_object(il.class_get_type(k)) };
+    Il2CppObject *obj = invoke_on(go, m_getc, a1, "GameObject.GetComponent");
+    if (!obj) { fprintf(stderr, "  [mprobe f%u] fields %s: %s carries none\n", frame, spec, path); return; }
+    fprintf(stderr, "  [mprobe f%u] fields of the live %s @%p:\n", frame, spec, (void *)obj);
+    const uint8_t *base = (const uint8_t *)obj;
+    void *fit = NULL;
+    for (void *f; (f = get_fields(k, &fit)) != NULL; ) {
+        if (f_flags(f) & 0x10) continue;                  // static: not in the instance
+        const void *t = f_type(f);
+        const char *tn = t ? t_name(t) : "?";
+        size_t off = f_off(f);
+        const uint8_t *p = base + off;
+        float v[4]; int32_t i32; memcpy(v, p, sizeof v); memcpy(&i32, p, sizeof i32);
+        if (!strcmp(tn, "System.Single"))
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s %g\n", off, f_name(f), v[0]);
+        else if (!strcmp(tn, "System.Boolean"))
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s %s\n", off, f_name(f), p[0] ? "true" : "false");
+        else if (!strcmp(tn, "UnityEngine.Vector3"))
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s (%g %g %g)\n", off, f_name(f), v[0], v[1], v[2]);
+        else if (!strcmp(tn, "UnityEngine.Quaternion"))
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s (%g %g %g %g)\n", off, f_name(f), v[0], v[1], v[2], v[3]);
+        else if (!strcmp(tn, "System.Int32") || strstr(tn, "Flags") || strstr(tn, "Type") || strstr(tn, "Mode"))
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s %d   (%s)\n", off, f_name(f), i32, tn);
+        else if (!strncmp(tn, "System.Nullable<", 16))
+            // Mono lays Nullable<T> out as { T value; bool has_value }.
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s raw(%g %g %g %g)   (%s)\n", off, f_name(f),
+                    v[0], v[1], v[2], v[3], tn);
+        else {
+            void *ref; memcpy(&ref, p, sizeof ref);
+            fprintf(stderr, "  [mprobe]   +0x%03zx %-34s %s   (%s)\n", off, f_name(f),
+                    ref ? "set" : "null", tn);
+        }
+    }
+}
+
+static void probe_fields(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_FIELDS", NULL);
+    static unsigned printed, cap;
+    if (!cap) cap = kl_env_uint("KL_PROBE_FIELDS_MAX", 8u);
+    if (!spec || !*spec || printed >= cap) return;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *p = buf, *tok; (tok = strsep(&p, ",")) != NULL; )
+        if (*tok) probe_fields_of(frame, tok);
+    printed++;
+}
+
+// ---- KL_PROBE_XFORM: the local TRS along a scene path ----------------------
+//
+// Unity says "Infinity or NaN ... transform matrix" and names the LEAF of a
+// hierarchy path. Which ancestor went bad first, and whether it is its
+// position, rotation or scale, is what decides where to look — a NaN rotation
+// is a pose source, a zero or NaN scale is something else entirely — and the
+// message carries none of it. So walk the path from the root object down and
+// print each level's own local values.
+//
+//   KL_PROBE_XFORM="PlayerController(Clone)/TrackingOffset/TrackedHeadset/Camera"
+//
+// Printed on the probe's cadence (KL_PROBE_FROM / KL_PROBE_EVERY), at most
+// eight times, and only once the root object exists.
+static void probe_xform_path(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_XFORM", NULL);
+    static unsigned printed;
+    if (!spec || !*spec || printed >= 8) return;
+    static const MethodInfo *m_find, *m_tr, *m_child, *m_lp, *m_lr, *m_ls, *m_wp;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        m_find  = find_method("UnityEngine", "GameObject", "Find", 1);
+        m_tr    = find_method("UnityEngine", "GameObject", "get_transform", 0);
+        m_child = find_method("UnityEngine", "Transform", "Find", 1);
+        m_lp    = find_method("UnityEngine", "Transform", "get_localPosition", 0);
+        m_lr    = find_method("UnityEngine", "Transform", "get_localRotation", 0);
+        m_ls    = find_method("UnityEngine", "Transform", "get_localScale", 0);
+        m_wp    = find_method("UnityEngine", "Transform", "get_position", 0);
+    }
+    if (!m_find || !m_tr || !m_child) return;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *rest = buf, *seg = strsep(&rest, "/");
+    void *a1[1] = { il.string_new(seg) };
+    Il2CppObject *go = invoke(m_find, a1, "GameObject.Find");
+    if (!go) return;                                  // not spawned yet: stay quiet
+    Il2CppObject *t = invoke_on(go, m_tr, NULL, "GameObject.transform");
+    fprintf(stderr, "  [mprobe f%u] xform path %s\n", frame, spec);
+    for (int depth = 0; t; depth++) {
+        float lp[3] = {0}, lr[4] = {0}, ls[3] = {0}, wp[3] = {0};
+        Il2CppObject *o;
+        if (m_lp && (o = invoke_on(t, m_lp, NULL, "localPosition"))) memcpy(lp, il.object_unbox(o), sizeof lp);
+        if (m_lr && (o = invoke_on(t, m_lr, NULL, "localRotation"))) memcpy(lr, il.object_unbox(o), sizeof lr);
+        if (m_ls && (o = invoke_on(t, m_ls, NULL, "localScale")))    memcpy(ls, il.object_unbox(o), sizeof ls);
+        if (m_wp && (o = invoke_on(t, m_wp, NULL, "position")))      memcpy(wp, il.object_unbox(o), sizeof wp);
+        fprintf(stderr, "  [mprobe]   %*s%-18s lpos(%g %g %g) lrot(%g %g %g %g) lscale(%g %g %g) wpos(%g %g %g)\n",
+                depth * 2, "", seg, lp[0], lp[1], lp[2], lr[0], lr[1], lr[2], lr[3],
+                ls[0], ls[1], ls[2], wp[0], wp[1], wp[2]);
+        seg = rest ? strsep(&rest, "/") : NULL;
+        if (!seg) break;
+        void *a2[1] = { il.string_new(seg) };
+        t = invoke_on(t, m_child, a2, "Transform.Find");
+        if (!t) fprintf(stderr, "  [mprobe]   %*s%s: no such child\n", depth * 2 + 2, "", seg);
+    }
+    printed++;
+}
+
 static void probe_dump_enums(void) {
     const char *spec = kl_env_str("KL_PROBE_ENUM", NULL);
     if (!spec || !*spec) return;
@@ -393,6 +656,75 @@ static void mprobe_resolve_offsets(void) {
     }
 }
 
+// ---- AC Nexus VR: the frame length the guest spins itself out to -------------
+//
+// Not a probe: the one place the runtime writes a managed value, kept here
+// because the il2cpp bindings are. AC Nexus runs with Application SpaceWarp and
+// paces ITSELF for it: NexusUtils.PhaseSyncHack.SpinWaitAtEndOfNexusFrame spins
+// every frame out to _nexusFrameTicksSpaceWarp, which its Awake sets from a
+// per-headset constant — 85% of two display periods, 21.25 ms for a Quest 2 at
+// 80 Hz (Q2_TARGET) and 18.89 ms for a Quest 3 at 90 Hz (Q3_TARGET). On a Quest
+// the compositor then holds the app to half the display rate and synthesises
+// the frames between. Nothing synthesises frames here, so that spin is half the
+// frame rate given away for nothing, and at the Quest 2 length it is not even a
+// whole number of display frames: 46.7 fps against a 100 Hz display, six frames
+// shown for two periods and the seventh for three.
+//
+// So the spin is taken out (0 ticks, the value the game itself uses outside
+// SpaceWarp — _nexusFrameTicksNormal is 0) and the game runs as fast as it
+// can: 100 fps in its menus and 70-98 in a level on device, where the spin had
+// held both at 46.7. Only the value its Awake wrote for a Quest 2 is replaced.
+// KL_NEXUS_FRAME_BUDGET=0 leaves it alone; KL_NEXUS_FRAME_BUDGET_MS=<ms> spins
+// to that length instead (17.0 is the game's own rule at 100 Hz, and with
+// KL_GUEST_FRESH_POSE gives exactly half the display rate).
+void kl_mprobe_nexus_frame_budget(unsigned frame) {
+    static int on = -1;
+    static double ms;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_NEXUS_FRAME_BUDGET", t && strcmp(t, "x5812519008825194") == 0);
+        const char *e = kl_env_str("KL_NEXUS_FRAME_BUDGET_MS", NULL);
+        ms = e ? strtod(e, NULL) : 0.0;
+        if (!(ms >= 0.0 && ms < 21.25)) ms = 0.0;
+    }
+    if (!on || frame < 300 || frame % 300) return;
+    if (!mprobe_init()) return;
+    static const MethodInfo *m_fo; static Il2CppObject *type; static size_t off; static int r;
+    if (!r) {
+        r = 1;
+        kl_image *img = kl_find_image("libil2cpp.so");
+        Il2CppClass *k = find_class("NexusUtils", "PhaseSyncHack");
+        typedef void *(*gfn_fn)(Il2CppClass *, const char *);
+        typedef size_t (*f_off_fn)(void *);
+        gfn_fn gfn = img ? (gfn_fn)kl_sym(img, "il2cpp_class_get_field_from_name") : NULL;
+        f_off_fn fo = img ? (f_off_fn)kl_sym(img, "il2cpp_field_get_offset") : NULL;
+        void *f = k && gfn ? gfn(k, "_nexusFrameTicksSpaceWarp") : NULL;
+        if (f && fo) off = fo(f);
+        if (k) type = il.type_get_object(il.class_get_type(k));
+        m_fo = find_method("UnityEngine", "Object", "FindObjectsOfType", 1);
+        if (!off || !type || !m_fo) {
+            fprintf(stderr, "  [nexus] frame length: PhaseSyncHack not found as expected — left alone\n");
+            on = 0;
+            return;
+        }
+    }
+    int64_t want = (int64_t)(ms * 1e4);                       // 100 ns ticks
+    void *ta[1] = { type };
+    Il2CppObject *arr = invoke(m_fo, ta, "FindObjectsOfType(PhaseSyncHack)");
+    unsigned n = arr ? il.array_length(arr) : 0;
+    for (unsigned i = 0; i < n; i++) {
+        Il2CppObject *o = ((Il2CppObject **)((uint8_t *)arr + ARR_DATA))[i];
+        if (!o) continue;
+        int64_t *p = (int64_t *)((uint8_t *)o + off);
+        if (*p == 212500) {                                   // Q2_TARGET, as Awake wrote it
+            fprintf(stderr, "  [nexus] frame length: the game's SpaceWarp spin of %.2f ms "
+                            "(Quest 2 at 80 Hz) -> %.2f ms\n", (double)*p / 1e4, ms);
+            *p = want;
+        }
+    }
+}
+
 void kl_mprobe_tick(unsigned frame) {
     // Independent of KL_PROBE_INPUT and of KL_PROBE_FROM: this one has to land
     // BEFORE the throw it exists to describe, and the throw here is on the
@@ -440,7 +772,9 @@ void kl_mprobe_tick(unsigned frame) {
     if (!mprobe_init()) { on = 0; return; }
 
     static int dumped_enums;
-    if (!dumped_enums) { dumped_enums = 1; probe_dump_enums(); }
+    if (!dumped_enums) { dumped_enums = 1; probe_dump_enums(); probe_dump_methods(); }
+    probe_xform_path(frame);
+    probe_fields(frame);
 
     // Input.GetJoystickNames and InputTracking.GetLocalPosition/Rotation are
     // NOT here: IL2CPP's managed stripping removed them, which is itself the

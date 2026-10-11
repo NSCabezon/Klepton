@@ -1054,6 +1054,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     uint64_t        published;    // poses the compositor has offered
+    uint64_t        published_ns; // when the last one was (guest_now_ns)
     uint64_t        consumed;     // poses the guest has started a frame for
     unsigned        limit;        // KL_FRAMES, or 0 for "until stopped"
     // volatile because the Steam Link pump reads it WITHOUT the lock: that loop
@@ -1134,6 +1135,23 @@ static int guest_pace_knobs(unsigned *div, double *hz) {
     return h > 0 || d > 1;
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) visionos/Sources/kl_app.c
+// (KL_GUEST_FRESH_POSE: guest_now_ns, guest_fresh_pose, published_ns) — default
+// on only for AC Nexus VR (x5812519008825194).
+static uint64_t guest_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+// See the frame loop. Default on for the one target measured.
+static int guest_fresh_pose(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_GUEST_FRESH_POSE", t && strcmp(t, "x5812519008825194") == 0);
+    }
+    return v;
+}
 static void guest_pace_wait(void) {
     static unsigned div;
     static double pace_hz, win_t0;
@@ -1252,6 +1270,22 @@ static void *guest_thread(void *unused) {
             fflush(NULL);
             break;
         }
+        // KL_GUEST_FRESH_POSE: start each frame ON a display frame. A pose
+        // that was offered while the frame was still running is not carried
+        // into the next one; the loop waits for the next offer, so a guest
+        // frame lasts a whole number of display frames and is rendered from a
+        // pose that is new when it starts. Without it a guest whose frames run
+        // a little over one display period starts each on a pose already most
+        // of a period old and its own period beats against the display's
+        // (measured on AC Nexus). A frame that ended only just after an offer
+        // keeps it, so one long frame costs a late start and not a whole period.
+        if (guest_fresh_pose()) {
+            pthread_mutex_lock(&g_guest.mu);
+            if (g_guest.published != g_guest.consumed &&
+                guest_now_ns() - g_guest.published_ns > 2500000ull)
+                g_guest.consumed = g_guest.published;
+            pthread_mutex_unlock(&g_guest.mu);
+        }
         if (limit && kl_driver_frames() >= limit) {
             printf("[guest] reached KL_FRAMES=%u\n", limit);
             fflush(NULL);
@@ -1328,6 +1362,7 @@ int kl_app_guest_start(void) {
 void kl_app_guest_publish(void) {
     pthread_mutex_lock(&g_guest.mu);
     g_guest.published++;
+    g_guest.published_ns = guest_now_ns();
     pthread_cond_signal(&g_guest.cv);
     pthread_mutex_unlock(&g_guest.mu);
 }
