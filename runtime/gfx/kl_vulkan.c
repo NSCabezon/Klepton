@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <TargetConditionals.h>
 #include <stdio.h>
@@ -4203,6 +4204,34 @@ static int klvk_fdm_passthrough(void) {
     }
     return v;
 }
+// Live switch (kl_vulkan.h). The fork keeps the density-map passes and
+// pipelines it built; OFF renders them through the identity map, as its
+// KL_FOVEATE_AB "off" phase does, so flipping back costs nothing.
+static _Atomic int g_fov_live_on = -1;     // -1 never set: whatever the fork does
+// Both answer "not live" until MoltenVK is loaded: klvk_fdm_passthrough latches
+// its answer, and asking before the dlopen would latch "cannot foveate".
+int kl_vulkan_foveate_state(void) {
+    if (!g_mvk || !klvk_fdm_passthrough() || !mvk_sym("klMVKFoveationSetEnabled")) return -1;
+    int v = atomic_load(&g_fov_live_on);
+    return v < 0 ? 1 : v;
+}
+int kl_vulkan_foveate_live(int on) {
+    if (!g_mvk || !klvk_fdm_passthrough()) {
+        VKI("foveation %s requested live: this run did not boot foveating (KL_FOVEATE=1 + the fork) "
+            "— next launch\n", on ? "ON" : "OFF");
+        return 0;
+    }
+    void (*set)(int) = (void (*)(int))mvk_sym("klMVKFoveationSetEnabled");
+    if (!set) {
+        VKI("foveation %s requested live: this foveating MoltenVK has no live switch "
+            "(klMVKFoveationSetEnabled; rebuild with tools/mvk_fdm_build.sh) — next launch\n", on ? "ON" : "OFF");
+        return 0;
+    }
+    set(on ? 1 : 0);
+    atomic_store(&g_fov_live_on, on ? 1 : 0);
+    VKI("foveation switched %s live (klMVKFoveationSetEnabled)\n", on ? "ON" : "OFF");
+    return 1;
+}
 // The game picks its map texel size inside [min, max]; Steam Frame's Adreno
 // reports 32x32 for both, and so does this by default — the path the game
 // was tuned on. KL_FDM_TEXEL overrides (a power of two, 8..128).
@@ -7262,7 +7291,8 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
     return r;
 }
 // KL_GPU_TIME: hand kl_gpu_time.m the MTLCommandQueue behind each queue the
-// guest submits on, once per queue. Never called with the knob unset.
+// guest submits on, once per queue. Never called while timing is off (neither
+// the knob nor the overlay's live flag).
 // Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) runtime/gfx/kl_vulkan.c klvk_gpu_watch.
 static void klvk_gpu_watch(VkQueue q) {
     static VkQueue seen[8];
@@ -7310,7 +7340,7 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
                 klvk_tid(), n, cb, fence != VK_NULL_HANDLE);
         }
     }
-    if (kl_gpu_time_mode()) klvk_gpu_watch(q);     // KL_GPU_TIME
+    if (kl_gpu_time_active()) klvk_gpu_watch(q);   // KL_GPU_TIME or the live overlay
     double pf_t0 = pf_on() ? pf_now() : 0;           // [perf-audit] KL_PERF_FRAME
     VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
     if (pf_t0 > 0) {
