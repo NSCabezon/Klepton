@@ -324,6 +324,15 @@ if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package
           "(set KL_STEAMDEPOT_PKG) - the in-app Steam download is left out", file=sys.stderr)
     STEAMDEPOT = False
 PKG_REF, PKG_PROD, B_PKG = _fixed("SDPKGREF"), _fixed("SDPKGPROD"), _fixed("SDPKGBLD")
+# The hub's Meta store source (Sources/KleptonMetaContent.swift): the MetaStore Swift package,
+# a sibling of SteamDepot in the AlyxAVP checkout. Hub only; KL_METASTORE_PKG overrides the path
+# (relative to visionos/). Without it the hub has no Meta source (Steam and the catalog still work).
+METASTORE_PKG = os.environ.get("KL_METASTORE_PKG", "../../../MetaStore")
+METASTORE = IS_HUB
+if METASTORE and not os.path.isfile(os.path.join(HERE, METASTORE_PKG, "Package.swift")):
+    print(f"!! hub: no MetaStore package at {os.path.join(HERE, METASTORE_PKG)} "
+          "(set KL_METASTORE_PKG) - the Meta store source is left out", file=sys.stderr)
+    METASTORE = False
 if STEAMDEPOT:
     swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
     # ...and the guest's Steamworks stand-in answered from the real account
@@ -341,6 +350,10 @@ if IS_HUB:
     swift.append({"name": "KleptonHubPrep.swift", "ref": _fixed("HUBPREPF"), "bld": _fixed("HUBPREPB")})
     # Steam Cloud saves per game (experimental, off by default); compiled out without SteamDepot.
     swift.append({"name": "KleptonCloudSaves.swift", "ref": _fixed("HUBCLOUDF"), "bld": _fixed("HUBCLOUDB")})
+    # The closed catalog of games and their store sources (Steam / Meta), and the Meta source
+    # itself (compiled out without the MetaStore package).
+    swift.append({"name": "KleptonCatalog.swift", "ref": _fixed("HUBCATF"), "bld": _fixed("HUBCATB")})
+    swift.append({"name": "KleptonMetaContent.swift", "ref": _fixed("HUBMETAF"), "bld": _fixed("HUBMETAB")})
     swift.append({"name": "../" + HUB_MANIFEST_REL, "ref": _fixed("HUBMANF"), "bld": _fixed("HUBMANB")})
 # Per-session performance summary (the compositor measures, the hub shows it).
 # Every target: the compositor calls it. Fixed ids, so the numbering above is kept.
@@ -400,28 +413,34 @@ def git_commit():
                               text=True, timeout=10).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
-PKG_BUILDFILE = (f'\t\t{B_PKG} /* SteamDepot in Frameworks */ = {{isa = PBXBuildFile; productRef = {PKG_PROD}; }};\n'
-                 if STEAMDEPOT else "")
-PKG_FRAMEWORK = f'\t\t\t\t{B_PKG} /* SteamDepot in Frameworks */,\n' if STEAMDEPOT else ""
-PKG_TARGET_DEPS = (f'\t\t\tpackageProductDependencies = (\n\t\t\t\t{PKG_PROD} /* SteamDepot */,\n\t\t\t);\n'
-                   if STEAMDEPOT else "")
-PKG_PROJECT_REFS = (f'\t\t\tpackageReferences = (\n\t\t\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */,\n\t\t\t);\n'
-                    if STEAMDEPOT else "")
-PKG_SECTIONS = (f'''/* Begin XCLocalSwiftPackageReference section */
-\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */ = {{
-\t\t\tisa = XCLocalSwiftPackageReference;
-\t\t\trelativePath = "{STEAMDEPOT_PKG}";
-\t\t}};
-/* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-\t\t{PKG_PROD} /* SteamDepot */ = {{
-\t\t\tisa = XCSwiftPackageProductDependency;
-\t\t\tpackage = {PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */;
-\t\t\tproductName = SteamDepot;
-\t\t}};
-/* End XCSwiftPackageProductDependency section */
-''' if STEAMDEPOT else "")
+# Local Swift packages linked into the app: (name, relative path, ref id, product id, build-file id).
+PACKAGES = []
+if STEAMDEPOT:
+    PACKAGES.append(("SteamDepot", STEAMDEPOT_PKG, PKG_REF, PKG_PROD, B_PKG))
+if METASTORE:
+    PACKAGES.append(("MetaStore", METASTORE_PKG, _fixed("MSPKGREF"), _fixed("MSPKGPROD"), _fixed("MSPKGBLD")))
+PKG_BUILDFILE = "".join(f'\t\t{b} /* {n} in Frameworks */ = {{isa = PBXBuildFile; productRef = {prod}; }};\n'
+                        for n, _, _, prod, b in PACKAGES)
+PKG_FRAMEWORK = "".join(f'\t\t\t\t{b} /* {n} in Frameworks */,\n' for n, _, _, _, b in PACKAGES)
+PKG_TARGET_DEPS = ('\t\t\tpackageProductDependencies = (\n'
+                   + "".join(f'\t\t\t\t{prod} /* {n} */,\n' for n, _, _, prod, _ in PACKAGES)
+                   + '\t\t\t);\n') if PACKAGES else ""
+PKG_PROJECT_REFS = ('\t\t\tpackageReferences = (\n'
+                    + "".join(f'\t\t\t\t{ref} /* XCLocalSwiftPackageReference "{n}" */,\n' for n, _, ref, _, _ in PACKAGES)
+                    + '\t\t\t);\n') if PACKAGES else ""
+PKG_SECTIONS = ("/* Begin XCLocalSwiftPackageReference section */\n"
+                + "".join(f'\t\t{ref} /* XCLocalSwiftPackageReference "{n}" */ = {{\n'
+                          f'\t\t\tisa = XCLocalSwiftPackageReference;\n'
+                          f'\t\t\trelativePath = "{path}";\n'
+                          f'\t\t}};\n' for n, path, ref, _, _ in PACKAGES)
+                + "/* End XCLocalSwiftPackageReference section */\n\n"
+                + "/* Begin XCSwiftPackageProductDependency section */\n"
+                + "".join(f'\t\t{prod} /* {n} */ = {{\n'
+                          f'\t\t\tisa = XCSwiftPackageProductDependency;\n'
+                          f'\t\t\tpackage = {ref} /* XCLocalSwiftPackageReference "{n}" */;\n'
+                          f'\t\t\tproductName = {n};\n'
+                          f'\t\t}};\n' for n, _, ref, prod, _ in PACKAGES)
+                + "/* End XCSwiftPackageProductDependency section */\n") if PACKAGES else ""
 
 swift_buildfiles = "\n".join(
     f'\t\t{s["bld"]} /* {s["name"]} in Sources */ = {{isa = PBXBuildFile; fileRef = {s["ref"]}; }};'
@@ -889,6 +908,8 @@ def main():
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     if STEAMDEPOT:
         print(f"  Swift package SteamDepot: {STEAMDEPOT_PKG} (in-app Steam content download)")
+    if METASTORE:
+        print(f"  Swift package MetaStore: {METASTORE_PKG} (in-app Meta store download)")
     if IS_HUB:
         for game, libs in GUEST_SETS:
             print(f"  hub game {game:<14} -> Frameworks/{game}/: "

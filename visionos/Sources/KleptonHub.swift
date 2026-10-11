@@ -24,6 +24,9 @@ import Combine
 #if canImport(SteamDepot)
 import SteamDepot
 #endif
+#if canImport(MetaStore)
+import MetaStore
+#endif
 
 /// One game the hub carries (generated from targets.py; see gen_xcodeproj.py).
 struct KLHubGameRow: Identifiable, Hashable {
@@ -114,14 +117,19 @@ enum HubStorage {
     /// Library/Application Support (a glibc game's saves and config).
     static func dataURLs(_ row: KLHubGameRow) -> [URL] {
         var urls: [URL] = []
+        let c = Paths.containerURL(for: row.target)
+        let derived = [c.appendingPathComponent(row.apk), c.appendingPathComponent(row.tree, isDirectory: true)]
         #if canImport(SteamDepot)
         if let game = SteamGames.descriptor(for: row.target) {
             urls.append(game.root)
-            if game.apk != nil {
-                let c = Paths.containerURL(for: row.target)
-                urls.append(c.appendingPathComponent(row.apk))
-                urls.append(c.appendingPathComponent(row.tree, isDirectory: true))
-            }
+            if game.apk != nil { urls += derived }
+        }
+        #endif
+        #if canImport(MetaStore)
+        // The Meta recipe's own files only (meta/, the OBB and add-on packs) — never the rest of android-files/.
+        if let r = KLCatalog.metaRecipe(row.target) {
+            urls += KLCatalog.metaStore(row.target).ownedURLs(r)
+            urls += derived.filter { !urls.contains($0) }
         }
         #endif
         return urls
@@ -163,6 +171,9 @@ enum HubStorage {
 
     /// A download or verify is running for the game.
     @MainActor static func isBusy(_ model: HubLibraryModel, _ target: String) -> Bool {
+        #if canImport(MetaStore)
+        if model.meta[target]?.isBusy == true { return true }
+        #endif
         #if canImport(SteamDepot)
         return model.content[target]?.isBusy ?? false
         #else
@@ -255,6 +266,14 @@ final class HubLibraryModel: ObservableObject {
     @Published var latest: [String: [UInt32: UInt64]] = [:]
     /// The account's other Steam VR games, classified (information only).
     @Published var owned: [LibraryEntry]?
+    /// Every app the signed-in Steam account owns (nil = library not read yet): which
+    /// catalog games Steam can install (KleptonCatalog.swift).
+    @Published var steamOwned: Set<UInt32>?
+    #endif
+    #if canImport(MetaStore)
+    /// One Meta download model per catalog game with a Meta recipe.
+    private(set) var meta: [String: MetaContentModel] = [:]
+    let metaAccount = MetaAccountModel.shared
     #endif
     @Published var account: String?
     /// Per game: why Play was refused (not owned), or the check in progress.
@@ -285,11 +304,109 @@ final class HubLibraryModel: ObservableObject {
         }
         account = (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load())?.accountName
         #endif
+        #if canImport(MetaStore)
+        var mm: [String: MetaContentModel] = [:]
+        for g in klHubGameRows {
+            if let r = KLCatalog.metaRecipe(g.target) { mm[g.target] = MetaContentModel(target: g.target, recipe: r) }
+        }
+        meta = mm
+        for m in mm.values {
+            relay.append(m.objectWillChange
+                .throttle(for: .milliseconds(500), scheduler: RunLoop.main, latest: true)
+                .sink { [weak self] _ in self?.objectWillChange.send() })
+        }
+        relay.append(metaAccount.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() })
+        #endif
         reloadSessions()
     }
 
+    // MARK: Sources (the catalog's stores, by ownership)
+
+    enum SourceState: Equatable {
+        /// The store says the account owns it.
+        case owned
+        /// Not known: not signed in to that store, or not checked yet.
+        case unknown(String)
+        case notOwned
+        /// The store sells a build this hub's port can't run.
+        case incompatible(String)
+    }
+
+    func sourceState(_ g: KLHubGameRow, _ store: KLStore) -> SourceState {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let app = KLCatalog.entry(g.target)?.steamApp else { return .incompatible("no Steam source") }
+            guard let lib = steamOwned else { return .unknown(account == nil ? "Not signed in to Steam" : "Steam library not read yet") }
+            return lib.contains(app) ? .owned : .notOwned
+            #else
+            return .incompatible("Steam is not in this build")
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            if let why = KLCatalog.metaIncompatibility(g) { return .incompatible(why) }
+            guard metaAccount.signedIn else { return .unknown("Not signed in to Meta (metastore login + push-token on the Mac)") }
+            guard let app = KLCatalog.metaRecipe(g.target)?.appId, let owns = metaAccount.owns(appId: app) else {
+                return .unknown(metaAccount.checking ? "Checking your Meta library…" : "Meta library not checked yet")
+            }
+            return owns ? .owned : .notOwned
+            #else
+            return .incompatible("Meta is not in this build")
+            #endif
+        }
+    }
+
+    /// The stores offered as install options: Steam unless Steam says it is not owned (signing in
+    /// happens from Download, as always); Meta only when Meta confirms ownership.
+    func offeredStores(_ g: KLHubGameRow) -> [KLStore] {
+        KLCatalog.stores(g.target).filter { st in
+            switch sourceState(g, st) {
+            case .owned: return true
+            case .unknown: return st == .steam
+            case .notOwned, .incompatible: return false
+            }
+        }
+    }
+
+    /// The store the card shows and Play/Download use: one with data on the headset first
+    /// (the player's pick when both), else the pick among the offered, else the only one offered.
+    func activeStore(_ g: KLHubGameRow) -> KLStore? {
+        let installed = KLCatalog.installedStores(g.target)
+        let offered = offeredStores(g)
+        let chosen = KLCatalog.chosenStore(g.target)
+        if let c = chosen, installed.contains(c) || offered.contains(c) { return c }
+        if let i = installed.first { return i }
+        if let o = offered.first { return o }
+        // Partial data from a store that is not offered (e.g. a Steam copy in progress): keep showing it.
+        #if canImport(SteamDepot)
+        if KLCatalog.stores(g.target).contains(.steam), SteamGames.descriptor(for: g.target)?.looksPresent == true { return .steam }
+        #endif
+        #if canImport(MetaStore)
+        if meta[g.target]?.hasAnything == true || meta[g.target]?.isBusy == true { return .meta }
+        #endif
+        return nil
+    }
+
+    /// The stores the card lets the player pick between (owned/offered, or with data).
+    func pickableStores(_ g: KLHubGameRow) -> [KLStore] {
+        let set = Set(offeredStores(g) + KLCatalog.installedStores(g.target))
+        return KLStore.allCases.filter(set.contains)
+    }
+
+    /// Why a catalog game is greyed out (owned nowhere / not signed in anywhere).
+    func notInLibraryReason(_ g: KLHubGameRow) -> String {
+        let parts = KLCatalog.stores(g.target).map { st -> String in
+            switch sourceState(g, st) {
+            case .owned: return "\(st.label): owned"
+            case .notOwned: return "\(st.label): not owned"
+            case .unknown(let w), .incompatible(let w): return "\(st.label): \(w)"
+            }
+        }
+        return parts.isEmpty ? "No store this build can download from" : parts.joined(separator: "\n")
+    }
+
     enum Status: Equatable {
-        case notInBuild, notDownloaded, partial, working(String, Double?), verifyScheduled, updateAvailable, ready, manual
+        case notInBuild, notDownloaded, partial, working(String, Double?), verifyScheduled, updateAvailable, ready, manual, notInLibrary
         var label: String {
             switch self {
             case .notInBuild: return "Not in this build"
@@ -300,6 +417,7 @@ final class HubLibraryModel: ObservableObject {
             case .updateAvailable: return "Update available"
             case .ready: return "Ready"
             case .manual: return "Data staged by hand"
+            case .notInLibrary: return "Not in your library"
             }
         }
         var color: Color {
@@ -307,7 +425,7 @@ final class HubLibraryModel: ObservableObject {
             case .ready, .manual: return .green
             case .updateAvailable, .verifyScheduled, .partial: return .orange
             case .working: return .blue
-            case .notDownloaded, .notInBuild: return .secondary
+            case .notDownloaded, .notInBuild, .notInLibrary: return .secondary
             }
         }
         var canPlay: Bool {
@@ -319,6 +437,16 @@ final class HubLibraryModel: ObservableObject {
     }
 
     func status(_ g: KLHubGameRow) -> Status {
+        if KLCatalog.entry(g.target) != nil {
+            switch activeStore(g) {
+            case .meta?:
+                #if canImport(MetaStore)
+                if let m = meta[g.target] { return metaStatus(m) }
+                #endif
+            case .steam?: break
+            case nil: return .notInLibrary
+            }
+        }
         #if canImport(SteamDepot)
         guard let m = content[g.target] else { return g.bundled ? .manual : .notInBuild }
         if m.isBusy {
@@ -342,6 +470,19 @@ final class HubLibraryModel: ObservableObject {
         #endif
     }
 
+    #if canImport(MetaStore)
+    private func metaStatus(_ m: MetaContentModel) -> Status {
+        if m.isBusy {
+            if case .working(let what) = m.stage, m.progress != nil {
+                return .working(what.hasPrefix("Downloading") ? "Downloading" : what, m.activeFraction)
+            }
+            return .working("Checking with Meta…", nil)
+        }
+        if m.complete { return .ready }
+        return m.hasAnything ? .partial : .notDownloaded
+    }
+    #endif
+
     func headerURL(_ g: KLHubGameRow) -> URL? {
         #if canImport(SteamDepot)
         return SteamGames.descriptor(for: g.target)?.headerImageURL
@@ -356,6 +497,13 @@ final class HubLibraryModel: ObservableObject {
     /// required on device, SteamAPI_Init then fails and the game shows its own
     /// "no Steam" behaviour).
     func checkOwnership(_ target: String, then play: @escaping () -> Void) {
+        #if canImport(MetaStore)
+        if let g = games.first(where: { $0.target == target }), KLCatalog.entry(target) != nil, activeStore(g) == .meta,
+           let app = KLCatalog.metaRecipe(target)?.appId {
+            checkMetaOwnership(target, app: app, then: play)
+            return
+        }
+        #endif
         #if canImport(SteamDepot)
         guard let app = SteamGames.descriptor(for: target)?.appID else { play(); return }
         guard verifying == nil else { return }
@@ -376,6 +524,31 @@ final class HubLibraryModel: ObservableObject {
         play()
         #endif
     }
+
+    #if canImport(MetaStore)
+    /// Meta's answer (re-asked when older than a day; the last answer stands when Meta can't
+    /// be reached). Only a "yes" lets the game boot.
+    private func checkMetaOwnership(_ target: String, app: String, then play: @escaping () -> Void) {
+        guard verifying == nil else { return }
+        verifying = target
+        playBlock[target] = nil
+        metaAccount.refresh { [weak self] in
+            guard let self else { return }
+            self.verifying = nil
+            switch self.metaAccount.owns(appId: app) {
+            case true?:
+                NSLog("[hub] \(target): Meta app \(app) owned by user \(self.metaAccount.userId ?? "?")")
+                play()
+            case false?:
+                self.playBlock[target] = "Not owned on this Meta account"
+            case nil:
+                self.playBlock[target] = self.metaAccount.signedIn
+                    ? "Could not confirm with Meta that you own it: \(self.metaAccount.error ?? "no answer")"
+                    : "Sign in to Meta (metastore login + push-token on the Mac) to play"
+            }
+        }
+    }
+    #endif
 
     /// Derive what the runtime reads from the downloaded data (HubPrep: the APK
     /// under the runtime's name, the small assets/ entries, the metadata), off the
@@ -402,6 +575,7 @@ final class HubLibraryModel: ObservableObject {
         for m in content.values { m.signOut() }
         try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").clear()
         owned = nil
+        steamOwned = nil
         latest = [:]
         #endif
         account = nil
@@ -419,6 +593,10 @@ final class HubLibraryModel: ObservableObject {
     func refreshAfterDelete(_ target: String) {
         #if canImport(SteamDepot)
         content[target]?.refreshLocal()
+        #endif
+        #if canImport(MetaStore)
+        meta[target]?.refreshLocal()
+        if case .complete? = meta[target]?.stage { meta[target]?.stage = .idle }
         #endif
         objectWillChange.send()
     }
@@ -453,6 +631,7 @@ final class HubLibraryModel: ObservableObject {
                 latest = found
                 for m in content.values { m.refreshLocal() }
                 let lib = try await SteamLibrary.fetch(session: session, log: { NSLog("[hub] library: %@", $0) })
+                steamOwned = Set(lib.map(\.appID))
                 owned = lib.filter { $0.isVR && !hubApps.contains($0.appID) }
             } catch {
                 NSLog("[hub] update check failed: \(error)")
@@ -784,6 +963,10 @@ struct HubAppSettingsView: View {
                     }
                 } header: { Text("Steam account") }
 
+                #if canImport(MetaStore)
+                MetaAccountSection()
+                #endif
+
                 Section {
                     ForEach(model.games) { g in
                         HStack {
@@ -800,7 +983,7 @@ struct HubAppSettingsView: View {
                     }
                     if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 } header: { Text("Storage") } footer: {
-                    Text("Deletes the files downloaded from Steam and those derived from them. "
+                    Text("Deletes the files downloaded from Steam or Meta and those derived from them. "
                          + "Saved games and settings are kept. Download again from the game's card.")
                 }
             }
@@ -864,26 +1047,27 @@ struct HubLibraryView: View {
     @MainActor private static var openedOnce = false
     #endif
     @State private var detail: String?
+    /// Which store's download page `detail` shows.
+    @State private var detailStore: KLStore = .steam
     /// The game whose settings sheet is open.
     @State private var settingsFor: KLHubGameRow?
     @State private var showAppSettings = false
 
     var body: some View {
         Group {
-            #if canImport(SteamDepot)
-            if let t = detail, let m = model.content[t] {
-                SteamContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() })
+            if let t = detail, let page = detailPage(t) {
+                page
             } else {
                 library
             }
-            #else
-            library
-            #endif
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
         .onAppear {
             Lifecycle.keepAlive = true; model.checkUpdates()
+            #if canImport(MetaStore)
+            model.metaAccount.refresh()
+            #endif
             #if canImport(SteamDepot)
             // Once per app open: a game session ends by closing Klepton, so this is "after quit" —
             // where a two-way sync sends that session's saves up.
@@ -892,6 +1076,21 @@ struct HubLibraryView: View {
         }
         .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
+    }
+
+    /// The download page of the store the card opened.
+    private func detailPage(_ t: String) -> AnyView? {
+        #if canImport(MetaStore)
+        if detailStore == .meta, let m = model.meta[t] {
+            return AnyView(MetaContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() }))
+        }
+        #endif
+        #if canImport(SteamDepot)
+        if detailStore == .steam, let m = model.content[t] {
+            return AnyView(SteamContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() }))
+        }
+        #endif
+        return nil
     }
 
     private func play(_ target: String) {
@@ -933,6 +1132,11 @@ struct HubLibraryView: View {
             if let a = model.account {
                 Text("Steam: \(a)").font(.footnote).foregroundStyle(.secondary)
             }
+            #if canImport(MetaStore)
+            if model.metaAccount.signedIn {
+                Text("Meta: \(model.metaAccount.userId ?? "signed in")").font(.footnote).foregroundStyle(.secondary)
+            }
+            #endif
             if model.checking {
                 ProgressView().controlSize(.small)
             } else if model.account != nil {
@@ -945,13 +1149,33 @@ struct HubLibraryView: View {
 
     private func card(_ g: KLHubGameRow) -> some View {
         let st = model.status(g)
+        let active = model.activeStore(g)
+        let pickable = model.pickableStores(g)
         return VStack(alignment: .leading, spacing: 10) {
             cover(g)
-            Text(g.display).font(.title3.bold()).lineLimit(1)
+            HStack(spacing: 8) {
+                Text(g.display).font(.title3.bold()).lineLimit(1)
+                Spacer(minLength: 4)
+                // One pill per store this game can come from: owned = highlighted, otherwise dimmed.
+                ForEach(KLCatalog.stores(g.target)) { store in
+                    storeBadge(store, owned: model.sourceState(g, store) == .owned, active: store == active)
+                }
+            }
             HStack(spacing: 6) {
                 Circle().fill(st.color).frame(width: 8, height: 8)
                 Text(st.label).font(.callout).foregroundStyle(st.color)
                     .monospacedDigit()
+            }
+            // Owned in more than one store: the player picks which one installs/plays it (remembered).
+            if pickable.count > 1, let a = active {
+                Picker("Store", selection: Binding(get: { a }, set: { KLCatalog.choose($0, for: g.target); model.objectWillChange.send() })) {
+                    ForEach(pickable) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .disabled(HubStorage.isBusy(model, g.target))
+            }
+            if st == .notInLibrary {
+                Text(model.notInLibraryReason(g)).font(.caption).foregroundStyle(.secondary)
             }
             if case .working(_, let f?) = st { ProgressView(value: f) }
             if let why = model.playBlock[g.target] {
@@ -973,11 +1197,9 @@ struct HubLibraryView: View {
                 Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
                     .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil || cloudBusy(g.target))
-                #if canImport(SteamDepot)
-                if model.content[g.target] != nil {
-                    Button(manageTitle(st)) { detail = g.target }
+                if let a = active, hasDownloadPage(g.target, a), st != .notInLibrary {
+                    Button(manageTitle(st)) { detailStore = a; detail = g.target }
                 }
-                #endif
                 Spacer()
                 Button { settingsFor = g } label: { Label("Settings", systemImage: "gearshape") }
                     .labelStyle(.iconOnly)
@@ -992,6 +1214,38 @@ struct HubLibraryView: View {
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .opacity(st == .notInLibrary ? 0.55 : 1)
+    }
+
+    /// A plain text pill per store (no logo artwork): Steam slate blue, Meta bright blue.
+    private func storeBadge(_ store: KLStore, owned: Bool, active: Bool) -> some View {
+        let tint = store == .steam ? Color(red: 0.16, green: 0.29, blue: 0.48) : Color(red: 0.0, green: 0.42, blue: 0.95)
+        return Label(store.label, systemImage: store == .steam ? "gamecontroller.fill" : "eyeglasses")
+            .labelStyle(.titleAndIcon)
+            .font(.caption.bold())
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle(owned ? Color.white : Color.secondary)
+            .background(owned ? tint : Color.gray.opacity(0.18), in: Capsule())
+            .overlay(Capsule().strokeBorder(active ? Color.white.opacity(0.8) : .clear, lineWidth: 1))
+            .opacity(owned ? 1 : 0.6)
+            .help(owned ? "Owned on \(store.label)" : "\(store.label): not owned or not checked")
+    }
+
+    private func hasDownloadPage(_ target: String, _ store: KLStore) -> Bool {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            return model.content[target] != nil
+            #else
+            return false
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            return model.meta[target] != nil
+            #else
+            return false
+            #endif
+        }
     }
 
     /// A cloud-save sync for this game is running (Play waits for it).
