@@ -298,8 +298,8 @@ enum KLAccountPrivacy {
         set { UserDefaults.standard.set(newValue, forKey: personaKey) }
     }
     /// The header/settings text for a signed-in Steam account.
-    static var steamLabel: String { steamPersona.map { "Steam: \($0)" } ?? klL("Steam ✓ signed in", "Steam ✓ con sesión") }
-    static var metaLabel: String { klL("Meta ✓ signed in", "Meta ✓ con sesión") }
+    static var steamLabel: String { steamPersona.map { "Steam: \($0)" } ?? "Steam ✓" }
+    static var metaLabel: String { "Meta ✓" }
     /// First two characters + •••, for login names and ids in logs.
     static func mask(_ s: String?) -> String {
         guard let s, !s.isEmpty else { return "?" }
