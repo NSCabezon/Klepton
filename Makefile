@@ -1225,6 +1225,14 @@ mvk-retarget:
 mvk: mvk-fetch
 	@./tools/mvk_retarget.sh
 
+# Phase H: the FOVEATING fork, built from source (v1.4.2 + mvk-patches/), staged
+# into the same vendor-moltenvk/out the prebuilt uses. KL_FOVEATE=1 turns it on;
+# off, it renders as stock. See tools/mvk_fdm_build.sh and DEBUG_ENV_VARS.md
+# ("Foveated rendering").
+.PHONY: mvk-fdm
+mvk-fdm:
+	@./tools/mvk_fdm_build.sh
+
 MVK_OUT := vendor-moltenvk/out
 
 # The host half of the gate — MoltenVK loaded and RUN, not inspected. See
