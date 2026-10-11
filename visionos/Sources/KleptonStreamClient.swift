@@ -653,6 +653,9 @@ struct StreamPlayView: View {
         exiting = true
         KLStreamSession.shared.stop(reason: why)
         await dismissImmersiveSpace()
+        // The session's summary (fps of the stream as shown here, its length) is final now;
+        // the next stream in this process is a session of its own.
+        KLSessionStats.shared.endStream(reason: "stream ended")
         onExit()
     }
 }

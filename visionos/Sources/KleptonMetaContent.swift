@@ -68,9 +68,13 @@ final class MetaAccountModel: ObservableObject {
     /// Ask Meta about every catalog game whose answer is older than a day (or all, `force`).
     func refresh(force: Bool = false, then: (() -> Void)? = nil) {
         importHandoff()
-        guard !checking, let token = token() else { then?(); return }
+        guard !checking, let token = token() else {
+            if !checking { NSLog("[meta] no Meta token on this headset: ownership unknown (sign in on the Mac and push the token)") }
+            then?(); return
+        }
         let ids = catalogAppIds
         guard !ids.isEmpty else { then?(); return }
+        NSLog("[meta] ownership check (\(force ? "forced" : "answers older than a day")) for app(s) \(ids.joined(separator: ", "))")
         checking = true
         error = nil
         let cache = self.cache, gate = self.gate
@@ -83,7 +87,8 @@ final class MetaAccountModel: ObservableObject {
                 NSLog("[meta] user \(KLAccountPrivacy.mask(r.userId)): " + r.apps.map { "\($0.key)=\($0.value.owned ? "owned" : "not owned")" }.sorted().joined(separator: ", "))
             } catch MetaError.tokenRejected(let why) {
                 NSLog("[meta] token rejected: \(why)")
-                error = "Meta rejected the saved sign-in. On the Mac: metastore login, then metastore push-token."
+                error = klL("Meta rejected the saved sign-in. Sign in to Meta again on your Mac (AVP Game Hub → Accounts).",
+                            "Meta rechazó la sesión guardada. Vuelve a iniciar sesión en Meta en tu Mac (AVP Game Hub → Cuentas).")
             } catch {
                 NSLog("[meta] ownership check failed: \(error)")
                 self.error = "\(error)"
@@ -172,7 +177,7 @@ final class MetaContentModel: ObservableObject {
     private func run() async {
         account.importHandoff()
         guard let token = account.token() else {
-            stage = .failed("Not signed in to Meta. On the Mac: metastore login, then metastore push-token.")
+            stage = .failed(HubLibraryModel.metaSignInHint)
             return
         }
         let client = MetaClient(token: token)
@@ -180,7 +185,7 @@ final class MetaContentModel: ObservableObject {
         let recipe = self.recipe, store = self.store
         do {
             // Ownership, asked fresh right before downloading (the cache only decides what is shown).
-            stage = .working("Checking your Meta library…")
+            stage = .working(klL("Checking your Meta library…", "Comprobando tu biblioteca de Meta…"))
             let user = try await gate.run { try await client.me() }
             let owns = try await gate.run { try await client.ownsApp(appId: recipe.appId, userId: user) }
             guard owns else { throw MetaError.notOwned(recipe.title) }
@@ -188,7 +193,7 @@ final class MetaContentModel: ObservableObject {
             // Add-ons: only what the store confirms as bought.
             var skus: Set<String> = []
             if let addons = recipe.addons, !addons.items.isEmpty {
-                stage = .working("Reading your purchases…")
+                stage = .working(klL("Reading your purchases…", "Leyendo tus compras…"))
                 do {
                     skus = Set(try await gate.run { try await client.purchases(appId: recipe.appId) })
                     log("\(skus.count) purchase(s) on the account")
@@ -208,10 +213,11 @@ final class MetaContentModel: ObservableObject {
             }
             refreshLocal()
             if let free = freeBytes, UInt64(max(0, missing)) + 1_000_000_000 > free {
-                stage = .failed("Not enough space: \(gb(missing)) to download, \(gb(Int64(free))) free.")
+                stage = .failed(klL("Not enough space: \(gb(missing)) to download, \(gb(Int64(free))) free.",
+                                    "No hay espacio: \(gb(missing)) por descargar, \(gb(Int64(free))) libres."))
                 return
             }
-            stage = .working("Downloading from Meta…")
+            stage = .working(klL("Downloading from Meta…", "Descargando de Meta…"))
             log("plan: " + plan.map { "\($0.file.name)=\($0.action)" }.joined(separator: ", "))
             let summary = try await Fetcher(client: client, store: store, gate: gate)
                 .run(plan, recipe: recipe, progress: { p in
@@ -219,7 +225,8 @@ final class MetaContentModel: ObservableObject {
                 }, log: { [target] s in NSLog("[meta] \(target): \(s)") })
             log("done: \(summary.downloaded) downloaded, \(summary.kept) kept, \(summary.withheld.count) withheld")
             refreshLocal()
-            stage = complete ? .complete : .failed("Download finished but the files are not complete.")
+            stage = complete ? .complete : .failed(klL("Download finished but the files are not complete.",
+                                                       "La descarga terminó pero faltan archivos."))
         } catch is CancellationError {
             stage = .paused
         } catch {
@@ -255,18 +262,21 @@ struct MetaContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .firstTextBaseline) {
-                Button { onBack() } label: { Label("Library", systemImage: "chevron.left") }
+                Button { onBack() } label: { Label(klL("Library", "Biblioteca"), systemImage: "chevron.left") }
                 Text(model.recipe.title).font(.largeTitle.bold())
                 Spacer()
                 if account.signedIn { Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary) }
             }
-            Text("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))")
+            Text(klL("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))",
+                     "Versión de Quest \(model.recipe.versionName) de la tienda de Meta · \(gb(model.requiredBytes))"))
                 .foregroundStyle(.secondary)
             content
             Spacer(minLength: 0)
             if model.isBusy {
-                Label("Keep this window open and the headset on: visionOS pauses apps in the background, "
-                      + "and the download stops with it. It resumes where it left off.",
+                Label(klL("Keep this window open and the headset on: visionOS pauses apps in the background, "
+                          + "and the download stops with it. It resumes where it left off.",
+                          "Deja esta ventana abierta y el visor puesto: visionOS pausa las apps en segundo plano "
+                          + "y la descarga se para con ellas. Sigue donde se quedó."),
                       systemImage: "exclamationmark.triangle")
                     .font(.footnote).foregroundStyle(.secondary)
             }
@@ -285,55 +295,61 @@ struct MetaContentView: View {
     @ViewBuilder private var content: some View {
         if !account.signedIn {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Not signed in to Meta").font(.title3)
-                Text("Sign in on the Mac with Meta's own tool, then send the sign-in to this headset:\n"
-                     + "  metastore login\n  metastore push-token\nThen open this page again.")
-                    .font(.callout.monospaced()).foregroundStyle(.secondary)
+                Text(klL("Not signed in to Meta", "Sin sesión en Meta")).font(.title3)
+                Text(HubLibraryModel.metaSignInHint + klL(", then open this page again.", " y vuelve a abrir esta página."))
+                    .font(.callout).foregroundStyle(.secondary)
             }
         } else {
             switch model.stage {
             case .idle:
                 VStack(alignment: .leading, spacing: 12) {
-                    if model.hasAnything { Text("Part of the game is already on this headset; only what is missing is downloaded.") }
+                    if model.hasAnything {
+                        Text(klL("Part of the game is already on this headset; only what is missing is downloaded.",
+                                 "Parte del juego ya está en este visor; solo se descarga lo que falta."))
+                    }
                     if let free = model.freeBytes {
-                        Text("Free space: \(gb(Int64(free)))").font(.footnote)
+                        Text(klL("Free space: \(gb(Int64(free)))", "Espacio libre: \(gb(Int64(free)))")).font(.footnote)
                             .foregroundStyle(Int64(free) < model.requiredBytes + 1_000_000_000 ? .orange : .secondary)
                     }
-                    Button(model.hasAnything ? "Complete download from Meta" : "Download \(model.recipe.title) from Meta") { model.start() }
+                    Button(model.hasAnything ? klL("Complete download from Meta", "Completar descarga de Meta")
+                                             : klL("Download \(model.recipe.title) from Meta", "Descargar \(model.recipe.title) de Meta")) { model.start() }
                         .buttonStyle(.borderedProminent).controlSize(.large)
-                    Text("Add-on packs are downloaded only when Meta confirms them as bought on this account.")
+                    Text(klL("Add-on packs are downloaded only when Meta confirms them as bought on this account.",
+                             "Los paquetes adicionales solo se descargan si Meta confirma que los compraste con esta cuenta."))
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             case .working(let what):
                 VStack(alignment: .leading, spacing: 12) {
                     if let p = model.progress, p.bytesTotal > 0 {
-                        Text(p.verifying ? "Verifying \(p.fileName)…" : what).font(.title3)
+                        Text(p.verifying ? klL("Verifying \(p.fileName)…", "Verificando \(p.fileName)…") : what).font(.title3)
                         ProgressView(value: Double(p.bytesDone), total: Double(p.bytesTotal))
-                        Text("\(gb(p.bytesDone)) of \(gb(p.bytesTotal)) · file \(p.fileIndex)/\(p.fileCount) · \(mbps(model.speed))")
+                        Text(klL("\(gb(p.bytesDone)) of \(gb(p.bytesTotal)) · file \(p.fileIndex)/\(p.fileCount) · \(mbps(model.speed))",
+                                 "\(gb(p.bytesDone)) de \(gb(p.bytesTotal)) · archivo \(p.fileIndex)/\(p.fileCount) · \(mbps(model.speed))"))
                             .monospacedDigit().foregroundStyle(.secondary)
                     } else {
                         HStack(spacing: 12) { ProgressView(); Text(what) }
                     }
-                    Button("Pause") { model.pause() }
+                    Button(klL("Pause", "Pausar")) { model.pause() }
                 }
             case .paused:
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Paused.").font(.title3)
-                    Button("Resume") { model.start() }.buttonStyle(.borderedProminent)
+                    Text(klL("Paused.", "En pausa.")).font(.title3)
+                    Button(klL("Resume", "Reanudar")) { model.start() }.buttonStyle(.borderedProminent)
                 }
             case .complete:
                 VStack(alignment: .leading, spacing: 12) {
-                    Label("\(model.recipe.title) is installed and verified.", systemImage: "checkmark.circle.fill")
+                    Label(klL("\(model.recipe.title) is installed and verified.", "\(model.recipe.title) está instalado y verificado."),
+                          systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green).font(.title3)
                     HStack(spacing: 16) {
-                        Button("Play") { onPlay() }.buttonStyle(.borderedProminent).controlSize(.large)
-                        Button("Check for new add-ons") { model.start() }
+                        Button(klL("Play", "Jugar")) { onPlay() }.buttonStyle(.borderedProminent).controlSize(.large)
+                        Button(klL("Check for new add-ons", "Buscar contenido adicional nuevo")) { model.start() }
                     }
                 }
             case .failed(let msg):
                 VStack(alignment: .leading, spacing: 12) {
                     Label(msg, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
-                    Button("Retry") { model.start() }.buttonStyle(.borderedProminent)
+                    Button(klL("Retry", "Reintentar")) { model.start() }.buttonStyle(.borderedProminent)
                 }
             }
         }
@@ -348,24 +364,29 @@ struct MetaAccountSection: View {
     var body: some View {
         Section {
             if account.signedIn {
-                LabeledContent("Signed in", value: account.userId != nil ? KLAccountPrivacy.metaLabel : "(not checked yet)")
+                LabeledContent(klL("Signed in", "Sesión iniciada"),
+                               value: account.userId != nil ? KLAccountPrivacy.metaLabel : klL("(not checked yet)", "(aún sin comprobar)"))
                 HStack {
-                    Button(account.checking ? "Checking…" : "Check Meta library now") { account.refresh(force: true) }
+                    Button(account.checking ? klL("Checking…", "Comprobando…") : klL("Check Meta library now", "Comprobar biblioteca de Meta ahora")) {
+                        account.refresh(force: true)
+                    }
                         .disabled(account.checking)
                     Spacer()
-                    Button("Sign out of Meta", role: .destructive) { confirmSignOut = true }
+                    Button(klL("Sign out of Meta", "Cerrar sesión de Meta"), role: .destructive) { confirmSignOut = true }
                 }
                 if let e = account.error { Text(e).font(.caption).foregroundStyle(.orange) }
             } else {
-                Text("Not signed in. On the Mac: metastore login, then metastore push-token (one time).")
+                Text(klL("Not signed in. ", "Sin sesión. ") + HubLibraryModel.metaSignInHint + ".")
                     .foregroundStyle(.secondary)
             }
-        } header: { Text("Meta account") } footer: {
-            Text("Only a sign-in token is kept, in this headset's Keychain; it is sent only to Meta's own servers. "
-                 + "Unofficial store access: personal use with your own purchases.")
+        } header: { Text(klL("Meta account", "Cuenta de Meta")) } footer: {
+            Text(klL("Only a sign-in token is kept, in this headset's Keychain; it is sent only to Meta's own servers. "
+                     + "Unofficial store access: personal use with your own purchases.",
+                     "Solo se guarda un token de sesión, en el llavero de este visor; solo se envía a los servidores de Meta. "
+                     + "Acceso no oficial a la tienda: uso personal con tus propias compras."))
         }
-        .confirmationDialog("Sign out of Meta?", isPresented: $confirmSignOut, titleVisibility: .visible) {
-            Button("Sign out", role: .destructive) { account.signOut() }
+        .confirmationDialog(klL("Sign out of Meta?", "¿Cerrar sesión de Meta?"), isPresented: $confirmSignOut, titleVisibility: .visible) {
+            Button(klL("Sign out", "Cerrar sesión"), role: .destructive) { account.signOut() }
         }
     }
 }

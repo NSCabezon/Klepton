@@ -247,7 +247,7 @@ enum KLGameLanguage: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .system: return "System"
+        case .system: return klL("System", "Sistema")
         case .en: return "English"
         case .es: return "Español"
         case .fr: return "Français"
