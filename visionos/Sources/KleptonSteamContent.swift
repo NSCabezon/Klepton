@@ -313,6 +313,7 @@ final class SteamContentModel: ObservableObject {
         task?.cancel()
         try? store.clear()
         account = nil
+        KLAccountPrivacy.steamPersona = nil
         stage = .idle
     }
 
@@ -327,7 +328,7 @@ final class SteamContentModel: ObservableObject {
             try? store.save(imported)
             try? FileManager.default.removeItem(at: handoff)
             account = imported.accountName
-            log("imported Steam token for '\(imported.accountName)' from Documents/steamdepot-token.json")
+            log("imported Steam token for '\(KLAccountPrivacy.mask(imported.accountName))' from Documents/steamdepot-token.json")
         }
     }
 
@@ -345,7 +346,7 @@ final class SteamContentModel: ObservableObject {
             case .password(let user, let password):
                 stage = .connecting("Contacting Steam…")
                 try await session.connect()
-                let device = "Klepton (\(UIDevice.current.name))"
+                let device = "AVP Game Hub (\(UIDevice.current.name))"
                 let auth: CredentialsAuthSession
                 do {
                     auth = try await session.beginCredentialsAuth(accountName: user, password: password, deviceName: device,
@@ -368,11 +369,11 @@ final class SteamContentModel: ObservableObject {
                 creds = try await session.waitForCredentialsAuth(auth)
                 pendingAuth = nil
                 try store.save(creds)
-                log("signed in with account name/password as '\(creds.accountName)'")
+                log("signed in with account name/password as '\(KLAccountPrivacy.mask(creds.accountName))'")
             case .qr:
                 stage = .connecting("Contacting Steam…")
                 try await session.connect()
-                let device = "Klepton (\(UIDevice.current.name))"
+                let device = "AVP Game Hub (\(UIDevice.current.name))"
                 creds = try await session.authenticateWithQR(deviceName: device) { url in
                     // The Mac can render this from the device log.
                     NSLog("[steam] QR url: %@", url)
@@ -381,7 +382,7 @@ final class SteamContentModel: ObservableObject {
                 try store.save(creds)
             }
 
-            stage = .connecting("Signing in as \(creds.accountName)…")
+            stage = .connecting("Signing in to Steam…")
             if case .saved = method { try await session.connect() }
             do {
                 try await session.logOn(creds)
@@ -393,6 +394,7 @@ final class SteamContentModel: ObservableObject {
                 return
             }
             account = creds.accountName
+            if let p = await session.personaName { KLAccountPrivacy.steamPersona = p }
             stage = .working
             let downloader = SteamDepotDownloader(session: session, log: { NSLog("[steam] %@", $0) })
             let game = self.game
@@ -508,8 +510,8 @@ struct SteamContentView: View {
                 }
                 Text(model.game.title).font(.largeTitle.bold())
                 Spacer()
-                if let a = model.account {
-                    Text("Steam: \(a)").font(.footnote).foregroundStyle(.secondary)
+                if model.account != nil {
+                    Text(KLAccountPrivacy.steamLabel).font(.footnote).foregroundStyle(.secondary)
                     Button("Sign out") { model.signOut() }.font(.footnote).disabled(model.isBusy)
                 }
             }

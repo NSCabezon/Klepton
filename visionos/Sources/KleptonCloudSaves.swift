@@ -149,7 +149,7 @@ final class KLCloudSaveModel: ObservableObject {
                 await session.disconnect()
                 return klL("This game has no Steam Cloud saves.", "Este juego no tiene partidas en Steam Cloud.")
             }
-            let remote = SteamCloud(session: session, appID: app, buildID: build, machineName: "Klepton (Apple Vision Pro)")
+            let remote = SteamCloud(session: session, appID: app, buildID: build, machineName: "AVP Game Hub (Apple Vision Pro)")
             var sync = profile.makeSync(remote: remote, rules: rules, writeLayer: layer, stateDir: stateDir, mode: mode)
             sync.log = { NSLog("[cloud] %@", $0) }
             let (report, _) = try await sync.run()
@@ -217,12 +217,12 @@ struct KLCloudSaveSection: View {
                          + "Two-way also uploads saves this headset changed since the last sync (the first two-way sync only "
                          + "records where things stand). Every local save is backed up before it is replaced, nothing is ever "
                          + "deleted from Steam Cloud, and a save changed in both places is kept twice and never uploaded until "
-                         + "you choose. Syncs before Play and when Klepton opens.",
+                         + "you choose. Syncs before Play and when AVP Game Hub opens.",
                          "Desactivado por defecto. Solo descargar trae aquí las partidas de tu PC y nunca envía nada. "
                          + "En ambos sentidos también sube las partidas que este visor cambió desde la última sincronización "
                          + "(la primera solo registra el estado). Antes de sustituir una partida local se hace copia, nunca se "
                          + "borra nada de Steam Cloud, y una partida cambiada en los dos sitios se guarda dos veces y no se sube "
-                         + "hasta que elijas. Se sincroniza antes de Jugar y al abrir Klepton."))
+                         + "hasta que elijas. Se sincroniza antes de Jugar y al abrir AVP Game Hub."))
             }
             .onAppear { s = KLCloudSaves.settings(target); model.reloadState(target) }
         }
