@@ -1,50 +1,26 @@
 {
   "sourceLanguage": "en",
   "strings": {
-    "Open settings in ${applicationName}": {
+    "Open game settings in ${applicationName}": {
       "localizations": {
         "es": {
           "stringSet": {
             "state": "translated",
             "values": [
-              "Abre los ajustes en ${applicationName}",
-              "Abrir ajustes en ${applicationName}"
-            ]
-          }
-        }
-      }
-    },
-    "Open the game settings in ${applicationName}": {
-      "localizations": {
-        "es": {
-          "stringSet": {
-            "state": "translated",
-            "values": [
+              "Abre ajustes del juego en ${applicationName}",
               "Abre los ajustes del juego en ${applicationName}"
             ]
           }
         }
       }
     },
-    "Close settings in ${applicationName}": {
+    "Close game settings in ${applicationName}": {
       "localizations": {
         "es": {
           "stringSet": {
             "state": "translated",
             "values": [
-              "Cierra los ajustes en ${applicationName}",
-              "Cerrar ajustes en ${applicationName}"
-            ]
-          }
-        }
-      }
-    },
-    "Close the game settings in ${applicationName}": {
-      "localizations": {
-        "es": {
-          "stringSet": {
-            "state": "translated",
-            "values": [
+              "Cierra ajustes del juego en ${applicationName}",
               "Cierra los ajustes del juego en ${applicationName}"
             ]
           }

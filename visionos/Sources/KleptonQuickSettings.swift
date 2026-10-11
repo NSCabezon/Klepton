@@ -15,14 +15,15 @@
 //     render thread only draws one more quad. Nothing per frame on the render
 //     thread but a lock-free pointer read.
 //
-//   * THE QUICK SETTINGS MENU. Opened by Siri ("Abre los ajustes en AVP Hub"),
-//     closed by Siri or ○. Four rows: the overlay, Alyx's antialiasing 2×/4×
-//     (live: `vr_fidelity_level 0|1` through kl_openvr_console — Source 2
+//   * THE QUICK SETTINGS MENU. Opened by Siri ("Abre ajustes del juego en Hub"),
+//     closed by Siri, ○ or its last row. Five rows: the overlay, Alyx's
+//     antialiasing 2×/4× (live: `vr_fidelity_level 0|1` through kl_openvr_console — Source 2
 //     changes MSAA when the fidelity level changes, as its own Auto-Fidelity
 //     does mid-game), foveated rendering (live through the foveating MoltenVK's
 //     klMVKFoveationSetEnabled when the game BOOTED foveating, else "next
 //     launch") and render scale 80/90/100 % (next launch: the eye targets are
-//     sized at boot). Every change is saved to the game's settings
+//     sized at boot), then "Cerrar"/"Close", which closes it like ○ (trigger,
+//     ✕ or right pinch on it). Every change is saved to the game's settings
 //     (KLGameSettingsStore) so the next launch keeps it.
 //     INPUT. While the menu is open the PSVR2 Sense input never reaches the
 //     game (KleptonControllers pushes a released controller instead; poses go
@@ -45,7 +46,7 @@ import simd
 final class KLQuickSettings: @unchecked Sendable {
     static let shared = KLQuickSettings()
 
-    enum Item: Int, CaseIterable { case overlay, antialiasing, foveation, renderScale }
+    enum Item: Int, CaseIterable { case overlay, antialiasing, foveation, renderScale, close }
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "klepton.quick-settings", qos: .utility)
@@ -121,8 +122,8 @@ final class KLQuickSettings: @unchecked Sendable {
     struct Reply { let outcome: Outcome; let text: String }
 
     func notRunning() -> Reply {
-        Reply(outcome: .notRunning, text: klL("No game is running in AVP Hub right now.",
-                                              "Ahora mismo no hay ningún juego en marcha en AVP Hub."))
+        Reply(outcome: .notRunning, text: klL("No game is running in AVP Game Hub right now.",
+                                              "Ahora mismo no hay ningún juego en marcha en AVP Game Hub."))
     }
 
     /// The performance overlay on/off (nil: toggle). Saved to the game's settings.
@@ -297,6 +298,8 @@ final class KLQuickSettings: @unchecked Sendable {
         }
         if select {
             lock.lock(); let item = Item(rawValue: cursor) ?? .overlay; lock.unlock()
+            // The "Close" row closes right here, as ○ does (the swallow starts this frame).
+            if item == .close { closeMenu(); return }
             // Off the render thread: the console queue, UserDefaults, the log.
             queue.async { self.activate(item) }
         }
@@ -319,6 +322,8 @@ final class KLQuickSettings: @unchecked Sendable {
             let steps: [Float] = [0.8, 0.9, 1.0]
             let i = steps.firstIndex(where: { abs($0 - cur) < 0.025 }) ?? 2
             r = setRenderScale(steps[(i + 1) % steps.count])
+        case .close:
+            _ = closeMenu(); return
         }
         lock.lock(); status = r.text; menuVersion += 1; lock.unlock()
         requestMenuRaster()
@@ -364,6 +369,7 @@ final class KLQuickSettings: @unchecked Sendable {
                      !alyx ? na : savedFov != fov ? next : ""))
         rows.append((es ? "Escala de render" : "Render scale", alyx ? "\(Int((scale * 100).rounded())) %" : "—",
                      !alyx ? na : abs(scale - renderScaleBoot) > 0.01 ? next : ""))
+        rows.append((es ? "Cerrar" : "Close", "", ""))
         let tex = KLPanelRaster.menu(title: es ? "Ajustes rápidos" : "Quick settings",
                                      subtitle: KLPanelRaster.gameName(target),
                                      rows: rows, cursor: cur, status: st,
@@ -463,7 +469,7 @@ enum KLPanelRaster {
     struct Line { let text: String; let size: Double; let bold: Bool; let color: SIMD3<Double> }
 
     static let overlaySize = (w: 512, h: 288)
-    static let menuSize = (w: 1024, h: 640)
+    static let menuSize = (w: 1024, h: 720)   // five 84-pt rows above status + hint
 
     static func gameName(_ target: String) -> String {
         #if KL_HUB

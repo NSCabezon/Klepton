@@ -1017,8 +1017,9 @@ TARGETS = {
         "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
         # The Home View name and what Siri calls the app in its phrases
-        # ("Activa el visor de FPS en AVP Hub", KleptonIntents.swift).
-        "display": "AVP Hub",
+        # ("Activa el visor de FPS en AVP Game Hub", KleptonIntents.swift). Siri also
+        # takes "Hub" / "Game Hub" (INAlternativeAppNames, gen_xcodeproj.py).
+        "display": "AVP Game Hub",
     },
 
     # ---- Meta Store rows (avp-play) ----
