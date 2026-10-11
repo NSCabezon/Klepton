@@ -2860,6 +2860,21 @@ except its own control vars (next section).
   anything.
 - `KL_TOAST_SECS=<s>` — how long each toast stays up, fades included
   (default 5). Several unlocks queue and show one after another.
+- `KL_CTRL_WARN=0|1|2` — the "controller disconnected" card (`KleptonHUD.swift`,
+  device only). A PSVR2 Sense controller that is not connected while a game runs
+  (asleep at start, or dropped mid-game) leaves that hand on ARKit hand
+  tracking; a head-locked card 1 m ahead, 25 cm below the eyes, says "Mando
+  izquierdo desconectado / Pulsa el botón PS para despertarlo" (or derecho /
+  both; English unless the HEADSET language is Spanish) until it reconnects,
+  then "Mando izquierdo conectado" for 2 s. 5 s grace after the compositor
+  starts, 1 s debounce for a mid-game drop. `1` (default): only once a Sense
+  controller has been seen connected in this process, so a hands-only player
+  never sees it; `2`: always (a game that needs controllers); `0`: off. Read
+  live. Log: `[hud] controller warning: left missing` / `left back`.
+- `KL_CTRL_WARN_FORCE=left|right|both[:secs]` — pretend that controller is
+  missing (and that one was seen), to check the card without real controllers;
+  with `:secs` it "comes back" that many seconds after the grace period, which
+  shows the confirmation too.
 - `KL_STEAM_ICON_TIMEOUT=<ms>` — the bridge `icon` fetch per unlocked
   achievement (default 10000); a failure shows the toast with a placeholder.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
