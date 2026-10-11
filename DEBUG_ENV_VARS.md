@@ -1568,6 +1568,10 @@ The composite/timewarp pass — one file, compiled by both compositors
   (needs the depth copy, i.e. `KL_REPROJECT_DEPTH_MODE=2`) and on device in mode 2.
   `KL_OPENVR_DUMP` also writes `eyeN_depth.pfm` (raw game depth, quarter size)
   in mode 2.
+- `KL_OPENVR_DUMP_SEC=<s>` — with `KL_OPENVR_DUMP`, dump at the first frame s
+  seconds after the first submit instead of at `KL_OPENVR_DUMP_AT`: a wall-clock
+  moment, so runs at different frame rates dump the same picture (Alyx's scripted
+  `40:load autosave` sits paused at its start gate; 120 is a static frame).
 - `KL_CHROMA=1` — chroma-key the guest's picture so the room shows through
   wherever it drew the key colour. Ported from VisionOSALVRClient with its maths
   and defaults intact, so a value found in that client transfers. Off by
@@ -2555,6 +2559,78 @@ vendored the whole path refuses by name and none of these do anything.
 - `KL_MVK_DIR=<dir>` — where to load MoltenVK from (default
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
+
+### One Metal encoder across suspend/resume, above stock MoltenVK (`runtime/gfx/kl_mtl_merge.m`)
+
+EXPERIMENTAL. Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
+`klepton/runtime/gfx/kl_gpu_time.m` and `kl_vulkan.c`. Alyx's stereo scene pass is
+one dynamic-rendering instance split into SUSPENDING/RESUMING segments; stock
+MoltenVK stores and reloads the whole 4x MSAA colour + D32S8 at every boundary
+(perf audit 2026-10-07, #1/#2). This does the merge at the Metal level with
+method swizzles on the command buffer / render encoder classes — no MoltenVK
+fork. **All default OFF; with none of these set nothing is swizzled and nothing
+changes.**
+
+- `KL_VK_MERGE=1` — MoltenVK's endEncoding on a guest MSAA render encoder is
+  deferred and its store actions cached; the next render pass on the same
+  MTLCommandBuffer continues in the SAME encoder when it is a confirmed resume:
+  identical attachments, all loaded, the held end was a plain Store, and
+  `kl_vulkan.c`'s marker (an empty debug group `kl-resume` recorded before every
+  RESUMING `vkCmdBeginRendering`, swallowed by the hook) was seen in between.
+  A MoltenVK pass restart (Alyx reads its MSAA colour as an input attachment,
+  ~1/frame; MoltenVK samples it as a texture) has no marker and stays stock.
+  Anything else on the command buffer (other encoder, event, commit) ends the
+  held encoder first with its real store actions — the fallback is stock. Fence
+  waits MoltenVK encodes at a continued encoder's start are dropped (it already
+  waited at its real start; it would otherwise wait on a fence it updates).
+  Every `KL_VK_GPU_TIME_LOG` s: `[merge] last 5.0 s: N held, N continued, N
+  MoltenVK restarts kept apart, N resumes after a barrier kept apart, ...`.
+  A pipeline barrier between segments (a second swallowed marker, `kl-barrier`,
+  before every `vkCmdPipelineBarrier`/`2`) also keeps the boundary stock.
+  **Alyx result (Mac M1 Max, 2026-10-11): it records a GENERAL->GENERAL barrier on
+  its MSAA colour (dst access includes SHADER_READ) before EVERY resume, and the
+  next segment samples that colour, so nothing merges and the picture is stock
+  (max channel diff 1 vs stock, the stock-vs-stock noise).** A Metal-level merge
+  cannot help Alyx; removing those store/loads needs the reads done in-tile
+  (framebuffer fetch) in MoltenVK.
+- `KL_VK_MERGE_BARRIERS=1` — (with MERGE) merge across those barriers anyway
+  (Glovebox's rule). A MEASUREMENT of what the store/load round trips cost, with
+  a WRONG picture: Alyx shows ring banding (max diff 29-32 vs stock). Alyx then
+  merges 2 of its 3 boundaries per frame (the third is MoltenVK's input-attachment
+  restart). Mac M1 Max in-process A/B (`KL_VK_MERGE_AB=10`, ~16k frames a phase):
+  merged +2.6 % GPU time at fidelity 1 (4x, 9.60 vs 9.36 ms), +4.7 % at fidelity 0
+  (2x, 8.39 vs 8.01 ms) — no gain on 400 GB/s; the M2 (~100 GB/s) is the test.
+- `KL_VK_MERGE_VIS=1` — (with MERGE) the scene's first segment has no occlusion
+  queries, so no visibility buffer, while its resume does; Metal fixes the buffer
+  per encoder. The buffer the resume brought is attached to the next frame's
+  first segment up front. Without it about half the boundaries cannot merge.
+- `KL_VK_MERGE_AB=<s>` — (with MERGE; implies GPU time) in-process A/B: merged /
+  stock alternate every s seconds, per guest frame (the first second after a
+  flip is not counted): `[merge] A/B so far: merged X GPU ms/frame | stock Y |
+  ±Z% GPU time`. Two runs on a shared Mac GPU are not comparable; two phases of
+  one run are.
+- `KL_VK_MERGE_ANY=1` — continue without the resume marker (Glovebox's rule).
+  Diagnostic: merges across MoltenVK's input-attachment restart, which reads
+  stale memory — expect a wrong picture.
+- `KL_VK_MERGE_DEBUG=1|2` — 1: the first reasons a pass did not continue / who
+  ended a held encoder; 2: every merge event (encoder labels, store actions,
+  markers, commits) for 2 guest frames from frame `KL_VK_MERGE_TRACE_AT`
+  (default 3000).
+- `KL_VK_GPU_TIME=1` (also `KL_MVK_GPU_TIME=1`) — GPU time per guest frame from
+  Metal: the union of the guest queue's MTLCommandBuffer [GPUStartTime,
+  GPUEndTime], frames closed at `kl_vulkan_frame_done`. `[vkgpu] HH:MM:SS GPU
+  time per frame: avg / worst ms over N frames (fps)` every `KL_VK_GPU_TIME_LOG`
+  s (default 5). Swizzles only `-commit`.
+- `KL_VK_MSAA_MEMORYLESS=1` — multisampled colour/depth attachments are created
+  TRANSIENT with their other usages dropped (`KL_VK_MSAA_ML_INPUT=1` keeps
+  INPUT_ATTACHMENT, and then MoltenVK offers no memoryless type) and their
+  allocation moved to MoltenVK's LAZILY_ALLOCATED (Metal memoryless) type. Only
+  meaningful with `KL_VK_MERGE=1`; `[ml] UNMERGED load` counts every segment
+  that would have to load one (must stay 0). In Alyx the input-attachment
+  restart is such a load, so the picture is expected to be wrong. Measured (Mac,
+  with MERGE+VIS): the colour image went memoryless, the D32S8 image had no
+  LAZILY_ALLOCATED type (stays in memory), every resume was an unmerged load,
+  wrong picture (max diff 32). Not usable for Alyx.
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 

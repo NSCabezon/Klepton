@@ -23,6 +23,7 @@
 
 #include "kl_vulkan.h"
 #include "kl_env.h"
+#include "kl_mtl_merge.h" // KL_VK_MERGE / KL_VK_GPU_TIME: Metal-level hooks above MoltenVK
 #include "kl_driver.h"   // kl_driver_target_name() — per-target GPU identity spoof
 
 // Matched on with a prefix test rather than equality: the guest asks by plain
@@ -2739,6 +2740,7 @@ void kl_vulkan_frame_done(int stage) {
         }
     }
     __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
+    kl_mtl_merge_frame_end();                        // KL_VK_GPU_TIME / KL_VK_MERGE_AB (no-op otherwise)
     if (pf_in > 0) {                                 // [perf-audit] KL_PERF_FRAME
         double t = pf_now();
         g_pf.waitidle += t - pf_in;
@@ -3072,6 +3074,55 @@ static void VKAPI_CALL klvk_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage img
 // Pipeline barrier is special: it carries an ARRAY of image barriers, so rather
 // than drop the whole call we filter out the ones on unknown images and forward
 // the rest - the eye layer's own transitions must still go through.
+// KL_VK_MERGE (kl_mtl_merge.m): an empty debug group named `name` recorded into cb, which the Metal
+// hooks swallow. Before a RESUMING vkCmdBeginRendering it confirms a resume; before a pipeline barrier
+// it says "memory between the segments must be real": a held encoder is then not continued (Alyx
+// reads its MSAA colour back after a GENERAL->GENERAL barrier between segments).
+static int perf_rt_find(VkImage img, uint32_t *samples, uint32_t *w, uint32_t *h, int *fmt);
+static int klvk_merge_dbg(void) { static int d = -1; if (d < 0) d = kl_env_int("KL_VK_MERGE_DEBUG", 0); return d; }
+static void klvk_merge_mark(VkCommandBuffer cb, const char *name) {
+    static PFN_vkCmdBeginDebugUtilsLabelEXT mb;
+    static PFN_vkCmdEndDebugUtilsLabelEXT me;
+    if (!mb || !me) {
+        me = (PFN_vkCmdEndDebugUtilsLabelEXT)mvk_sym("vkCmdEndDebugUtilsLabelEXT");
+        mb = (PFN_vkCmdBeginDebugUtilsLabelEXT)mvk_sym("vkCmdBeginDebugUtilsLabelEXT");
+    }
+    if (mb && me) {
+        VkDebugUtilsLabelEXT l = { .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name };
+        mb(cb, &l);
+        me(cb);
+    } else {
+        static int said;
+        if (!said++) VKI("[merge] MoltenVK has no vkCmdBeginDebugUtilsLabelEXT: segments cannot be marked, nothing merges\n");
+    }
+}
+// KL_VK_MERGE_DEBUG: the last barrier recorded on this thread, printed when the same command buffer
+// then resumes a dynamic-rendering instance (what stands between the segments).
+static __thread VkCommandBuffer t_bar_cb;
+static __thread char t_bar[512];
+static void VKAPI_CALL klvk_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
+    static PFN_vkCmdPipelineBarrier2 real;
+    if (!real) real = (PFN_vkCmdPipelineBarrier2)mvk_sym("vkCmdPipelineBarrier2");
+    if (kl_mtl_merge_on()) klvk_merge_mark(cb, KL_MTL_MERGE_BARRIER_MARK);
+    if (kl_mtl_merge_on() && di && klvk_merge_dbg()) {
+        int k = snprintf(t_bar, sizeof t_bar, "barrier2 flags %#x mem %u buf %u img %u", di->dependencyFlags,
+                         di->memoryBarrierCount, di->bufferMemoryBarrierCount, di->imageMemoryBarrierCount);
+        for (uint32_t i = 0; i < di->memoryBarrierCount && k < 400; i++)
+            k += snprintf(t_bar + k, sizeof t_bar - k, " | M stg %#llx->%#llx acc %#llx->%#llx",
+                          (unsigned long long)di->pMemoryBarriers[i].srcStageMask, (unsigned long long)di->pMemoryBarriers[i].dstStageMask,
+                          (unsigned long long)di->pMemoryBarriers[i].srcAccessMask, (unsigned long long)di->pMemoryBarriers[i].dstAccessMask);
+        for (uint32_t i = 0; i < di->imageMemoryBarrierCount && k < 400; i++) {
+            const VkImageMemoryBarrier2 *b = &di->pImageMemoryBarriers[i];
+            uint32_t sm = 0, w = 0, h = 0; int fmt = 0;
+            perf_rt_find(b->image, &sm, &w, &h, &fmt);
+            k += snprintf(t_bar + k, sizeof t_bar - k, " | I x%u %ux%u fmt %d lay %d->%d stg %#llx->%#llx acc %#llx->%#llx",
+                          sm, w, h, fmt, b->oldLayout, b->newLayout, (unsigned long long)b->srcStageMask,
+                          (unsigned long long)b->dstStageMask, (unsigned long long)b->srcAccessMask, (unsigned long long)b->dstAccessMask);
+        }
+        t_bar_cb = cb;
+    }
+    if (real) real(cb, di);
+}
 static void VKAPI_CALL klvk_CmdPipelineBarrier(VkCommandBuffer cb,
         VkPipelineStageFlags ss, VkPipelineStageFlags ds, VkDependencyFlags df,
         uint32_t mbc, const VkMemoryBarrier *mb,
@@ -3080,6 +3131,19 @@ static void VKAPI_CALL klvk_CmdPipelineBarrier(VkCommandBuffer cb,
     static PFN_vkCmdPipelineBarrier real;
     if (!real) real = (PFN_vkCmdPipelineBarrier)mvk_sym("vkCmdPipelineBarrier");
     if (!real) return;
+    if (kl_mtl_merge_on()) klvk_merge_mark(cb, KL_MTL_MERGE_BARRIER_MARK);
+    if (kl_mtl_merge_on() && klvk_merge_dbg()) {
+        int k = snprintf(t_bar, sizeof t_bar, "barrier1 stg %#x->%#x flags %#x mem %u buf %u img %u", ss, ds, df, mbc, bbc, ibc);
+        for (uint32_t i = 0; i < mbc && k < 400; i++)
+            k += snprintf(t_bar + k, sizeof t_bar - k, " | M acc %#x->%#x", mb[i].srcAccessMask, mb[i].dstAccessMask);
+        for (uint32_t i = 0; i < ibc && k < 400; i++) {
+            uint32_t sm = 0, w = 0, h = 0; int fmt = 0;
+            perf_rt_find(ib[i].image, &sm, &w, &h, &fmt);
+            k += snprintf(t_bar + k, sizeof t_bar - k, " | I x%u %ux%u fmt %d lay %d->%d acc %#x->%#x", sm, w, h, fmt,
+                          ib[i].oldLayout, ib[i].newLayout, ib[i].srcAccessMask, ib[i].dstAccessMask);
+        }
+        t_bar_cb = cb;
+    }
     int bad = 0;
     for (uint32_t i = 0; i < ibc; i++) if (KLVK_IMG_BAD(ib[i].image)) { bad = 1; break; }
     if (!bad) { real(cb, ss, ds, df, mbc, mb, bbc, bb, ibc, ib); return; }
@@ -3184,6 +3248,96 @@ static int perf_rt_find(VkImage img, uint32_t *samples, uint32_t *w, uint32_t *h
     pthread_mutex_unlock(&g_perf_rt_lock);
     return ok;
 }
+// KL_VK_MSAA_MEMORYLESS=1 (default off; EXPERIMENTAL, needs KL_VK_MERGE=1 to have a chance):
+// back the guest's multisampled colour and depth attachments with Metal memoryless (tile-only)
+// storage. The image is created as a TRANSIENT attachment with its other usages dropped
+// (KL_VK_MSAA_ML_INPUT=1 keeps INPUT_ATTACHMENT, and then MoltenVK offers no memoryless type),
+// and its allocation is moved to MoltenVK's LAZILY_ALLOCATED memory type, which MoltenVK backs
+// with MTLStorageModeMemoryless. Memoryless storage lives only inside one Metal encoder, so this
+// relies on kl_mtl_merge.m keeping the pass's segments in one encoder; it counts every segment
+// that is not ("[ml] UNMERGED load", must stay 0) and keeps Metal legal. Alyx reads its MSAA
+// colour back as an input attachment (a MoltenVK pass restart), so expect a wrong picture there.
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c.
+static int g_msaa_ml = -1;
+static int msaa_ml_on(void) { if (g_msaa_ml < 0) g_msaa_ml = kl_env_on("KL_VK_MSAA_MEMORYLESS", 0); return g_msaa_ml; }
+enum { kMlImgs = 32 };
+static pthread_mutex_t g_ml_mu = PTHREAD_MUTEX_INITIALIZER;
+static VkImage g_ml_imgs[kMlImgs];
+static int g_ml_nimg;
+// The guest may not use dedicated allocations: it allocates a block of exactly the image's size
+// right after asking for its requirements. So the requirements are noted and the next allocation
+// of that exact size (whose type the image accepts) is the one moved to the memoryless type.
+static struct { VkImage img; VkDeviceSize size; uint32_t bits; int open; } g_ml_req[kMlImgs];
+static int g_ml_nreq;
+static void ml_add(VkImage img, VkImageUsageFlags was, const VkImageCreateInfo *ci) {
+    pthread_mutex_lock(&g_ml_mu);
+    if (g_ml_nimg < kMlImgs) g_ml_imgs[g_ml_nimg++] = img;
+    pthread_mutex_unlock(&g_ml_mu);
+    VKI("[ml] image %#llx %ux%u layers %u samples %u fmt %d: usage %#x -> %#x (transient)\n",
+        (unsigned long long)(uintptr_t)img, ci->extent.width, ci->extent.height, ci->arrayLayers,
+        (unsigned)ci->samples, (int)ci->format, was, ci->usage);
+}
+static int ml_has(VkImage img) {
+    int hit = 0;
+    pthread_mutex_lock(&g_ml_mu);
+    for (int i = 0; i < g_ml_nimg; i++) if (g_ml_imgs[i] == img) { hit = 1; break; }
+    pthread_mutex_unlock(&g_ml_mu);
+    return hit;
+}
+static int ml_lazy_type(VkDevice dev, uint32_t bits, int say) {
+    PFN_vkGetPhysicalDeviceMemoryProperties gmp = real_gipa
+        ? (PFN_vkGetPhysicalDeviceMemoryProperties)real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties") : NULL;
+    klvk_device *pd = dev_find(dev);
+    if (!pd || !gmp) return -1;
+    VkPhysicalDeviceMemoryProperties mp; gmp(pd->phys, &mp);
+    int lazy = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (say) VKI("[ml] memory type %u: heap %u props %#x%s\n", i, mp.memoryTypes[i].heapIndex,
+                     mp.memoryTypes[i].propertyFlags, (bits >> i) & 1 ? " (the image accepts it)" : "");
+        if (lazy < 0 && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) && ((bits >> i) & 1)) lazy = (int)i;
+    }
+    return lazy;
+}
+static void ml_note_req(VkDevice dev, VkImage img, const VkMemoryRequirements *mr) {
+    static int said;
+    int lazy = ml_lazy_type(dev, mr->memoryTypeBits, !said++);
+    pthread_mutex_lock(&g_ml_mu);
+    int k = -1;
+    for (int i = 0; i < g_ml_nreq; i++) if (g_ml_req[i].img == img) k = i;
+    if (k < 0 && g_ml_nreq < kMlImgs) k = g_ml_nreq++;
+    if (k >= 0) { g_ml_req[k].img = img; g_ml_req[k].size = mr->size; g_ml_req[k].bits = mr->memoryTypeBits; g_ml_req[k].open = lazy >= 0; }
+    pthread_mutex_unlock(&g_ml_mu);
+    VKI("[ml] image %#llx needs %.1f MB, types %#x: %s\n", (unsigned long long)(uintptr_t)img,
+        mr->size / 1048576.0, mr->memoryTypeBits, lazy >= 0 ? "the next allocation of that size goes memoryless" :
+        "no LAZILY_ALLOCATED type among them; stays in real memory");
+}
+// The memory type an allocation should really use (KL_VK_MSAA_MEMORYLESS), or -1 to leave it.
+static int ml_alloc_type(VkDevice dev, const VkMemoryAllocateInfo *ai) {
+    if (!ai || !msaa_ml_on() || !g_ml_nimg) return -1;
+    const VkMemoryDedicatedAllocateInfo *ded = NULL;
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) ded = (const void *)b;
+    VkImage img = VK_NULL_HANDLE; uint32_t bits = ~0u;
+    if (ded && ded->image) {
+        if (!ml_has(ded->image)) return -1;
+        img = ded->image;
+    } else if (!ded) {
+        int k = -1;
+        pthread_mutex_lock(&g_ml_mu);
+        for (int i = 0; i < g_ml_nreq; i++)
+            if (g_ml_req[i].open && g_ml_req[i].size == ai->allocationSize && ((g_ml_req[i].bits >> ai->memoryTypeIndex) & 1)) { k = i; break; }
+        if (k >= 0) { g_ml_req[k].open = 0; img = g_ml_req[k].img; bits = g_ml_req[k].bits; }
+        pthread_mutex_unlock(&g_ml_mu);
+        if (k < 0) return -1;
+    } else return -1;
+    int lazy = ml_lazy_type(dev, bits, 0);
+    if (lazy >= 0)
+        VKI("[ml] allocation of %.1f MB for image %#llx moved from memory type %u to %d (LAZILY_ALLOCATED, memoryless)\n",
+            ai->allocationSize / 1048576.0, (unsigned long long)(uintptr_t)img, ai->memoryTypeIndex, lazy);
+    else { static int said; if (!said++) VKI("[ml] no LAZILY_ALLOCATED memory type; MSAA stays in real memory\n"); }
+    return lazy;
+}
+
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
     static PFN_vkCreateImage real;
@@ -3191,6 +3345,15 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     int did_astc_sub = 0;
     VkImageCreateInfo mod;
+    // KL_VK_MSAA_MEMORYLESS: a multisampled colour/depth attachment becomes a transient attachment
+    // (its other usages dropped), so its memory can be Metal memoryless storage (ml_alloc_type).
+    int ml_pending = 0; VkImageUsageFlags ml_usage_was = 0;
+    if (ci && ci->samples > 1 && (ci->usage & 0x30u) && msaa_ml_on()) {
+        mod = *ci; ci = &mod;
+        ml_usage_was = mod.usage;
+        mod.usage = (mod.usage & (0x10u | 0x20u | (kl_env_on("KL_VK_MSAA_ML_INPUT", 0) ? 0x80u : 0u))) | 0x40u;
+        ml_pending = 1;
+    }
     if (ci && (ci->usage & 0x80u) && kl_env_on("KL_STRIP_INPUT_ATT", 0)) {
         // No render pass in this guest uses an input attachment (census: inputAtts 0),
         // yet its temp render targets carry INPUT_ATTACHMENT usage — which makes
@@ -3300,6 +3463,7 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
             fflush(stderr);
         }
     }
+    if (r == VK_SUCCESS && out && *out && ml_pending) ml_add(*out, ml_usage_was, ci);
     if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);
     if (r == VK_SUCCESS && out && ci)
         klvk_img_info_add(*out, ci->format, ci->extent.width, ci->extent.height);
@@ -3363,6 +3527,7 @@ static void VKAPI_CALL klvk_GetImageMemoryRequirements(VkDevice dev, VkImage img
         return;
     }
     if (real) real(dev, img, mr);
+    if (mr && msaa_ml_on() && g_ml_nimg && ml_has(img)) ml_note_req(dev, img, mr);
 }
 
 // A thin pass-through over MoltenVK's vkCreateImageView that LOGS the guest's
@@ -3978,6 +4143,19 @@ static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
             }
         }
     }
+    // KL_VK_MERGE (kl_mtl_merge.m): mark every RESUMING segment with an empty debug group right
+    // before it. MoltenVK encodes it on the Metal command buffer between the segments; the merge
+    // hook swallows it and only then lets the resume continue the held encoder (a MoltenVK pass
+    // restart, which looks the same at the Metal level, has no marker and stays stock).
+    if (ri && (ri->flags & VK_RENDERING_RESUMING_BIT) && kl_mtl_merge_on()) {
+        klvk_merge_mark(cb, KL_MTL_MERGE_RESUME_MARK);
+        static int said;
+        if (t_bar_cb == cb && said < 16 && klvk_merge_dbg()) {
+            said++;
+            VKI("[merge] resume (flags %#x) after %s\n", ri->flags, t_bar);
+        }
+        t_bar_cb = VK_NULL_HANDLE;
+    }
     if (real) real(cb, ri);
 }
 // KL_TRACE: catch a temp-RT allocation that FAILS at bind time — the step Unity
@@ -4170,6 +4348,9 @@ static VkResult VKAPI_CALL klvk_AllocateMemory(VkDevice dev,
         const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     static PFN_vkAllocateMemory real;
     if (!real && real_gdpa) real = (PFN_vkAllocateMemory)real_gdpa(dev, "vkAllocateMemory");
+    VkMemoryAllocateInfo ml_ai;                      // KL_VK_MSAA_MEMORYLESS (ml_alloc_type)
+    int ml_type = ml_alloc_type(dev, ai);
+    if (ml_type >= 0) { ml_ai = *ai; ml_ai.memoryTypeIndex = (uint32_t)ml_type; ai = &ml_ai; }
     VkResult r = real ? real(dev, ai, a, out) : VK_ERROR_INITIALIZATION_FAILED;
     // [perf-audit 2026-10-07] KL_PERF_RT_LOG: big allocations (>= 16 MB) with
     // the memory type's property flags — 0x10 = LAZILY_ALLOCATED, which MoltenVK
@@ -4509,6 +4690,27 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
             fprintf(stderr, "[TRACE] [thr] QueueSubmit tid=%u batches=%u cmdbufs=%u fence=%d\n",
                 klvk_tid(), n, cb, fence != VK_NULL_HANDLE);
         }
+    }
+    // KL_VK_MERGE / KL_VK_GPU_TIME (kl_mtl_merge.m): hand the Metal queue behind each guest queue
+    // to the Metal hooks once, before its first submit is encoded.
+    if (kl_mtl_merge_wanted()) {
+        static VkQueue seen[8];
+        static int nseen;
+        static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&mu);
+        int have = 0;
+        for (int i = 0; i < nseen; i++) if (seen[i] == q) have = 1;
+        if (!have && nseen < 8) {
+            typedef void (*pfn_get_mtl_queue)(VkQueue, void **);
+            pfn_get_mtl_queue get = (pfn_get_mtl_queue)mvk_sym("vkGetMTLCommandQueueMVK");
+            void *mq = NULL;
+            if (get) get(q, &mq);
+            if (mq) kl_mtl_merge_watch_queue(mq);
+            else VKI("[merge] no MTLCommandQueue behind guest queue %p (vkGetMTLCommandQueueMVK %s)\n",
+                     (void *)q, get ? "answered nil" : "missing");
+            seen[nseen++] = q;
+        }
+        pthread_mutex_unlock(&mu);
     }
     double pf_t0 = pf_on() ? pf_now() : 0;           // [perf-audit] KL_PERF_FRAME
     VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
@@ -6422,7 +6624,8 @@ static const entry g_ours[] = {
     E(CreateBuffer), E(BindBufferMemory), E(MapMemory),
     E(CmdCopyBuffer), E(CmdUpdateBuffer),
     E(CmdBlitImage), E(CmdResolveImage), E(CmdClearColorImage),
-    E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier),
+    E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier), E(CmdPipelineBarrier2),
+    { "vkCmdPipelineBarrier2KHR", (PFN_vkVoidFunction)klvk_CmdPipelineBarrier2 },
     E(CreateGraphicsPipelines), E(CreateComputePipelines),
     E(CreateFramebuffer), E(CmdBeginRenderPass),
     E(CmdBeginRenderPass2),
