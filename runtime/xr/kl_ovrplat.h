@@ -36,7 +36,16 @@
 // else is measured and answered as the trace forces it.
 //
 // Reporting that the platform is unavailable is true here; answering "yes,
-// entitled" would not be.
+// entitled" to content we cannot see would not be.
+//
+// Walkabout courses are the narrow exception that stays on that side of the
+// line (adapted from avp-play (MIT, github.com/myMartek/avp-play)
+// runtime/xr/kl_ovrplat.h). A course is reported installed only when the real
+// track bundle is already on disk — files the user copied from a Quest they
+// own; its store ids are reported purchased only when, in addition, the store
+// confirmed the purchase (klepton-entitlements.txt). A stub bundle does not
+// count. Download, delete and consume still abort; checkout completes as an
+// error ("the purchase did not happen").
 #ifndef KL_OVRPLAT_H
 #define KL_OVRPLAT_H
 #include <stdio.h>

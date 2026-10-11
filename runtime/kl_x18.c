@@ -182,6 +182,20 @@ static int ldst(uint32_t w, klx_info *o) {
     // Load/store exclusive
     if ((w & 0x3F000000) == 0x08000000) {
         unsigned L = (w >> 22) & 1, o2 = (w >> 23) & 1;
+        // Single-register compare-and-swap (cas{,a,l,al}{,b,h}: o2 and o1 set,
+        // Rt2 all ones) lives in this group too and shares none of the roles
+        // below: Rs is the expected value AND receives what was in memory, Rt
+        // is only read, whatever L says (there it is the acquire bit). Treating
+        // it as an exclusive load made Rt write-only, so a veneer never loaded
+        // the shadow slot, and missed Rs altogether. The PAIR form (o2 clear)
+        // is KLX_HZ_CASP above.
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/kl_x18.c.
+        if (o2 && ((w >> 21) & 1) && ((w >> 10) & 31) == 31) {
+            addfld(o, w, KLX_RN, KLX_R);
+            addfld(o, w, KLX_RM, KLX_R | KLX_W);
+            addfld(o, w, KLX_RD, KLX_R);
+            return 1;
+        }
         addfld(o, w, KLX_RN, KLX_R);
         addfld(o, w, KLX_RD, L ? KLX_W : KLX_R);
         addfld(o, w, KLX_RA, L ? KLX_W : KLX_R);            // Rt2, pair forms
@@ -1364,6 +1378,11 @@ int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
     }
     *cursor = end;
     return 0;
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/kl_x18.c.
+void kl_x18_report_reset(void) {
+    g_nrefused_kinds = g_refused_total = 0;
 }
 
 void kl_x18_report(FILE *f) {

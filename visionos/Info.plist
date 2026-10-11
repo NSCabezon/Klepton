@@ -45,6 +45,25 @@
 	     Assets.car and the Home View shows the blank default. -->
 	<key>CFBundleIconName</key>
 	<string>$(KL_APPICON_NAME)</string>
+	<!-- Per-target defaults from targets.py, filled by the generated
+	     KL_*_DEFAULT build settings (gen_xcodeproj.py). Adapted from avp-play
+	     (MIT, github.com/myMartek/avp-play) visionos/Info.plist. Read by
+	     KleptonChroma (hand matting), KleptonControllers (gamepad face-button
+	     map), KleptonTuning's KleptonRendering (render scale, in-game video,
+	     foveation) and KleptonApp (autoboot). The defaults in targets.py keep
+	     every pre-existing target as it was. -->
+	<key>KLGamepadMap</key>
+	<string>$(KL_GAMEPAD_MAP)</string>
+	<key>KLHandMattingDefault</key>
+	<string>$(KL_HAND_MATTING_DEFAULT)</string>
+	<key>KLRenderScaleDefault</key>
+	<string>$(KL_RENDER_SCALE_DEFAULT)</string>
+	<key>KLVideoDefault</key>
+	<string>$(KL_VIDEO_DEFAULT)</string>
+	<key>KLAutoBootDefault</key>
+	<string>$(KL_AUTOBOOT_DEFAULT)</string>
+	<key>KLFoveationDefault</key>
+	<string>$(KL_FOVEATION_DEFAULT)</string>
 	<!-- THE SCENE MANIFEST — and specifically the immersive-space ROLE.
 	     Without this the app has no immersive scene session, and the failure is
 	     silent in every direction that can be checked from inside the app:

@@ -110,3 +110,7 @@ tools/__pycache__/
 /superhot
 /vendor-fossilize
 /vendor-moltenvk
+# Per-game artwork is never part of this tree: an installer writes the icon and
+# the start picture from the owner's own copy of the game at build time.
+visionos/Assets.xcassets/AppIcon-*.solidimagestack/
+visionos/Assets.xcassets/StartHero-*.imageset/

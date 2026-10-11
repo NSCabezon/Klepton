@@ -27,6 +27,41 @@
 #include "kl_egl.h"
 #include "kl_vulkan.h"
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/xr/kl_ovrp.c
+// — the changes from that fork in this file: OVRPlugin gaps, per-title workarounds
+// (Walkabout, Arkham Shadow, Moss, Alien: Rogue Incursion, AC Nexus, Deadpool,
+// Cave Crave, Max Mustard, Keep Talking...) and frame-record/overlay fixes.
+//
+// Their fork applies several of those fixes to EVERY guest. Here a change that
+// alters what an already-working title sees defaults ON only for the titles
+// avp-play measured it on, and stays OFF for this fork's existing targets
+// (alyx, beatsaber, superhot, ...) unless its knob says otherwise. Note that
+// avp-play's "alyx" is a different guest (a Linux process) from ours; nothing
+// here defaults on for "alyx".
+static int klovrp_avpplay_title(void) {
+    static int v = -1;
+    if (v < 0) {
+        static const char *const names[] = {
+            "wrath2", "batman", "beatsaber140", "beatsaber128", "moss", "walkabout",
+            "steamlink-vr", "doom3quest",
+            "x24882487241367228",   // Alien: Rogue Incursion
+            "x3240283705987790",    // Marvel's Deadpool VR
+            "x5812519008825194",    // Assassin's Creed Nexus VR
+            "x5361030930653377",    // Eye of the Temple
+            "x7527722310622065",    // Cave Crave
+            "x6323807174332876",    // Tea For God
+            "x5269080709783454",    // Max Mustard
+            "x5841245619310585",    // Steam Link (store row; SUPERHOT's row keeps ours)
+        };
+        const char *t = kl_driver_target_name();
+        v = 0;
+        if (t) for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+            if (strcmp(t, names[i]) == 0) { v = 1; break; }
+    }
+    return v;
+}
+int kl_ovrp_avpplay_title(void) { return klovrp_avpplay_title(); }
+
 #define KL_OVRP_MAX 512
 static struct { const char *name; unsigned calls; } g_ovrp[KL_OVRP_MAX];
 static unsigned g_novrp;
@@ -348,8 +383,43 @@ static uint64_t klovrp_GetAudioInId2(const void **out)       { return klovrp_Get
 // crashed in MVKPhysicalDevice::getQueueFamilies. Report the real LUID (first 8
 // bytes of the 32-byte id) so the match lands. A GLES guest has no Vulkan
 // instance; kl_vulkan_display_luid leaves the id empty, the prior behaviour.
+//
+// Walkabout (Unity 6000.3, OculusXR 4.x) reads the answer differently: the
+// pointer handed back IS the VkPhysicalDevice. Its plugin passes it to Unity
+// unread as the XR device, and Unity's SelectPhysicalDevice looks for that exact
+// handle among vkEnumeratePhysicalDevices — so the LUID buffer's address matched
+// nothing and the guest put up "Unable to initialize the Unity Engine Graphics
+// API". KL_OVRP_ADAPTER_PHYS=0/1 forces the A/B either way.
+static int klovrp_adapter_is_phys(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        // batman (Unity 2022.3.45) is the second title measured to need it: on
+        // the LUID answer it enumerated the one device, read its properties,
+        // matched nothing and went straight to "Your device does not match the
+        // hardware requirements" and a GLES2 context — with the Adreno identity
+        // and the Quest 3 model already in place, so neither of those was the
+        // gate. With the handle it creates its device (35 extensions) and renders.
+        // Max Mustard (x5269080709783454, Unity 2022.3.16) is the third: same
+        // LUID answer, same one-device walk, same fall to GLES2 — whose shaders
+        // it does not ship ("shader compiler platform 5"), so every material
+        // drew as Unity's pink error shader.
+        on = kl_env_on("KL_OVRP_ADAPTER_PHYS",
+                       t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0 ||
+                             strcmp(t, "x5269080709783454") == 0));
+    }
+    return on;
+}
 static uint64_t klovrp_GetDisplayAdapterId2(const void **out) {
     ovrp_hit("ovrp_GetDisplayAdapterId2");
+    if (klovrp_adapter_is_phys()) {
+        void *pd = kl_vulkan_display_phys();
+        if (pd) {
+            fprintf(stderr, "  [ovrp] display adapter -> VkPhysicalDevice %p\n", pd);
+            if (out) *out = pd;
+            return OVRP_SUCCESS;
+        }
+    }
     static uint8_t id[32];
     memset(id, 0, sizeof id);
     if (kl_vulkan_display_luid(id))
@@ -800,6 +870,21 @@ static uint64_t klovrp_GetUserPresent2(int *out) {
     if (out) *out = 1;
     return OVRP_SUCCESS;
 }
+// Environment depth (Quest 3 passthrough occlusion). There is no depth pipe on
+// visionOS, so no frame is ever valid — and that has to be WRITTEN: the
+// descriptor's first field is its IsValid, and Meta's Unreal plugin hands in an
+// uninitialised local and reads it back after a success. Left untouched, Alien:
+// Rogue Incursion found a stale stack-guard value there on its first frame,
+// took the frame for valid and indexed its depth swapchain with more of the
+// same (SIGSEGV on RenderThread, 2026-10-09). wanderer's local happens to be
+// zero, which is why "success and touch nothing" was enough for it. Only that
+// one field is written; the rest of the struct is not read behind a false.
+static uint64_t klovrp_GetEnvironmentDepthFrameDesc(int eye, int *desc) {
+    ovrp_hit("ovrp_GetEnvironmentDepthFrameDesc");
+    (void)eye;
+    if (desc) *desc = 0;    // ovrpEnvironmentDepthFrameDesc.IsValid = ovrpBool_False
+    return OVRP_SUCCESS;
+}
 static uint64_t klovrp_GetNodePresent2(int node, int *out) {
     ovrp_hit("ovrp_GetNodePresent2");
     // node comes FIRST (real 0x16f450: w0 = ovrpNode, x1 = int* out) — the
@@ -1079,10 +1164,75 @@ static uint64_t klovrp_SetSystemDisplayFrequency(float hz) {
     return -1001;                     // ovrpFailure_InvalidParameter
 }
 
+// KL_OVRP_ADAPTIVE_RES — the eye layer's recommended resolution follows the GPU.
+//
+// Meta's dynamic resolution is the runtime telling the application, frame by
+// frame, how large an eye picture the GPU can afford
+// (ovrp_GetLayerRecommendedResolution), and the application moving its render
+// viewport toward that inside the eye texture it already has. Answered with the
+// full size every time, a title built on it renders at its maximum whatever
+// that costs: Alien: Rogue Incursion sat at 3028x2464 an eye and 16-20 frames a
+// second outdoors, the GPU taking 45-50 ms a frame (2026-10-09).
+//
+// The load is the time the guest's frame still had to go on the GPU when the
+// guest called it done (measured at frame end, below) — near zero for a guest
+// the GPU keeps up with, most of the frame for one it does not. Averaged over
+// 30 frames; the scale goes down by the square root of the overshoot (GPU time
+// follows the pixel count), at most 8 % a step and never below 70 %, and back
+// up 3 % a step once there is room. The application smooths it on its side.
+//   KL_OVRP_ADAPTIVE_RES=0|1     default 1 for that title, else 0
+//   KL_OVRP_ADAPTIVE_GPU_MS=<ms> the wait it steers toward, default 14
+static float g_adapt_scale = 1.0f;
+static int klovrp_adapt_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_OVRP_ADAPTIVE_RES", t && !strcmp(t, "x24882487241367228"));
+    }
+    return on;
+}
+static void klovrp_adapt_note(double wait_ms) {
+    if (!klovrp_adapt_on()) return;
+    static double sum;
+    static unsigned n, changes;
+    static float target = -1.0f;
+    if (target < 0) {
+        target = kl_env_float("KL_OVRP_ADAPTIVE_GPU_MS", 14.0f);
+        if (!(target >= 2.0f && target <= 100.0f)) target = 14.0f;
+    }
+    sum += wait_ms;
+    if (++n < 30) return;
+    double mean = sum / n;
+    sum = 0; n = 0;
+    float s = g_adapt_scale;
+    if (mean > target * 1.15) {
+        float k = sqrtf(target / (float)mean);
+        s *= k < 0.92f ? 0.92f : k;
+    } else if (mean < target * 0.80 && s < 1.0f) {
+        s *= 1.03f;
+    }
+    if (s > 1.0f) s = 1.0f;
+    if (s < 0.70f) s = 0.70f;
+    if (s == g_adapt_scale) return;
+    g_adapt_scale = s;
+    if (changes++ < 12 || changes % 50 == 0)
+        fprintf(stderr, "  [ovrp] adaptive resolution: the GPU had %.1f ms to go at frame end "
+                        "(target %.0f) — recommending %.0f%% of the eye size (change %u)\n",
+                mean, (double)target, (double)s * 100.0, changes);
+}
+
 // The per-eye render target size. Quest 2's recommendation until a frontend
 // measures the display it is actually running on — see kl_ovrp.h.
 static int g_eye_w = (int)KL_OVRP_EYE_W;
 static int g_eye_h = (int)KL_OVRP_EYE_H;
+
+// What KL_OVRP_RENDER_SCALE defaults to: the frontend's stored setting, itself
+// defaulting to the target's own (targets.py "render_scale").
+static float g_render_scale_default = 1.0f;
+void kl_ovrp_set_render_scale_default(float s) {
+    if (s >= 0.4f && s <= 1.0f) g_render_scale_default = s;
+}
 
 void kl_ovrp_set_eye_texture_size(int w, int h) {
     // A degenerate size is a measurement that went wrong, and it would reach
@@ -1101,7 +1251,31 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         w = (int)((float)w * scale + 0.5f);
         h = (int)((float)h * scale + 0.5f);
     }
-    int cap = kl_env_int("KL_OVRP_EYE_MAX", 3072);
+    // Per-target default. Doom3Quest lights in passes — every light re-shades
+    // the pixels it touches — and squares and supersamples whatever it is told
+    // (3072x2464 became 3379x3379 per eye, 22.8 MP a frame, against ~5 MP on the
+    // Quest 2 it was tuned for). Its cap was 2048 for that reason (about
+    // 2250x2250 per eye after its own 1.1x), which on this display is roughly 19
+    // pixels per degree and reads as a coarse picture. Measured on device,
+    // 2026-10-08: at 4000 (4400x4400 per eye) the owner called the picture good
+    // and the guest ran at 53-55 frames a second falling to 31-35 over three
+    // minutes. So the CEILING is 4000 and the target's render scale
+    // (targets.py "render_scale", the "Render resolution" setting) picks the
+    // point under it: 0.5 is the old picture, 1.0 the sharp one. Foveation
+    // cannot help yet — this guest renders into an array swapchain of its own
+    // (see kl_glfb_set_eye_rate_map).
+    int cap_dflt = 3072;
+    {
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "doom3quest") == 0) cap_dflt = 4000;
+        // AC Nexus: a quarter more, paid for by rendering 2x multisampled
+        // instead of 4x (KL_VK_MAX_SAMPLES in kl_vulkan.c, which is where the
+        // memory arithmetic is). 3072 px is about 22 pixels a degree at the
+        // centre of this display, and its owner read that as "no anti-aliasing
+        // or too little resolution"; at 3840 he called it good enough.
+        if (t && strcmp(t, "x5812519008825194") == 0) cap_dflt = 3840;
+    }
+    int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
     if (cap > 0 && (w > cap || h > cap)) {
         // Preserve the aspect ratio: clamping the axes independently would
         // change the shape of the picture, and the frustum tangents pushed
@@ -1110,6 +1284,23 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         w = (int)((float)w * k + 0.5f);
         h = (int)((float)h * k + 0.5f);
     }
+    // The person's (or the target's) render scale, applied AFTER the cap so it
+    // always means "this fraction of what would otherwise be rendered" — the
+    // pre-cap KL_OVRP_EYE_SCALE above cannot do that on a display that asks for
+    // twice the cap, where 0.75 of the request is still clamped to the same
+    // size. This is the fill-rate lever for a Vulkan guest: its own fixed
+    // foveation needs a fragment density map MoltenVK does not offer ("Foveation
+    // is not supported" in Arkham Shadow's log), so every pixel of the eye
+    // texture is shaded at full rate, and a guest that saturates the GPU takes
+    // the compositor's 100 Hz down to 50 with it — each reprojection shown
+    // twice, which is judder on every head turn. Kept even so the viewport
+    // halves cleanly.
+    float rs = kl_env_float("KL_OVRP_RENDER_SCALE", g_render_scale_default);
+    if (!(rs >= 0.4f && rs <= 1.0f)) rs = 1.0f;
+    if (rs < 1.0f) {
+        w = ((int)((float)w * rs + 0.5f) + 1) & ~1;
+        h = ((int)((float)h * rs + 0.5f) + 1) & ~1;
+    }
     if (w == g_eye_w && h == g_eye_h) return;
 
     // Logged every change, not once: each one costs the guest a swapchain
@@ -1117,9 +1308,9 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
     // the whole swapchain Unity will hold.
     double mib = (double)w * h * 8.0 * 2.0 * kl_ovrp_stage_count() / (1024 * 1024);
     fprintf(stderr, "  [ovrp] eye texture size %dx%d -> %dx%d; the display asked "
-                    "for %dx%d (scale %.2f, cap %d). %.0f MiB of swapchain, "
-                    "before Unity's own ~1.2x\n",
-            g_eye_w, g_eye_h, w, h, req_w, req_h, scale, cap, mib);
+                    "for %dx%d (scale %.2f, cap %d, render scale %.2f). %.0f MiB "
+                    "of swapchain, before Unity's own ~1.2x\n",
+            g_eye_w, g_eye_h, w, h, req_w, req_h, scale, cap, rs, mib);
     g_eye_w = w;
     g_eye_h = h;
 }
@@ -1241,12 +1432,59 @@ static const float *klovrp_forced_tan(void) {
 // composite reproject, one symmetric union cone per eye — they agree, the cross
 // is gone, at the known cost of the union's slightly lower angular density. The
 // env still overrides in either direction.
+//
+// Walkabout is the same shape by a different route: its OculusXR (Unity 6) widens
+// the eye texture itself for Meta's symmetric projection (3072 -> 3936 on device),
+// renders both eyes with that one symmetric cone, and asks
+// ovrp_CalculateEyeViewportRect where each eye goes — which answers "the whole
+// texture", so both eyes arrive at 0,0 full-width (device log: `render viewport:
+// eye0 0,0 3936x2464 eye1 0,0 3936x2464`). User-reported on device as the same
+// picture in both eyes with no usable stereo.
 static int klovrp_unify_default(void) {
-    static const char *on[] = { "intotheradius" };
+    static const char *on[] = { "intotheradius", "walkabout" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
     return 0;
+}
+
+static const float *klovrp_eye_tan(int eye);
+void kl_ovrp_eye_display_tangents(int eye, float tan[4]) {
+    if ((unsigned)eye > 1) eye = 0;
+    const float *forced = klovrp_forced_tan();
+    const float *raw = forced ? forced + 4 * eye : &g_eye_tan[eye][0];
+    memcpy(tan, raw, 4 * sizeof(float));
+}
+void kl_ovrp_eye_texture_size_for_cone(int *w, int *h) {
+    int ew = g_eye_w, eh = g_eye_h;
+    const float *forced = klovrp_forced_tan();
+    const float *raw = forced ? forced : &g_eye_tan[0][0];      // eye 0, as measured
+    const float *told = klovrp_eye_tan(0);                      // ...and as told
+    float wr = raw[0] + raw[1], wt = told[0] + told[1];
+    float hr = raw[2] + raw[3], ht = told[2] + told[3];
+    if (wr > 0.01f && hr > 0.01f && (wt < wr * 0.99f || ht < hr * 0.99f) && wt <= wr * 1.01f) {
+        // A capped cone (KL_OVRP_EYE_TAN_MAX): fewer tangents at the same
+        // pixels a tangent, so the pixels that are saved are saved.
+        ew = (int)((float)ew * wt / wr + 0.5f);
+        eh = (int)((float)eh * ht / hr + 0.5f);
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [ovrp] eye texture narrowed with the capped cone: %dx%d -> "
+                            "%dx%d (%.0f%% of the pixels, same density)\n", g_eye_w, g_eye_h,
+                    ew, eh, (double)(100.0f * (float)ew * (float)eh / ((float)g_eye_w * (float)g_eye_h)));
+    } else
+    if (wr > 0.01f && wt > wr * 1.01f) {
+        float k = sqrtf(wt / wr);
+        ew = (int)((float)ew * k + 0.5f);
+        eh = (int)((float)eh / k + 0.5f);
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [ovrp] eye texture reshaped for the unified cone: %dx%d -> "
+                            "%dx%d (same area, %.0f%% wider cone)\n",
+                    g_eye_w, g_eye_h, ew, eh, (double)((wt / wr - 1.0f) * 100.0f));
+    }
+    if (w) *w = ew;
+    if (h) *h = eh;
 }
 
 static const float *klovrp_eye_tan(int eye) {
@@ -1261,6 +1499,36 @@ static const float *klovrp_eye_tan(int eye) {
     // layer desc, every frame record) and the answer cannot change mid-run.
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_OVRP_UNIFY_FRUSTUM", klovrp_unify_default());
+    // KL_OVRP_EYE_TAN_MAX=<t> — no cone is told wider than t in any direction.
+    //
+    // A picture is uniform in TANGENT, not in angle, so its outermost degrees
+    // are its most expensive: of a Vision Pro eye's 105 degrees the 8 from 52
+    // to 60 on the temporal side are a sixth of the width (tan 1.28 to 1.73 of
+    // 2.73), and they land where the display's own foveation map draws at an
+    // eighth of its central density. Capping the tangent gives those pixels
+    // back — the eye texture is narrowed in proportion
+    // (kl_ovrp_eye_texture_size_for_cone), so density is kept and cost falls —
+    // at the price of a dark band at the very edge of view. The composite needs
+    // no change: it places the picture as a quad of the size it was rendered
+    // with, and beyond the quad is the clear colour.
+    static float cap = -1.0f;
+    if (cap < 0) cap = kl_env_float("KL_OVRP_EYE_TAN_MAX", 0.0f);
+    if (!on && cap > 0.05f) {
+        static float c[2][4];
+        int cut = 0;
+        for (int e = 0; e < 2; e++)
+            for (int i = 0; i < 4; i++) {
+                c[e][i] = src[e][i] > cap ? cap : src[e][i];
+                cut |= src[e][i] > cap;
+            }
+        static int said;
+        if (cut && !said++)
+            fprintf(stderr, "  [ovrp] KL_OVRP_EYE_TAN_MAX=%.3f: eye 0 told l=%.4f r=%.4f t=%.4f "
+                            "b=%.4f instead of l=%.4f r=%.4f t=%.4f b=%.4f\n", (double)cap,
+                    (double)c[0][0], (double)c[0][1], (double)c[0][2], (double)c[0][3],
+                    (double)src[0][0], (double)src[0][1], (double)src[0][2], (double)src[0][3]);
+        return c[eye];
+    }
     if (!on) return src[eye];
     for (int i = 0; i < 4; i++)
         u[0][i] = u[1][i] = src[0][i] > src[1][i] ? src[0][i] : src[1][i];
@@ -1275,6 +1543,10 @@ static const float *klovrp_eye_tan(int eye) {
                         "angular density and submits full-width per-eye rects)\n",
                 (double)u[0][0], (double)u[0][1], (double)u[0][2], (double)u[0][3]);
     return u[eye];
+}
+
+void kl_ovrp_eye_told_tangents(int eye, float tan[4]) {
+    memcpy(tan, klovrp_eye_tan(eye), 4 * sizeof(float));
 }
 
 // The head->eye offsets, head-local metres, and the guest's whole source of
@@ -1455,6 +1727,57 @@ static uint64_t klovrp_GetTiledMultiResLevel(int* out) {
 // below the floor, out of frustum. Recorded here and read by the pose defaults.
 static int g_tracking_origin;          // 0 = eye level, until the guest says otherwise
 int kl_ovrp_tracking_origin(void) { return g_tracking_origin; }
+
+// --- where an EYE-LEVEL origin is ------------------------------------------
+//
+// A frontend publishes poses in ITS world, and on a headset that world's y=0 is
+// the floor: the head arrives a seated or standing eye height above it. That is
+// what a FloorLevel guest means by a pose. An EyeLevel guest means something
+// else — on a Quest the EyeLevel origin is where the head WAS when the origin
+// was established, so the head starts at y=0 and a seated title authors its
+// whole scene around that point. Hand such a guest the frontend's height and
+// its camera is that far above everything it placed: Moss, on device, showed
+// its splash (a head-relative layer) and then only the dark backdrop of a first
+// screen that was 1.19 m below the view.
+//
+// So when the guest EXPLICITLY selects EyeLevel, the head height at that moment
+// becomes the origin's height, and every pose crossing this seam is shifted by
+// it: down on the way to the guest (head, hands), back up on the way to a
+// compositor (the frame record, world-locked overlays, the published head), so
+// the display side keeps working in the frontend's world. Height only — the
+// frontend's world already starts under the user facing forward, and yaw/XZ are
+// its recenter's business. Applied only WHILE the origin is EyeLevel, so a
+// guest that later switches to FloorLevel gets real heights again, and never
+// for a guest that merely never said (g_tracking_origin's default is also 0).
+static float g_eye_origin_y;           // the frontend-world height of the origin
+static int   g_eye_origin_have;        // ...once captured
+static int   g_eye_origin_want;        // capture at the next head pose
+static float g_head_raw_y;             // the last height the frontend published
+static int   g_head_raw_seen;
+static inline float klovrp_origin_y(void) {
+    return (g_tracking_origin == 0 && g_eye_origin_have) ? g_eye_origin_y : 0.0f;
+}
+static void klovrp_eye_origin_capture(float y, const char *why) {
+    g_eye_origin_y = y;
+    g_eye_origin_have = 1;
+    g_eye_origin_want = 0;
+    fprintf(stderr, "  [ovrp] EyeLevel origin placed at the head's height, %.3f m "
+                    "above the frontend's floor (%s) — poses to the guest are "
+                    "lowered by that, poses back to the compositor raised\n",
+            (double)y, why);
+}
+// KL_OVRP_EYE_ORIGIN=0|1 — the shift above. Default on for avp-play's titles
+// (klovrp_avpplay_title), off for this fork's existing ones: an EyeLevel guest
+// that already works here keeps the heights it has always been given.
+static int klovrp_eye_origin_on(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_OVRP_EYE_ORIGIN", klovrp_avpplay_title());
+    return v;
+}
+static void klovrp_eye_origin_request(const char *why) {
+    if (g_head_raw_seen) klovrp_eye_origin_capture(g_head_raw_y, why);
+    else                 g_eye_origin_want = 1;      // no head yet: take the first
+}
 //
 // **The v1 and v2 spellings of this pair are four different ABIs, not two**, and
 // three of the four were wrong here. Read out of the real plugin (SUPERHOT's
@@ -1474,12 +1797,16 @@ int kl_ovrp_tracking_origin(void) { return g_tracking_origin; }
 static uint64_t klovrp_SetTrackingOriginType(int origin) {
     ovrp_hit("ovrp_SetTrackingOriginType");
     ovrp_log_arg("ovrp_SetTrackingOriginType", origin, __builtin_return_address(0));
+    if (origin == 0 && !g_eye_origin_have && klovrp_eye_origin_on())
+        klovrp_eye_origin_request("the guest selected EyeLevel");
     g_tracking_origin = origin;
     return OVRP_TRUE;                       // ovrpBool
 }
 static uint64_t klovrp_SetTrackingOriginType2(int origin) {
     ovrp_hit("ovrp_SetTrackingOriginType2");
     ovrp_log_arg("ovrp_SetTrackingOriginType2", origin, __builtin_return_address(0));
+    if (origin == 0 && !g_eye_origin_have && klovrp_eye_origin_on())
+        klovrp_eye_origin_request("the guest selected EyeLevel");
     g_tracking_origin = origin;
     return OVRP_SUCCESS;                    // ovrpResult
 }
@@ -1526,16 +1853,37 @@ static uint64_t klovrp_GetTrackingOriginType2(int *out) {
 
 // The pose of a tracking origin relative to the current tracking transform.
 // Real signature: (ovrpPosef* out, ovrpTrackingOrigin origin). Nothing has been
-// recentered here and there is one origin, so the honest answer is identity —
-// orientation (0,0,0,1), position (0,0,0). Liminal reaches this during Touch
-// controller/avatar setup once it recognises the Quest, and an unimplemented
-// entry point aborts.
+// recentered here, so the orientation is identity and x/z are 0 — but the
+// origins are NOT one point. The head is posed klovrp_eye_height() above y=0
+// under FloorLevel (see that function), which is exactly the statement that the
+// EyeLevel origin sits that far above the floor one, and this call is how a
+// guest asks for the distance.
+//
+// Answering (0,0,0) for every origin cost Arkham Shadow its whole picture:
+// PlayerController.SetCalibratedEyeHeightToMatchTrackingOrigin asks for
+// EyeLevel (0) while running FloorLevel, stores the y as OffsetTracker's
+// calibratedEyeHeight, and every frame divides the live eye height by it.
+// 1.6 / 0 through an AnimationCurve is NaN, which went into TrackingOffset's
+// localPosition.y and from there into the player, the camera and the audio
+// listener — sound, a compositor presenting frames, and nothing in them.
+// Liminal, the first caller, only needed the entry point to exist.
 static uint64_t klovrp_GetTrackingTransformRelativePose(float *out, int origin) {
     ovrp_hit("ovrp_GetTrackingTransformRelativePose");
-    (void)origin;
     if (!out) return -1001;
+    // Height of each origin above the floor; FloorLevel (1) and Stage (2) are
+    // both on it. klovrp_eye_height() is 0 while the CURRENT origin is EyeLevel,
+    // so the configured height is read by asking as a floor-level guest would.
+    float h = kl_env_float("KL_OVRP_EYE_HEIGHT", 1.6f);
+    if (!(h > 0.0f && h < 3.0f)) h = 1.6f;
+    // KL_OVRP_ORIGIN_HEIGHTS=0|1 — answer the height difference. Default on for
+    // avp-play's titles; off keeps the old identity answer for existing ones.
+    static int heights = -1;
+    if (heights < 0) heights = kl_env_on("KL_OVRP_ORIGIN_HEIGHTS", klovrp_avpplay_title());
+    float want = origin == 0 ? h : 0.0f;
+    float have = g_tracking_origin == 0 ? h : 0.0f;
+    if (!heights) want = have = 0.0f;
     out[0] = 0.0f; out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;  // orientation
-    out[4] = 0.0f; out[5] = 0.0f; out[6] = 0.0f;                 // position
+    out[4] = 0.0f; out[5] = want - have; out[6] = 0.0f;          // position
     return OVRP_SUCCESS;
 }
 
@@ -1881,7 +2229,51 @@ static float klovrp_quat_degrees(const klovrp_pose *a, const klovrp_pose *b) {
 // comfortable frame rate it is a fraction of a degree; when the guest is
 // struggling it is whole degrees, and a whole degree of mis-correction is
 // plainly visible.
+// KL_OVRP_HEAD=x,y,z[,yaw[,after,yaw2[,x2,y2,z2]]] — a head pose for a run that
+// has no frontend to publish one (metres in the tracking space, yaw in degrees
+// about +Y). An OpenXR guest is otherwise handed a head on the floor at the
+// origin, and a game that fades the picture out when the head is inside geometry
+// — avp-play saw its Linux Alyx go orange — shows nothing of a level from there.
+// Diagnostic for headless (host/viewer) runs; inert unless the variable is set
+// and no frontend has published a head.
+//
+// The second pose takes over `after` seconds in. It is there because a game
+// aligns its world to where the head faces when a level starts: a yaw given
+// from the start is simply "forward", and looking anywhere else means turning
+// afterwards.
+static void klovrp_headless_pose(void) {
+    static int state;                       // 0 unread, 1 none, 2 first pose, 3 second pose
+    static float p[9];
+    static int nparam;
+    static uint64_t t0;
+    if (state == 1 || state == 3) return;
+    if (!state) {
+        const char *e = kl_env_str("KL_OVRP_HEAD", NULL);
+        state = 1;
+        if (!e || !*e || __atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) return;
+        nparam = sscanf(e, "%f,%f,%f,%f,%f,%f,%f,%f,%f", &p[0], &p[1], &p[2], &p[3], &p[4], &p[5],
+                        &p[6], &p[7], &p[8]);
+        if (nparam < 3) return;
+        if (nparam < 4) p[3] = 0;
+        t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        float half = p[3] * 0.008726646f;
+        kl_ovrp_set_head_pose(p[0], p[1], p[2], 0, sinf(half), 0, cosf(half));
+        fprintf(stderr, "  [ovrp] KL_OVRP_HEAD: no frontend, head put at (%.2f %.2f %.2f) yaw %.0f\n",
+                (double)p[0], (double)p[1], (double)p[2], (double)p[3]);
+        state = nparam >= 6 ? 2 : 3;
+        return;
+    }
+    if ((double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9 < (double)p[4]) return;
+    float x = nparam >= 9 ? p[6] : p[0], y = nparam >= 9 ? p[7] : p[1], z = nparam >= 9 ? p[8] : p[2];
+    float half = p[5] * 0.008726646f;
+    kl_ovrp_set_head_pose(x, y, z, 0, sinf(half), 0, cosf(half));
+    fprintf(stderr, "  [ovrp] KL_OVRP_HEAD: head moved to (%.2f %.2f %.2f) yaw %.0f\n",
+            (double)x, (double)y, (double)z, (double)p[5]);
+    state = 3;
+}
+
 void kl_ovrp_frame_latch(void) {
+    klovrp_headless_pose();
     if (!klovrp_latch_enabled()) return;
     klovrp_pose h = klovrp_pose_read(&g_head_pose);
     klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
@@ -2065,6 +2457,9 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // from the same sample. It stopped being the whole story when an OpenXR
     // guest arrived: velocity there is a chained output struct on any space,
     // and zeros in it are an assertion rather than a silence.
+    g_head_raw_y = py; g_head_raw_seen = 1;
+    if (g_eye_origin_want) klovrp_eye_origin_capture(py, "first head pose after the guest selected EyeLevel");
+    py -= klovrp_origin_y();
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     v.t = g_head_pose_time;
@@ -2092,6 +2487,7 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
 void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
                            float *qx, float *qy, float *qz, float *qw) {
     klovrp_pose h = klovrp_head_published();
+    h.py += klovrp_origin_y();           // back into the frontend's world
     if (px) *px = h.px; if (py) *py = h.py; if (pz) *pz = h.pz;
     if (qx) *qx = h.qx; if (qy) *qy = h.qy;
     if (qz) *qz = h.qz; if (qw) *qw = h.qw;
@@ -2122,21 +2518,126 @@ static klovrp_pose g_step_head[KLOVRP_NSTEPS];
 static klovrp_pose g_step_hand[KLOVRP_NSTEPS][2];
 static uint32_t    g_step_seq;
 static int         g_step_valid[KLOVRP_NSTEPS];
+// When each step's sample was latched (seconds, the clock
+// kl_ovrp_predicted_display_time answers on), for ovrpPoseStatef.Time.
+static double      g_step_time[KLOVRP_NSTEPS];
 static int         g_saw_update2;
 
 // The render step's sample, kept apart so BeginFrame can record exactly what
 // the guest was told to render with rather than re-reading anything.
 static klovrp_pose g_render_sample;
 
+// Set by BeginFrame, taken by the first render-step ovrp_Update after it — see
+// the note in klovrp_Update2.
+// KL_OVRP_POSE_TRACE=<first frame>: print every frame-loop call for 60 frames
+// from there, with thread and frame index — which sample belongs to which
+// frame, in a guest's steady state rather than its first single-threaded ones.
+static unsigned g_trace_frame;      // the last frame index BeginFrame saw
+static int klovrp_pose_trace(unsigned frame) {
+    static int from = -2;
+    if (from == -2) from = kl_env_int("KL_OVRP_POSE_TRACE", -1);
+    return from >= 0 && frame >= (unsigned)from && frame < (unsigned)from + 60;
+}
+static int g_sample_after_begin;
+static void klovrp_record_late_sample(const klovrp_pose *h);
+
+// --- samples by the guest's own FRAME INDEX ---------------------------------
+//
+// ovrp_Update3 and ovrp_GetNodePoseState3 both carry the frame index the sample
+// is FOR, and so does ovrp_BeginFrame4. Both engines here use it consistently
+// (traced, steady state): Unity samples frame N twice on its main thread, before
+// and after BeginFrame(N); Unreal samples N on its game thread and then again on
+// its render thread — the late update its view matrices are built from — while
+// the game thread is already sampling N+1. One shared "latest render sample"
+// cannot serve that: whichever thread wrote last answers every reader, and
+// BeginFrame(N) files whatever is current, which for Unreal is N+1's game-thread
+// sample whenever the two threads interleave that way. The picture is then
+// reprojected against the next frame's pose — smooth, with the camera hopping
+// back by a frame of head motion every so often (Moss, on device).
+//
+// So each sample is ALSO kept under its index. The frame record takes the LAST
+// sample taken for its own index (at BeginFrame if it already exists, and from
+// any later Update for that index while the frame is open), and a read that
+// names an index is answered from that index's sample. The shared slot stays
+// for everything that does not name one. `g_fs_tracks` turns this on only once
+// a BeginFrame has actually found its own index among the samples, so a guest
+// whose indices mean nothing keeps the older first-sample-after-Begin rule.
+#define KLOVRP_FS 16
+typedef struct { int idx; klovrp_pose head, hand[2]; } klovrp_fsample;
+static klovrp_fsample g_fs[KLOVRP_FS];
+static pthread_mutex_t g_fs_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_fs_tracks;
+static __thread const klovrp_fsample *g_fs_read;   // set around an indexed read
+static int klovrp_fs_get(int frame_index, klovrp_fsample *out) {
+    if (frame_index <= 1) return 0;
+    pthread_mutex_lock(&g_fs_mu);
+    const klovrp_fsample *e = &g_fs[(unsigned)frame_index % KLOVRP_FS];
+    int ok = e->idx == frame_index;
+    if (ok) *out = *e;
+    pthread_mutex_unlock(&g_fs_mu);
+    return ok;
+}
+static void klovrp_record_indexed_sample(int frame_index, const klovrp_pose *h);
+static int kl_env_on_once_fs(void);
+
 static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     ovrp_hit("ovrp_Update2");
-    { static unsigned n; if (n < 48 || n % 600 == 0)
-        fprintf(stderr, "  [ovrp] frameloop Update2 #%u step=%d\n", n, step); n++; }
-    (void)frame_index; (void)prediction;
+    { static unsigned n;
+      if (n < 48 || n % 600 == 0 || klovrp_pose_trace(g_trace_frame)) {
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        fprintf(stderr, "  [ovrp] frameloop Update2 #%u step=%d frameIdx=%d tid=%llu\n", n, step,
+                frame_index, (unsigned long long)tid); } n++; }
+    (void)prediction;
     int ix = klovrp_step_ix(step);
 
     klovrp_pose h = klovrp_pose_read(&g_head_pose);
     if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
+    // --- the sample the picture is DRAWN from ------------------------------
+    //
+    // A multithreaded Unity guest samples the render step twice a frame, both
+    // on its main thread: once at the top (game logic reads it, and the render
+    // thread reads the frame's eye poses from it just before ovrp_BeginFrame),
+    // and once more in its before-render update, AFTER BeginFrame. The view
+    // matrices it then builds its draw calls from come from that second sample.
+    // Measured on Arkham Shadow with KL_OVRP_TEST_BR_YAW (below): turning the
+    // head 25 degrees in the second sample alone turns the captured eye picture
+    // 25 degrees.
+    //
+    // klovrp_begin_frame_impl recorded the FIRST one — the only sample that
+    // exists at that moment — so every frame was reprojected against a pose a
+    // game-logic-tick older than the one in the picture. The correction is then
+    // wrong by the head's rotation across that tick: nothing with a still head,
+    // and with a turning one an error that changes with every frame's logic
+    // time. On device that is the world jumping aside and back during head
+    // turns, at a healthy 100 Hz with every counter clean.
+    //
+    // So the first render-step sample taken while a frame is open replaces the
+    // pose in that frame's pending record. One per frame: a pipelined main
+    // thread reaches the NEXT frame's top-of-frame sample before this frame's
+    // EndFrame, and that one is not this picture's. A single-threaded guest
+    // (1.28's legacy VRDevice) samples before BeginFrame and never in between,
+    // so nothing changes for it. KL_OVRP_RECORD_LATE=0|1 (default on for avp-play titles only, see klovrp_avpplay_title).
+    int after_begin = ix == 0 &&
+        __atomic_exchange_n(&g_sample_after_begin, 0, __ATOMIC_ACQ_REL);
+    // KL_OVRP_TEST_BR_YAW=<deg>: turn the head by that much in exactly that
+    // sample and in no other — the experiment the paragraph above reports.
+    // Diagnostic only.
+    { static float yaw = -1.0f;
+      if (yaw < 0.0f) yaw = kl_env_float("KL_OVRP_TEST_BR_YAW", 0.0f);
+      if (yaw > 0.0f && after_begin) {
+          float a = yaw * (3.14159265358979f / 180.0f) * 0.5f;
+          float sy = sinf(a), cy = cosf(a);            // q_yaw * h
+          klovrp_pose o = h;
+          o.qw = cy * h.qw - sy * h.qy;
+          o.qx = cy * h.qx + sy * h.qz;
+          o.qy = cy * h.qy + sy * h.qw;
+          o.qz = cy * h.qz - sy * h.qx;
+          h = o;
+      } }
+    if (ix == 0 && __atomic_load_n(&g_fs_tracks, __ATOMIC_ACQUIRE))
+        klovrp_record_indexed_sample(frame_index, &h);
+    else if (after_begin)
+        klovrp_record_late_sample(&h);
     klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
     klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
 
@@ -2155,6 +2656,12 @@ static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
         }
     }
 
+    if (ix == 0 && frame_index > 1) {
+        pthread_mutex_lock(&g_fs_mu);
+        klovrp_fsample *e = &g_fs[(unsigned)frame_index % KLOVRP_FS];
+        e->idx = frame_index; e->head = h; e->hand[0] = l; e->hand[1] = r;
+        pthread_mutex_unlock(&g_fs_mu);
+    }
     uint32_t s = __atomic_load_n(&g_step_seq, __ATOMIC_RELAXED);
     __atomic_store_n(&g_step_seq, s + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -2162,6 +2669,7 @@ static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     g_step_hand[ix][0] = l; g_step_hand[ix][1] = r;
     if (ix == 0) g_render_sample = h;
     __atomic_store_n(&g_step_seq, s + 2, __ATOMIC_RELEASE);
+    g_step_time[ix] = kl_ovrp_predicted_display_time();
     __atomic_store_n(&g_step_valid[ix], 1, __ATOMIC_RELEASE);
     __atomic_store_n(&g_saw_update2, 1, __ATOMIC_RELEASE);
 
@@ -2191,6 +2699,7 @@ static uint64_t klovrp_Update3(int step, int frame_index, double prediction) {
 // that does not use this part of the API.
 static klovrp_pose klovrp_step_head(int step) {
     int ix = klovrp_step_ix(step);
+    if (ix == 0 && g_fs_read) return g_fs_read->head;
     if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
         return klovrp_seq_read(&g_step_head[ix], &g_step_seq);
     return klovrp_head();
@@ -2268,7 +2777,9 @@ static void klovrp_grip_to_touch(klovrp_pose *p, int hand) {
 static klovrp_pose klovrp_step_hand(int step, int hand) {
     int ix = klovrp_step_ix(step);
     klovrp_pose p;
-    if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
+    if (ix == 0 && g_fs_read)
+        p = g_fs_read->hand[hand];
+    else if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
         p = klovrp_seq_read(&g_step_hand[ix][hand], &g_step_seq);
     else
         p = klovrp_hand(hand);
@@ -2360,7 +2871,15 @@ static struct {
 int kl_ovrp_stage_count(void) {
     static int n;
     if (!n) {
-        n = kl_env_int("KL_OVRP_STAGES", KLOVRP_STAGES_DEFAULT);
+        // Two for AC Nexus. Unity keeps a 4x multisampled colour and depth
+        // target per stage beside each eye image, transient on a Quest and
+        // real memory here (865 MB a stage at this eye size — a memoryless
+        // target is refused by the GPU: "too much geometry"). With three the
+        // level load peaked at 8.1 GB of an 8.2 GB limit and was killed once;
+        // with two it peaks at 7.1-7.6.
+        const char *t = kl_driver_target_name();
+        int dflt = t && !strcmp(t, "x5812519008825194") ? 2 : KLOVRP_STAGES_DEFAULT;
+        n = kl_env_int("KL_OVRP_STAGES", dflt);
         if (n < 1) n = 1;
         if (n > KLOVRP_MAX_STAGES) n = KLOVRP_MAX_STAGES;
     }
@@ -2383,6 +2902,19 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     // subtracts whatever is recorded here.
     klovrp_pose h = __atomic_load_n(&g_saw_update2, __ATOMIC_ACQUIRE)
                     ? klovrp_step_head(KLOVRP_STEP_RENDER) : klovrp_head();
+    // ...unless the guest sampled FOR this frame index, in which case that
+    // sample is the answer whatever has been written since — see g_fs.
+    {
+        klovrp_fsample fs;
+        if (kl_env_on_once_fs() && klovrp_fs_get(guest_frame_index, &fs)) {
+            h = fs.head;
+            if (!__atomic_exchange_n(&g_fs_tracks, 1, __ATOMIC_ACQ_REL))
+                fprintf(stderr, "  [ovrp] frame records follow the guest's frame "
+                                "index: BeginFrame(%d) found a sample taken for "
+                                "%d (KL_OVRP_RECORD_INDEXED=0 reverts)\n",
+                        guest_frame_index, guest_frame_index);
+        }
+    }
     pthread_mutex_lock(&g_frames.mu);
     uint64_t s = ++g_frames.serial;
     // Into the PENDING record, not into a stage. Which stage this frame goes to
@@ -2419,7 +2951,77 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     // "last stage" without a window answers with the previous frame's when this
     // one drew nothing, and that answer is indistinguishable from a right one.
     kl_glfb_begin_render_window();
+    // Armed last, once the pending record is this frame's: the guest's
+    // before-render sample may now replace its pose (klovrp_Update2).
+    __atomic_store_n(&g_sample_after_begin, 1, __ATOMIC_RELEASE);
     return OVRP_SUCCESS;
+}
+
+static int kl_env_on_once_fs(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_RECORD_INDEXED", klovrp_avpplay_title());
+    return on;
+}
+
+// An Update for the frame that is OPEN right now: the guest re-sampled the frame
+// it is drawing (Unity's before-render update), so the record follows it.
+static void klovrp_record_indexed_sample(int frame_index, const klovrp_pose *h) {
+    if (frame_index <= 1) return;
+    pthread_mutex_lock(&g_frames.mu);
+    kl_ovrp_render_pose *r = &g_frames.pending;
+    int open = g_frames.serial && r->serial == g_frames.serial && !r->complete &&
+               g_frames.pending_index == frame_index;
+    float moved = 0;
+    if (open) {
+        klovrp_pose was = { .qx = r->qx, .qy = r->qy, .qz = r->qz, .qw = r->qw };
+        moved = klovrp_quat_degrees(&was, h);
+        r->px = h->px; r->py = h->py; r->pz = h->pz;
+        r->qx = h->qx; r->qy = h->qy; r->qz = h->qz; r->qw = h->qw;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+    if (!open) return;
+    static float worst, sum;
+    static unsigned n;
+    sum += moved;
+    if (moved > worst) worst = moved;
+    if (++n % 600 == 0) {
+        fprintf(stderr, "  [ovrp] frame record re-sampled for its own index while "
+                        "open: %.2f deg mean, %.2f worst over the last 600\n",
+                (double)(sum / 600), (double)worst);
+        sum = 0; worst = 0;
+    }
+}
+
+static void klovrp_record_late_sample(const klovrp_pose *h) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_RECORD_LATE", klovrp_avpplay_title());
+    if (!on) return;
+    pthread_mutex_lock(&g_frames.mu);
+    kl_ovrp_render_pose *r = &g_frames.pending;
+    // Only a frame that is still open. `complete` is set when EndFrame files
+    // the record, after which `pending` is a stale copy until the next Begin.
+    int open = g_frames.serial && r->serial == g_frames.serial && !r->complete;
+    float moved = 0;
+    if (open) {
+        klovrp_pose was = { .qx = r->qx, .qy = r->qy, .qz = r->qz, .qw = r->qw };
+        moved = klovrp_quat_degrees(&was, h);
+        r->px = h->px; r->py = h->py; r->pz = h->pz;
+        r->qx = h->qx; r->qy = h->qy; r->qz = h->qz; r->qw = h->qw;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+    if (!open) return;
+    // How far apart the two samples were — the error every frame used to carry.
+    static float worst, sum;
+    static unsigned n;
+    sum += moved;
+    if (moved > worst) worst = moved;
+    if (++n % 600 == 0 || n == 1) {
+        fprintf(stderr, "  [ovrp] frame record takes the before-render sample: "
+                        "%.2f deg mean, %.2f worst from the BeginFrame one over "
+                        "the last %u frame(s)\n",
+                (double)(sum / (n == 1 ? 1 : 600)), (double)worst, n == 1 ? 1u : 600u);
+        sum = 0; worst = 0;
+    }
 }
 
     // The two named entry points over the core above. They exist separately only
@@ -2440,7 +3042,7 @@ static uint64_t klovrp_BeginFrame(int guest_frame_index) {
 static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
     ovrp_hit("ovrp_BeginFrame4");
     (void)extra;
-    { static unsigned n; if (n < 48 || n % 300 == 0) {
+    { static unsigned n; g_trace_frame = n; if (n < 48 || n % 300 == 0 || klovrp_pose_trace(n)) {
         uint64_t tid=0; pthread_threadid_np(NULL,&tid);
         fprintf(stderr, "  [ovrp] frameloop BeginFrame4 #%u frameIdx=%d tid=%llu\n",
                 n, guest_frame_index, (unsigned long long)tid);
@@ -2724,10 +3326,16 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // The guest's submitted-frame counter — see KL_OVRP_POKE and kl_vulkan_capture_eyes.
 static unsigned g_vk_frame;
 
+static volatile unsigned g_loadvid_frames_since;   // defined with the loading video, below
+// EndFrames since the guest last called ovrp_EnqueueSubmitLayer — see
+// klovrp_enq_owns_overlays.
+static volatile unsigned g_enq_frames_since = 1000000u;
 static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submits,
                                  int layer_submit_count, void *sync) {
     ovrp_hit("ovrp_EndFrame4");
-    { static unsigned n; if (n < 48 || n % 300 == 0) {
+    if (g_loadvid_frames_since < 1000000u) g_loadvid_frames_since++;
+    if (g_enq_frames_since < 1000000u) g_enq_frames_since++;
+    { static unsigned n; if (n < 48 || n % 300 == 0 || klovrp_pose_trace(n)) {
         uint64_t tid=0; pthread_threadid_np(NULL,&tid);
         fprintf(stderr, "  [ovrp] frameloop EndFrame4 #%u frameIdx=%d layers=%d "
                 "sync=%p tid=%llu\n",
@@ -2746,22 +3354,45 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
       } n++; }
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
     klovrp_census_submits(layer_submits, layer_submit_count);
-// The list of everything that is NOT the eye layer, for the compositors.
-    // Before this, all of it was dropped here.
-    klovrp_record_overlays(layer_submits, layer_submit_count);
-    int vp[8], of[2] = { 0, 0 };
-    int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
     // The guest's own answer to "which stage did I just draw?", at submit+0x04.
     // -1 when there is no eye layer in the list to read it from, which is a
     // different thing from stage 0 and has to stay distinguishable — the frame
     // record's fallback ladder tests it (klovrp_end_frame_impl).
     int named = klovrp_submit_stage(layer_submits, layer_submit_count);
-    uint64_t r = klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
-                                       have ? of : NULL, named);
+
+    // KL_OVRP_FILE_AFTER_GPU=0|1 — file the record (and the overlays) after the
+    // GPU wait below rather than before it. Default on for avp-play's titles
+    // only; this fork's existing Vulkan guests keep the old order unless asked.
+    static int after_gpu = -1;
+    if (after_gpu < 0) after_gpu = kl_env_on("KL_OVRP_FILE_AFTER_GPU", klovrp_avpplay_title());
+    uint64_t filed = 0;
+    if (!after_gpu) {
+        klovrp_record_overlays(layer_submits, layer_submit_count);
+        int vp[8], of[2] = { 0, 0 };
+        int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
+        filed = klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
+                                      have ? of : NULL, named);
+    }
 
     // BONELAB / the Vulkan path: this call IS the guest's assertion that it has
-    // finished drawing the eye textures, so it is where they can be read back
-    // and where a compositor is told the picture is ready.
+    // SUBMITTED the eye textures' drawing, so it is where they can be read back
+    // and where the GPU is waited for.
+    //
+    // **Before the record is filed, not after.** klovrp_end_frame_impl sets
+    // last_complete and files the pose, and the compositor's next pass — on its
+    // own thread, up to a display period later at most — takes both and samples
+    // that stage's MTLTexture. On the GL path an MTLSharedEvent orders that pass
+    // behind the guest's rendering; a Vulkan guest has no such event (the
+    // compositor logs fence=0), so the ONLY ordering is that the stage is not
+    // announced until its picture exists. Filing first announced a stage the
+    // GPU had not reached yet: for the length of the guest's GPU frame the
+    // compositor reprojected by frame N's pose a texture still holding the
+    // picture of frame N-stages. Standing still the two are the same picture.
+    // Turning the head they are several frames of rotation apart, so the world
+    // is drawn in the wrong place for one display frame and snaps back —
+    // Arkham Shadow on device, "flicker when I look around, walking is smooth",
+    // worst exactly when the game is GPU-bound, since that is when the window
+    // is longest.
     //
     // g_vk_frame is defined down with KL_OVRP_POKE, which reads it: a poke
     // aimed at `f9900` and the capture named `vk_f09900_*.png` have to be the
@@ -2772,7 +3403,7 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     // derived from GL draw observation (kl_glfb_render_stages), which sees
     // nothing at all on a Vulkan guest.
     if (kl_vulkan_guest_active()) {
-    // File-scope rather than a static in here, because KL_OVRP_POKE's
+        // File-scope rather than a static in here, because KL_OVRP_POKE's
         // frame form is timed against THIS number: a poke aimed at `f9900`
         // has to mean the same frame as `vk_f09900_*.png`, or a script written
         // by looking at the captures presses at some other screen.
@@ -2781,17 +3412,42 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
         // the same queue, and a compositor let loose between the two would race
         // it. Ordinary runs write no captures at all, so this is the only
         // frame-completion point either way.
+        uint64_t t0 = klovrp_mono_ns();
         kl_vulkan_frame_done(named < 0 ? 0 : named);
+        // How long the GPU still had to go when the guest said "done" — the
+        // width of the window described above, and the number that says
+        // whether the guest is GPU-bound.
+        static double sum_ms, worst_ms;
+        static unsigned n;
+        double ms = (double)(klovrp_mono_ns() - t0) / 1e6;
+        klovrp_adapt_note(ms);
+        sum_ms += ms;
+        if (ms > worst_ms) worst_ms = ms;
+        if (++n % 600 == 0) {
+            fprintf(stderr, "  [ovrp] frame end waited for the GPU: %.1f ms mean, "
+                            "%.1f worst over the last 600 frames (stage filed "
+                            "after the wait)\n", sum_ms / 600.0, worst_ms);
+            sum_ms = 0; worst_ms = 0;
+        }
     }
-    return r;
-}
 
+    if (!after_gpu) return filed;
+    // The list of everything that is NOT the eye layer, for the compositors.
+    // Before this, all of it was dropped here. After the wait for the same
+    // reason the record is: these name stages of their own.
+    klovrp_record_overlays(layer_submits, layer_submit_count);
+    int vp[8], of[2] = { 0, 0 };
+    int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
+    return klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
+                                 have ? of : NULL, named);
+}
 int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
     if ((unsigned)stage >= KLOVRP_MAX_STAGES || !out) return 0;
     pthread_mutex_lock(&g_frames.mu);
     int have = g_frames.r[stage].serial != 0;
     if (have) *out = g_frames.r[stage];
     pthread_mutex_unlock(&g_frames.mu);
+    if (have) out->py += klovrp_origin_y();   // the compositor works in the frontend's world
     return have;
 }
 
@@ -3124,6 +3780,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
+    py -= klovrp_origin_y();
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
@@ -3142,6 +3799,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
+    py -= klovrp_origin_y();
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
@@ -3506,6 +4164,23 @@ static void klovrp_hand_sweep(const klovrp_pose *head, klovrp_pose *hand) {
     hand->px = head->px; hand->py = head->py; hand->pz = head->pz;
 }
 
+// KL_OVRP_POSE_TIME: fill ovrpPoseStatef.Time (the double at +0x50) with the
+// moment the step's sample was latched. It was left 0, which a guest reads as
+// "tracking has never produced a sample": AC Nexus drives its physical hand
+// bodies (GrabPhysTracker, a joint from the rig to each PlayerHandCollider)
+// only when the controller's pose time has moved on, so with a constant 0 the
+// visual hands followed the controllers while the bodies that touch things
+// stayed at the rig's origin (_lastControllerTime 0 in a managed dump) — the
+// start cube could not be touched. Default on for the one target measured.
+static int klovrp_pose_time(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_POSE_TIME", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
+
     // out-struct via the sret register x8, NOT x2: the real function returns the
 // 88-byte ovrpPoseStatef by value (its own prologue does `mov x19, x8` and an
 // 0x58-byte memcpy back), so callers place the destination in x8 and the
@@ -3517,6 +4192,14 @@ static void klovrp_hand_sweep(const klovrp_pose *head, klovrp_pose *hand) {
 // Node 9 (Head) and the eyes/trackers report the frontend head pose; nodes
 // 3/4 (HandLeft/HandRight) report their own poses.
 uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
+    // KL_OVRP_POSE_TRACE: which THREAD reads which node, in order with the
+    // frame loop's own lines — the question being which Update's sample the
+    // picture is actually drawn from when the guest samples on two threads.
+    if ((node == 0 || node == 1 || node == 2 || node == 9) && klovrp_pose_trace(g_trace_frame)) {
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        fprintf(stderr, "  [ovrp] posetrace read step=%d node=%d tid=%llu\n",
+                step, node, (unsigned long long)tid);
+    }
     ovrp_hit("ovrp_GetNodePoseState");
     ovrp_log_arg("ovrp_GetNodePoseState", node, __builtin_return_address(0));
     memset(out, 0, 0x58);
@@ -3596,6 +4279,12 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     // estimate off a 90 Hz pose stream is noise wearing a physical name.
     f[7]  = p->vx;  f[8]  = p->vy;  f[9]  = p->vz;
     f[13] = p->avx; f[14] = p->avy; f[15] = p->avz;
+    if (klovrp_pose_time()) {
+        int ix = klovrp_step_ix(step);
+        double t = __atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE)
+                       ? g_step_time[ix] : kl_ovrp_predicted_display_time();
+        memcpy((char *)out + 0x50, &t, sizeof t);   // ovrpPoseStatef.Time
+    }
     return OVRP_SUCCESS;
 }
 
@@ -3623,6 +4312,19 @@ static uint64_t klovrp_GetNodePoseState3(int a, int b, int c, void *out) {
                     b, c);
         }
     }
+    if ((c == 0 || c == 1 || c == 2 || c == 9) && klovrp_pose_trace(g_trace_frame))
+        fprintf(stderr, "  [ovrp] posetrace GetNodePoseState3 step=%d frameIdx=%d node=%d\n", a, b, c);
+    // A read that names a frame index is answered from the sample taken FOR
+    // that index, when there is one — not from whatever another thread has
+    // sampled since (see g_fs).
+    klovrp_fsample fs;
+    if (a == KLOVRP_STEP_RENDER && __atomic_load_n(&g_fs_tracks, __ATOMIC_ACQUIRE) &&
+        klovrp_fs_get(b, &fs)) {
+        g_fs_read = &fs;
+        uint64_t r = klovrp_GetNodePoseState_impl(a, c, out);
+        g_fs_read = NULL;
+        return r;
+    }
     return klovrp_GetNodePoseState_impl(a, c, out);
 }
 
@@ -3645,7 +4347,7 @@ void kl_ovrp_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
 
 static uint64_t klovrp_WaitToBeginFrame(long frame_index) {
     ovrp_hit("ovrp_WaitToBeginFrame");
-    { static unsigned n; if (n < 48 || n % 300 == 0) {
+    { static unsigned n; if (n < 48 || n % 300 == 0 || klovrp_pose_trace(n)) {
         uint64_t tid=0; pthread_threadid_np(NULL,&tid);
         fprintf(stderr, "  [ovrp] frameloop WaitToBeginFrame #%u frameIdx=%ld tid=%llu\n",
                 n, frame_index, (unsigned long long)tid);
@@ -3761,6 +4463,14 @@ static void fill_controller_state(int mask, void *out, int version) {
     // script is timed, so two reads inside one fill could straddle a press's
     // end and hand the guest a button that is down in Buttons and up in Touches.
     klovrp_input_state in[2] = { klovrp_input(0), klovrp_input(1) };
+    // Start is a LEFT-hand button on a Touch pair, and a guest that polls the
+    // hands one mask at a time looks for it only there. The right Sense pill
+    // (Options) publishes it too — see KleptonControllers.swift — so carry it
+    // across, or it is seen by a both-hands poll and missed by a left-only one.
+    if (in[1].buttons & KL_OVRP_RAW_START) {
+        in[0].buttons |= KL_OVRP_RAW_START;
+        in[0].touches |= KL_OVRP_RAW_START;
+    }
     w[0] = conn;                                        // ConnectedControllers
     if (conn & OVRP_CTRL_LTOUCH) {
         w[1] |= in[0].buttons;                          // Buttons
@@ -4757,6 +5467,11 @@ static struct klovrp_layer *klovrp_layer(int id) {
 // layer stays and the loading screen stays, and when the guest finishes it
 // destroys the layer, g_loadvid_active clears, and the world shows through.
 static int g_loadvid_active;
+// Eye frames ended since an Equirect layer was last submitted — see
+// kl_loadingvideo_active. Written from the guest's main and render threads and
+// read by the compositor; a stale read costs one frame of backdrop either way.
+#define KLOVRP_LOADVID_GRACE_FRAMES 6
+static volatile unsigned g_loadvid_frames_since;
 static int g_loadvid_suppressed;   // the guest asked to hide the loading screen
 static void kl_loadvid_recount(void) {
     int any = 0;
@@ -4777,7 +5492,27 @@ int kl_loadingvideo_active(void) {
     // overlays. This knob lets a run reveal the menu behind it without a rebuild;
     // the proper fix is to deactivate the skybox when the menu is being submitted.
     if (kl_env_on("KL_LOADVID_OFF", 0)) return 0;
-    return g_loadvid_active;
+    // ...and this is that fix. The layer's EXISTENCE is the wrong signal: the
+    // guest keeps its Equirect layers allocated and simply stops SUBMITTING
+    // them when its loading screen is hidden. So once eye frames are flowing,
+    // a run of them with no Equirect submitted means the guest is showing its
+    // own picture and the backdrop has to get out of the way. Counted in the
+    // guest's own frames (klovrp_EndFrame4), not in time, so a load that stalls
+    // the main thread for a second does not uncover a stale eye — no frame
+    // ends, the count does not move. With no eye frames at all (a guest whose
+    // display never came up) it never trips and the old behaviour stands.
+    // KL_LOADVID_FOLLOW_SUBMIT=0|1, default on for avp-play titles only; 0 is "live while the layer exists".
+    static int follow = -1, shown = -1;
+    if (follow < 0) follow = kl_env_on("KL_LOADVID_FOLLOW_SUBMIT", klovrp_avpplay_title());
+    int on = g_loadvid_active &&
+             !(follow && g_loadvid_frames_since >= KLOVRP_LOADVID_GRACE_FRAMES);
+    if (on != shown && g_loadvid_active) {
+        shown = on;
+        fprintf(stderr, "  [ovrp] loading-video skybox %s (the guest %s its Equirect "
+                        "layer)\n", on ? "shown" : "hidden",
+                on ? "is submitting" : "stopped submitting");
+    }
+    return on;
 }
 // The guest's LoadingScreen.stopUpdatingLoadingScreen() - it wants the loading
 // screen gone, so hide the skybox and reveal whatever the eye now holds (the
@@ -5043,6 +5778,25 @@ static struct {
 // wrong placement has no error surface at all.
 #define KLOVRP_SUBMIT_HEAD_LOCKED 0x2
 
+// KL_OVRP_ENQ_OWNS_OVERLAYS: a guest that files its panels through
+// ovrp_EnqueueSubmitLayer hands ovrp_EndFrame4 a list holding the eye layer and
+// nothing else, on another thread. Read as "this frame has no overlays", that
+// list emptied the published set every KLOVRP_OVERLAY_TTL frames, and the
+// panels were gone until the next enqueue put them back — AC Nexus's cards
+// blinking every few seconds, seen on device. While enqueue submits are
+// arriving the enqueue path owns the set (it publishes an empty one itself
+// when every panel is hidden); once they stop for a few frames this takes the
+// panels down as before. Default on for the one target measured.
+#define KLOVRP_ENQ_LIVE_FRAMES 6
+static int klovrp_enq_owns_overlays(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_ENQ_OWNS_OVERLAYS", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v && g_enq_frames_since < KLOVRP_ENQ_LIVE_FRAMES;
+}
+
 static void klovrp_record_overlays(const void *layer_submits, int count) {
     const ovrp_layer_submit *const *list = layer_submits;
     kl_ovrp_overlay tmp[KLOVRP_MAX_LAYERS];
@@ -5075,6 +5829,12 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
             }
         }
         struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        // An Equirect layer handed in through the frame's own list counts as
+        // submitted for the loading backdrop, the same as one that came through
+        // ovrp_EnqueueSubmitLayer (see kl_loadingvideo_active). Without this the
+        // backdrop would leave after a few frames on every guest that submits
+        // its loading layer this way — the count is only ever reset there.
+        if (l && !l->is_eye && l->desc.shape == 5) g_loadvid_frames_since = 0;
         int effective_id = s->layer_id;
         if (!l) {
             // A submit can outlive its layer. UE4 destroys the toast layer and
@@ -5165,6 +5925,7 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
     // while a real removal still clears once the TTL lapses. The bridging above
     // handles a submit that NAMES a destroyed layer; this handles a frame that
     // omits it entirely. KL_OVRP_OVERLAY_PERSIST=0 restores strict per-frame.
+    if (n == 0 && klovrp_enq_owns_overlays()) return;
     static int persist = -1;
     if (persist < 0) persist = kl_env_on("KL_OVRP_OVERLAY_PERSIST", 1);
     enum { KLOVRP_OVERLAY_TTL = 12 };   // frames a dropped overlay is held for
@@ -5298,6 +6059,9 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out) {
     int ok = i < g_overlays.n;
     if (ok) *out = g_overlays.v[i];
     pthread_mutex_unlock(&g_frames.mu);
+    // A world-locked layer's pose is in the guest's tracking space; a
+    // head-locked one is relative to the head and has no height to convert.
+    if (ok && !out->head_locked) out->pose[5] += klovrp_origin_y();
     return ok;
 }
 
@@ -5346,6 +6110,25 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
                     l->desc.texture_size.w > 0
                         ? 100.0 * (double)vp[2] / (double)l->desc.texture_size.w : 0.0);
         }
+        // The compositors read the rect as rows counted from the texture's
+        // first row, which is where a GL guest's y=0 is. Unreal on Vulkan counts
+        // its rect from the picture's TOP, and its picture lies the other way up
+        // in the texture, so a shortened rect sits against the LAST row: taken
+        // as it stands, Alien: Rogue Incursion at 73 % showed the lower part of
+        // the picture and, under it, rows nothing had drawn since the viewport
+        // shrank (2026-10-09). A full-height rect is the same either way, which
+        // is all any Vulkan guest had submitted until then.
+        //   KL_OVRP_VIEWPORT_TOP=0|1   default 1 for that title, else 0
+        static int top = -1;
+        if (top < 0) {
+            const char *t = kl_driver_target_name();
+            top = kl_env_on("KL_OVRP_VIEWPORT_TOP", t && !strcmp(t, "x24882487241367228"));
+        }
+        if (top && l->desc.texture_size.h > 0)
+            for (int eye = 0; eye < 2; eye++) {
+                int y = l->desc.texture_size.h - (vp[eye * 4 + 1] + vp[eye * 4 + 3]);
+                vp[eye * 4 + 1] = y > 0 ? y : 0;
+            }
         return 1;
     }
     return 0;
@@ -5360,6 +6143,21 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
 // textureScale is the render-scale multiplier Unity carries in its frame setup
 // hints; the real plugin applies it to the recommended size, so we do too, and
 // clamp to at least 1 pixel so a hint of 0 cannot produce a zero-sized layer.
+// ovrpLayerFlag_SpaceWarpDataAllocation: "this eye layer also carries motion
+// vectors and their depth". AC Nexus sets it (flags=0x300, with the dedicated-
+// depth bit beside it) because its OculusSettings asset has SpaceWarp on.
+#define KLOVRP_LAYER_FLAG_SPACEWARP 0x100
+// KL_OVRP_SPACEWARP_TEX: hand the provider real motion-vector textures when it
+// asks. Default on for the one target measured; see
+// klovrp_GetLayerTextureSpaceWarp for why refusing is not survivable there.
+static int klovrp_spacewarp_tex(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_SPACEWARP_TEX", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
 static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
                                  int mip_levels, int sample_count, int format,
                                  int depth_format, int mv_format,
@@ -5402,6 +6200,16 @@ static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
     d->depth_format    = depth_format;
     d->mv_format       = mv_format;
     d->mv_depth_format = mv_depth_format;
+    // ...unless the guest asked for Application SpaceWarp and we serve it (see
+    // klovrp_GetLayerTextureSpaceWarp): then the motion-vector textures need a
+    // size, and it is read from here. A quarter of the eye in each direction —
+    // nothing consumes the vectors, so the only thing the number buys is a
+    // cheap extra pass for the guest.
+    if ((layer_flags & KLOVRP_LAYER_FLAG_SPACEWARP) && klovrp_spacewarp_tex()) {
+        d->mv_texture_size = (ovrp_sizei){ (w + 3) / 4, (h + 3) / 4 };
+        if (d->mv_texture_size.w < 16) d->mv_texture_size.w = 16;
+        if (d->mv_texture_size.h < 16) d->mv_texture_size.h = 16;
+    }
 }
 
     // ovrp_CalculateEyeLayerDesc3(layout, mipLevels, sampleCount, format,
@@ -5678,21 +6486,83 @@ static uint64_t klovrp_EnqueueSetupLayer2(const ovrp_layer_desc_eyefov *desc,
 //   (uint flags, void* texL, void* texR, int layerId, int frameIndex,
 //    const ovrpPosef* pose, const ovrpVector3f* scale, int layerIndex)
 // Record each submitted non-eye layer into a per-frame set and publish it to the
-// compositor at the frame boundary. The boundary is detected two ways (a changed
-// frameIndex, or the same layer id appearing again) so it is robust even if the
-// frameIndex arg is not what this ABI guess assumes.
+// compositor at the frame boundary — the same layer id appearing again (see the
+// note at the test for why frameIndex is no part of it).
 static kl_ovrp_overlay g_enq[KLOVRP_MAX_LAYERS];
 static int g_enq_n;
-static int g_enq_frame = -0x7fffffff;
+// Every layer id submitted in the frame being gathered, hidden ones included —
+// what the boundary test looks at (see klovrp_EnqueueSubmitLayer2).
+static int g_enq_seen[KLOVRP_MAX_LAYERS], g_enq_seen_n;
+#define KLOVRP_SUBMIT_HIDDEN 0x200
+// KL_OVRP_ENQ_STRICT=0|1 — avp-play's reading of ovrp_EnqueueSubmitLayer2 as a
+// whole: the frame boundary by layer id only, hidden (0x200) layers skipped, an
+// empty frame published, the 1.34 source rect honoured and the layer's
+// TextureOriginAtBottomLeft flag obeyed on Vulkan. Default on for avp-play's
+// titles; 0 (this fork's existing targets) is the older reading exactly.
+static int g_enq_frame = -0x7fffffff;      // the older boundary's state
+static int klovrp_enq_strict(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_OVRP_ENQ_STRICT", klovrp_avpplay_title());
+    return v;
+}
 static void klovrp_enq_flush(void) {
-    if (g_enq_n) kl_ovrp_overlays_external(g_enq, g_enq_n);
+    // An EMPTY set is published too: a frame in which every panel was hidden
+    // has to take the previous frame's panels down, not leave them standing.
+    if (g_enq_n || klovrp_enq_strict()) kl_ovrp_overlays_external(g_enq, g_enq_n);
     g_enq_n = 0;
 }
+//
+// **...and five more arguments, on the stack.** The 1.34 form this name always
+// is continues past x7:
+//    Bool overrideTextureRectMatrix, const ovrpTextureRectMatrixf *matrix,
+//    Bool overridePerLayerColorScaleAndOffset, const Vector4 *scale, *offset
+// (int / pointer / int / pointer / pointer land in the same five 8-byte slots
+// under AAPCS64 and under Apple's packed rule, because every pointer re-aligns
+// to 8.) The matrix opens with two rects — leftRect, rightRect, each x, y, w, h
+// as a FRACTION of the texture — and that is OVROverlay's srcRect: which part
+// of the layer's texture each eye shows.
+//
+// Dropping it shows the whole texture, and a guest that animates a layer by
+// moving the rect over a sprite strip then shows every frame at once. Arkham
+// Shadow's loading icon is that: a 2048x128 strip of sixteen 128x128 frames on
+// a 0.2 m square quad, seen on device as a row of slivers where a bat symbol
+// should turn.
+//
+// The stack words are only what the ABI says they are if the caller really is
+// that form, so they are trusted in steps: the flag must be exactly 1, the
+// matrix is COPIED with vm_read_overwrite (an error, not a fault, if the word
+// was never a pointer), and both rects must be sane fractions.
+static int klovrp_read_rect_matrix(const float *m, float out[8]) {
+    if ((uintptr_t)m < 0x10000) return 0;
+    float v[8];
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)m, sizeof v,
+                          (vm_address_t)(uintptr_t)v, &got) != KERN_SUCCESS ||
+        got != sizeof v)
+        return 0;
+    for (int e = 0; e < 2; e++) {
+        const float *r = v + 4 * e;
+        if (!(r[0] >= -0.001f && r[0] <= 1.0f && r[1] >= -0.001f && r[1] <= 1.0f &&
+              r[2] > 0.0f && r[2] <= 1.001f && r[3] > 0.0f && r[3] <= 1.001f))
+            return 0;
+    }
+    memcpy(out, v, sizeof v);
+    return 1;
+}
+
 static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *texR,
                                            int layer_id, int frame_index,
                                            const float *pose, const float *scale,
-                                           int layer_index) {
+                                           int layer_index,
+                                           int override_rect, const float *rect_matrix,
+                                           int override_color, const float *color_scale,
+                                           const float *color_offset) {
     ovrp_hit("ovrp_EnqueueSubmitLayer2");
+    g_enq_frames_since = 0;
+    (void)override_color; (void)color_scale; (void)color_offset;
+    { struct klovrp_layer *eq = klovrp_layer(layer_id);
+      if (eq && !eq->is_eye && eq->desc.shape == 5 && !(flags & 0x200))
+          g_loadvid_frames_since = 0; }
     // Log the SUBMITTED texture handles per layer (once each): if texL differs
     // from the VkImage we handed out via GetLayerTexture2 for this layer, the
     // guest is drawing its UI into ITS OWN texture and we are sampling an empty
@@ -5715,11 +6585,38 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
                 pose ? pose[4] : 0.f, pose ? pose[5] : 0.f, pose ? pose[6] : 0.f,
                 scale ? scale[0] : 0.f, scale ? scale[1] : 0.f, scale ? scale[2] : 0.f);
     }
+    // The frame boundary is the same layer id coming round again, and ONLY
+    // that. The frameIndex argument cannot serve: OVROverlay keeps one counter
+    // per overlay — 0 for ever on a static one, and on a dynamic one the number
+    // of frames since THAT overlay was created — so two panels submitted in the
+    // same frame routinely carry different numbers. Reading a changed number as
+    // a boundary (what this did) cut every frame of AC Nexus's UI into
+    // fragments, each published and replaced within the frame: the published
+    // set flipped between { 5 } and { 55..61 } on every flush, and the
+    // calibration card, submitted on every frame for fourteen seconds, reached
+    // the compositor once.
+    //
+    // Hidden layers (ovrpLayerSubmitFlag 0x200, OVROverlay.hidden) count for
+    // the boundary — they are how a frame of nothing-but-hidden panels is still
+    // seen to have begun — but are not handed on: "hidden" means do not
+    // composite, and these are the panels the guest has parked.
+    const int strict = klovrp_enq_strict();
     int dup = 0;
-    for (int i = 0; i < g_enq_n; i++) if (g_enq[i].layer_id == layer_id) { dup = 1; break; }
-    if (dup || frame_index != g_enq_frame) {
-        klovrp_enq_flush();
-        g_enq_frame = frame_index;
+    if (strict) {
+        for (int i = 0; i < g_enq_seen_n; i++) if (g_enq_seen[i] == layer_id) { dup = 1; break; }
+        if (dup) {
+            klovrp_enq_flush();
+            g_enq_seen_n = 0;
+        }
+        if (g_enq_seen_n < KLOVRP_MAX_LAYERS) g_enq_seen[g_enq_seen_n++] = layer_id;
+        if (flags & KLOVRP_SUBMIT_HIDDEN) return OVRP_SUCCESS;
+    } else {
+        // The older boundary: a changed frameIndex, or the same layer again.
+        for (int i = 0; i < g_enq_n; i++) if (g_enq[i].layer_id == layer_id) { dup = 1; break; }
+        if (dup || frame_index != g_enq_frame) {
+            klovrp_enq_flush();
+            g_enq_frame = frame_index;
+        }
     }
     struct klovrp_layer *l = klovrp_layer(layer_id);
     if (l && !l->is_eye && g_enq_n < KLOVRP_MAX_LAYERS) {
@@ -5734,8 +6631,41 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
         if (scale) { o->size[0] = scale[0]; o->size[1] = scale[1]; }
         o->flags       = (int)flags;
         o->head_locked = ((int)flags & KLOVRP_SUBMIT_HEAD_LOCKED) != 0;
-        o->origin_top_left = kl_vulkan_guest_active();
+        // Row 0 is the top of the picture on a Vulkan guest — UNLESS the layer
+        // says otherwise, and OVROverlay does: it creates its layers with
+        // ovrpLayerFlag_TextureOriginAtBottomLeft (0x8, visible in the
+        // CalculateLayerDesc line as flags=0x8), because it fills them from
+        // Unity textures, whose row 0 is the bottom on every backend. Taking
+        // the backend's word alone drew Arkham Shadow's loading icon upside
+        // down, which only became visible once its source rect was honoured.
+        o->origin_top_left = kl_vulkan_guest_active() &&
+                             !(strict && (l->desc.layer_flags & 0x8));
         o->tex = (unsigned long long)(uintptr_t)texL;
+        // The source rect, as the per-eye pixel viewport the compositor's
+        // overlay pass already honours (kl_overlay_build). Left at zero — "the
+        // whole texture" — whenever the guest did not override it.
+        float rm[8];
+        if (strict && override_rect == 1 && o->tex_w > 0 && o->tex_h > 0 &&
+            klovrp_read_rect_matrix(rect_matrix, rm)) {
+            for (int e = 0; e < 2; e++) {
+                const float *r = rm + 4 * e;
+                o->viewport[e][0] = (int)(r[0] * (float)o->tex_w + 0.5f);
+                o->viewport[e][1] = (int)(r[1] * (float)o->tex_h + 0.5f);
+                o->viewport[e][2] = (int)(r[2] * (float)o->tex_w + 0.5f);
+                o->viewport[e][3] = (int)(r[3] * (float)o->tex_h + 0.5f);
+            }
+            static int said[128];
+            if ((unsigned)layer_id < 128 && !said[layer_id]) {
+                said[layer_id] = 1;
+                fprintf(stderr, "  [ovrp] EnqueueSubmitLayer2: layer %d carries a "
+                                "source rect — left %.4f,%.4f %.4fx%.4f of its "
+                                "%dx%d texture (%dx%d px); composited as that "
+                                "part, not the whole\n",
+                        layer_id, (double)rm[0], (double)rm[1], (double)rm[2],
+                        (double)rm[3], o->tex_w, o->tex_h,
+                        o->viewport[0][2], o->viewport[0][3]);
+            }
+        }
     }
     // Diagnostic: every ~600 submits, dump the layer images' lit counts so we
     // can see if the guest is drawing UI into them or submitting empties.
@@ -5804,6 +6734,15 @@ static uint64_t klovrp_GetLayerRecommendedResolution(int layer_id, ovrp_sizei *o
     } else {
         int w = 0, h = 0; kl_ovrp_eye_texture_size(&w, &h);
         out->w = w; out->h = h;
+    }
+    // The eye layer's follows the GPU where that is asked for (klovrp_adapt_note).
+    if (klovrp_adapt_on() && (!l || l->is_eye)) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [ovrp] ovrp_GetLayerRecommendedResolution is asked for the eye "
+                                     "layer (%dx%d) — KL_OVRP_ADAPTIVE_RES answers it\n", out->w, out->h);
+        float k = g_adapt_scale;
+        out->w = ((int)((float)out->w * k + 0.5f) + 1) & ~1;
+        out->h = ((int)((float)out->h * k + 0.5f) + 1) & ~1;
     }
     return OVRP_SUCCESS;
 }
@@ -6071,11 +7010,58 @@ static uint64_t klovrp_GetLayerTextureFoveation(int layer_id, int stage, int eye
 // SpaceWarp and carries on; SUCCESS with zero handles would be the damaging
 // answer, flagging the descriptor as space-warped against texture id 0. Same
 // story we already tell for foveation and ovrp_GetTiledMultiResSupported.
+// ...which is true of the provider that note was written from, and false of AC
+// Nexus's (Oculus XR Plugin on OVRPlugin 1.60, SpaceWarp enabled in its
+// settings). There OculusDisplayProvider::CreateMotionVectorTexture treats any
+// failure as fatal for the STAGE: "Failed to get spaceWarp layer textures" ->
+// "CreateEyeTextureStages failed." -> "Failed to create eye textures.", and
+// Unity answers a failed first frame by stopping the display provider for good
+// (GfxThread_Stop, "Destroying distortion window"). Everything after that runs
+// with no XR display: one frame submitted in the whole run, XRSettings reporting
+// a 0x0 eye texture, and only OVROverlay quads ever reaching the compositor.
+//
+// So for that provider the textures are handed out. Its call has SEVEN
+// arguments, read off its own call site (libOculusXRPlugin+0x13c28):
+//
+//   ovrp_GetLayerTextureSpaceWarp(layerId, stage, eye,
+//                                 &motionVector, &a, &motionVectorDepth, &b)
+//
+// and it uses the first and third out-params as the colour and depth native
+// textures of a Unity render texture of desc.mv_texture_size (two array layers
+// under the Array layout); the other two it never reads, so they are zeroed.
+// The five-argument shape above is what every other caller gets, untouched —
+// its x5/x6 are not pointers and must not be written through.
 static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye,
-                                                uint64_t *motion, uint64_t *depth) {
+                                                uint64_t *motion, uint64_t *depth,
+                                                uint64_t *motion_depth, uint64_t *extra) {
     ovrp_hit("ovrp_GetLayerTextureSpaceWarp");
-    (void)layer_id; (void)stage; (void)eye;
     if (!motion || !depth) return OVRP_FAIL_INVALID_PARAM;
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    if (klovrp_spacewarp_tex() && kl_vulkan_guest_active() && l && l->is_eye &&
+        (l->desc.layer_flags & KLOVRP_LAYER_FLAG_SPACEWARP) &&
+        motion_depth && extra && l->desc.mv_texture_size.w > 0) {
+        int layers = (l->desc.layout == KLOVRP_LAYOUT_ARRAY) ? 2 : 1;
+        unsigned w = (unsigned)l->desc.mv_texture_size.w;
+        unsigned h = (unsigned)l->desc.mv_texture_size.h;
+        unsigned long long c = kl_vulkan_spacewarp_image(0, stage, w, h, layers);
+        unsigned long long z = kl_vulkan_spacewarp_image(1, stage, w, h, layers);
+        if (c && z) {
+            *motion = c;
+            *depth = 0;
+            *motion_depth = z;
+            *extra = 0;
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [ovrp] GetLayerTextureSpaceWarp: layer %d stage %d eye %d "
+                                "-> motion vectors %#llx, depth %#llx (%ux%u, %d layer(s)); "
+                                "rendered into by the guest, consumed by nothing\n",
+                        layer_id, stage, eye, c, z, w, h, layers);
+            }
+            return OVRP_SUCCESS;
+        }
+    }
+    (void)stage; (void)eye;
     *motion = 0;
     *depth = 0;
     return OVRP_FAIL_UNSUPPORTED;
@@ -6088,12 +7074,52 @@ static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye
 // layers by layer_id (not the shared eye storage), so this allocates the layer's
 // own image and cannot disturb the eyes. The handle it hands back is the same
 // 64-bit value - a GL name on the GLES path, a VkImage on Vulkan.
+//
+// ...except that on Vulkan the name of this entry is literal: what the caller
+// wants is a POINTER to the VkImage, not the VkImage. OVROverlay hands the value
+// straight to Texture2D.CreateExternalTexture, and Unity's Vulkan backend reads
+// a native texture pointer as VkImage* - the same shape kl_vulkan_mtl_for_handle
+// already found on the way back (texL is a pointer whose first word is the
+// image). Handed the VkImage itself, Unity dereferences it: the first word of a
+// MoltenVK image object is its C++ vtable, so every layer yields the SAME
+// "image", pointing into MoltenVK's read-only data. That is AC Nexus's
+// deterministic wild handle in vkCreateImageView (0x...d99d0 on every layer,
+// moving only with the ASLR slide), and why its overlay textures never held a
+// picture. Tied to the one target it was traced on; KL_OVRP_TEXPTR_INDIRECT
+// overrides in either direction.
+static int klovrp_texptr_indirect(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_TEXPTR_INDIRECT", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
+// One stable word per distinct image, because the guest may read the pointer
+// again long after this call returns. Images are recycled by value, so the
+// table stops growing once the guest's set of layers has been seen.
+static uint64_t *klovrp_texptr_slot(uint64_t img) {
+    static uint64_t slots[4096];
+    static int n;
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t *s = NULL;
+    pthread_mutex_lock(&lk);
+    for (int i = 0; i < n; i++) if (slots[i] == img) { s = &slots[i]; break; }
+    if (!s && n < (int)(sizeof slots / sizeof slots[0])) { s = &slots[n++]; *s = img; }
+    pthread_mutex_unlock(&lk);
+    return s;
+}
 static uint64_t klovrp_GetLayerTexturePtr(int layer_id, int stage, int eye,
                                           uint64_t *texture_ptr) {
     ovrp_hit("ovrp_GetLayerTexturePtr");
     uint64_t color = 0, depth = 0;
     uint64_t r = klovrp_GetLayerTexture2(layer_id, stage, eye, &color, &depth);
-    if (texture_ptr) *texture_ptr = color;
+    uint64_t out = color;
+    if (color && kl_vulkan_guest_active() && klovrp_texptr_indirect()) {
+        uint64_t *slot = klovrp_texptr_slot(color);
+        if (slot) out = (uint64_t)(uintptr_t)slot;
+    }
+    if (texture_ptr) *texture_ptr = out;
     // TEMP diagnostic: the guest was seen creating an image view on a wild
     // pointer right after this call - if these args do not read as a plausible
     // (layer, stage, eye, ptr) then the signature is wrong and the real texture
@@ -6429,6 +7455,28 @@ static uint64_t klovrp_GetEyeTrackingEnabled(int *out) {
     return 0;
 }
 
+// Body and face tracking: the same question as eye tracking, about the Quest's
+// own body estimate and face cameras. Neither exists here — the headset gives a
+// guest its head and its hands, nothing of the torso or the face — so "not
+// supported" and "not enabled" are the truthful answers, and with them the
+// guest has no reason to start either. (Deadpool VR reads the body state all the
+// same; that and the start/stop calls say UNSUPPORTED, see the shared list
+// further down.) Marvel's Deadpool VR asks
+// whether body tracking is supported once it has loaded, seven minutes in, and
+// with no entry point it stopped there (2026-10-09). Each takes an ovrpBool* out
+// and returns ovrpResult, exactly like the eye-tracking pair above.
+#define KLOVRP_TRACKING_ABSENT(fn)                                              \
+    static uint64_t klovrp_##fn(int *out) {                                     \
+        ovrp_hit("ovrp_" #fn);                                                  \
+        if (out) *out = 0;                                                      \
+        return 0;                                                               \
+    }
+KLOVRP_TRACKING_ABSENT(GetBodyTrackingSupported)
+KLOVRP_TRACKING_ABSENT(GetBodyTrackingEnabled)
+KLOVRP_TRACKING_ABSENT(GetFullBodyTrackingEnabled)
+KLOVRP_TRACKING_ABSENT(GetFaceTrackingSupported)
+KLOVRP_TRACKING_ABSENT(GetFaceTrackingEnabled)
+
 // Mixed-reality capture — the camera composite an Oculus device does for
 // spectators. It takes no arguments and returns `ovrpBool`, not `ovrpResult`, so
 // 0 is FALSE and is the intended answer — worth saying out loud, because the two
@@ -6640,6 +7688,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
     {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},
     {"ovrp_GetNodePresent2", (void *)klovrp_GetNodePresent2},
+    {"ovrp_GetEnvironmentDepthFrameDesc", (void *)klovrp_GetEnvironmentDepthFrameDesc},
     {"ovrp_GetNodeOrientationTracked2", (void *)klovrp_GetNodeOrientationTracked2},
     {"ovrp_GetSystemBatteryTemperature2", (void *)klovrp_GetSystemBatteryTemperature2},
     {"ovrp_GetSystemBatteryLevel2", (void *)klovrp_GetSystemBatteryLevel2},
@@ -6746,6 +7795,11 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
     {"ovrp_GetEyeTrackingSupported", (void *)klovrp_GetEyeTrackingSupported},
     {"ovrp_GetEyeTrackingEnabled", (void *)klovrp_GetEyeTrackingEnabled},
+    {"ovrp_GetBodyTrackingSupported", (void *)klovrp_GetBodyTrackingSupported},
+    {"ovrp_GetBodyTrackingEnabled", (void *)klovrp_GetBodyTrackingEnabled},
+    {"ovrp_GetFullBodyTrackingEnabled", (void *)klovrp_GetFullBodyTrackingEnabled},
+    {"ovrp_GetFaceTrackingSupported", (void *)klovrp_GetFaceTrackingSupported},
+    {"ovrp_GetFaceTrackingEnabled", (void *)klovrp_GetFaceTrackingEnabled},
     {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
 };
 
@@ -6833,10 +7887,8 @@ static const char *const g_ovrp_result_ok[] = {
     // out reads as "profile 0"; controllers still flow through GetControllerState6, so
     // this only gates a binding-string lookup the guest does not need on this path.
     "ovrp_GetCurrentInteractionProfile",
-    // Environment depth (Quest 3 passthrough occlusion) — wanderer probes the frame
-    // descriptor. No depth pipe on visionOS; success + a zeroed desc reads as an
-    // empty/absent depth frame, which the guest treats as "no occlusion this frame".
-    "ovrp_GetEnvironmentDepthFrameDesc",
+    // (ovrp_GetEnvironmentDepthFrameDesc was here; it has to write its answer —
+    // see klovrp_GetEnvironmentDepthFrameDesc.)
     // Controller haptics — wanderer fires it the frame after it starts submitting
     // eye layers. No haptics sink on visionOS controllers here; accept and drop.
     "ovrp_SetControllerLocalizedVibration",
@@ -6979,6 +8031,13 @@ static const char *const g_ovrp_result_ok[] = {
     // without changing what reaches the display. Graduates to a real body only
     // if a title turns out to read the alpha mode back and require it.
     "ovrp_SetEyeFovPremultipliedAlphaMode",
+    // Whether the compositor masks the lens' hidden area with the occlusion
+    // mesh. ovrpResult (the C# wrapper compares it to Result.Success).
+    // There is no occlusion mesh on this host — ovrp_GetEyeOcclusionMesh and
+    // ovrp_GetViewportStencil already say so — so the switch has nothing to
+    // act on; accepting it is recorded state, like the other setters here.
+    // Keep Talking and Nobody Explodes pushes it while OVRManager starts up.
+    "ovrp_SetEyeOcclusionMeshEnabled",
 };
 
 static const char *const g_ovrp_bool_yes[] = {
@@ -7090,6 +8149,32 @@ static const char *const g_ovrp_result_unsupported[] = {
     // cannot fill. Flip this to success and wire the compositor if a target
     // turns out to REQUIRE passthrough.
     "ovrp_InitializeInsightPassthrough",
+    // Parametric haptics: a newer OVRPlugin's amplitude/frequency curves, next to
+    // the buffered and PCM paths answered further up. Marvel's Deadpool VR asks
+    // for the controller's parametric properties while it sets haptics up, and
+    // with no entry point the game stopped there, two seconds in (2026-10-09).
+    // Nothing here plays a parametric effect, so UNSUPPORTED with the out-struct
+    // untouched is the truthful answer — the one a headset without the feature
+    // gives — and the guest keeps to the haptics paths that are real.
+    "ovrp_GetControllerParametricProperties",
+    // Body and face tracking, the calls behind the supported/enabled questions
+    // answered above. Deadpool VR reads ovrp_GetBodyState4 every frame once it is
+    // in the game even though it was told body tracking is neither supported nor
+    // enabled, and with no entry point it stopped there (2026-10-09). The state
+    // struct is large and its layout is not something to guess at, so it is left
+    // untouched and the call says UNSUPPORTED — which Meta's Unreal plugin treats
+    // as "no body state this frame". (Not NOT_YET_IMPLEMENTED: that one trips an
+    // ensure in the same plugin.) Starting, stopping and tuning what does not
+    // exist get the same answer.
+    "ovrp_GetBodyState4",
+    "ovrp_StartBodyTracking2",
+    "ovrp_StopBodyTracking",
+    "ovrp_RequestBodyTrackingFidelity",
+    "ovrp_ResetBodyTrackingCalibration",
+    "ovrp_SuggestBodyTrackingCalibrationOverride",
+    "ovrp_GetFaceState",
+    "ovrp_StartFaceTracking",
+    "ovrp_StopFaceTracking",
 };
 
 static void *klovrp_shared(const char *name) {
@@ -7126,9 +8211,26 @@ void *kl_ovrp_sym(const char *name) {
     return fn;
 }
 
+// Entry points this plugin reports as NOT EXPORTED rather than as named stubs.
+// Only for callers that probe by dlsym and have their own fallback for a NULL:
+// a stub there reads as "present", and the first call aborts.
+//
+// The Haptics SDK (1.0.0-beta.2, Cave Crave) resolves the parametric pair and,
+// if both load, prefers its parametric driver over PCM ("Capabilities of
+// OVRPlugin backend: Parametric: true, PCM: true"). Parametric streaming is
+// not implemented here; PCM is (SetControllerHapticsPcm above). With these
+// two absent it logs "Unable to load ..." and drives the controllers over PCM
+// — the same path Beat Saber's copy of the SDK takes.
+static const char *const g_ovrp_absent[] = {
+    "ovrp_SetControllerHapticsParametric",
+    "ovrp_GetControllerParametricStreamingTimingProperties",
+};
+
 static void *kl_ovrp_sym_inner(const char *name) {
     for (size_t i = 0; i < sizeof g_ovrp_impl / sizeof g_ovrp_impl[0]; i++)
         if (strcmp(g_ovrp_impl[i].name, name) == 0) return g_ovrp_impl[i].fn;
+    for (size_t i = 0; i < sizeof g_ovrp_absent / sizeof g_ovrp_absent[0]; i++)
+        if (strcmp(g_ovrp_absent[i], name) == 0) return NULL;
     void *shared = klovrp_shared(name);
     if (shared) return shared;
     return kl_named_stub(name, (void *)klovrp_called);

@@ -177,7 +177,12 @@ static klj_val klj_Looper_prepare(void *env, void *self, const klj_val *a, int n
     return (klj_val){0};
 }
 
+static void *klj_looper_thread_object(void);
 static klj_val klj_Looper_myLooper(void *env, void *self, const klj_val *a, int n) {
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_looper.c
+    // A HandlerThread's own thread first: its looper is not the main one.
+    void *mine = klj_looper_thread_object();
+    if (mine) return (klj_val){.l = mine};
     if (!kl_ndk_thread_has_looper()) return (klj_val){.l = NULL};
     return klj_Looper_getMainLooper(env, self, a, n);
 }
@@ -244,6 +249,8 @@ typedef struct {
     pthread_cond_t  wake;
     pthread_t       thread;
     int             running, started;
+    int             finished, joined;      // the thread has left its loop / been reaped
+    int             busy;                  // a message is being delivered right now
     void           *q[KLJ_MAX_LOOPER_MSGS];
     unsigned        head, tail, count;
 } klj_looper;
@@ -252,19 +259,29 @@ typedef struct {
 // Guest code runs on this thread, so kl_thread_init() before the first delivery is
 // mandatory — without it the stack-protector prologue reads an
 // empty TSD slot and the guest dies a long way from here.
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_looper.c
+// Which looper the calling thread IS, when it is one of these: what
+// Looper.myLooper() answers on it. A callback that ends its own thread asks
+// for exactly that — myLooper().quit() from inside handleMessage.
+static _Thread_local void *g_tls_looper;    // klj_looper *, typed below
+
 static void *klj_looper_thread(void *arg) {
     klj_looper *lp = arg;
     kl_thread_init();
+    g_tls_looper = lp;
     pthread_mutex_lock(&lp->lock);
     while (lp->running) {
         if (!lp->count) { pthread_cond_wait(&lp->wake, &lp->lock); continue; }
         void *msg = lp->q[lp->head];
         lp->head  = (lp->head + 1) % KLJ_MAX_LOOPER_MSGS;
         lp->count--;
+        lp->busy = 1;
         pthread_mutex_unlock(&lp->lock);
         klj_deliver_message(msg);          // outside the lock: it runs guest code
         pthread_mutex_lock(&lp->lock);
+        lp->busy = 0;
     }
+    lp->finished = 1;
     pthread_mutex_unlock(&lp->lock);
     return NULL;
 }
@@ -286,6 +303,20 @@ static void klj_looper_post(klj_looper *lp, void *message) {
 static klj_looper *klj_looper_of(void *looper_obj) {
     klj_object *o = klj_as_object(looper_obj);
     return (o && strcmp(o->cls, "android/os/Looper") == 0) ? o->data : NULL;
+}
+
+// The Looper object of the HandlerThread the caller is running on, or NULL on
+// any other thread. One per thread, made on first use.
+static void *klj_looper_thread_object(void) {
+    static _Thread_local void *obj;
+    if (!g_tls_looper) return NULL;
+    if (!obj) {
+        obj = kl_jni_new_object("android/os/Looper");
+        klj_as_object(obj)->data = g_tls_looper;
+        // Kept for the thread's life: a local frame popping must not retire it.
+        kl_jni_pin_object(obj);
+    }
+    return obj;
 }
 
 // Looper.quit() — stop the loop on the looper this object names. For a
@@ -497,6 +528,127 @@ static klj_val klj_HandlerThread_getLooper(void *env, void *self, const klj_val 
     return (klj_val){.j = 0};
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_looper.c
+// HandlerThread.quit() / quitSafely(), Thread.isAlive(), join() and interrupt()
+// — the other end of a HandlerThread's life, which nothing here had needed while
+// every such thread lived as long as the run. Unity's VideoPlayer is the first to
+// take one down: a clip that has played to its end quits the thread its frame
+// callbacks ran on and then asks whether it is still alive (AC Nexus, at the end
+// of each loading-screen clip — and an unanswered isAlive() is an abort).
+//
+// The two quits are one here: "safely" means deliver what is already due first,
+// and nothing is ever queued for the future on these loopers.
+static klj_looper *klj_handlerthread_looper(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && strcmp(o->cls, "android/os/HandlerThread") == 0) ? o->data : NULL;
+}
+static klj_val klj_HandlerThread_quit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp || !lp->started) return (klj_val){.j = 0};
+    pthread_mutex_lock(&lp->lock);
+    lp->running = 0;
+    pthread_cond_broadcast(&lp->wake);
+    pthread_mutex_unlock(&lp->lock);
+    KLJ_LOG("HandlerThread.quit() — looper thread told to stop");
+    return (klj_val){.j = 1};
+}
+// isAlive() is true between start() and the thread leaving its loop. Any other
+// Thread object the guest holds came from Thread.currentThread(), which is by
+// construction a thread that is running.
+static klj_val klj_Thread_isAlive(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp) return (klj_val){.j = o && strcmp(o->cls, "java/lang/Thread") == 0};
+    pthread_mutex_lock(&lp->lock);
+    int alive = lp->started && !lp->finished;
+    pthread_mutex_unlock(&lp->lock);
+    return (klj_val){.j = alive};
+}
+// join() / join(millis): wait for the looper thread to end, as Java does.
+//
+// It has to WAIT, and the first version did not when the thread had not been
+// told to stop yet. Unity ends its video thread by sending it a message whose
+// callback quits the looper from inside, and joins straight after: the callback
+// object lives on the caller's stack, so a join that returns early lets the
+// caller destroy it while the message is still queued — the looper then calls
+// into a destroyed object ("Pure virtual function called!", AC Nexus at the end
+// of a loading clip).
+//
+// The one case that cannot be waited out is a thread nobody ever stops; that
+// would hang the caller for the rest of the run, so once the queue is drained
+// and the thread has sat idle for a second it is said and given up. From the
+// looper's own thread a join is a deadlock in Java too, and returns.
+static klj_val klj_Thread_join(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp || !lp->started) return (klj_val){.j = 0};
+    if (pthread_equal(lp->thread, pthread_self())) return (klj_val){.j = 0};
+    int idle_ms = 0, reap = 0;
+    for (;;) {
+        pthread_mutex_lock(&lp->lock);
+        int finished = lp->finished, quiet = !lp->count && !lp->busy && lp->running;
+        if (finished && !lp->joined) { lp->joined = 1; reap = 1; }
+        pthread_mutex_unlock(&lp->lock);
+        if (finished) break;
+        idle_ms = quiet ? idle_ms + 2 : 0;
+        if (idle_ms >= 1000) {
+            KLJ_LOG("Thread.join() on a HandlerThread that is idle and was never "
+                    "quit — given up after a second rather than hanging the caller");
+            return (klj_val){.j = 0};
+        }
+        usleep(2000);
+    }
+    if (reap) pthread_join(lp->thread, NULL);
+    return (klj_val){.j = 0};
+}
+static klj_val klj_Thread_interrupt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (lp && lp->started) {
+        pthread_mutex_lock(&lp->lock);
+        pthread_cond_broadcast(&lp->wake);
+        pthread_mutex_unlock(&lp->lock);
+    }
+    return (klj_val){.j = 0};
+}
+// Message.getTarget() and Handler.getLooper(): how the callback that ends
+// Unity's video thread finds the looper to quit — handleMessage is handed the
+// Message, and from it walks to the Handler it was sent through and that
+// Handler's Looper. On the looper's own thread the answer is that thread's
+// Looper object, which is kept for its life; the one the Handler was built
+// with was a local of whoever built it.
+static klj_val klj_Message_getTarget(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_message *m = klj_as_message(self);
+    return (klj_val){.l = m ? m->target : NULL};
+}
+static klj_val klj_Handler_getLooper(void *env, void *self, const klj_val *a, int n) {
+    klj_handler *h = klj_as_handler(self);
+    klj_looper *lp = h ? klj_looper_of(h->looper) : NULL;
+    if (lp && lp == g_tls_looper) return (klj_val){.l = klj_looper_thread_object()};
+    if (lp) return (klj_val){.l = h->looper};
+    return klj_Looper_getMainLooper(env, self, a, n);
+}
+
+// The rest of what Unity's teardown names beside those (read off libunity's
+// method-name table rather than waited for one abort at a time): each has an
+// answer that is simply true of these loopers. Nothing is ever pending on one
+// that a removal could cancel, no thread here is ever interrupted, and the id
+// is Linux's gettid() as the guest would see it — the thread's own, which the
+// caller only compares or logs.
+static klj_val klj_looper_nothing(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_HandlerThread_getThreadId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_handlerthread_looper(self);
+    if (!lp || !lp->started) return (klj_val){.j = -1};
+    return (klj_val){.j = (int32_t)pthread_mach_thread_np(lp->thread)};
+}
+
 // ---- android.view.Choreographer ----
 //
 // Android's vsync callback, and the engine's frame clock: the guest posts a
@@ -645,9 +797,15 @@ static klj_val klj_Process_setThreadPriority(void *env, void *self, const klj_va
 // provides the clock, so the guest's feeder is a producer into a ring rather
 // than something with a deadline.
 static klj_val klj_SDLAM_audioSetThreadPriority(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    if (n > 1) KLJ_LOG("SDLAudioManager.audioSetThreadPriority(recording=%d, device=%d) "
-                       "— not applied on Darwin", (int)a[0].j, (int)a[1].j);
+    (void)env; (void)self; (void)a; (void)n;
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_looper.c
+    // Called ON the SDL audio thread to raise its own priority. The Java
+    // Process.setThreadPriority(AUDIO) path already maps that to QoS; do the
+    // same for this thread, or its buffer refills are scheduled behind the
+    // compositor and underrun — the periodic half-second audio dropouts Steam
+    // Link shows. Self, so the boost is exact (no tid to map).
+    uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+    kl_pthread_boost_qos(self_tid);
     return (klj_val){0};
 }
 
@@ -696,6 +854,7 @@ const klj_binding klj_bind_looper[] = {
     {"android/os/Looper",  "prepare",       "()V",                    klj_Looper_prepare},
     {"android/os/Looper",  "getQueue",      "()Landroid/os/MessageQueue;", klj_Looper_getQueue},
     {"android/os/Looper",  "quit",          "()V",                    klj_Looper_quit},
+    {"android/os/Looper",  "quitSafely",    "()V",                    klj_Looper_quit},
     {"android/os/MessageQueue", "next",     "()Landroid/os/Message;", klj_MessageQueue_next},
     // A HandlerThread is a thread with a Looper on it. We have one queue and one
     // drain point (kl_jni_drain_ui_tasks) for the main looper — but a
@@ -703,11 +862,30 @@ const klj_binding klj_bind_looper[] = {
     // waiting on it. See the looper section above.
     {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},
     {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
+    {"android/os/Message", "getTarget", "()Landroid/os/Handler;", klj_Message_getTarget},
+    {"android/os/Handler", "getLooper", "()Landroid/os/Looper;", klj_Handler_getLooper},
     {"android/view/Choreographer", "getInstance", "()Landroid/view/Choreographer;", klj_Choreographer_getInstance},
     {"android/view/Choreographer", "postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_postFrameCallback},
     {"android/os/HandlerThread", "<init>", "(Ljava/lang/String;)V", klj_HandlerThread_init},
     {"android/os/HandlerThread", "start", "()V", klj_HandlerThread_start},
     {"android/os/HandlerThread", "getLooper", "()Landroid/os/Looper;", klj_HandlerThread_getLooper},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_looper.c
+    {"android/os/HandlerThread", "quit",       "()Z", klj_HandlerThread_quit},
+    {"android/os/HandlerThread", "quitSafely", "()Z", klj_HandlerThread_quit},
+    // Asked of java/lang/Thread (the declaring class) and of the HandlerThread
+    // itself, depending on how the caller resolved the method.
+    {"java/lang/Thread",         "isAlive",   "()Z",  klj_Thread_isAlive},
+    {"android/os/HandlerThread", "isAlive",   "()Z",  klj_Thread_isAlive},
+    {"java/lang/Thread",         "join",      "()V",  klj_Thread_join},
+    {"java/lang/Thread",         "join",      "(J)V", klj_Thread_join},
+    {"android/os/HandlerThread", "join",      "()V",  klj_Thread_join},
+    {"android/os/HandlerThread", "join",      "(J)V", klj_Thread_join},
+    {"java/lang/Thread",         "interrupt", "()V",  klj_Thread_interrupt},
+    {"java/lang/Thread",         "isInterrupted", "()Z", klj_looper_nothing},
+    {"android/os/HandlerThread", "isInterrupted", "()Z", klj_looper_nothing},
+    {"android/os/HandlerThread", "getThreadId", "()I", klj_HandlerThread_getThreadId},
+    {"android/os/Handler", "removeCallbacksAndMessages", "(Ljava/lang/Object;)V", klj_looper_nothing},
+    {"android/os/HandlerThread", "interrupt", "()V",  klj_Thread_interrupt},
     {"android/os/Handler", "<init>", "()V",                        klj_Handler_init},
     {"android/os/Handler", "<init>", "(Landroid/os/Looper;)V",     klj_Handler_init},
     // The Callback form. The callback handles Messages sent through this Handler,

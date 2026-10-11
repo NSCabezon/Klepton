@@ -59,6 +59,10 @@ void *kl_jni_new_object(const char *class_name);
 // Pin a host-made object against local-frame retirement (the C NewGlobalRef).
 // Use for objects the host caches and hands back more than once.
 void kl_jni_pin_object(void *obj);
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/kl_jni.h
+// Retire, by age, strings a guest makes outside any local frame and never
+// deletes. See klj_loose_note in kl_jni.c.
+void kl_jni_reclaim_frameless_strings(int on);
 
 // The rest of UnityPlayer's constructor, for a driver that has just run initJni.
 //

@@ -479,6 +479,26 @@ int kl_native_load(FILE *out) {
     // exactly that gap; kl_load_recursive walks DT_NEEDED (skipping shim-served
     // names like libopenxr_loader/libandroid/libc, which bind through the shims)
     // and register+inits each, deps first, then the target.
+    //
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_native.c
+    // Tea For God (x6323807174332876) lists libfmod/libfmodstudio in its
+    // DT_NEEDED BEFORE libc++_shared, and libfmodstudio's static initializers
+    // call __cxa_guard_acquire — which Android's libstdc++.so would serve, but
+    // which here only libc++_shared exports. Walking DT_NEEDED in order binds
+    // FMOD first and its init aborts in kl_unresolved_named. Pull libc++_shared
+    // in up front, the way UE4_CHAIN does, so FMOD binds against it.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *tn = kl_driver_target_name();
+        if (tn && strcmp(tn, "x6323807174332876") == 0) {
+            char cxx[1400];
+            snprintf(cxx, sizeof cxx, "%s/libc++_shared.so", g_libdir);
+            if (kl_can_load(cxx) && !kl_load_recursive(cxx) && out) {
+                fprintf(out, "  libc++_shared.so preload failed: %s\n", kl_error());
+                fflush(out);
+            }
+        }
+    }
     kl_image *img = kl_load_recursive(path);
     if (!img) { snprintf(g_err, sizeof g_err, "%s: %s", g_engine_lib, kl_error()); return 1; }
     g_img = img;

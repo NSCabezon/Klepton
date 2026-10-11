@@ -81,6 +81,26 @@ static int src_slot(const void *key) {
     return 0;
 }
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_audio.c
+// A producer that is gone. Without this a closed stream's key stays in the
+// table for the life of the process: a guest that opens and closes its stream
+// repeatedly fills all four slots, and from the second one on every write takes
+// the MIXING path against cursors nobody advances.
+void kl_audio_src_release(const void *key) {
+    if (!key) return;
+    pthread_mutex_lock(&g_wlock);
+    for (int i = 0; i < g_src_n; i++)
+        if (g_src_key[i] == key) {
+            for (int k = i + 1; k < g_src_n; k++) {
+                g_src_key[k - 1] = g_src_key[k];
+                g_src_pos[k - 1] = g_src_pos[k];
+            }
+            g_src_n--;
+            break;
+        }
+    pthread_mutex_unlock(&g_wlock);
+}
+
 // A driver-set floor for the fill target, in ms (0 = none). See kl_audio_open.
 static unsigned         g_latency_override_ms;
 void kl_audio_set_latency_ms(unsigned ms) { g_latency_override_ms = ms; }
@@ -387,6 +407,11 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     }
     if (g_open) unit_destroy();
     g_open = 0;
+    // A different format is a different ring: every source cursor described
+    // the old one. (Lock order g_lock -> g_wlock is this function's only.)
+    pthread_mutex_lock(&g_wlock);
+    g_src_n = 0;
+    pthread_mutex_unlock(&g_wlock);
 
     g_in_rate = rate; g_in_ch = channels; g_in_bits = bits;
     g_out_ch = channels == 1 ? 1 : 2;
@@ -745,6 +770,8 @@ void kl_audio_resume(void) {
 size_t kl_audio_write(const void *pcm, size_t bytes) {
     return kl_audio_write_src(NULL, pcm, bytes);
 }
+
+int kl_audio_peak(void) { return g_peak; }
 
 size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     if (!g_open || !pcm || !bytes) return 0;

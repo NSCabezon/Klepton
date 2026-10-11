@@ -142,6 +142,12 @@ def check(t_x18, lib):
                 base = TEST_REG & ~1
                 want = re.sub(r"\b([xw])18, \1(19)\b",
                               lambda m: f"{m.group(1)}{base}, {m.group(1)}{base+1}", orig)
+            # `extr Xd, Xn, Xn, #s` is spelled `ror Xd, Xn, #s`, and the rewrite
+            # is what makes the two source registers equal.
+            # Adapted from avp-play (MIT, github.com/myMartek/avp-play) tools/check_x18.py.
+            want = re.sub(r"^extr\s+(\w+), (\w+), \2, (#\w+)$", r"ror \1, \2, \3", want)
+            want = re.sub(r"^ror\s+", "ror ", want)
+            got = re.sub(r"^ror\s+", "ror ", got)
             if got != want:
                 bad_subst.append((addr, word, subst, want, got))
 
