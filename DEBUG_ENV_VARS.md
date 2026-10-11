@@ -3494,3 +3494,83 @@ keeps the old behaviour for targets that existed before the port, unless noted.
 - `KL_SENSE_STICK_TOUCH`, `KL_SENSE_RIGHT_START` — report thumbstick touch, and
   make the right Options pill also send Start. Default 1, 0 for `alyx`
   (behaviour fix for OVRPlugin games; Beat Saber/SUPERHOT get it).
+
+## "Jugar desde el Mac" — headset client (`runtime/net/kl_stream_client.c`, `visionos/Sources/KleptonStreamClient.swift`)
+
+- `KL_STREAM_HOST_ADDR=ip[:port]` — a Mac to stream from without Bonjour (also
+  shown in the hub's list). IPv6 with a port goes in brackets:
+  `[fe80::1%en0]:9944`. Default port `KL_STREAM_PORT_DEFAULT` (9944).
+- `KL_STREAM_HOST_NAME=<name>` — the display name for that address (default: the address).
+- `KL_STREAM_AUTOCONNECT=1` — hub only: skip the library and go straight to
+  "Jugar desde el Mac" against `KL_STREAM_HOST_ADDR` (`KL_HUB_GAME` names the
+  game, default `alyx`). The scripted/simulator test path.
+- `KL_STREAM_MAX_KBPS=<n>` — HELLO's `max_bitrate_kbps` hint (default 0 = host decides).
+- `KL_STREAM_IDR_MIN_S=<s>` — minimum gap between IDR_REQUESTs (default 0.25);
+  an unanswered one is repeated every 2x this.
+- `KL_STREAM_NOSIGNAL_S=<s>` — seconds without a decoded frame before the state
+  is "no signal" ("Sin señal del Mac" card). Default 1.
+- `KL_STREAM_RCVBUF=<bytes>` — UDP receive buffer (default 8 MiB; a keyframe is
+  a burst of hundreds of fragments).
+- `KL_STREAM_DECODE_BGRA=1` — decode to BGRA and blit the eyes (the v1 path).
+  Default: the decoder's native biplanar 4:2:0 (`420v`, `x420` for a 10-bit
+  stream), converted to RGB while the eyes are split, by `kl_stream_yuv_msl()`
+  (one render pass per eye into a `bgra8Unorm` view of the stage texture).
+  Measured in the harness (M1 Max, loaded): 6144x2912 decode 5.7–7.8 ms BGRA vs
+  2.6–2.7 ms native; the split pass ~0.2 ms GPU (same as the blit).
+- `KL_STREAM_LOG=0` — silence the once-a-second `[stream-client]` stats line.
+- `KL_STREAM_SIM_YAW_DPS=<deg/s>` — Simulator only (no world tracking there): the
+  fixed standing head the stream sends yaws at this rate. Default 0.
+
+## "Jugar desde el Mac" — Mac host (`runtime/net/kl_stream_host.c`, `KL_STREAM_HOST=1 ./build/m_boot alyx`)
+
+Protocol v2 (`runtime/net/kl_stream_proto.h`): VIDEO carries `fec_n` and XOR
+parity packets; host and hub must both be v2 (a v1 hub is refused at HELLO).
+
+- `KL_STREAM_HOST=1` — this frontend instead of the viewer.
+- `KL_STREAM_PORT` (9944), `KL_STREAM_NAME` (Bonjour instance), `KL_STREAM_BONJOUR=0`
+  (do not advertise — loopback tests), `KL_STREAM_WAIT` (1: boot the guest
+  after the first HELLO), `KL_STREAM_TIMEOUT_MS` (2000), `KL_STREAM_PREVIEW=1`,
+  `KL_STREAM_BITRATE_KBPS` (100000), `KL_STREAM_MAX_INFLIGHT` (2).
+- `KL_STREAM_LOCK_FPS=45` — **default on**: `WaitGetPoses` is paced to a fixed
+  1/45 s grid (`kl_openvr_set_frame_pacer`; an overrun re-anchors the grid,
+  never catches up) and the guest is told a 45 Hz display; the encoder expects
+  45 fps. The headset reprojects to 90 Hz. `0` = free-running at the client's
+  rate (v1). Measured on loopback (fidelity 0): per-second fps 50.0 ± 8.3
+  (min 31) free vs 44.5 ± 1.9 locked; per-frame interval sd ~3.3 ms either way
+  on a loaded Mac (wake-up jitter).
+- `KL_STREAM_LOCK_AB=<s>` — alternate locked/free every `<s>` seconds in one run
+  (A/B; the 1 s lines are tagged `[locked]` / `[AB: free]`).
+- `KL_STREAM_PACE_SPIN_MS=1.5` — the pacer sleeps to this long before the slot
+  and spins the rest. `KL_STREAM_PACE_RT=1` — also put the guest's frame thread
+  under a Mach real-time policy (experimental; no measurable gain on a loaded Mac).
+- `KL_STREAM_FPS` — encoder ExpectedFrameRate / HELLO_ACK target (default: the
+  lock, or 60 with the lock off).
+- `KL_STREAM_SCALE=<f>` — encode at HELLO eye size × f (v1 behaviour). **Unset
+  (default)**: encode at what the guest actually SUBMITS (its rendered rect,
+  `kl_ovrp_submit_size`), the max over ~60 frames, adopted after 30 stable
+  frames, then capped by:
+  - `KL_STREAM_MAX_MPIX=7.0` — megapixels of the side-by-side frame (0 = no cap).
+    VT HEVC on the M1 Max costs ~2.4 ms/MP and does not overlap frames
+    (4608x1920 22 ms, 5376x2208 29 ms, 6144x2400 35.6 ms), so 7 MP ≈ 17 ms keeps 45.
+  - `KL_STREAM_MAX_EYE=<px>` — cap on the longest side per eye (0 = none).
+  Alyx submits (HELLO eye 3072x2465): fidelity 0 → 2304x1920/eye (encoded
+  4100x1708 under the 7 MP cap), 3 → 2688x2208, 5 → 3072x2400.
+- `KL_STREAM_PACE_MS=8` — spread each frame's packets over this long instead of
+  one burst (0 = burst). A newer frame waiting sends the rest at once.
+- `KL_STREAM_FEC=10` — one XOR parity packet per N fragments (overhead 1/N);
+  any one lost fragment per group is rebuilt on the headset with no keyframe.
+  0 = off. Real Alyx, loopback, 1% simulated loss, 100 s: FEC 0 → 274 IDR
+  requests, 1168 frames decoded; FEC 10 → 89 IDR, 3593; FEC 5 → 45 IDR, 3914.
+- `KL_STREAM_TEST_DROP=<p>` — drop this fraction of VIDEO packets (data and
+  parity) before sending: loss tests.
+
+## "Jugar desde el Mac" — test host (`tools/kl_stream_testhost.m`, `build/kl_stream_testhost`)
+
+- `KL_TESTHOST_PORT` (9944), `KL_TESTHOST_NAME` (Bonjour instance, default
+  "<Mac name> (test)"), `KL_TESTHOST_FPS` (72), `KL_TESTHOST_EYE` (cap on the
+  per-eye size, 1024), `KL_TESTHOST_KBPS` (30000), `KL_TESTHOST_GOP` (600),
+  `KL_TESTHOST_DROP` (probability of dropping each VIDEO packet, data or parity, 0),
+  plus the host's `KL_STREAM_FEC` (10) and `KL_STREAM_PACE_MS` (8),
+  `KL_TESTHOST_HAPTICS_S` (seconds between test buzzes, 0 = never),
+  `KL_TESTHOST_SECONDS` (run time then BYE, 0 = forever),
+  `KL_TESTHOST_LOWLAT` (1: try low-latency rate control).

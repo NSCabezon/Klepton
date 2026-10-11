@@ -29,6 +29,7 @@
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
 #include "../runtime/gfx/kl_view.h"
+#include "../runtime/net/kl_stream_host.h"
 #include "../runtime/gfx/kl_hostwin.h"
 #include "../runtime/diag/kl_sample.h"
 #include "../runtime/diag/kl_mprobe.h"
@@ -851,6 +852,58 @@ static int view_run(void) {
     return rc;
 }
 
+// KL_STREAM_HOST=1: "Jugar desde el Mac" — the headset is the frontend. Same
+// shape as view_run (in-process guest thread, no fork, no re-exec), but the
+// main thread serves a UDP client instead of a window: poses arrive from the
+// network and every completed guest frame leaves as HEVC (kl_stream_host.c).
+//
+// The display description (frustum, IPD, rate, eye size) arrives in the
+// client's HELLO, and the guest reads some of it ONCE at boot (the display
+// rate certainly, Alyx's projection very likely), so by default the guest is
+// not started until a client has said hello. KL_STREAM_WAIT=0 boots at once
+// with the built-in Vision Pro description instead; a client that then
+// differs is applied late and the log says what that means.
+static int stream_run(void) {
+    // Alyx: the poses and frame the hub gives a LOCAL Alyx (kl_app.c's
+    // defaults), so a streamed session hands the guest the same controller
+    // pose path — M1 bridge, symmetric offer, hand velocities (gravity-glove
+    // flick) and the Touch raw frame with the inward tracked origin (the
+    // 2026-10-11 hand fix). Never overwriting: the launch environment wins.
+    // Not taken from kl_app.c: foveation and the Glovebox mobile render
+    // profile (the Mac has the GPU for full-rate, full-quality frames) and
+    // KL_GUEST_PACE_HZ (the stream host paces with KL_STREAM_LOCK_FPS).
+    if (!strcmp(TARGET->name, "alyx")) {
+        setenv("KL_OPENVR_MINIMAL", "1", 0);
+        setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
+        setenv("KL_OPENVR_SYM_PROJ", "1", 0);
+        setenv("KL_OPENVR_HAND_VEL", "1", 0);
+        setenv("KL_OPENVR_TOUCH_FRAME", "1", 0);
+        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 3", 0);
+    }
+    if (kl_stream_host_start(TARGET->name) != 0) return fail("stream host: could not start");
+    if (kl_env_on("KL_STREAM_WAIT", 1)) {
+        fprintf(stderr, "[stream-host] waiting for a client's HELLO before booting the guest "
+                        "(KL_STREAM_WAIT=0 boots now with Vision Pro defaults)\n");
+        if (!kl_stream_host_wait_hello(-1.0, &g_view_quit)) return 1;
+    } else {
+        kl_stream_host_apply_defaults();
+    }
+    kl_stream_host_install_pacer();
+    pthread_t guest;
+    if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
+        fprintf(stderr, "stream: pthread_create failed\n");
+        return 1;
+    }
+    int rc = kl_stream_host_run(&g_view_quit);
+    g_view_quit = 1;
+    // The guest is inside its own main() and is not joined: the host stopping
+    // is the process ending, exactly as closing the viewer window is.
+    pthread_detach(guest);
+    kl_driver_report(stdout);
+    fflush(NULL);
+    _exit(rc);
+}
+
 int main(int argc, char **argv) {
     TARGET = kl_target_resolve(argc > 1 ? argv[1] : NULL);
     if (!TARGET) {
@@ -895,7 +948,7 @@ int main(int argc, char **argv) {
     // wait forever for a window nobody creates; its eyes reach the viewer
     // through IVRCompositor::Submit instead.
     if (TARGET->kind == KL_GUEST_GLIBC && !kl_env_on("KL_GLIBC_HEADLESS", 0) &&
-        !getenv("KL_VIEW"))
+        !getenv("KL_VIEW") && !kl_stream_host_enabled())
         kl_flatwin_set_backend(kl_hostwin_backend());
 
     // Re-entry of the re-exec'd recon child (see below).
@@ -904,6 +957,8 @@ int main(int argc, char **argv) {
 
     if (getenv("KL_VIEW"))
         return view_run();
+    if (kl_stream_host_enabled())
+        return stream_run();
 
     printf("=== DRM policy guard ===\n");
     // Under a debugger the forked child inherits the parent's Mach exception
