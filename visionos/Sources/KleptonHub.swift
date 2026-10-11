@@ -1358,37 +1358,45 @@ struct HubLibraryView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("AVP Game Hub").font(.extraLargeTitle2.bold())
-            Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 16) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("AVP Game Hub").font(.extraLargeTitle2.bold())
+                Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
+            }
             Spacer()
-            if model.account != nil {
-                Text(model.steamLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
-            }
-            #if canImport(MetaStore)
-            if model.metaAccount.signedIn {
-                Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
-            }
-            #endif
-            if model.checking || model.metaChecking {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.mini)
-                    Text(klL("Checking library…", "Comprobando biblioteca…"))
+            // Right side on one centred row: the library check first (left of the
+            // accounts), then the accounts, then the actions.
+            HStack(alignment: .center, spacing: 12) {
+                if model.checking || model.metaChecking {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.mini)
+                        Text(klL("Checking library…", "Comprobando biblioteca…"))
+                    }
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize()
+                } else if model.checkError != nil || model.metaCheckFailed {
+                    Button { model.retryChecks() } label: {
+                        Label(klL("Couldn't check · Retry", "No se pudo comprobar · Reintentar"),
+                              systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    }
+                    .font(.footnote).tint(.orange)
+                    .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
                 }
-                .font(.footnote).foregroundStyle(.secondary)
-                .fixedSize()
-            } else if model.checkError != nil || model.metaCheckFailed {
-                Button { model.retryChecks() } label: {
-                    Label(klL("Couldn't check · Retry", "No se pudo comprobar · Reintentar"),
-                          systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                if model.account != nil {
+                    Text(model.steamLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .font(.footnote).tint(.orange)
-                .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
-            } else if model.account != nil {
-                Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
+                #if canImport(MetaStore)
+                if model.metaAccount.signedIn {
+                    Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                }
+                #endif
+                if !(model.checking || model.metaChecking), model.checkError == nil, !model.metaCheckFailed,
+                   model.account != nil {
+                    Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
+                }
+                Button { showAppSettings = true } label: { Label("Settings", systemImage: "gearshape") }
+                    .font(.footnote)
             }
-            Button { showAppSettings = true } label: { Label("Settings", systemImage: "gearshape") }
-                .font(.footnote)
         }
     }
 
