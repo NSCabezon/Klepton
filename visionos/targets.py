@@ -1013,6 +1013,12 @@ TARGETS = {
             # Sources/KleptonMetaContent.swift). Offered only when the recipe's
             # build is the one this port is translated from (KleptonCatalog.swift).
             "beatsaber",
+            # Batman: Arkham Shadow 1.4.1 (com.camouflaj.manta 350961), Meta's
+            # store only: APK to games/batman/meta/, the main OBB and the loose
+            # audio OBBs, videos, manifest and 69 Addressables bundles (18.3 GB)
+            # to android-files/obb/ — the row's obb_raw layout, as the game reads
+            # them by name. Voice packs are opt-in (MetaStore recipe `locale`).
+            "batman",
         ],
         "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
