@@ -202,6 +202,10 @@ struct KLGameSettings: Codable, Equatable {
     /// "Precompile graphics": replay the game's pipeline list (klfz/<target>.foz)
     /// before it boots, so the Metal compiler is warm (KL_FOZ_PREWARM). nil = off.
     var precompileGraphics: Bool?
+    /// "Performance overlay": the in-game fps/GPU/memory panel
+    /// (KleptonQuickSettings.swift), KL_HUD. nil = off. Siri and the in-game
+    /// quick settings write it too.
+    var perfOverlay: Bool?
 }
 
 /// See KLGameSettings.calibration and KleptonTuning. Degrees and metres, in the
@@ -400,6 +404,9 @@ enum KLGameSettingsStore {
         // The compositor reads KL_GHOST_CTRL (KleptonHUD); a value already in
         // the launch environment wins.
         if let g = load(target).ghostControllers { setenv("KL_GHOST_CTRL", g ? "1" : "0", 0) }
+        // The performance overlay (KleptonQuickSettings reads KL_HUD once, at
+        // its first use, which is after this).
+        if load(target).perfOverlay == true { setenv("KL_HUD", "1", 0) }
         applyPrecompile(for: target)
         guard hasPerformance(target), let p = load(target).performance else { return }
         if let v = p.renderScale { setenv("KL_OPENVR_RT_SCALE", String(format: "%.3f", v), 0) }

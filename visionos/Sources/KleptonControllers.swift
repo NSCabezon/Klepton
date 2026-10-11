@@ -1820,9 +1820,7 @@ final class KleptonControllers {
                 // never saw it, and a menu gated on "press trigger" waited
                 // forever. Push the buttons; only the pose stays synthesised.
                 if st.fromController {
-                    kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
-                                                 st.indexTrigger, st.handTrigger,
-                                                 st.stick.x, st.stick.y)
+                    pushInput(hand, st)
                     lock.lock(); state[hand] = st; lock.unlock()
                 }
                 continue
@@ -1836,12 +1834,24 @@ final class KleptonControllers {
                                         st.angularVelocity.x, st.angularVelocity.y,
                                         st.angularVelocity.z)
             }
-            kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
-                                         st.indexTrigger, st.handTrigger,
-                                         st.stick.x, st.stick.y)
+            pushInput(hand, st)
 
             lock.lock(); state[hand] = st; lock.unlock()
         }
         reportPinch()
+        KLQuickSettings.shared.processInput()
+    }
+
+    /// The buttons, triggers and stick to the guest — unless the in-game quick
+    /// settings own them (KleptonQuickSettings.swift): then the guest sees a
+    /// released controller (the pose still goes through) and the menu reads it.
+    private func pushInput(_ hand: Int, _ st: KleptonHandState) {
+        if KLQuickSettings.shared.capture(hand: hand, st) {
+            kl_ovrp_set_controller_input(Int32(hand), 0, 0, 0, 0, 0, 0)
+            return
+        }
+        kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
+                                     st.indexTrigger, st.handTrigger,
+                                     st.stick.x, st.stick.y)
     }
 }

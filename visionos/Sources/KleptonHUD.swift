@@ -28,6 +28,11 @@
 //     KleptonHUD.updateControllerPresence for the policy and the knobs
 //     (KL_CTRL_WARN, KL_CTRL_WARN_FORCE).
 //
+//   * THE PERFORMANCE OVERLAY and THE QUICK SETTINGS MENU
+//     (KleptonQuickSettings.swift): textures rastered off the render thread
+//     and picked up here each frame; the overlay lower left, 1 m ahead, the
+//     menu straight ahead at 0.9 m. Both follow the head like the prompt.
+//
 //   * THE GATE PROMPT. Alyx's "Pulsa Trigger para empezar" after every load
 //     (mailbox show_message -> kl_ovrp_set_prompt): a panel "Pulsa el gatillo
 //     para empezar" held in front of the eyes until the level starts
@@ -379,6 +384,11 @@ final class KleptonHUD {
     private var ctrlAlpha: Float = 0
     private var ctrlPos: SIMD3<Float>?
     private var ctrlModel = matrix_identity_float4x4
+    // The overlay and the quick settings menu (KLQuickSettings).
+    private var perfTex: MTLTexture?, menuTex: MTLTexture?
+    private var perfAlpha: Float = 0, menuAlpha: Float = 0
+    private var perfPos: SIMD3<Float>?, menuPos: SIMD3<Float>?
+    private var perfModel = matrix_identity_float4x4, menuModel = matrix_identity_float4x4
     private static let ctrlGrace = 5.0        // s after the compositor starts
     private static let ctrlDebounce = 1.0     // s a mid-game drop must last
     private static let ctrlConfirmSecs = 2.0
@@ -664,6 +674,7 @@ final class KleptonHUD {
         lastPrepare = now
         preparePrompt(originFromHead: originFromHead, dt: dt)
         prepareControllerCard(originFromHead: originFromHead, dt: dt)
+        prepareQuickSettings(originFromHead: originFromHead, dt: dt)
         var c: [Float] = [0, 0, 0, 0]
         let on = c.withUnsafeMutableBufferPointer { kl_ovrp_fade_color($0.baseAddress) } != 0
         let newFade = on ? SIMD4<Float>(c[0], c[1], c[2], c[3]) : SIMD4<Float>(0, 0, 0, 0)
@@ -732,16 +743,43 @@ final class KleptonHUD {
                                       tau: 0.12, dt: dt, pos: &promptPos)
     }
 
+    /// The overlay (lower left: 1 m ahead, 32 cm left, 18 cm below the eyes,
+    /// 20 cm wide) and the menu (0.9 m ahead, at eye level, 46 cm wide). A
+    /// texture that goes away fades out with the last one it showed.
+    private func prepareQuickSettings(originFromHead: simd_float4x4, dt: Float) {
+        let (p, m) = KLQuickSettings.shared.panels()
+        let step = dt / 0.2
+        if let p { perfTex = p }
+        perfAlpha = p == nil ? max(0, perfAlpha - step) : min(1, perfAlpha + step)
+        if perfAlpha <= 0 { perfTex = nil; perfPos = nil } else {
+            let o = KLPanelRaster.overlaySize
+            perfModel = Self.panelModel(originFromHead: originFromHead, dist: 1.0, drop: 0.18,
+                                        tau: 0.15, dt: dt, pos: &perfPos, side: -0.32,
+                                        width: 0.20, aspect: Float(o.h) / Float(o.w))
+        }
+        if let m { menuTex = m }
+        menuAlpha = m == nil ? max(0, menuAlpha - step) : min(1, menuAlpha + step)
+        if menuAlpha <= 0 { menuTex = nil; menuPos = nil } else {
+            let o = KLPanelRaster.menuSize
+            menuModel = Self.panelModel(originFromHead: originFromHead, dist: 0.9, drop: 0.02,
+                                        tau: 0.25, dt: dt, pos: &menuPos, side: 0,
+                                        width: 0.46, aspect: Float(o.h) / Float(o.w))
+        }
+    }
+
     /// A panel ahead of the head along its yaw, `drop` metres below the eyes,
     /// easing toward that spot with time constant `tau`, upright and facing
     /// the eyes. The toast's placement, shared with the prompt.
     private static func panelModel(originFromHead: simd_float4x4, dist: Float, drop: Float,
-                                   tau: Float, dt: Float, pos: inout SIMD3<Float>?) -> simd_float4x4 {
+                                   tau: Float, dt: Float, pos: inout SIMD3<Float>?,
+                                   side: Float = 0, width: Float = 0.40,
+                                   aspect: Float? = nil) -> simd_float4x4 {
         let h = SIMD3<Float>(originFromHead.columns.3.x, originFromHead.columns.3.y,
                              originFromHead.columns.3.z)
         var f = -SIMD3<Float>(originFromHead.columns.2.x, 0, originFromHead.columns.2.z)
         f = simd_length(f) > 1e-3 ? simd_normalize(f) : SIMD3(0, 0, -1)
-        let target = h + f * dist + SIMD3(0, -drop, 0)
+        let right = SIMD3<Float>(-f.z, 0, f.x)
+        let target = h + f * dist + right * side + SIMD3(0, -drop, 0)
         if let p = pos, dt > 0 {
             pos = p + (target - p) * (1 - exp(-dt / tau))
         } else {
@@ -753,7 +791,7 @@ final class KleptonHUD {
         var x = simd_cross(SIMD3<Float>(0, 1, 0), z)
         x = simd_length(x) > 1e-3 ? simd_normalize(x) : SIMD3(1, 0, 0)
         let y = simd_cross(z, x)
-        let w: Float = 0.40, ht = w * Float(KLToastRaster.height) / Float(KLToastRaster.width)
+        let w = width, ht = w * (aspect ?? Float(KLToastRaster.height) / Float(KLToastRaster.width))
         return simd_float4x4(SIMD4(x * w, 0), SIMD4(y * ht, 0), SIMD4(z, 0), SIMD4(p, 1))
     }
 
@@ -761,6 +799,7 @@ final class KleptonHUD {
         (toastTex != nil && toastAlpha > 0) || ghosts.contains { $0.alpha > 0 }
             || fade.w > 0 || (promptTex != nil && promptAlpha > 0)
             || (ctrlTex != nil && ctrlAlpha > 0)
+            || (perfTex != nil && perfAlpha > 0) || (menuTex != nil && menuAlpha > 0)
     }
 
     // MARK: Encode
@@ -854,6 +893,23 @@ final class KleptonHUD {
             enc.setFragmentSamplerState(sampler, index: 0)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
+
+        // The overlay, then the menu over everything.
+        func panel(_ tex: MTLTexture?, _ alpha: Float, _ model: simd_float4x4) {
+            guard let tex, alpha > 0, let quad, let sampler else { return }
+            enc.setRenderPipelineState(texPipe)
+            if let toastDepth { enc.setDepthStencilState(toastDepth) }
+            enc.setCullMode(.none)
+            var o = KLHObj(model: model, color: SIMD4(1, 1, 1, 1), params: SIMD4(0, alpha, 0, 0))
+            enc.setVertexBuffer(quad, offset: 0, index: 0)
+            enc.setVertexBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 2)
+            enc.setFragmentBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 0)
+            enc.setFragmentTexture(tex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        panel(perfTex, perfAlpha, perfModel)
+        panel(menuTex, menuAlpha, menuModel)
     }
 
     // MARK: The controller model

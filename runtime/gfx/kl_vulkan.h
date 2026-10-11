@@ -244,4 +244,15 @@ int kl_foz_prewarm_env(void);
 // `done`/`total`: pipelines compiled / listed so far; `elapsed` seconds.
 int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed);
 
+// Foveation ON/OFF while the game runs (the visionOS quick settings / Siri).
+// Only a game that BOOTED foveating (KL_FOVEATE=1 through the foveating MoltenVK
+// fork) has density-map passes to switch; the fork's klMVKFoveationSetEnabled
+// then renders them through the identity map (full rate) or the rate map again,
+// from the next render pass instance on. 1 applied; 0 not possible live (booted
+// without KL_FOVEATE, stock MoltenVK, or a fork without the live switch — the
+// setting then applies at the next launch).
+int kl_vulkan_foveate_live(int on);
+// -1 foveation cannot change live in this run, else 0 off / 1 on right now.
+int kl_vulkan_foveate_state(void);
+
 #endif

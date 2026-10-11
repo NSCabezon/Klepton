@@ -398,10 +398,10 @@ index 9772757..8229d77 100644
  }
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h
 new file mode 100644
-index 0000000..94c6a64
+index 0000000..f4144c5
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.h
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,178 @@
 +/*
 + * MVKFoveation.h
 + *
@@ -549,6 +549,13 @@ index 0000000..94c6a64
 +/** Exported for Klepton's libvulkan layer: the foveation ABI this MoltenVK implements (1). */
 +extern "C" int klMVKFoveationABI(void);
 +
++/**
++ * Exported for Klepton: foveation on (1) or off (0) from the next render pass instance,
++ * without rebuilding anything — off renders density-map passes through the identity map
++ * (full rate), exactly as KL_FOVEATE_AB's off phase does. Default on.
++ */
++extern "C" void klMVKFoveationSetEnabled(int on);
++
 +/** One attachment of a foveated render pass instance: the real image and its shadow. */
 +struct MVKFovTarget {
 +	id<MTLTexture> real = nil;
@@ -575,10 +582,10 @@ index 0000000..94c6a64
 +};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm
 new file mode 100644
-index 0000000..b917179
+index 0000000..cd824aa
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKFoveation.mm
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,603 @@
 +/*
 + * MVKFoveation.mm
 + *
@@ -601,6 +608,7 @@ index 0000000..b917179
 +#include <cstdarg>
 +#include <cstdlib>
 +#include <cstring>
++#include <atomic>
 +
 +namespace mvkfov {
 +
@@ -1093,7 +1101,13 @@ index 0000000..b917179
 +	return on;
 +}
 +
++// Klepton's live switch (klMVKFoveationSetEnabled): the quick settings turn
++// foveation off and on while the game runs. Off is the A/B's off phase for
++// every instance, so passes and pipelines stay as built.
++static std::atomic<bool> s_liveOff{false};
++
 +bool isABOffPhase() {
++	if (s_liveOff.load(std::memory_order_relaxed)) { return true; }
 +	return abPeriod() > 0 && abPhaseAt(CACurrentMediaTime()) == 1;
 +}
 +
@@ -1168,6 +1182,13 @@ index 0000000..b917179
 +// MoltenVK below reads VkRenderPassFragmentDensityMapCreateInfoEXT. Bump on any
 +// change to what the layer must pass through.
 +extern "C" MVK_PUBLIC_SYMBOL int klMVKFoveationABI(void) { return 1; }
++
++extern "C" MVK_PUBLIC_SYMBOL void klMVKFoveationSetEnabled(int on) {
++	bool off = !on;
++	if (mvkfov::s_liveOff.exchange(off) != off) {
++		fprintf(stderr, "[mvk-fov] foveation %s live (klMVKFoveationSetEnabled)\n", on ? "ON" : "OFF");
++	}
++}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 index 7eae64c..9cafb0e 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
