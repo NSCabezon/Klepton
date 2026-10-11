@@ -49,9 +49,10 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 
 - `KL_GL_VENDOR=<s>`, `KL_GL_RENDERER=<s>` — what the null driver answers for
   `GL_VENDOR` / `GL_RENDERER` (default `Klepton` / `Klepton GLES`). Unreal
-  picks its Android device profile partly from the renderer string; tried as
-  `Qualcomm` / `Adreno (TM) 750` (the Steam Frame) for Metro Awakening, which
-  did not change its RHI choice. Diagnostic only.
+  picks its Android device profile partly from the renderer string. Per-target
+  defaults: moss `Qualcomm` / `Adreno (TM) 650`; metro `Qualcomm` /
+  `Adreno (TM) 750` (the Steam Frame's GPU — with the maker "Valve" and a real
+  Android version it selects the Vulkan profile; alone it did not).
 - `KL_DUMP_SHADERS=<dir>` — after the frame pump, write every captured
   `glShaderSource` text into `<dir>`. Read by m_boot; the dump runs in
   `kl_egl.c`. The only place Unity's GLSL ES exists in plain text.
@@ -411,6 +412,9 @@ Built for the loading-pace investigation; all default off.
 - `KL_TRACE_THREADS=1` — one line per guest `pthread_create`: entry, arg, stack
   size, detached, result. The entry pointer symbolises against the load
   addresses phase 1 prints, so it names which subsystem the thread belongs to.
+  Also one `[thr] tid=N named "..."` line per `pthread_setname_np`, with the
+  same id the fault report prints — so "a guest worker thread" in a fault can
+  be read as the engine's own thread name (UE: "RenderThread 0", ...).
 - `KL_TRACE_TSD=1` — one line per guest `pthread_key_create`: index handed out,
   destructor, and how many keys are live. The guest TSD table is Klepton's own
   (512 keys, indices recycled on delete) rather than one Darwin key apiece, and
@@ -3468,7 +3472,9 @@ keeps the old behaviour for targets that existed before the port, unless noted.
   (`x3240283705987790`).
 - `KL_UE4_OS_RELEASE=0|1` — (`kl_jni_ue4.c`) tell a UE4 guest the real Android
   version string (avp-play's fix; Moss needs it for Vulkan). Default 1, except 0
-  for intotheradius, metro, re4, redmatter2, vampire (renderer choice could move).
+  for intotheradius, re4, redmatter2, vampire (renderer choice could move).
+  metro needs 1: its Steam-path device profile enables Vulkan only with a real
+  Android version (together with the Adreno 750 GL identity, kl_egl.c).
 - `KL_GLFB_ESSL_COMPAT=0` — (`kl_glfb.c`) turn off the shader rewrites for
   sources ANGLE refuses (clip-distance rename, `fma` define, whitespace before
   `#version`). Default 1.

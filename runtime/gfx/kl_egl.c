@@ -397,6 +397,13 @@ static const char *klgl_identity(int renderer) {
     const char *t = kl_driver_target_name();
     if (t && strcmp(t, "moss") == 0)
         return renderer ? "Adreno (TM) 650" : "Qualcomm";
+    // metro on its Steam path (maker "Valve", kl_jni.c): with "Klepton GLES"
+    // no device-profile rule enables Vulkan and UE falls back to the GLES RHI
+    // the build does not ship; the Steam Frame's GPU (Adreno 750) plus a real
+    // Android version (kl_ue4.c) select the Vulkan profile. Measured: the two
+    // are needed together.
+    if (t && strcmp(t, "metro") == 0)
+        return renderer ? "Adreno (TM) 750" : "Qualcomm";
     return renderer ? "Klepton GLES" : "Klepton";
 }
 
@@ -409,9 +416,10 @@ static const char *klgl_GetString(uint32_t name) {
     // Awakening, told it is a Valve device, matches no profile for "Klepton
     // GLES" and falls back to the GLES RHI, which needs ES 3.2 features ANGLE
     // does not have (glTexBuffer). The Steam Frame is an Adreno 750. Measured:
-    // "Adreno (TM) 750" alone did NOT flip Metro back to Vulkan, so this is a
-    // diagnostic knob, not a fix. Unset/empty gives the per-target default
-    // (klgl_identity: "Klepton"/"Klepton GLES" for every target except moss).
+    // "Adreno (TM) 750" alone did NOT flip Metro back to Vulkan; with a real
+    // Android version as well it does, so metro now defaults to it. Unset/empty
+    // gives the per-target default (klgl_identity: "Klepton"/"Klepton GLES"
+    // except moss and metro).
     // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_egl.c
     case GL_VENDOR: {
         const char *v = getenv("KL_GL_VENDOR");

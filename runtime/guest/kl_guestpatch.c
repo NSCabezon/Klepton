@@ -507,6 +507,36 @@ static const kl_gp_word k_alyx_startup_nopause[] = {
     { 0xf81be0, 0x5400050d, 0x14000028, "b.le 0xf81c80 -> b 0xf81c80 (skip the startup-pause countdown)" },
 };
 
+// Metro Awakening (Steam Frame build 944116, libUnreal.so, UE 5.2) — Vertigo's
+// "FireAnt" VR loading screen draws on its own thread ("LoadingScreen") from a
+// snapshot of FOpenXRHMD's rendering frame state, taken when a map load starts
+// (the copy at 0x3c42028 reads PipelinedFrameStateRendering, HMD+0x830). The
+// draw (0x3c40104) then dereferences the snapshot's TrackingSpace
+// (this+0x178) without a check. On the Steam path the first map load starts
+// before the render thread has transferred any frame state — Steam init answers
+// synchronously, where the Meta path waits on an async entitlement and renders
+// frames first — so the snapshot holds a null TrackingSpace and the thread
+// faults on its first draw (`ldr x22, [x8, #0x18]`, x8 = 0). Measured with
+// watchpoints on both identities: with Meta the field is set by the render
+// thread (0x3c2c7b4) before the copy, with Valve it is still null.
+//
+// The patch makes that draw return when the snapshot has no tracking space:
+// the loading screen skips its frame and draws once a later snapshot (the next
+// map load) has one. Three words, reordered so nothing is lost:
+//   0x3c40150  ldr x22, [x8, #0x18]   -> ldr x20, [x20, #0xaa0]  (moved up)
+//   0x3c40154  ldr x20, [x20, #0xaa0] -> cbz x8, 0x3c41544        (the epilogue:
+//              stack-guard check + register restore; [sp,#0x10] and
+//              [x29,#-0x50] are already written at this point)
+//   0x3c40158  cbz x22, 0x3c401a8     -> ldr x22, [x8, #0x18]
+// The dropped `cbz x22` only skipped refcount increments for a null pointer the
+// code dereferences unconditionally further down (0x3c40268), so the non-null
+// path is unchanged.
+static const kl_gp_word k_metro_fireant_nullspace[] = {
+    { 0x3c40150, 0xf9400d16, 0xf9455294, "ldr x20, [x20, #0xaa0]" },
+    { 0x3c40154, 0xf9455294, 0xb4009f88, "cbz x8, 0x3c41544 (no tracking space: skip this draw)" },
+    { 0x3c40158, 0xb4000296, 0xf9400d16, "ldr x22, [x8, #0x18]" },
+};
+
 static const kl_gp_patch k_patches[] = {
     { "alyx-lua-arena-anywhere", "libvscript.so",
       "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
@@ -538,6 +568,10 @@ static const kl_gp_patch k_patches[] = {
     // { "hl2-matqueue-allow", "libmaterialsystem.so",
     //   "force HL2Q3 Queued Material System allow=1 so VR render targets get created",
     //   k_hl2_matqueue_allow, sizeof k_hl2_matqueue_allow / sizeof *k_hl2_matqueue_allow },
+
+    { "metro-fireant-null-trackingspace", "libUnreal.so",
+      "the FireAnt loading screen skips a draw whose frame-state snapshot has no tracking space",
+      k_metro_fireant_nullspace, sizeof k_metro_fireant_nullspace / sizeof *k_metro_fireant_nullspace },
 
     { "wrath2-force-vulkan-available", "libUE4.so",
       "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
