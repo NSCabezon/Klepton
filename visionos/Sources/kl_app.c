@@ -404,13 +404,20 @@ int kl_app_configure(const char *resources, const char *container) {
         mkdir(g_libdir, 0755);
         setenv("KL_GLIBC_MODDIRS", g_libdir, 0);
         setenv("KL_GLIBC_SYSROOT", "", 0);
-        // Fidelity level 0 (2x MSAA, 0.78 scale) fixed: on device 4x MSAA cost
-        // 38% fps and 1.7 GB at the same resolution and did not remove the
-        // jaggies (2026-10-08, D2/D3). The OpenVR knobs are the M1 pipeline,
-        // the best picture of the on-device bisect.
-        // KL_ALYX_MSAA=4 (the hub's Antialiasing setting, applied before
-        // configure) picks level 1 (4x MSAA) instead; a KL_GLIBC_ARGS from the
-        // launch environment still wins over both.
+        // Default: fidelity level 1 (4x MSAA) WITH fixed foveated rendering
+        // (KL_FOVEATE=1, the MoltenVK FDM fork). Device, M2, 2026-10-11: 4x
+        // plus foveation cost 18.3 GPU ms/frame against 28.8 at 4x full rate
+        // (-36%), which pays for the smoother 4x picture; 4x alone had cost
+        // 38% fps and 1.7 GB over 2x (2026-10-08, D2/D3). With the pipeline
+        // prewarm the foveated pipelines are compiled too (kl_fossilize.cpp,
+        // the density-map twins), so foveation adds no stalls.
+        // Precedence, each a setenv that never overwrites: the launch
+        // environment (KL_ALYX_MSAA, KL_FOVEATE, or a whole KL_GLIBC_ARGS)
+        // > the hub's per-game Antialiasing / Foveated rendering (applied
+        // before configure) > these defaults. KL_ALYX_MSAA=2 picks level 0
+        // (2x MSAA, 0.78 scale); KL_FOVEATE=0 renders at full rate.
+        setenv("KL_ALYX_MSAA", "4", 0);
+        setenv("KL_FOVEATE", "1", 0);
         const char *msaa = getenv("KL_ALYX_MSAA");
         setenv("KL_GLIBC_ARGS", (msaa && atoi(msaa) >= 4)
                ? "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 1"
