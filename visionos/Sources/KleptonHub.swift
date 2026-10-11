@@ -519,6 +519,15 @@ struct HubGameSettingsView: View {
                                range: 0.6 ... 1.2, step: 0.05, format: "%.2f×") { v in
                             perf { $0.renderScale = v }
                         }
+                        Picker(klL("Antialiasing", "Antialiasing"), selection: Binding(
+                            get: { s.performance?.msaa ?? KLGameSettingsStore.defaultMSAA },
+                            set: { v in perf { $0.msaa = v } })) {
+                            Text("2×").tag(2)
+                            Text("4×").tag(4)
+                        }
+                        Toggle(klL("Foveated rendering", "Renderizado foveado"), isOn: Binding(
+                            get: { s.performance?.foveate ?? KLGameSettingsStore.defaultFoveate },
+                            set: { v in perf { $0.foveate = v } }))
                         slider("Overscan margin", value: s.performance?.overscan ?? KLGameSettingsStore.defaultOverscan,
                                range: 0 ... 0.2, step: 0.01, format: "%.2f") { v in
                             perf { $0.overscan = v }
@@ -530,7 +539,13 @@ struct HubGameSettingsView: View {
                     } header: { Text("Performance") } footer: {
                         Text("Lower render scale = faster and blurrier. The overscan margin renders "
                              + "past the edge of the view so fast head turns show picture instead of "
-                             + "black; extra pixels keep the centre sharp at a GPU cost.")
+                             + "black; extra pixels keep the centre sharp at a GPU cost.\n\n"
+                             + klL("Antialiasing 4× looks smoother but costs ~5 ms of GPU per frame "
+                                   + "(about 30 fps instead of 45 on M2). Foveated rendering keeps the "
+                                   + "centre sharp and lowers the resolution at the edges, saving GPU.",
+                                   "Antialiasing 4× se ve más suave pero cuesta ~5 ms de GPU por imagen "
+                                   + "(unos 30 fps en vez de 45 en M2). El renderizado foveado mantiene "
+                                   + "nítido el centro y baja la resolución en los bordes, ahorrando GPU."))
                     }
                 }
 
