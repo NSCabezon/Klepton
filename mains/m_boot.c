@@ -24,6 +24,7 @@
 #include "../runtime/gfx/kl_glfb.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/gfx/kl_egl.h"
+#include "../runtime/gfx/kl_vulkan.h"   // kl_foz_prewarm_env
 #include "../runtime/xr/kl_openxr.h"
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
@@ -481,6 +482,9 @@ static int begin_and_pump(int view_pump) {
 }
 
 static int native_door_run(int view_pump) {
+    // KL_FOZ_PREWARM: warm the Metal cache on a device of our own before the guest exists
+    // (kl_fossilize.cpp; nothing without the knob or without `make fossilize`).
+    kl_foz_prewarm_env();
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
     if (kl_driver_gap_only()) return 0;
     return begin_and_pump(view_pump);

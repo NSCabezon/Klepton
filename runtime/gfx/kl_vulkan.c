@@ -99,6 +99,13 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned l,
     (void)w; (void)h; (void)l; (void)m; (void)f; (void)depth; return 0;
 }
 void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
+int kl_foz_prewarm_env(void) { return 1; }
+int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed) {
+    if (done) *done = 0;
+    if (total) *total = 0;
+    if (elapsed) *elapsed = 0;
+    return 0;
+}
 
 #else  /* MoltenVK headers present */
 
@@ -117,8 +124,10 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 #include <vulkan/vulkan.h>
 #include "kl_glfb.h"
 #include "kl_gpu_time.h"
+#include "kl_vk_pipe_hooks.h"   // pipeline recorder/replayer add-on (kl_fossilize.cpp)
 
 #include <zlib.h>
+#include <unistd.h>   // unlink (device info)
 
 #define KLVK_MAX_IMAGES 8
 
@@ -169,6 +178,33 @@ static PFN_vkGetDeviceProcAddr   real_gdpa;
 static int g_init_done, g_avail;
 
 static void *mvk_sym(const char *n) { return g_mvk ? dlsym(g_mvk, n) : NULL; }
+
+// Pipeline-object hooks (kl_vk_pipe_hooks.h): an add-on records every sampler, layout, module,
+// render pass and pipeline the guest creates (KL_FOZ_RECORD) and replays them on its own
+// threads (KL_FOZ_REPLAY). NULL unless one of those knobs is set, so the hot path is a single
+// branch. Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+static const klvk_pipe_hooks *g_pipe_hooks;
+static _Thread_local int t_pipe_replay;
+void klvk_set_pipe_hooks(const klvk_pipe_hooks *h) { g_pipe_hooks = h; }
+void klvk_set_replay_thread(int on) { t_pipe_replay = on; }
+#define PIPE_HOOK(fn, ...) do { if (g_pipe_hooks && g_pipe_hooks->fn && !t_pipe_replay) \
+                                    g_pipe_hooks->fn(__VA_ARGS__); } while (0)
+// No Fossilize linked (it is fetched by `make fossilize`): no hooks, no prewarm. Weak on the
+// host, where m_boot links kl_fossilize.o as an object and the strong ones win. The visionOS
+// archive is built with -DKL_HAVE_FOSSILIZE when Fossilize is vendored and has no stubs at
+// all: from a static archive a weak definition already satisfies the reference, so the
+// linker would never pull kl_fossilize.o in.
+#ifndef KL_HAVE_FOSSILIZE
+__attribute__((weak)) void kl_fossilize_install(void) {}
+__attribute__((weak)) int kl_foz_prewarm_env(void) { return 1; }
+__attribute__((weak)) int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed) {
+    if (done) *done = 0;
+    if (total) *total = 0;
+    if (elapsed) *elapsed = 0;
+    return 0;
+}
+#endif
+static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev, const char *name);
 
 static void vk_init(void) {
     if (g_init_done) return;
@@ -236,6 +272,7 @@ static void vk_init(void) {
     // MVK_CONFIG_USE_MTLHEAP explicitly if wanted.)
 
     g_mvk = mvk_open();
+    if (g_mvk) kl_fossilize_install();   // KL_FOZ_RECORD / KL_FOZ_REPLAY; no-op when unset
     if (!g_mvk) {
         VKI("MoltenVK could not be loaded — run 'make mvk' (BUILDING.md).\n");
         return;
@@ -348,6 +385,31 @@ static klvk_device *dev_of_queue(VkQueue q) {
     // device — which is every case here — the answer is unambiguous.
     (void)q;
     return g_ndev ? g_devs[0] : NULL;
+}
+
+// kl_foz_prewarm's device and instance, once its replay is done (kl_fossilize.cpp): out of
+// the layer's books and destroyed. The game's own device has to be g_devs[0], the one eye
+// images, the compositor and queue lookups use, and nothing of the prewarm may be left for a
+// handle of the game's to collide with. Adapted from Glovebox (MIT,
+// github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+void klvk_retire_device(VkInstance inst, VkDevice dev) {
+    klvk_device *d = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_ndev; i++)
+        if (g_devs[i]->dev == dev) {
+            d = g_devs[i];
+            memmove(&g_devs[i], &g_devs[i + 1], (size_t)(g_ndev - i - 1) * sizeof *g_devs);
+            g_ndev--;
+            break;
+        }
+    pthread_mutex_unlock(&g_lock);
+    PFN_vkDestroyDevice dd = (PFN_vkDestroyDevice)real_gipa(inst, "vkDestroyDevice");
+    if (dd && dev) dd(dev, NULL);
+    free(d);
+    PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)real_gipa(inst, "vkDestroyInstance");
+    if (di && inst) di(inst, NULL);
+    if (g_instance == inst) g_instance = VK_NULL_HANDLE;
+    VKI("prewarm device and instance retired; %d device(s) left\n", g_ndev);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,11 +557,138 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
     return r;
 }
 
+// ---- The guest's own instance and device settings, as it asked for them (KL_VK_DEVICE_INFO=<file>) ----
+// Pipelines compile to the same MSL only on a device made the same way, so a replay that runs before the game
+// (KL_FOZ_PREWARM: kl_foz_prewarm makes its own device before the guest boots) needs these: written as JSON at
+// the guest's vkCreateDevice. Feature structs go out as their bytes after the sType/pNext header; one this table
+// does not know is listed by sType with size 0 (and the prewarm then refuses that file).
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+static struct { uint32_t api, app_ver, eng_ver; char app[64], eng[64]; char *ext[64]; uint32_t n; } g_inst_info;
+
+static void devinfo_note_instance(const VkInstanceCreateInfo *ci) {
+    if (!ci) return;
+    for (uint32_t i = 0; i < g_inst_info.n; i++) free(g_inst_info.ext[i]);
+    g_inst_info.n = 0;  // the latest instance's
+    const VkApplicationInfo *a = ci->pApplicationInfo;
+    if (a) {
+        g_inst_info.api = a->apiVersion; g_inst_info.app_ver = a->applicationVersion; g_inst_info.eng_ver = a->engineVersion;
+        snprintf(g_inst_info.app, sizeof g_inst_info.app, "%s", a->pApplicationName ? a->pApplicationName : "");
+        snprintf(g_inst_info.eng, sizeof g_inst_info.eng, "%s", a->pEngineName ? a->pEngineName : "");
+    }
+    for (uint32_t i = 0; i < ci->enabledExtensionCount && g_inst_info.n < 64; i++)
+        g_inst_info.ext[g_inst_info.n++] = strdup(ci->ppEnabledExtensionNames[i]);
+}
+
+static const struct { VkStructureType t; size_t size; } k_feature_structs[] = {
+#define F(T, S) { VK_STRUCTURE_TYPE_##T, sizeof(S) }
+    F(PHYSICAL_DEVICE_FEATURES_2, VkPhysicalDeviceFeatures2),
+    F(PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features),
+    F(PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features),
+    F(PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, VkPhysicalDeviceVulkan13Features),
+    F(PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, VkPhysicalDevice16BitStorageFeatures),
+    F(PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, VkPhysicalDevice8BitStorageFeatures),
+    F(PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, VkPhysicalDeviceShaderFloat16Int8Features),
+    F(PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, VkPhysicalDeviceDescriptorIndexingFeatures),
+    F(PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, VkPhysicalDeviceTimelineSemaphoreFeatures),
+    F(PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, VkPhysicalDeviceBufferDeviceAddressFeatures),
+    F(PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, VkPhysicalDeviceHostQueryResetFeatures),
+    F(PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, VkPhysicalDeviceScalarBlockLayoutFeatures),
+    F(PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, VkPhysicalDeviceImagelessFramebufferFeatures),
+    F(PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, VkPhysicalDeviceUniformBufferStandardLayoutFeatures),
+    F(PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES, VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures),
+    F(PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures),
+    F(PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, VkPhysicalDeviceVulkanMemoryModelFeatures),
+    F(PHYSICAL_DEVICE_MULTIVIEW_FEATURES, VkPhysicalDeviceMultiviewFeatures),
+    F(PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, VkPhysicalDeviceSamplerYcbcrConversionFeatures),
+    F(PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES, VkPhysicalDeviceVariablePointersFeatures),
+    F(PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, VkPhysicalDeviceShaderDrawParametersFeatures),
+    F(PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES, VkPhysicalDeviceProtectedMemoryFeatures),
+    F(PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, VkPhysicalDeviceDynamicRenderingFeatures),
+    F(PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, VkPhysicalDeviceSynchronization2Features),
+    F(PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, VkPhysicalDeviceMaintenance4Features),
+    F(PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, VkPhysicalDeviceImageRobustnessFeatures),
+    F(PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES, VkPhysicalDeviceInlineUniformBlockFeatures),
+    F(PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, VkPhysicalDevicePipelineCreationCacheControlFeatures),
+    F(PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES, VkPhysicalDevicePrivateDataFeatures),
+    F(PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES, VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures),
+    F(PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, VkPhysicalDeviceShaderIntegerDotProductFeatures),
+    F(PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES, VkPhysicalDeviceShaderTerminateInvocationFeatures),
+    F(PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, VkPhysicalDeviceSubgroupSizeControlFeatures),
+    F(PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES, VkPhysicalDeviceTextureCompressionASTCHDRFeatures),
+    F(PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures),
+    F(PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, VkPhysicalDeviceRobustness2FeaturesEXT),
+    F(PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicStateFeaturesEXT),
+    F(PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicState2FeaturesEXT),
+    F(PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicState3FeaturesEXT),  // Alyx, 2026-10-11
+    F(PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, VkPhysicalDeviceCustomBorderColorFeaturesEXT),
+    F(PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, VkPhysicalDeviceDepthClipEnableFeaturesEXT),
+    F(PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT, VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT),
+    F(PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT, VkPhysicalDevice4444FormatsFeaturesEXT),
+    F(PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT),
+    F(PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT, VkPhysicalDeviceShaderAtomicFloatFeaturesEXT),
+    // Alyx's own (Source 2 on MoltenVK, 2026-10-05): multiview, dynamic rendering, these two
+    F(PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR),
+    F(PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, VkPhysicalDeviceHostImageCopyFeaturesEXT),
+#ifdef VK_VERSION_1_4
+    F(PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features),
+#endif
+#undef F
+};
+
+static void devinfo_hex(FILE *f, const void *p, size_t n) {
+    for (size_t i = 0; i < n; i++) fprintf(f, "%02x", ((const unsigned char *)p)[i]);
+}
+
+static void devinfo_write(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci) {
+    const char *e = getenv("KL_VK_DEVICE_INFO");
+    if (!e || !*e || !ci) return;
+    if (!strcmp(e, "0")) return;
+    char path[1024], tmp[1100];
+    snprintf(path, sizeof path, "%s", e);
+    // written beside and renamed over, so a prewarm never reads half a file
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { VKI("device info: cannot write %s\n", tmp); return; }
+    VkPhysicalDeviceProperties pr = {0};
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(g_instance, "vkGetPhysicalDeviceProperties");
+    if (gp && phys) gp(phys, &pr);
+    fprintf(f, "{\"v\": 1, \"gpu\": \"%s\", \"driver\": %u, \"gpu_api\": %u,\n", pr.deviceName, pr.driverVersion, pr.apiVersion);
+    fprintf(f, " \"instance\": {\"api\": %u, \"app\": \"%s\", \"app_version\": %u, \"engine\": \"%s\", \"engine_version\": %u, \"extensions\": [",
+            g_inst_info.api, g_inst_info.app, g_inst_info.app_ver, g_inst_info.eng, g_inst_info.eng_ver);
+    for (uint32_t i = 0; i < g_inst_info.n; i++) fprintf(f, "%s\"%s\"", i ? ", " : "", g_inst_info.ext[i]);
+    fprintf(f, "]},\n \"device\": {\"extensions\": [");
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) fprintf(f, "%s\"%s\"", i ? ", " : "", ci->ppEnabledExtensionNames[i]);
+    fprintf(f, "],\n  \"queues\": [");
+    for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++)
+        fprintf(f, "%s{\"family\": %u, \"count\": %u, \"flags\": %u}", i ? ", " : "", ci->pQueueCreateInfos[i].queueFamilyIndex,
+                ci->pQueueCreateInfos[i].queueCount, ci->pQueueCreateInfos[i].flags);
+    fprintf(f, "],\n  \"enabled_features\": ");
+    if (ci->pEnabledFeatures) { fputc('"', f); devinfo_hex(f, ci->pEnabledFeatures, sizeof *ci->pEnabledFeatures); fputc('"', f); }
+    else fprintf(f, "null");
+    fprintf(f, ",\n  \"pnext\": [");
+    unsigned n = 0, unknown = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext, n++) {
+        size_t size = 0;
+        for (size_t k = 0; k < sizeof k_feature_structs / sizeof *k_feature_structs; k++)
+            if (k_feature_structs[k].t == b->sType) { size = k_feature_structs[k].size; break; }
+        fprintf(f, "%s\n   {\"sType\": %u, \"size\": %zu, \"data\": \"", n ? "," : "", (unsigned)b->sType, size);
+        if (size > sizeof *b) devinfo_hex(f, (const char *)b + sizeof *b, size - sizeof *b);
+        else unknown++;
+        fputc('"', f); fputc('}', f);
+    }
+    fprintf(f, "]}}\n");
+    if (fclose(f) != 0 || rename(tmp, path) != 0) { VKI("device info: cannot write %s\n", path); unlink(tmp); return; }
+    VKI("device info: %u instance + %u device extension(s), %u pNext struct(s) (%u not in the table) -> %s\n",
+        g_inst_info.n, ci->enabledExtensionCount, n, unknown, path);
+}
+
+
 static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
                                     const VkAllocationCallbacks *alloc,
                                     VkInstance *out) {
     vk_init();
     if (!g_avail) return VK_ERROR_INITIALIZATION_FAILED;
+    devinfo_note_instance(ci);
     PFN_vkCreateInstance real = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
     PFN_vkEnumerateInstanceExtensionProperties enum_ext =
         (PFN_vkEnumerateInstanceExtensionProperties)
@@ -743,6 +932,9 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     // NULL physicalDevice (its GPU select left it null), and MoltenVK would make
     // a device on nothing. Give it the real GPU so it gets a working VkDevice.
     phys = KLVK_PHYS_OR_SUB(phys, "CreateDevice");
+    // as the guest asked, before anything below edits it
+    devinfo_write(phys, ci);
+    if (ci && g_pipe_hooks && g_pipe_hooks->device_info) g_pipe_hooks->device_info(ci);
 
     uint32_t nhave = 0;
     VkExtensionProperties *have = NULL;
@@ -814,6 +1006,8 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     pthread_mutex_unlock(&g_lock);
 
     VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
+    if (g_pipe_hooks && g_pipe_hooks->device_created)
+        g_pipe_hooks->device_created(d->dev, klvk_GetDeviceProcAddr);
     return VK_SUCCESS;
 }
 
@@ -3497,19 +3691,34 @@ static VkResult VKAPI_CALL klvk_CreateImageView(VkDevice dev,
 // Gated on nothing: it is one fprintf per ~50 pipelines, negligible against a
 // compile measured in tens of milliseconds.
 static unsigned long long g_pipe_gfx, g_pipe_comp, g_pipe_ns;
+// Stalls: guest pipeline-create calls over KL_VK_STALL_MS (default 50 ms), each one a frame the
+// guest's render thread lost. Logged one line each with the running count and total, which is
+// what the KL_FOZ_REPLAY A/B measures. Replay threads are not counted (t_pipe_replay).
+static unsigned long long g_stall_n;
+static double g_stall_ms;
 static double kl_pipe_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
+    if (t_pipe_replay) return;
+    static double thr = -1;
+    if (thr < 0) { const char *e = getenv("KL_VK_STALL_MS"); thr = e && *e ? atof(e) : 50.0; }
+    if (thr > 0 && dt_ms >= thr) {
+        g_stall_n++; g_stall_ms += dt_ms;
+        VKI("pipeline stall: %s batch of %u took %.0f ms (stalls so far: %llu, %.0f ms total)\n",
+            kind, n, dt_ms, g_stall_n, g_stall_ms);
+    }
     g_pipe_ns += (unsigned long long)(dt_ms * 1e6);
     unsigned long long tot = g_pipe_gfx + g_pipe_comp;
     static unsigned long long last;
     if (tot - last >= 50 || dt_ms > 250.0) {
         last = tot;
         VKI("pipeline warmup: %llu graphics + %llu compute = %llu compiled, "
-            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms)\n",
-            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms);
+            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms; "
+            "%llu stalls, %.0f ms)\n",
+            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms,
+            g_stall_n, g_stall_ms);
     }
 }
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
@@ -3592,8 +3801,11 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
         VKI("CreateGraphicsPipelines: forced primitiveRestartEnable=TRUE on %d "
             "strip pipeline(s) MoltenVK would otherwise reject (invisible "
             "geometry)\n", fixed); } }
-    g_pipe_gfx += n;
+    if (!t_pipe_replay) g_pipe_gfx += n;
     kl_pipe_report("gfx", n, kl_pipe_ms() - t0);
+    // the guest's own create infos (not the fixed-up copy): a replay goes through this wrapper again
+    if (g_pipe_hooks && ci && out)
+        for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(graphics_pipeline, out[i], &ci[i]);
     return r;
 }
 static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
@@ -3605,8 +3817,66 @@ static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
     double t0 = kl_pipe_ms();
     VkResult r = real ? real(dev, cache, n, ci, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
-    g_pipe_comp += n;
+    if (!t_pipe_replay) g_pipe_comp += n;
     kl_pipe_report("compute", n, kl_pipe_ms() - t0);
+    if (g_pipe_hooks && ci && out)
+        for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(compute_pipeline, out[i], &ci[i]);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-object recording seam (kl_vk_pipe_hooks.h). Each wrapper hands the GUEST's create
+// info to the recorder after a successful create; whatever the inner wrapper rewrites is
+// redone on replay, which comes back through these same entry points. Adapted from Glovebox
+// (MIT, github.com/glovebox-vr/glovebox) klepton/runtime/gfx/kl_vulkan.c
+// ---------------------------------------------------------------------------
+static VkResult VKAPI_CALL klvk_CreateShaderModule_inner(VkDevice, const VkShaderModuleCreateInfo *,
+        const VkAllocationCallbacks *, VkShaderModule *);
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout_inner(VkDevice,
+        const VkDescriptorSetLayoutCreateInfo *, const VkAllocationCallbacks *, VkDescriptorSetLayout *);
+static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice, const VkRenderPassCreateInfo *,
+        const VkAllocationCallbacks *, VkRenderPass *);
+static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice, const VkRenderPassCreateInfo2 *,
+        const VkAllocationCallbacks *, VkRenderPass *);
+static VkResult VKAPI_CALL klvk_CreateSampler(VkDevice dev, const VkSamplerCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkSampler *out) {
+    static PFN_vkCreateSampler real;
+    if (!real && real_gdpa) real = (PFN_vkCreateSampler)real_gdpa(dev, "vkCreateSampler");
+    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(sampler, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreatePipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkPipelineLayout *out) {
+    static PFN_vkCreatePipelineLayout real;
+    if (!real && real_gdpa) real = (PFN_vkCreatePipelineLayout)real_gdpa(dev, "vkCreatePipelineLayout");
+    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(pipeline_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkShaderModule *out) {
+    VkResult r = klvk_CreateShaderModule_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(shader_module, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev,
+        const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a,
+        VkDescriptorSetLayout *out) {
+    VkResult r = klvk_CreateDescriptorSetLayout_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(set_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    VkResult r = klvk_CreateRenderPass_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev, const VkRenderPassCreateInfo2 *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    VkResult r = klvk_CreateRenderPass2_inner(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass2, *out, ci);
     return r;
 }
 
@@ -3770,7 +4040,7 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
 // not found"); this shows whether the passes that DO get built use input
 // attachments / multiple subpasses (the MoltenVK-thorny shapes) and whether any
 // creation fails outright.
-static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice dev,
         const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass real;
@@ -3799,7 +4069,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
     }
     return r;
 }
-static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice dev,
         const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass2 real;
@@ -5763,7 +6033,7 @@ static uint32_t *klvk_spirv_mirror_rewrite(const uint32_t *in, size_t nwords,
 // vkCreateShaderModule — gated SPIR-V rewrite. emu_on() false, or a module with
 // no texel-buffer image, is EXACT passthrough. A rewrite MoltenVK rejects falls
 // back to the original module (buggy but never a hard failure).
-static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateShaderModule_inner(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
     static PFN_vkCreateShaderModule real;
@@ -5795,7 +6065,7 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
 
 // vkCreateDescriptorSetLayout — UNIFORM_TEXEL_BUFFER bindings become SAMPLED_IMAGE
 // so the layout matches the rewritten shader. Exact passthrough when emu off.
-static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout_inner(VkDevice dev,
         const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkDescriptorSetLayout *out) {
     static PFN_vkCreateDescriptorSetLayout real;
@@ -6448,6 +6718,7 @@ static const entry g_ours[] = {
     E(CmdBindPipeline), E(CmdBindDescriptorSets),
     E(GetImageMemoryRequirements), E(CreateBufferView),
     E(CreateShaderModule), E(CreateDescriptorSetLayout), E(CreateDescriptorPool),
+    E(CreateSampler), E(CreatePipelineLayout),
     E(UpdateDescriptorSets),
     E(CreateDescriptorUpdateTemplate), E(UpdateDescriptorSetWithTemplate),
     { "vkCreateDescriptorUpdateTemplateKHR", (PFN_vkVoidFunction)klvk_CreateDescriptorUpdateTemplate },

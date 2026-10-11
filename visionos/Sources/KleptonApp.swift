@@ -264,6 +264,14 @@ enum Paths {
     }
 }
 
+/// English or Spanish by the headset's first preferred language. The hub has no
+/// string catalog (its UI is English); the session texts are the first that
+/// speak Spanish too, chosen here rather than through a catalog. Here rather
+/// than in KleptonHub.swift because the boot window uses it in every build.
+func klL(_ en: String, _ es: String) -> String {
+    (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
+}
+
 /// The window's root: the hub's library until a game is picked (KleptonHub.swift),
 /// then the boot window for it. A single-game build goes straight to the boot window.
 struct KleptonRootView: View {
@@ -360,6 +368,12 @@ struct BootView: View {
     // mid-frame. A timer at 5 Hz costs nothing and cannot deadlock.
     @State private var showShell = false
     @State private var handedOff = false
+    // The pipeline prewarm before the game boots (KL_FOZ_PREWARM, the hub's
+    // "Precompile graphics"): kl_foz_progress, polled with the rest below.
+    @State private var fozState: Int32 = 0
+    @State private var fozDone: UInt32 = 0
+    @State private var fozTotal: UInt32 = 0
+    @State private var fozElapsed: Double = 0
     // The visionOS system keyboard for an immersive guest: there is no on-screen
     // keyboard in an immersive space, so when the guest asks for text entry
     // (kl_mono_text_input_wanted, set by SDLActivity.showTextInput) we focus a
@@ -411,6 +425,12 @@ struct BootView: View {
         while !Task.isCancelled {
             let mono = kl_present_mode_now() == KL_PRESENT_MONO
             if mono != showShell { showShell = mono }
+
+            var fd: UInt32 = 0, ft: UInt32 = 0, fe: Double = 0
+            let fs = kl_foz_progress(&fd, &ft, &fe)
+            if fs != fozState || fd != fozDone || ft != fozTotal {
+                fozState = fs; fozDone = fd; fozTotal = ft; fozElapsed = fe
+            }
 
             // Raise the system keyboard on EACH text-entry request. The guest
             // calls showTextInput every time a field is clicked, so this is
@@ -470,6 +490,26 @@ struct BootView: View {
         kl_mono_key(0, code)
     }
 
+    /// "Preparando gráficos… n/N" while the prewarm replays (kl_foz_progress), and
+    /// what it did once done. Nothing when there is no prewarm this run.
+    @ViewBuilder private var fozLine: some View {
+        let waiting = fozState == 0 && running && KLGameSettingsStore.willPrecompile(klTargetName())
+        if fozState == 1 || waiting {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(fozTotal > 0
+                     ? klL("Preparing graphics… \(fozDone)/\(fozTotal)",
+                           "Preparando gráficos… \(fozDone)/\(fozTotal)")
+                     : klL("Preparing graphics…", "Preparando gráficos…"))
+                    .font(.headline)
+                ProgressView(value: fozTotal > 0 ? Double(fozDone) / Double(fozTotal) : 0)
+            }
+        } else if fozState == 2 {
+            Text(klL("Graphics prepared: \(fozDone) pipelines",
+                     "Gráficos preparados: \(fozDone) pipelines"))
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
     private var bootReport: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -491,6 +531,8 @@ struct BootView: View {
                         .foregroundStyle(succeeded ? .green : .red)
                 }
             }
+
+            fozLine
 
             ScrollView {
                 Text(log.isEmpty ? "Press Boot to load the guest chain." : log)

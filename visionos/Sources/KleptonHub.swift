@@ -202,12 +202,8 @@ enum HubStorage {
 
 // MARK: - Session summaries
 
-/// English or Spanish by the headset's first preferred language. The hub has no
-/// string catalog (its UI is English); the session texts are the first that
-/// speak Spanish too, chosen here rather than through a catalog.
-func klL(_ en: String, _ es: String) -> String {
-    (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
-}
+// klL (English or Spanish by the headset's language) lives in KleptonApp.swift:
+// the boot window uses it too, in every build.
 
 enum HubSessionText {
     /// "12 min", "45 s", "1 h 05 min".
@@ -541,6 +537,27 @@ struct HubGameSettingsView: View {
                 #if canImport(SteamDepot)
                 KLCloudSaveSection(target: game.target)
                 #endif
+
+                if KLGameSettingsStore.hasPrecompile(game.target) {
+                    Section {
+                        Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
+                            get: { s.precompileGraphics ?? false },
+                            set: { s.precompileGraphics = $0 ? true : nil; save() }))
+                        let have = FileManager.default.fileExists(
+                            atPath: KLGameSettingsStore.fozURL(game.target).path)
+                        Text(have ? klL("Pipeline list found.", "Lista de pipelines encontrada.")
+                                  : klL("No pipeline list on the headset yet.",
+                                        "Aún no hay lista de pipelines en el visor."))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } header: { Text(klL("Graphics", "Gráficos")) } footer: {
+                        Text(klL("Before the game starts, compiles the shaders it will need, so walking "
+                                 + "into a new area does not freeze the picture. Takes a while each "
+                                 + "launch; the progress shows in the game's window.",
+                                 "Antes de arrancar el juego compila los shaders que va a usar, para "
+                                 + "que la imagen no se congele al entrar en una zona nueva. Tarda un "
+                                 + "rato en cada arranque; el progreso sale en la ventana del juego."))
+                    }
+                }
 
                 sessionsSection
 
