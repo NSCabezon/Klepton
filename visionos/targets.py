@@ -748,8 +748,8 @@ TARGETS = {
         "kind":    "hub",
         # The games the hub carries, in library order. Adding a game is one more
         # name here (it must be a row above, with its frameworks built by
-        # mkguest.sh); give it a Steam descriptor in Sources/KleptonGames.swift
-        # if its data can be downloaded in-app.
+        # mkguest.sh); give it a row in Sources/KleptonCatalog.swift (its Steam
+        # descriptor and/or Meta recipe) if its data can be downloaded in-app.
         "games":   [
             "alyx",
             # SUPERHOT VR, the Steam Frame build (app 617830, Android depot
@@ -758,6 +758,12 @@ TARGETS = {
             # (Sources/KleptonHubPrep.swift), and apktool.yml / AndroidManifest.xml
             # ride in the generated manifest (gen_xcodeproj.py) — no staging.
             "superhot",
+            # Beat Saber, from Meta's store only (Steam's is Windows-only): the
+            # headset downloads the Quest build through MetaStore (APK to
+            # games/beatsaber/meta/, OBB + bought DLC packs to android-files/obb/;
+            # Sources/KleptonMetaContent.swift). Offered only when the recipe's
+            # build is the one this port is translated from (KleptonCatalog.swift).
+            "beatsaber",
         ],
         "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
