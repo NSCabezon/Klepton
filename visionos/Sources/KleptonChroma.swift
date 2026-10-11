@@ -223,6 +223,8 @@ struct KLPerformance: Codable, Equatable {
     var renderScale: Float?          // KL_OPENVR_RT_SCALE, 0.6–1.2 (default 1.0)
     var overscan: Float?             // KL_OPENVR_OVERSCAN, 0–0.2 (default 0.12 for alyx)
     var overscanRT: Bool?            // KL_OPENVR_OVERSCAN_RT (default on)
+    var msaa: Int?                   // KL_ALYX_MSAA, 2 or 4 (default 2; kl_app.c picks the fidelity level)
+    var foveate: Bool?               // KL_FOVEATE (default off)
 }
 
 /// The languages a game can be told to boot in, and what each one means on the
@@ -322,6 +324,8 @@ enum KLGameSettingsStore {
     static let defaultRenderScale: Float = 1.0
     static let defaultOverscan: Float = 0.12
     static let defaultOverscanRT = true
+    static let defaultMSAA = 2
+    static let defaultFoveate = false
 
     /// Whether "Precompile graphics" applies (a Vulkan game with a pipeline list).
     static func hasPrecompile(_ target: String) -> Bool { target == "alyx" }
@@ -401,10 +405,14 @@ enum KLGameSettingsStore {
         if let v = p.renderScale { setenv("KL_OPENVR_RT_SCALE", String(format: "%.3f", v), 0) }
         if let v = p.overscan    { setenv("KL_OPENVR_OVERSCAN", String(format: "%.3f", v), 0) }
         if let v = p.overscanRT  { setenv("KL_OPENVR_OVERSCAN_RT", v ? "1" : "0", 0) }
+        if let v = p.msaa        { setenv("KL_ALYX_MSAA", String(v), 0) }
+        if let v = p.foveate     { setenv("KL_FOVEATE", v ? "1" : "0", 0) }
         let env = ProcessInfo.processInfo.environment
         NSLog("[perf] \(target): KL_OPENVR_RT_SCALE=\(env["KL_OPENVR_RT_SCALE"] ?? "default") "
               + "KL_OPENVR_OVERSCAN=\(env["KL_OPENVR_OVERSCAN"] ?? "default") "
-              + "KL_OPENVR_OVERSCAN_RT=\(env["KL_OPENVR_OVERSCAN_RT"] ?? "default")")
+              + "KL_OPENVR_OVERSCAN_RT=\(env["KL_OPENVR_OVERSCAN_RT"] ?? "default") "
+              + "KL_ALYX_MSAA=\(env["KL_ALYX_MSAA"] ?? "default") "
+              + "KL_FOVEATE=\(env["KL_FOVEATE"] ?? "default")")
     }
 
     /// "Precompile graphics": KL_VK_DEVICE_INFO so the runtime records how the game
