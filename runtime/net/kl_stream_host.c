@@ -74,6 +74,7 @@
 #include "kl_env.h"
 #include "kl_openvr.h"
 #include "kl_ovrp.h"
+#include "kl_openxr.h"
 #include "kl_stream_tx.h"
 #include "kl_vulkan.h"
 #include <mach/mach_time.h>
@@ -1150,7 +1151,10 @@ void kl_stream_host_install_pacer(void) {
     }
     g_pace_period = 1.0 / f;
     kl_openvr_set_frame_pacer(pace_wait);
-    fprintf(stderr, SH "frame rate locked to %.1f fps: WaitGetPoses paced to %.1f ms, the guest is "
+    // ...and xrWaitFrame, for an OpenXR guest (Metro Awakening): the same wait,
+    // at the same place in its frame (before the pose latch).
+    kl_openxr_set_frame_pacer(pace_wait);
+    fprintf(stderr, SH "frame rate locked to %.1f fps: WaitGetPoses/xrWaitFrame paced to %.1f ms, the guest is "
                     "told a %.1f Hz display (KL_STREAM_LOCK_FPS=0 to run free)\n",
             (double)f, 1000.0 / f, (double)f);
 }
