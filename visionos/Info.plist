@@ -144,7 +144,7 @@
 	     NSBonjourServices — an unlisted type browses nothing, silently. The
 	     type is KL_STREAM_BONJOUR in runtime/net/kl_stream_proto.h. -->
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Klepton finds the Mac or PC on your network that streams your game to the headset, and streams from the one you choose.</string>
+	<string>Finds the Mac that streams your game to the headset (Play from Mac), and the PCs Steam Link streams from.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_klepton-stream._udp</string>
