@@ -199,6 +199,9 @@ struct KLGameSettings: Codable, Equatable {
     var calibration: KLCalibration?
     /// Render performance (Alyx's OpenVR path only, for now).
     var performance: KLPerformance?
+    /// "Precompile graphics": replay the game's pipeline list (klfz/<target>.foz)
+    /// before it boots, so the Metal compiler is warm (KL_FOZ_PREWARM). nil = off.
+    var precompileGraphics: Bool?
 }
 
 /// See KLGameSettings.calibration and KleptonTuning. Degrees and metres, in the
@@ -320,6 +323,27 @@ enum KLGameSettingsStore {
     static let defaultOverscan: Float = 0.12
     static let defaultOverscanRT = true
 
+    /// Whether "Precompile graphics" applies (a Vulkan game with a pipeline list).
+    static func hasPrecompile(_ target: String) -> Bool { target == "alyx" }
+    /// The game's pipeline list, and the record of how it makes its Vulkan device
+    /// (written by the runtime at the game's vkCreateDevice), in the game's
+    /// container: Documents/games/<target>/klfz/ in the hub. Generated on the Mac
+    /// (tools/alyx_pipelines.py) and copied there (BUILDING.md, Fossilize).
+    static func fozDir(_ target: String) -> URL {
+        Paths.containerURL(for: target).appendingPathComponent("klfz", isDirectory: true)
+    }
+    static func fozURL(_ target: String) -> URL {
+        fozDir(target).appendingPathComponent("\(target).foz")
+    }
+    static func precompileGraphics(for target: String) -> Bool {
+        hasPrecompile(target) && (load(target).precompileGraphics ?? false)
+    }
+    /// The setting is on and the pipeline list is there: the boot window shows
+    /// "Preparing graphics… n/N" before the game starts.
+    static func willPrecompile(_ target: String) -> Bool {
+        precompileGraphics(for: target) && FileManager.default.fileExists(atPath: fozURL(target).path)
+    }
+
     // Defaults. The hub's are "a VR game, fully": every hub game draws its own
     // world and its own hands, so it opens .full with the real hands hidden.
     // A single-game build keeps its development defaults: .mixed unless the
@@ -372,6 +396,7 @@ enum KLGameSettingsStore {
         // The compositor reads KL_GHOST_CTRL (KleptonHUD); a value already in
         // the launch environment wins.
         if let g = load(target).ghostControllers { setenv("KL_GHOST_CTRL", g ? "1" : "0", 0) }
+        applyPrecompile(for: target)
         guard hasPerformance(target), let p = load(target).performance else { return }
         if let v = p.renderScale { setenv("KL_OPENVR_RT_SCALE", String(format: "%.3f", v), 0) }
         if let v = p.overscan    { setenv("KL_OPENVR_OVERSCAN", String(format: "%.3f", v), 0) }
@@ -380,6 +405,23 @@ enum KLGameSettingsStore {
         NSLog("[perf] \(target): KL_OPENVR_RT_SCALE=\(env["KL_OPENVR_RT_SCALE"] ?? "default") "
               + "KL_OPENVR_OVERSCAN=\(env["KL_OPENVR_OVERSCAN"] ?? "default") "
               + "KL_OPENVR_OVERSCAN_RT=\(env["KL_OPENVR_OVERSCAN_RT"] ?? "default")")
+    }
+
+    /// "Precompile graphics": KL_VK_DEVICE_INFO so the runtime records how the game
+    /// makes its device (the prewarm rebuilds that device on the next launch), and
+    /// KL_FOZ_PREWARM when the pipeline list is there. Never overwrites.
+    static func applyPrecompile(for target: String) {
+        guard precompileGraphics(for: target) else { return }
+        let dir = fozDir(target)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        setenv("KL_VK_DEVICE_INFO", dir.appendingPathComponent("device-info.json").path, 0)
+        let foz = fozURL(target)
+        if FileManager.default.fileExists(atPath: foz.path) {
+            setenv("KL_FOZ_PREWARM", foz.path, 0)
+        }
+        let env = ProcessInfo.processInfo.environment
+        NSLog("[foz] \(target): KL_FOZ_PREWARM=\(env["KL_FOZ_PREWARM"] ?? "unset (no \(foz.path))") "
+              + "KL_VK_DEVICE_INFO=\(env["KL_VK_DEVICE_INFO"] ?? "")")
     }
 
     static func applyLanguage(for target: String) {

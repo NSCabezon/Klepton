@@ -2574,6 +2574,26 @@ create call.
   N pipelines (failed, unparsed) in X s; Y s of compiles, Z over 100 ms`.
 - `KL_FOZ_REPLAY_BLOCK=1` — hold vkCreateDevice until the replay is done
   (load time instead of racing the guest). Default: background, utility QoS.
+- `KL_FOZ_PREWARM=<file.foz|dir>[:...]` — just before the guest boots
+  (`kl_app_boot` on visionOS, `native_door_run` in m_boot), make a Vulkan
+  instance and device of our own exactly as the game makes its own, replay the
+  databases on it (`KL_FOZ_THREADS`), blocking, then retire it so the game's
+  device is the layer's first. Same process as the game, on purpose: a replay in
+  an earlier process did not warm a later one. Logs `[foz] prewarm done in X s:
+  N pipelines, M over 100 ms`; progress for the boot window is
+  `kl_foz_progress()` ("Preparando gráficos… n/N"). Set by the hub's per-game
+  "Precompilar gráficos" (Alyx, default off) when
+  `Documents/games/alyx/klfz/alyx.foz` exists. Without usable device info it
+  falls back to `KL_FOZ_REPLAY` + `KL_FOZ_REPLAY_BLOCK=1` (a blocking replay on
+  the game's own device).
+- `KL_FOZ_DEVICE_INFO=<file>` — the device info the prewarm rebuilds the game's
+  device from. Default: `device-info.json` beside the first `.foz`.
+- `KL_VK_DEVICE_INFO=<file>` — (kl_vulkan.c) at the guest's vkCreateDevice,
+  write its instance + device create info (extensions, queues, feature structs
+  as bytes) as JSON. The hub sets it to `klfz/device-info.json` whenever
+  "Precompilar gráficos" is on, so the headset's own record replaces any copy.
+  A feature struct the table does not know is written with size 0, and the
+  prewarm refuses that file (add the struct to `k_feature_structs`).
 - `KL_VK_STALL_MS=<ms>` — (kl_vulkan.c, always on) a guest
   vkCreate*Pipelines call at or over this (default 50; 0 = off) logs
   `pipeline stall: ... (stalls so far: N, T ms total)`; the running totals

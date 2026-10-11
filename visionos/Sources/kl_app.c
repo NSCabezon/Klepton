@@ -24,6 +24,7 @@
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // claim the veneers' TSD slot before anything else can
 #include "kl_env.h"
+#include "kl_vulkan.h"    // kl_foz_prewarm_env — KL_FOZ_PREWARM, before the guest exists
 
 // --- Which guest ------------------------------------------------------------
 //
@@ -852,6 +853,18 @@ int kl_app_boot(void) {
     // Before the chain runs, so nothing it starts reads a default we meant to
     // replace.
     if (kl_app_target_is_steamlink()) steamlink_policy();
+
+    // KL_FOZ_PREWARM (the hub's "Precompile graphics"): warm the Metal compiler on a
+    // device of our own, made as the game makes its own, before the guest exists.
+    // Blocks; the boot window reads kl_foz_progress meanwhile. Here, in the game's
+    // own process, because a replay in an earlier process did not warm a later one.
+    {
+        int rc = kl_foz_prewarm_env();
+        if (rc != 1) printf("  prewarm   : %s\n", rc == 0 ? "done" : rc == -2
+               ? "no usable device-info.json; the game's own device replays instead"
+               : "could not run (see [foz] lines)");
+        fflush(NULL);
+    }
 
     // The door's own sequence, in kl_driver: the chain and its entry point for
     // Steam Link, Unreal and OpenJK; libmain -> NativeLoader.load -> initJni for

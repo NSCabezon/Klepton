@@ -32,6 +32,10 @@ typedef struct klvk_pipe_hooks {
 
 void klvk_set_pipe_hooks(const klvk_pipe_hooks *h);
 
+// A replayer's own device (kl_foz_prewarm), when it is done with it: out of the layer's books
+// and destroyed, with its instance, so the game's device is the layer's first.
+void klvk_retire_device(VkInstance inst, VkDevice dev);
+
 // On a replayer's own threads: their creates are neither handed to the hooks nor counted
 // as guest compiles in the "pipeline warmup" / stall report.
 void klvk_set_replay_thread(int on);
