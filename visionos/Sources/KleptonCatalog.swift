@@ -53,6 +53,9 @@ enum KLCatalog {
         // Meta only (a Quest 3 exclusive): the Quest build 1.4.1-350961 — APK, main OBB, audio OBBs,
         // videos and the 69 Addressables bundles (18.3 GB); voice-language packs are opt-in.
         KLCatalogEntry(target: "batman", display: "Batman: Arkham Shadow", steamApp: nil, metaRecipe: "batman"),
+        // Meta only (the Steam build is PC VR): the Quest build 1.2.174682 — a single APK, no OBB;
+        //        byte-identical to the APK this port is translated from.
+        KLCatalogEntry(target: "ieytd", display: "I Expect You To Die", steamApp: nil, metaRecipe: "ieytd"),
         // Steam only: the Steam Frame build (depot 2669412 = Impact-Android-Shipping-arm64.apk,
         //        com.vertigogames.ImpactDevelopment 944116, + 14 OBBs, 19.2 GB). The Quest build on
         //        Meta's store is a different APK and is not what this port is translated from.

@@ -200,6 +200,14 @@ TARGETS = {
         "kind":    "unity",
         "product": "KleptonIEYTD",
         "display": "I Expect You To Die",
+        # The game draws its own gloved hands where the user's are, so the
+        # system's matte of the real arms would be a second pair (beatsaber128).
+        "hand_matting": False,
+        # Unmeasured default for an M2: a light Unity 2019 GLES title through
+        # ANGLE/Metal, multi-pass stereo. 0.8 is ~two thirds of the pixels; the
+        # in-app "Render resolution" slider starts here and goes back up if the
+        # headset's fps allow.
+        "render_scale": 0.8,
     },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
@@ -1079,6 +1087,11 @@ TARGETS = {
             # to android-files/obb/ — the row's obb_raw layout, as the game reads
             # them by name. Voice packs are opt-in (MetaStore recipe `locale`).
             "batman",
+            # I Expect You To Die 1.2.174682 (com.schellgames.ieytdquest 74682),
+            # Meta's store only (app 1987283631365460): one 533 MB APK, no OBB,
+            # to games/ieytd/meta/IEYTD.apk; the hub derives ieytd.apk and
+            # ieytd/assets from it (Sources/KleptonHubPrep.swift).
+            "ieytd",
             # Metro Awakening, the Steam Frame build (app 2669410, Android depot
             # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
             # chunk OBBs, 19.2 GB). The depot lands straight in the OBB
