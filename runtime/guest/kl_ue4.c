@@ -718,11 +718,13 @@ static void kl_ue4_java_create(FILE *out) {
     // profile's 1 and the engine at "This device does not support Vulkan".
     // In this fork the fix is gated (KL_UE4_OS_RELEASE): it can move a guest's
     // device-profile choice (e.g. the RHI), so the UE4 targets this fork had
-    // before the port (intotheradius, metro, re4, redmatter2, vampire) keep the
-    // old empty answer by default; every other UE4 guest gets the real one.
+    // before the port (intotheradius, re4, redmatter2, vampire) keep the old
+    // empty answer by default; every other UE4 guest gets the real one. metro
+    // NEEDS the real one: on its Steam path the device-profile rules enable
+    // Vulkan only for a parseable Android version (Moss's shape).
     int rel_def = 1;
     {
-        static const char *const k_old[] = { "intotheradius", "metro", "re4", "redmatter2", "vampire" };
+        static const char *const k_old[] = { "intotheradius", "re4", "redmatter2", "vampire" };
         extern const char *kl_driver_target_name(void);
         const char *tn = kl_driver_target_name();
         for (unsigned i = 0; tn && i < sizeof k_old / sizeof *k_old; i++)
