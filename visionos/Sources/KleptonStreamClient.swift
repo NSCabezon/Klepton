@@ -39,7 +39,14 @@ struct KLStreamTarget: Identifiable, Hashable {
     let endpoint: NWEndpoint?
     let host: String?
     let port: Int
+    /// The game the Mac is hosting (the host's Bonjour TXT "guest", its
+    /// m_boot target). nil = not known (manual address, an older host): offered
+    /// for every streamable game, as before.
+    var guest: String? = nil
     var id: String { name + (host ?? "") }
+
+    /// Whether this Mac can be offered for `target`'s "Jugar desde el Mac".
+    func serves(_ target: String) -> Bool { guest == nil || guest == target }
 
     /// KL_STREAM_HOST_ADDR=ip[:port] — the manual fallback (testing, a Mac whose
     /// Bonjour does not reach the headset). An IPv6 literal goes in brackets
@@ -73,20 +80,23 @@ final class KLStreamBrowser: ObservableObject {
         guard browser == nil else { return }
         macs = manual.map { [$0] } ?? []
         let type = String(KL_STREAM_BONJOUR)
-        let b = NWBrowser(for: .bonjour(type: type, domain: nil), using: NWParameters())
+        // With the TXT record: the host publishes which game it runs ("guest").
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: type, domain: nil), using: NWParameters())
         b.stateUpdateHandler = { state in
             NSLog("[stream] Bonjour browser (\(type)): \(state)")
         }
         b.browseResultsChangedHandler = { [weak self] results, _ in
             let found: [KLStreamTarget] = results.compactMap { r in
                 guard case let .service(name, _, _, _) = r.endpoint else { return nil }
+                var guest: String?
+                if case let .bonjour(txt) = r.metadata { guest = txt["guest"] }
                 return KLStreamTarget(name: name, endpoint: r.endpoint, host: nil,
-                                      port: Int(KL_STREAM_PORT_DEFAULT))
+                                      port: Int(KL_STREAM_PORT_DEFAULT), guest: guest)
             }.sorted { $0.name < $1.name }
             Task { @MainActor in
                 guard let self else { return }
                 self.macs = (self.manual.map { [$0] } ?? []) + found
-                NSLog("[stream] Macs: \(self.macs.map(\.name))")
+                NSLog("[stream] Macs: \(self.macs.map { "\($0.name) [\($0.guest ?? "?")]" })")
             }
         }
         b.start(queue: .main)
