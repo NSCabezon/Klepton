@@ -44,6 +44,8 @@ enum kl_stream_type {
     KL_STREAM_PING        = 7,   // either way; PONG echoes t_send
     KL_STREAM_PONG        = 8,
     KL_STREAM_BYE         = 9,   // either way; stop streaming
+    KL_STREAM_AUDIO       = 10,  // host -> client, the guest's PCM (additive in v2:
+                                 // a v2 client without audio ignores the type)
 };
 
 enum kl_stream_status {
@@ -180,6 +182,23 @@ typedef struct {
     double        t_send;        // sender's clock; PONG echoes it
     double        t_reply;       // PONG: replier's clock, else 0
 } kl_stream_ping;
+
+// The guest's sound, as it left its mixer (before the host's resampler):
+// interleaved signed 16-bit little-endian PCM, `frames` frames of `channels`
+// channels at `sample_rate` Hz. `first_frame` counts frames since the host
+// started sending (per stream; it restarts from 0 with a new sample_rate or
+// channel count), so the client sees loss and reordering and fills a gap with
+// silence. The host sends ~5 ms per packet (240 frames of 48 kHz stereo = 960
+// bytes), each in one datagram, no FEC: a lost packet is 5 ms of silence.
+typedef struct {
+    kl_stream_hdr h;
+    uint32_t      sample_rate;
+    uint16_t      channels;      // 1 or 2
+    uint16_t      frames;
+    uint64_t      first_frame;
+    // followed by frames * channels int16
+} kl_stream_audio;
+#define KL_STREAM_AUDIO_MAX_FRAMES 288   // 288 * 2 ch * 2 B = 1152 <= KL_STREAM_MTU_PAYLOAD
 
 #pragma pack(pop)
 

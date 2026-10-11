@@ -26,6 +26,7 @@
 #include "kl_stream_client.h"
 #include "kl_ovrp.h"
 #include "kl_env.h"
+#include "kl_audio.h"
 
 #include <VideoToolbox/VideoToolbox.h>
 #include <CoreMedia/CoreMedia.h>
@@ -157,6 +158,19 @@ struct kl_stream_client {
     uint32_t          w_p2p_n;
     double            w_start;
     kl_stream_client_status st;         // the last published window
+
+    // AUDIO (klsc_audio_*): rx thread pushes into a jitter ring, the audio
+    // thread pops and feeds kl_audio (whose blocking write is the clock).
+    pthread_mutex_t   au_mu;
+    pthread_cond_t    au_cv;
+    pthread_t         au_thread;
+    int               au_started;
+    int16_t          *au_ring;          // au_cap frames x 2 ch (mono is widened)
+    size_t            au_cap, au_r, au_w;   // frames; au_w - au_r = buffered
+    unsigned          au_rate;
+    uint64_t          au_expect;        // next first_frame expected
+    int               au_have_expect;
+    uint32_t          au_pkts, au_gap_frames, au_late, au_underruns, au_overflow;
 };
 
 // ---------------------------------------------------------------------------
@@ -664,6 +678,137 @@ static void klsc_on_video(kl_stream_client *c, const uint8_t *pkt, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
+// audio (KL_STREAM_AUDIO packets)
+//
+// A jitter buffer between the network and kl_audio. The rx thread appends
+// (filling a short gap from lost packets with silence, dropping late ones);
+// the audio thread waits for KL_STREAM_AUDIO_PREBUFFER_MS (default 40) before
+// it starts, then hands kl_audio 5 ms at a time — kl_audio_write blocks for
+// as long as that takes to play, so the device paces the drain. The two
+// clocks (the Mac's device, this one) drift apart slowly: more than
+// KL_STREAM_AUDIO_MAX_MS (150) buffered drops the oldest down to the prebuffer
+// target, running dry re-primes (one short gap). KL_STREAM_AUDIO_PLAY=0
+// receives and counts without opening a device (the Mac harness).
+
+static size_t klsc_au_buffered(kl_stream_client *c) { return c->au_w - c->au_r; }
+
+static void *klsc_audio_main(void *arg) {
+    kl_stream_client *c = arg;
+    pthread_setname_np("Klepton stream audio");
+    int play = kl_env_on("KL_STREAM_AUDIO_PLAY", 1);
+    pthread_mutex_lock(&c->au_mu);
+    unsigned rate = c->au_rate;
+    pthread_mutex_unlock(&c->au_mu);
+    if (play && kl_audio_open(rate, 2, 16) != 0) {
+        klsc_log("[stream-client] audio: could not open the output at %u Hz — receiving without playing", rate);
+        play = 0;
+    }
+    if (play) kl_audio_play();
+    klsc_log("[stream-client] audio: %u Hz stereo, %s", rate, play ? "playing" : "not played (KL_STREAM_AUDIO_PLAY=0)");
+    size_t chunk = rate / 200;             // 5 ms
+    if (chunk < 32) chunk = 32;
+    size_t prebuf = (size_t)(kl_env_float("KL_STREAM_AUDIO_PREBUFFER_MS", 40.0f) * rate / 1000.0f);
+    int16_t *tmp = malloc(chunk * 2 * sizeof(int16_t));
+    int primed = 0;
+    pthread_mutex_lock(&c->au_mu);
+    while (c->running) {
+        size_t have = klsc_au_buffered(c);
+        if (!primed) {
+            if (have < prebuf) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 10 * 1000000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&c->au_cv, &c->au_mu, &ts);
+                continue;
+            }
+            primed = 1;
+        }
+        if (have < chunk) {                // ran dry: wait for the prebuffer again
+            primed = 0;
+            c->au_underruns++;
+            continue;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            size_t off = (c->au_r + i) % c->au_cap;
+            tmp[i * 2] = c->au_ring[off * 2];
+            tmp[i * 2 + 1] = c->au_ring[off * 2 + 1];
+        }
+        c->au_r += chunk;
+        pthread_mutex_unlock(&c->au_mu);
+        if (play) {
+            if (kl_audio_write(tmp, chunk * 4) == 0) usleep(5000);
+        } else {
+            usleep((useconds_t)(chunk * 1000000ull / rate));
+        }
+        pthread_mutex_lock(&c->au_mu);
+    }
+    pthread_mutex_unlock(&c->au_mu);
+    free(tmp);
+    if (play) { kl_audio_pause(); kl_audio_flush(); }
+    return NULL;
+}
+
+static void klsc_on_audio(kl_stream_client *c, const uint8_t *pkt, size_t n) {
+    if (n < sizeof(kl_stream_audio) || !kl_env_on("KL_STREAM_AUDIO", 1)) return;
+    kl_stream_audio a;
+    memcpy(&a, pkt, sizeof a);
+    if ((a.channels != 1 && a.channels != 2) || !a.frames || a.frames > KL_STREAM_AUDIO_MAX_FRAMES ||
+        a.sample_rate < 8000 || a.sample_rate > 192000) return;
+    if (n < sizeof a + (size_t)a.frames * a.channels * 2) return;
+    const int16_t *pcm = (const int16_t *)(pkt + sizeof a);
+    pthread_mutex_lock(&c->au_mu);
+    if (!c->au_started) {
+        c->au_rate = a.sample_rate;
+        c->au_cap = a.sample_rate;           // 1 s
+        c->au_ring = calloc(c->au_cap * 2, sizeof(int16_t));
+        c->au_started = 1;
+        if (pthread_create(&c->au_thread, NULL, klsc_audio_main, c) != 0) {
+            klsc_log("[stream-client] audio: cannot start the audio thread");
+            c->au_started = -1;
+        }
+    }
+    if (c->au_started < 0 || a.sample_rate != c->au_rate) {   // rate changes are not followed
+        pthread_mutex_unlock(&c->au_mu);
+        return;
+    }
+    c->au_pkts++;
+    if (c->au_have_expect) {
+        if (a.first_frame < c->au_expect) {
+            // Late or duplicate — or the host restarted its count (a new
+            // session): only a big step back is taken as the latter.
+            if (c->au_expect - a.first_frame < c->au_rate) { c->au_late++; pthread_mutex_unlock(&c->au_mu); return; }
+        } else if (a.first_frame > c->au_expect) {
+            uint64_t gap = a.first_frame - c->au_expect;
+            if (gap <= c->au_rate / 10) {      // <= 100 ms lost: that much silence
+                for (uint64_t i = 0; i < gap; i++) {
+                    size_t off = c->au_w++ % c->au_cap;
+                    c->au_ring[off * 2] = c->au_ring[off * 2 + 1] = 0;
+                }
+                c->au_gap_frames += (uint32_t)gap;
+            }
+        }
+    }
+    for (unsigned i = 0; i < a.frames; i++) {
+        size_t off = c->au_w++ % c->au_cap;
+        int16_t l = pcm[i * a.channels], r = a.channels == 2 ? pcm[i * 2 + 1] : l;
+        c->au_ring[off * 2] = l;
+        c->au_ring[off * 2 + 1] = r;
+    }
+    c->au_expect = a.first_frame + a.frames;
+    c->au_have_expect = 1;
+    size_t maxb = (size_t)(kl_env_float("KL_STREAM_AUDIO_MAX_MS", 150.0f) * c->au_rate / 1000.0f);
+    if (maxb > c->au_cap - 1) maxb = c->au_cap - 1;
+    if (klsc_au_buffered(c) > maxb) {
+        size_t keep = (size_t)(kl_env_float("KL_STREAM_AUDIO_PREBUFFER_MS", 40.0f) * c->au_rate / 1000.0f);
+        c->au_r = c->au_w - keep;
+        c->au_overflow++;
+    }
+    pthread_cond_signal(&c->au_cv);
+    pthread_mutex_unlock(&c->au_mu);
+}
+
+// ---------------------------------------------------------------------------
 // receive thread
 
 static void klsc_on_packet(kl_stream_client *c, const uint8_t *pkt, size_t n) {
@@ -702,6 +847,9 @@ static void klsc_on_packet(kl_stream_client *c, const uint8_t *pkt, size_t n) {
     }
     case KL_STREAM_VIDEO:
         klsc_on_video(c, pkt, n);
+        break;
+    case KL_STREAM_AUDIO:
+        klsc_on_audio(c, pkt, n);
         break;
     case KL_STREAM_HAPTICS: {
         if (n < sizeof(kl_stream_haptics)) return;
@@ -769,17 +917,18 @@ static void klsc_window(kl_stream_client *c, double now) {
 
     kl_stream_client_status now_s;
     kl_stream_client_get_status(c, &now_s);
-    char line[256];
+    char line[384];
     snprintf(line, sizeof line,
              "[stream-client] %s: video %.1f fps (interval %.1f sd %.1f ms), decode %.2f ms, "
              "lost %u, idr %u, fec-fixed %u, "
              "pose->photon %.1f ms, %.1f Mbps, rtt %.1f ms, pose-miss %u, skipped %u, "
-             "dec-err %u, poses %u",
+             "dec-err %u, poses %u, audio %u pkts (%.0f ms buffered, %u underruns)",
              kl_stream_client_state_name(now_s.state), (double)now_s.video_fps,
              (double)now_s.interval_ms, (double)now_s.interval_sd_ms,
              (double)now_s.decode_ms, now_s.frames_lost, now_s.idr_requests, now_s.fec_fixed,
              (double)now_s.p2p_ms, (double)now_s.kbps / 1000.0, (double)now_s.rtt_ms,
-             now_s.pose_misses, skipped, now_s.decode_errors, now_s.poses_sent);
+             now_s.pose_misses, skipped, now_s.decode_errors, now_s.poses_sent,
+             now_s.audio_packets, (double)now_s.audio_ms, now_s.audio_underruns);
     pthread_mutex_lock(&c->mu);
     memcpy(c->st.line, line, sizeof line);
     pthread_mutex_unlock(&c->mu);
@@ -863,6 +1012,8 @@ kl_stream_client *kl_stream_client_create(const char *host, int port) {
     c->port = port;
     pthread_mutex_init(&c->mu, NULL);
     pthread_mutex_init(&c->tx_mu, NULL);
+    pthread_mutex_init(&c->au_mu, NULL);
+    pthread_cond_init(&c->au_cv, NULL);
     c->running = 1;
     c->t_last_video = -1;
     c->last_idr = -1e9;
@@ -882,6 +1033,18 @@ void kl_stream_client_destroy(kl_stream_client *c) {
     if (!c) return;
     c->running = 0;
     pthread_join(c->rx, NULL);
+    pthread_mutex_lock(&c->au_mu);
+    int au = c->au_started > 0;
+    pthread_cond_broadcast(&c->au_cv);
+    pthread_mutex_unlock(&c->au_mu);
+    if (au) pthread_join(c->au_thread, NULL);
+    if (c->au_pkts)
+        klsc_log("[stream-client] audio: %u packets, %u frames of gaps filled, %u late, "
+                 "%u underruns, %u overflows", c->au_pkts, c->au_gap_frames, c->au_late,
+                 c->au_underruns, c->au_overflow);
+    free(c->au_ring);
+    pthread_mutex_destroy(&c->au_mu);
+    pthread_cond_destroy(&c->au_cv);
     for (int i = 0; i < 3; i++) {
         kl_stream_hdr b = {0};
         klsc_send(c, &b, sizeof b, KL_STREAM_BYE);
@@ -952,6 +1115,12 @@ void kl_stream_client_get_status(kl_stream_client *c, kl_stream_client_status *s
     s->pose_misses = c->tot_pose_miss;
     s->poses_sent = c->tot_poses;
     s->fec_fixed = c->tot_fec_fixed;
+    pthread_mutex_lock(&c->au_mu);
+    s->audio_packets = c->au_pkts;
+    s->audio_underruns = c->au_underruns;
+    s->audio_gap_frames = c->au_gap_frames;
+    s->audio_ms = c->au_rate ? (float)((double)(c->au_w - c->au_r) * 1000.0 / c->au_rate) : 0;
+    pthread_mutex_unlock(&c->au_mu);
     s->decode_ms_mean = c->tot_decoded ? (float)(c->t_decode_ms / c->tot_decoded) : 0;
     if (c->t_iv_n) {
         double m = c->t_iv_sum / c->t_iv_n, var = c->t_iv_sq / c->t_iv_n - m * m;
