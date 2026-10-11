@@ -176,10 +176,32 @@ enum SteamGames {
         verifyNextLaunchKey: "kl.steam.verifyNextLaunch.superhot",
         apk: "shvr.apk")
 
+    /// Metro Awakening — the Steam Frame build: the Android depot is the APK
+    /// (Impact-Android-Shipping-arm64.apk, 50 MB) and the game's 14 OBBs
+    /// (main.944116 + chunk.1..12 + chunk.20, IoStore paks, stored zips). The
+    /// depot root IS the OBB directory UE builds for itself
+    /// (<files>/Android/obb/<package>, targets.py "obb"), so the OBBs are read
+    /// where they land, with no second copy; the APK beside them is what the hub
+    /// derives metro.apk and metro/assets from (KleptonHubPrep.swift). Ownership
+    /// is Steam's (no depot key without a licence), and in game the real account
+    /// answers through the Steam bridge.
+    static let metro = SteamGameDescriptor(
+        target: "metro", title: "Metro Awakening", appID: 2669410,
+        depots: [2669412], osFilter: nil, branch: "public",
+        dataSubpath: "android-files/Android/obb/com.vertigogames.ImpactDevelopment",
+        legacyDataSubpath: nil,
+        include: { _ in true },
+        presenceProbes: ["Impact-Android-Shipping-arm64.apk",
+                         "main.944116.com.vertigogames.ImpactDevelopment.obb"],
+        approxBytes: 19_300_000_000,
+        verifyNextLaunchKey: "kl.steam.verifyNextLaunch.metro",
+        apk: "Impact-Android-Shipping-arm64.apk")
+
     /// One line per downloadable game.
     static let all: [String: SteamGameDescriptor] = [
         "alyx": alyx,
         "superhot": superhot,
+        "metro": metro,
     ]
 
     static func descriptor(for target: String) -> SteamGameDescriptor? { all[target] }

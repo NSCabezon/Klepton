@@ -546,6 +546,16 @@ TARGETS = {
         "kind":    "ue4",
         "product": "KleptonMetro",
         "display": "Metro Awakening",
+        # The game draws its own hands; the passthrough pair on top is a second,
+        # mismatched one.
+        "hand_matting": False,
+        # Fraction of the capped eye texture the game is told (the "Render
+        # resolution" setting starts here; in the hub, until the slider is
+        # moved). Not measured on a headset yet: a UE5 title through MoltenVK
+        # with no fixed foveation, on an M2. 0.6 is a little over a third of
+        # the capped pixels — about a Quest 2's eye — and the in-app slider
+        # goes back up if the fps allow (batman uses 0.7 on an M5).
+        "render_scale": 0.6,
     },
     "vicecity": {
         # GTA Vice City VR (GTAVCVR) — a reVC/re3 (open-source re-implementation)
@@ -1019,6 +1029,14 @@ TARGETS = {
             # to android-files/obb/ — the row's obb_raw layout, as the game reads
             # them by name. Voice packs are opt-in (MetaStore recipe `locale`).
             "batman",
+            # Metro Awakening, the Steam Frame build (app 2669410, Android depot
+            # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
+            # chunk OBBs, 19.2 GB). The depot lands straight in the OBB
+            # directory UE builds itself (android-files/Android/obb/<package>),
+            # the hub derives metro.apk and metro/assets from the APK; the
+            # runtime takes the game's Steam path (kl_jni.c maker "Valve"), so
+            # ownership is the real account's through the Steam bridge.
+            "metro",
         ],
         "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
