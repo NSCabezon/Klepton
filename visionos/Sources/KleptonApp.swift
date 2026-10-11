@@ -284,6 +284,26 @@ func klL(_ en: String, _ es: String) -> String {
     (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
 }
 
+/// What the hub may show of a store account: Steam's public persona name ("Steam: NSCabezon"),
+/// never the login name used to sign in nor the SteamID; Meta only as signed in. Logs mask login
+/// names and ids the same way, since logs end up in bug reports.
+enum KLAccountPrivacy {
+    private static let personaKey = "kl.hub.steam.persona"
+    /// Steam's public persona name, from the last logon that reported it.
+    static var steamPersona: String? {
+        get { UserDefaults.standard.string(forKey: personaKey).flatMap { $0.isEmpty ? nil : $0 } }
+        set { UserDefaults.standard.set(newValue, forKey: personaKey) }
+    }
+    /// The header/settings text for a signed-in Steam account.
+    static var steamLabel: String { steamPersona.map { "Steam: \($0)" } ?? klL("Steam ✓ signed in", "Steam ✓ con sesión") }
+    static var metaLabel: String { klL("Meta ✓ signed in", "Meta ✓ con sesión") }
+    /// First two characters + •••, for login names and ids in logs.
+    static func mask(_ s: String?) -> String {
+        guard let s, !s.isEmpty else { return "?" }
+        return String(s.prefix(2)) + "•••"
+    }
+}
+
 /// The window's root: the hub's library until a game is picked (KleptonHub.swift),
 /// then the boot window for it. A single-game build goes straight to the boot window.
 struct KleptonRootView: View {

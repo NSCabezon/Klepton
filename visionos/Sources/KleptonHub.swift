@@ -19,6 +19,7 @@
 // shows this library again. The UI says so.
 #if KL_HUB
 import SwiftUI
+import UIKit
 import Foundation
 import Combine
 #if canImport(SteamDepot)
@@ -275,7 +276,10 @@ final class HubLibraryModel: ObservableObject {
     private(set) var meta: [String: MetaContentModel] = [:]
     let metaAccount = MetaAccountModel.shared
     #endif
+    /// The login name (never shown or logged; nil = not signed in to Steam).
     @Published var account: String?
+    /// What the header shows for Steam: the public persona name, or just "signed in".
+    @Published var steamLabel = KLAccountPrivacy.steamLabel
     /// Per game: why Play was refused (not owned), or the check in progress.
     @Published var playBlock: [String: String] = [:]
     @Published var verifying: String?
@@ -345,7 +349,7 @@ final class HubLibraryModel: ObservableObject {
         case .meta:
             #if canImport(MetaStore)
             if let why = KLCatalog.metaIncompatibility(g) { return .incompatible(why) }
-            guard metaAccount.signedIn else { return .unknown("Not signed in to Meta (metastore login + push-token on the Mac)") }
+            guard metaAccount.signedIn else { return .unknown(Self.metaSignInHint) }
             guard let app = KLCatalog.metaRecipe(g.target)?.appId, let owns = metaAccount.owns(appId: app) else {
                 return .unknown(metaAccount.checking ? "Checking your Meta library…" : "Meta library not checked yet")
             }
@@ -393,7 +397,76 @@ final class HubLibraryModel: ObservableObject {
         return KLStore.allCases.filter(set.contains)
     }
 
-    /// Why a catalog game is greyed out (owned nowhere / not signed in anywhere).
+    static var metaSignInHint: String {
+        klL("Sign in to Meta on your Mac (AVP Game Hub → Accounts)",
+            "Inicia sesión en Meta en tu Mac (AVP Game Hub → Cuentas)")
+    }
+
+    /// Why a game has no store to install from, in a few words for its card: a port that needs
+    /// rebuilding, a store not signed in or not checked yet, or (only once every store answered)
+    /// not owned. `title` replaces the card's status line; `detail` is one short line under it.
+    func unavailable(_ g: KLHubGameRow) -> (title: String, detail: String?) {
+        let states = KLCatalog.stores(g.target).map { ($0, sourceState(g, $0)) }
+        if states.isEmpty {
+            return (klL("Not available", "No disponible"), klL("No store this build can download from",
+                                                                 "Ninguna tienda de la que esta versión pueda descargar"))
+        }
+        // Stores whose build this port can run; none = the port needs rebuilding.
+        let open = states.filter { if case .incompatible = $0.1 { return false }; return true }
+        if open.isEmpty {
+            return (klL("Update needed", "Hace falta actualizar"),
+                    klL("Use AVP Game Hub on your Mac to update it", "Usa AVP Game Hub en tu Mac para actualizarlo"))
+        }
+        // A store that could not be asked (not signed in / not checked yet) wins over "not owned".
+        for (st, state) in open {
+            guard case .unknown = state else { continue }
+            if st == .meta, !metaAccountSignedIn { return (klL("Sign in needed", "Falta iniciar sesión"), Self.metaSignInHint) }
+            if st == .steam, account == nil {
+                return (klL("Sign in needed", "Falta iniciar sesión"),
+                        klL("Sign in to Steam from Download", "Inicia sesión en Steam desde Descargar"))
+            }
+            if (st == .steam && checking) || (st == .meta && metaChecking) {
+                return (klL("Checking your library…", "Comprobando tu biblioteca…"), nil)
+            }
+            return (klL("Library not checked", "Biblioteca sin comprobar"),
+                    klL("\(st.label): couldn't check — use Retry at the top",
+                        "\(st.label): no se pudo comprobar — usa Reintentar arriba"))
+        }
+        return (klL("Not in your library", "No está en tu biblioteca"), nil)
+    }
+
+    private var metaAccountSignedIn: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.signedIn
+        #else
+        return false
+        #endif
+    }
+    var metaChecking: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.checking
+        #else
+        return false
+        #endif
+    }
+    /// The Meta ownership check failed (signed in, no answer).
+    var metaCheckFailed: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.signedIn && !metaAccount.checking && metaAccount.error != nil
+        #else
+        return false
+        #endif
+    }
+
+    /// Header "Retry": both stores' library checks again.
+    func retryChecks() {
+        checkUpdates()
+        #if canImport(MetaStore)
+        metaAccount.refresh(force: true)
+        #endif
+    }
+
+    /// Per store, in full (technical) — the game's settings sheet shows it under Details.
     func notInLibraryReason(_ g: KLHubGameRow) -> String {
         let parts = KLCatalog.stores(g.target).map { st -> String in
             switch sourceState(g, st) {
@@ -483,6 +556,15 @@ final class HubLibraryModel: ObservableObject {
     }
     #endif
 
+    /// The game's Meta store app id (cover art for a game with no Steam header).
+    func metaAppId(_ g: KLHubGameRow) -> String? {
+        #if canImport(MetaStore)
+        return KLCatalog.metaRecipe(g.target)?.appId
+        #else
+        return nil
+        #endif
+    }
+
     func headerURL(_ g: KLHubGameRow) -> URL? {
         #if canImport(SteamDepot)
         return SteamGames.descriptor(for: g.target)?.headerImageURL
@@ -537,14 +619,14 @@ final class HubLibraryModel: ObservableObject {
             self.verifying = nil
             switch self.metaAccount.owns(appId: app) {
             case true?:
-                NSLog("[hub] \(target): Meta app \(app) owned by user \(self.metaAccount.userId ?? "?")")
+                NSLog("[hub] \(target): Meta app \(app) owned by user \(KLAccountPrivacy.mask(self.metaAccount.userId))")
                 play()
             case false?:
                 self.playBlock[target] = "Not owned on this Meta account"
             case nil:
                 self.playBlock[target] = self.metaAccount.signedIn
                     ? "Could not confirm with Meta that you own it: \(self.metaAccount.error ?? "no answer")"
-                    : "Sign in to Meta (metastore login + push-token on the Mac) to play"
+                    : Self.metaSignInHint
             }
         }
     }
@@ -579,6 +661,8 @@ final class HubLibraryModel: ObservableObject {
         latest = [:]
         #endif
         account = nil
+        KLAccountPrivacy.steamPersona = nil
+        steamLabel = KLAccountPrivacy.steamLabel
         NSLog("[hub] signed out of Steam")
     }
 
@@ -609,14 +693,28 @@ final class HubLibraryModel: ObservableObject {
         guard !checking, let creds = try? store.load() else { return }
         account = creds.accountName
         checking = true; checkError = nil
+        checkGen += 1
+        let gen = checkGen
         let games = content.values.map(\.game)
         let hubApps = Set(games.map(\.appID))
-        Task {
+        // Never spin forever: a Steam connection that hangs ends the check here (the card
+        // shows "couldn't check" + Retry); a late answer from that attempt is dropped.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.checkTimeout))
+            guard let self, self.checking, self.checkGen == gen else { return }
+            NSLog("[hub] update check timed out after \(Int(Self.checkTimeout)) s")
+            self.checkGen += 1
+            self.checking = false
+            self.checkError = klL("timed out", "sin respuesta")
+            self.checkTask?.cancel()
+        }
+        checkTask = Task {
             let session = SteamSession(log: { NSLog("[hub] %@", $0) })
             defer { Task { await session.disconnect() } }
             do {
                 try await session.connect()
                 try await session.logOn(creds)
+                if let p = await session.personaName { KLAccountPrivacy.steamPersona = p; steamLabel = KLAccountPrivacy.steamLabel }
                 let dl = SteamDepotDownloader(session: session)
                 var found: [String: [UInt32: UInt64]] = [:]
                 for g in games {
@@ -628,12 +726,15 @@ final class HubLibraryModel: ObservableObject {
                     }
                     found[g.target] = m
                 }
+                guard gen == checkGen else { return }
                 latest = found
                 for m in content.values { m.refreshLocal() }
                 let lib = try await SteamLibrary.fetch(session: session, log: { NSLog("[hub] library: %@", $0) })
+                guard gen == checkGen else { return }
                 steamOwned = Set(lib.map(\.appID))
                 owned = lib.filter { $0.isVR && !hubApps.contains($0.appID) }
             } catch {
+                guard gen == checkGen else { return }
                 NSLog("[hub] update check failed: \(error)")
                 checkError = "\(error)"
             }
@@ -641,6 +742,11 @@ final class HubLibraryModel: ObservableObject {
         }
         #endif
     }
+
+    /// Seconds the Steam update/library check may take before it counts as failed.
+    static let checkTimeout: Double = 45
+    private var checkGen = 0
+    private var checkTask: Task<Void, Never>?
 }
 
 // MARK: - Per-game settings
@@ -652,6 +758,8 @@ final class HubLibraryModel: ObservableObject {
 /// on a scripted launch still win over everything here.
 struct HubGameSettingsView: View {
     let game: KLHubGameRow
+    /// Store availability in full (technical: versions, packages), when the card shows a short reason.
+    var details: String? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var s = KLGameSettings()
     @State private var sessions: [KLSessionRecord] = []
@@ -661,6 +769,13 @@ struct HubGameSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let details {
+                    Section {
+                        DisclosureGroup(klL("Details", "Detalles")) {
+                            Text(details).font(.footnote).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    } header: { Text(klL("Availability", "Disponibilidad")) }
+                }
                 Section {
                     Picker("Language", selection: Binding(
                         get: { KLGameLanguage(rawValue: s.language ?? "system") ?? .system },
@@ -956,8 +1071,8 @@ struct HubAppSettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    if let a = model.account {
-                        LabeledContent("Signed in as", value: a)
+                    if model.account != nil {
+                        LabeledContent(klL("Signed in", "Sesión iniciada"), value: model.steamLabel)
                         Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
                     } else {
                         Text("Not signed in. Signing in happens from a game's Download button.")
@@ -1039,11 +1154,94 @@ struct HubAppSettingsView: View {
     }
 }
 
+// MARK: - Meta cover art
+
+/// Cover art for a game whose only store is Meta: the first landscape image of its public store
+/// page (meta.com/experiences/<app id>, JSON-LD), fetched without any sign-in or cookie — the Meta
+/// token never goes to that host — and only from Meta's CDNs. Cached in Caches/hub-art; until it
+/// is there (or offline) the card keeps its plain tile.
+@MainActor
+final class HubMetaArt: ObservableObject {
+    static let shared = HubMetaArt()
+    @Published private(set) var images: [String: UIImage] = [:]
+    private var started: Set<String> = []
+
+    nonisolated private static var dir: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("hub-art", isDirectory: true)
+    }
+
+    /// The cached cover, or nil (and a fetch is started, once per app run).
+    func image(appId: String) -> UIImage? {
+        if let i = images[appId] { return i }
+        guard !appId.isEmpty, appId.allSatisfy(\.isNumber), !started.contains(appId) else { return nil }
+        started.insert(appId)
+        let file = Self.dir.appendingPathComponent("meta-\(appId).img")
+        Task {   // not from inside the view update that asked
+            let data = await Task.detached(priority: .utility) { () -> Data? in
+                if let d = try? Data(contentsOf: file), UIImage(data: d) != nil { return d }
+                guard let d = await Self.fetchCover(appId: appId) else { return nil }
+                try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
+                try? d.write(to: file, options: .atomic)
+                return d
+            }.value
+            if let data, let img = UIImage(data: data) { images[appId] = img }
+            else { NSLog("[hub] no Meta store cover for app \(appId)") }
+        }
+        return nil
+    }
+
+    nonisolated private static func fetchCover(appId: String) async -> Data? {
+        guard let page = URL(string: "https://www.meta.com/experiences/\(appId)/") else { return nil }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 30
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+        var req = URLRequest(url: page)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                     + "Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        guard let (html, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        // The page's first images are its covers (landscape, square, portrait), then screenshots.
+        var fallback: Data?
+        for url in imageURLs(String(decoding: html.prefix(400_000), as: UTF8.self)).prefix(4) {
+            guard let (img, r) = try? await session.data(from: url), (r as? HTTPURLResponse)?.statusCode == 200,
+                  let size = UIImage(data: img)?.size, size.width > 0 else { continue }
+            let ratio = size.width / max(size.height, 1)
+            if size.width >= 1024, ratio >= 1.5, ratio <= 2.1 { return img }
+            if fallback == nil, ratio >= 1 { fallback = img }
+        }
+        return fallback
+    }
+
+    nonisolated private static func imageURLs(_ html: String) -> [URL] {
+        guard let re = try? NSRegularExpression(pattern: #"<script type="application/ld\+json"[^>]*>(.*?)</script>"#,
+                                                options: [.dotMatchesLineSeparators]) else { return [] }
+        var out: [URL] = []
+        for m in re.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            guard let r = Range(m.range(at: 1), in: html),
+                  let json = try? JSONSerialization.jsonObject(with: Data(html[r].utf8)) else { continue }
+            let nodes: [Any] = (json as? [Any]) ?? ((json as? [String: Any])?["@graph"] as? [Any]) ?? [json]
+            for case let node as [String: Any] in nodes {
+                let images = (node["image"] as? [Any]) ?? node["image"].map { [$0] } ?? []
+                for image in images {
+                    let raw = (image as? String) ?? (image as? [String: Any]).flatMap { ($0["@id"] ?? $0["url"] ?? $0["contentUrl"]) as? String }
+                    guard let raw, let url = URL(string: raw), url.scheme == "https", let host = url.host?.lowercased(),
+                          host.hasSuffix(".oculuscdn.com") || host.hasSuffix(".fbcdn.net") else { continue }
+                    out.append(url)
+                }
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Library UI
 
 struct HubLibraryView: View {
     let onPlay: (String) -> Void
     @StateObject private var model = HubLibraryModel()
+    @ObservedObject private var art = HubMetaArt.shared
     #if canImport(SteamDepot)
     @ObservedObject private var cloud = KLCloudSaveModel.shared
     @MainActor private static var openedOnce = false
@@ -1071,12 +1269,14 @@ struct HubLibraryView: View {
             model.metaAccount.refresh()
             #endif
             #if canImport(SteamDepot)
-            // Once per app open: a game session ends by closing Klepton, so this is "after quit" —
+            // Once per app open: a game session ends by closing the app, so this is "after quit" —
             // where a two-way sync sends that session's saves up.
             if !Self.openedOnce { Self.openedOnce = true; KLCloudSaveModel.shared.syncAll(why: "app open") }
             #endif
         }
-        .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
+        .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in
+            HubGameSettingsView(game: g, details: model.status(g) == .notInLibrary ? model.notInLibraryReason(g) : nil)
+        }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
     }
 
@@ -1116,8 +1316,10 @@ struct HubLibraryView: View {
                           alignment: .leading, spacing: 24) {
                     ForEach(model.games) { g in card(g) }
                 }
-                Label("One game per session: when a game ends, Klepton closes. Open Klepton again "
-                      + "to come back to this library and pick another game.",
+                Label(klL("One game per session: when a game ends, AVP Game Hub closes. Open AVP Game Hub again "
+                          + "to come back to this library and pick another game.",
+                          "Un juego por sesión: al terminar una partida, AVP Game Hub se cierra. Vuelve a abrir "
+                          + "AVP Game Hub para volver a esta biblioteca y elegir otro juego."),
                       systemImage: "info.circle")
                     .font(.footnote).foregroundStyle(.secondary)
                 ownedSection
@@ -1128,35 +1330,51 @@ struct HubLibraryView: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("Klepton").font(.extraLargeTitle2.bold())
-            Text("Library").font(.title).foregroundStyle(.secondary)
+            Text("AVP Game Hub").font(.extraLargeTitle2.bold())
+            Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
             Spacer()
-            if let a = model.account {
-                Text("Steam: \(a)").font(.footnote).foregroundStyle(.secondary)
+            if model.account != nil {
+                Text(model.steamLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
             }
             #if canImport(MetaStore)
             if model.metaAccount.signedIn {
-                Text("Meta: \(model.metaAccount.userId ?? "signed in")").font(.footnote).foregroundStyle(.secondary)
+                Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
             }
             #endif
-            if model.checking {
-                ProgressView().controlSize(.small)
+            if model.checking || model.metaChecking {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.mini)
+                    Text(klL("Checking library…", "Comprobando biblioteca…"))
+                }
+                .font(.footnote).foregroundStyle(.secondary)
+                .fixedSize()
+            } else if model.checkError != nil || model.metaCheckFailed {
+                Button { model.retryChecks() } label: {
+                    Label(klL("Couldn't check · Retry", "No se pudo comprobar · Reintentar"),
+                          systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                }
+                .font(.footnote).tint(.orange)
+                .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
             } else if model.account != nil {
-                Button("Check for updates") { model.checkUpdates() }.font(.footnote)
+                Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
             }
             Button { showAppSettings = true } label: { Label("Settings", systemImage: "gearshape") }
                 .font(.footnote)
         }
     }
 
+    /// Every card has the same sections at the same heights (art, title + store pills, status,
+    /// a two-line message slot, buttons, two footer lines), so a row of cards lines up whatever
+    /// each one has to say; long text is truncated (the full text is on hover / in Settings).
     private func card(_ g: KLHubGameRow) -> some View {
         let st = model.status(g)
         let active = model.activeStore(g)
         let pickable = model.pickableStores(g)
+        let unavailable = st == .notInLibrary ? model.unavailable(g) : nil
         return VStack(alignment: .leading, spacing: 10) {
             cover(g)
             HStack(spacing: 8) {
-                Text(g.display).font(.title3.bold()).lineLimit(1)
+                Text(g.display).font(.title3.bold()).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 4)
                 // One pill per store this game can come from: owned = highlighted, otherwise dimmed.
                 ForEach(KLCatalog.stores(g.target)) { store in
@@ -1164,59 +1382,74 @@ struct HubLibraryView: View {
                 }
             }
             HStack(spacing: 6) {
-                Circle().fill(st.color).frame(width: 8, height: 8)
-                Text(st.label).font(.callout).foregroundStyle(st.color)
-                    .monospacedDigit()
+                Circle().fill(unavailable != nil ? Color.orange : st.color).frame(width: 8, height: 8)
+                Text(unavailable?.title ?? st.label).font(.callout)
+                    .foregroundStyle(unavailable != nil ? Color.orange : st.color)
+                    .monospacedDigit().lineLimit(1)
             }
-            // Owned in more than one store: the player picks which one installs/plays it (remembered).
-            if pickable.count > 1, let a = active {
-                Picker("Store", selection: Binding(get: { a }, set: { KLCatalog.choose($0, for: g.target); model.objectWillChange.send() })) {
-                    ForEach(pickable) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .disabled(HubStorage.isBusy(model, g.target))
-            }
-            if st == .notInLibrary {
-                Text(model.notInLibraryReason(g)).font(.caption).foregroundStyle(.secondary)
-            }
-            if case .working(_, let f?) = st { ProgressView(value: f) }
-            if let why = model.playBlock[g.target] {
-                Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
-            } else if model.verifying == g.target {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking your Steam license…").font(.callout) }
-            } else if model.preparing == g.target {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Preparing the game's files…").font(.callout) }
-            }
-            #if canImport(SteamDepot)
-            if let c = klCloudSaveCardLine(g.target) {
-                Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1)
-            }
-            #endif
-            if !g.bundled {
-                Text("This build carries no game code (library-only build).").font(.caption).foregroundStyle(.secondary)
-            }
+            messageSlot(g, st, unavailable: unavailable)
+                .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48, alignment: .topLeading)
+                .clipped()
             HStack(spacing: 12) {
-                Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
+                Button { play(g.target) } label: { Label(klL("Play", "Jugar"), systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
                     .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil || cloudBusy(g.target))
                 if let a = active, hasDownloadPage(g.target, a), st != .notInLibrary {
-                    Button(manageTitle(st)) { detailStore = a; detail = g.target }
+                    Button(manageTitle(st)) { detailStore = a; detail = g.target }.lineLimit(1)
                 }
-                Spacer()
+                Spacer(minLength: 0)
+                // Owned in more than one store: the player picks which one installs/plays it (remembered).
+                if pickable.count > 1, let a = active {
+                    Picker(klL("Store", "Tienda"), selection: Binding(get: { a }, set: { KLCatalog.choose($0, for: g.target); model.objectWillChange.send() })) {
+                        ForEach(pickable) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
+                    .disabled(HubStorage.isBusy(model, g.target))
+                }
                 Button { settingsFor = g } label: { Label("Settings", systemImage: "gearshape") }
                     .labelStyle(.iconOnly)
-                    .help("Language and immersion for this game")
+                    .help(klL("Language and immersion for this game", "Idioma e inmersión de este juego"))
             }
-            Text(HubGameSettingsView.summary(g.target))
-                .font(.caption).foregroundStyle(.secondary)
-            if let r = model.lastSession[g.target] {
-                Text(HubSessionText.card(r))
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(HubGameSettingsView.summary(g.target)).lineLimit(1)
+                // Always two lines tall, with or without a last session.
+                Text(model.lastSession[g.target].map(HubSessionText.card) ?? " ").lineLimit(1).monospacedDigit()
             }
+            .font(.caption).foregroundStyle(.secondary)
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
-        .opacity(st == .notInLibrary ? 0.55 : 1)
+        .opacity(st == .notInLibrary ? 0.7 : 1)
+    }
+
+    /// The card's variable part, at most two short lines: why Play was refused, a check or
+    /// preparation in progress, why the game can't be installed, download progress, cloud saves.
+    @ViewBuilder private func messageSlot(_ g: KLHubGameRow, _ st: HubLibraryModel.Status,
+                                          unavailable: (title: String, detail: String?)?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let why = model.playBlock[g.target] {
+                Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
+                    .lineLimit(2).help(why)
+            } else if model.verifying == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(klL("Checking your license…", "Comprobando tu licencia…")).font(.callout) }
+            } else if model.preparing == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(klL("Preparing the game's files…", "Preparando los archivos del juego…")).font(.callout) }
+            } else if let u = unavailable {
+                if let d = u.detail { Text(d).font(.callout).foregroundStyle(.secondary).lineLimit(2).help(d) }
+            } else if case .working(_, let f?) = st {
+                ProgressView(value: f)
+            }
+            #if canImport(SteamDepot)
+            if unavailable == nil, model.playBlock[g.target] == nil, let c = klCloudSaveCardLine(g.target) {
+                Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1).lineLimit(1)
+            }
+            #endif
+            if !g.bundled {
+                Text(klL("This build carries no game code (library-only build).",
+                         "Esta versión no incluye el código del juego (solo biblioteca)."))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
     }
 
     /// A plain text pill per store (no logo artwork): Steam slate blue, Meta bright blue.
@@ -1270,7 +1503,7 @@ struct HubLibraryView: View {
     }
 
     private func cover(_ g: KLHubGameRow) -> some View {
-        // Steam header art is 460x215.
+        // Steam header art is 460x215; a Meta-only game gets its store page's landscape cover.
         ZStack {
             RoundedRectangle(cornerRadius: 14).fill(.quaternary)
             Text(g.display).font(.headline).foregroundStyle(.secondary).padding()
@@ -1278,6 +1511,8 @@ struct HubLibraryView: View {
                 AsyncImage(url: url) { phase in
                     if let img = phase.image { img.resizable().scaledToFill() } else { Color.clear }
                 }
+            } else if let id = model.metaAppId(g), let img = art.image(appId: id) {
+                Image(uiImage: img).resizable().scaledToFill()
             }
         }
         .aspectRatio(460.0 / 215.0, contentMode: .fit)
