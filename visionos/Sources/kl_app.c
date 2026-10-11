@@ -408,7 +408,13 @@ int kl_app_configure(const char *resources, const char *container) {
         // 38% fps and 1.7 GB at the same resolution and did not remove the
         // jaggies (2026-10-08, D2/D3). The OpenVR knobs are the M1 pipeline,
         // the best picture of the on-device bisect.
-        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 0", 0);
+        // KL_ALYX_MSAA=4 (the hub's Antialiasing setting, applied before
+        // configure) picks level 1 (4x MSAA) instead; a KL_GLIBC_ARGS from the
+        // launch environment still wins over both.
+        const char *msaa = getenv("KL_ALYX_MSAA");
+        setenv("KL_GLIBC_ARGS", (msaa && atoi(msaa) >= 4)
+               ? "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 1"
+               : "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 0", 0);
         setenv("KL_OPENVR_MINIMAL", "1", 0);
         setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
         setenv("KL_REPROJECT_OFF", "0", 0);
