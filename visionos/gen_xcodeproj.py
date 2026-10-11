@@ -272,7 +272,7 @@ USAGE_DESCRIPTIONS = {
     "NSHandsTrackingUsageDescription": "Klepton maps your hands onto the guest's two Touch controllers.",
     "NSAccessoryTrackingUsageDescription": "Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.",
     "NSBluetoothAlwaysUsageDescription": "Klepton connects to spatial controllers that are not visible to the system as standard game controllers.",
-    "NSLocalNetworkUsageDescription": "Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.",
+    "NSLocalNetworkUsageDescription": "Finds the Mac that streams your game to the headset (Play from Mac), and the PCs Steam Link streams from.",
 }
 _usage_settings = "".join(
     '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
