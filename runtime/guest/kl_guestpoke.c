@@ -187,7 +187,12 @@ static int addr_mapped(const void *p, size_t len) {
 // dispatches through. The process then dies in an unrelated subsystem thousands
 // of frames later, on device and in the viewer alike, branching through a slot
 // holding whatever the page held. Stale unit-0 textures are the lesser fault.
-struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use; };
+//
+// `target`, when set, narrows `use` to that one target: the offsets belong to
+// the Unity build, but whether raising the cap is safe was shown per title
+// (Beat Saber 1.40 is a 2022.3 build that dies when it is raised).
+struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use;
+                      const char *target; };
 static const struct poke_cap_row k_poke_caps[] = {
     // Unity 2019.4.21f1 — I Expect You To Die 1.2.174682 (2026-10-08). BEFORE
     // the bare "2019.4" row below, which would otherwise claim it by prefix and
@@ -204,10 +209,26 @@ static const struct poke_cap_row k_poke_caps[] = {
     // the room renders correctly, and 6000 headless frames plus ~2300 viewer
     // frames ran clean. Beat Saber's poisoning needed a unit at or past the
     // combined limit (64..67); nothing here reaches it.
-    { "2019.4.21f1", 0x1101480, 0xe8, 1 },
+    { "2019.4.21f1", 0x1101480, 0xe8, 1, "ieytd" },
+    // Unity 2019.4.36f1 — Eye of the Temple 1.528 (2026-10-10). 1.28 million
+    // "Invalid texture unit!" in 45 seconds at the cap of 32, and every texture
+    // in the game black. Measured by the recipe above against this build's
+    // libunity:
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_guestpoke.c
+    // (this row, the 2022.3.62f3 row and the per-target `target` narrowing).
+    //   0xdad5f4   "OpenGL Error: Invalid texture unit!"
+    //   0x404730   bl 0x2e1bac            ; the singleton getter
+    //   0x404734   ldr w8, [x0, #0xe8]    ; the cap
+    //   0x404738   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x2e1bac   adrp x8, 0x112b000 / ldr x0, [x8, #0xec0]
+    // 0x112bec0 lands in the RW LOAD's BSS (va 0x10729c0, filesz 0x5c568 <
+    // memsz 0x15a6f0), a singleton pointer filled at runtime. Field 0xe8 as on
+    // the other 2019 builds. BEFORE the "2019.4" row because the match is a
+    // prefix test and takes the first hit; that row is Beat Saber's build.
+    { "2019.4.36f1", 0x112bec0, 0xe8, 1, "x5361030930653377" },
     // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
     // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
-    { "2019.4", 0x122e340, 0xe8, 0 },
+    { "2019.4", 0x122e340, 0xe8, 0, NULL },
     // Unity 2022.3 — Beat Saber 1.40 (2026-08-12). Measured by the recipe above:
     //   0x14b20b  "OpenGL Error: Invalid texture unit!"
     //   0xbd29b8  bl 0x6420f0            ; the singleton getter
@@ -221,7 +242,7 @@ static const struct poke_cap_row k_poke_caps[] = {
     // test, and VRChat is a different 2022.3 build with a different singleton,
     // so a "2022.3" key would aim this store at Beat Saber's address inside
     // VRChat's libunity. A minor version is not a build.
-    { "2022.3.33f1", 0x13d7cc0, 0xec, 0 },
+    { "2022.3.33f1", 0x13d7cc0, 0xec, 0, NULL },
     // Unity 2022.3.22f2-DWR — VRChat (2026-08-13). Same recipe, and the guard
     // is INLINE in this build rather than behind a getter, so steps 3 and 4
     // collapse into one read:
@@ -234,7 +255,7 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x19943c0 lands in the RW LOAD's BSS (va 0x18c7970, filesz 0x1ca90 <
     // memsz 0x111676), which is what a singleton pointer filled at runtime
     // looks like.
-    { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1 },
+    { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1, NULL },
     // Unity 2019.1.10f1 — Liminal (2026-08-23). The engine was rejecting units
     // >= 32 ~68k times a session, so its dialog/dynamic text sampled a stale
     // unit-0 texture and rendered as tofu boxes. Measured by the recipe above
@@ -247,7 +268,20 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x149e280 lands in the RW LOAD (va 0x13b2000, memsz 0x1b3d18 -> 0x1565d18),
     // a singleton pointer filled at runtime. Field 0xe8 is the same slot 2019.4
     // uses; the singleton address is this build's own.
-    { "2019.1.10f1", 0x149e280, 0xe8, 1 },
+    { "2019.1.10f1", 0x149e280, 0xe8, 1, NULL },
+    // Unity 2022.3.62f3 — Keep Talking and Nobody Explodes 1.10.15 (2026-10-10).
+    // ~21k "Invalid texture unit!" in one short session at the cap of 32; none
+    // at boot once raised. Measured by the recipe above against the __klelf
+    // ELF inside this build's libunity framework:
+    //   0x120002   "OpenGL Error: Invalid texture unit!"
+    //   0xa20418   bl 0x50e4b4            ; the singleton getter
+    //   0xa2041c   ldr w8, [x0, #0xec]    ; the cap
+    //   0xa20420   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x50e4b4   adrp x8, 0x10cd000 / ldr x0, [x8, #0x2c0]
+    // 0x10cd2c0 lands in the last RW LOAD's BSS (va 0x104ef20, filesz 0x19180 <
+    // memsz 0x103c60), a singleton pointer filled at runtime. Used on this
+    // title only; another title on the same build is told it was declined.
+    { "2022.3.62f3", 0x10cd2c0, 0xec, 1, "x2010043642376517" },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
@@ -286,7 +320,13 @@ void kl_guest_poke_texture_unit_cap(void) {
         }
     // A row that exists and is not used declines by name, so the absence of a
     // raise on a build the offsets ARE known for never reads as an unlisted one.
-    if (row && !row->use && !pv) {
+    int use = row && row->use;
+    if (use && row->target) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        use = t && strcmp(t, row->target) == 0;
+    }
+    if (row && !use && !pv) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: not raised on Unity %s — the "
                         "engine's own 32-unit check is what keeps an out-of-range unit out "
                         "of its GL state cache, and raising it trades stale unit-0 textures "
@@ -307,6 +347,11 @@ void kl_guest_poke_texture_unit_cap(void) {
                 ver ? ver : "an unknown version");
         return;
     }
+    // The reference row is the plain "2019.4" one (Beat Saber's build), which is
+    // no longer first now that a narrower 2019.4 row has to precede it.
+    if (!row)
+        for (size_t i = 0; i < POKE_NROWS; i++)
+            if (strcmp(k_poke_caps[i].ver, "2019.4") == 0) { row = &k_poke_caps[i]; break; }
     if (!row) row = &k_poke_caps[0];
     const uint32_t POKE_SINGLETON = row->singleton;
     const uint32_t POKE_FIELD     = row->field;

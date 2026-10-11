@@ -1,10 +1,13 @@
 // The hub's last step before booting an APK game: derive, on the headset, what
-// the runtime reads, from the data the headset downloaded itself.
+// the runtime reads, from the data the headset downloaded itself (from Steam or,
+// through MetaStore, from Meta's store — whichever store is active for the game,
+// KLCatalog.sourceAPK).
 //
 // A single-game build has run.sh/stage_assets.sh push three things from the
 // Mac into the container: <tree>.apk, the apktool tree's <tree>/assets, and the
 // two metadata files beside it. The hub stages nothing (its games download their
-// own data), so for a game whose Steam depot is an APK (SteamGameDescriptor.apk)
+// own data), so for a game whose download is an APK (SteamGameDescriptor.apk, or
+// a Meta recipe's apk file in <container>/meta/; its OBBs land in place already)
 // this does the same on device, laid out exactly as kl_app_configure expects
 // under the game's container root (Documents/games/<target>/):
 //
@@ -50,9 +53,9 @@ enum HubPrep {
                     if (try? Data(contentsOf: url)) != data { try data.write(to: url, options: .atomic) }
                 }
             }
-            #if canImport(SteamDepot)
-            guard let game = SteamGames.descriptor(for: row.target), let depotAPK = game.apk else { return nil }
-            let src = game.root.appendingPathComponent(depotAPK)
+            // The APK the active store downloaded (Steam depot or Meta recipe; KleptonCatalog.swift).
+            guard let source = KLCatalog.sourceAPK(row.target) else { return nil }
+            let src = source.url, depotAPK = source.label
             guard let attrs = try? fm.attributesOfItem(atPath: src.path) else {
                 return "\(depotAPK) has not been downloaded"
             }
@@ -69,7 +72,7 @@ enum HubPrep {
                 } catch {
                     try fm.createSymbolicLink(at: dst, withDestinationURL: src)
                 }
-                NSLog("[hub] \(row.target): \(row.apk) -> \(game.dataSubpath)/\(depotAPK)")
+                NSLog("[hub] \(row.target): \(row.apk) -> \(depotAPK)")
             }
 
             // The small assets/ entries.
@@ -91,7 +94,6 @@ enum HubPrep {
             try stamp.write(to: stampURL, atomically: true, encoding: .utf8)
             NSLog("[hub] \(row.target): extracted \(n) assets/ entries (\(bytes) bytes) from \(depotAPK) "
                   + "in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
-            #endif
             return nil
         } catch {
             return "\(error)"

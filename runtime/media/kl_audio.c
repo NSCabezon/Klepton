@@ -44,6 +44,8 @@ static void         watchdog_start(void);
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // unit lifecycle only
 
 static unsigned g_in_rate, g_in_ch, g_in_bits;   // the guest's format
+static kl_audio_tap_fn g_tap;                    // kl_audio_set_tap
+static _Atomic int     g_mute_local;
 static unsigned g_out_ch = 2;
 static double   g_out_rate;                      // the device's, measured
 static double   g_session_rate;                  // what Swift told us, if anything
@@ -79,6 +81,26 @@ static int src_slot(const void *key) {
     for (int i = 0; i < g_src_n; i++) if (g_src_key[i] == key) return i;
     if (g_src_n < KL_AU_MAX_SRC) { g_src_key[g_src_n] = key; g_src_pos[g_src_n] = 0; return g_src_n++; }
     return 0;
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_audio.c
+// A producer that is gone. Without this a closed stream's key stays in the
+// table for the life of the process: a guest that opens and closes its stream
+// repeatedly fills all four slots, and from the second one on every write takes
+// the MIXING path against cursors nobody advances.
+void kl_audio_src_release(const void *key) {
+    if (!key) return;
+    pthread_mutex_lock(&g_wlock);
+    for (int i = 0; i < g_src_n; i++)
+        if (g_src_key[i] == key) {
+            for (int k = i + 1; k < g_src_n; k++) {
+                g_src_key[k - 1] = g_src_key[k];
+                g_src_pos[k - 1] = g_src_pos[k];
+            }
+            g_src_n--;
+            break;
+        }
+    pthread_mutex_unlock(&g_wlock);
 }
 
 // A driver-set floor for the fill target, in ms (0 = none). See kl_audio_open.
@@ -266,6 +288,10 @@ static OSStatus render_cb(void *ref, AudioUnitRenderActionFlags *flags,
     }
     atomic_fetch_add_explicit(&g_frames_played, take, memory_order_relaxed);
     atomic_store_explicit(&g_r, r + take, memory_order_release);
+    // The stream host's "the headset plays it": consumed at the device's
+    // rate as always (the clock), heard nowhere here.
+    if (atomic_load_explicit(&g_mute_local, memory_order_relaxed))
+        memset(dst, 0, want * g_out_ch * sizeof(float));
     return noErr;
 }
 
@@ -387,6 +413,11 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     }
     if (g_open) unit_destroy();
     g_open = 0;
+    // A different format is a different ring: every source cursor described
+    // the old one. (Lock order g_lock -> g_wlock is this function's only.)
+    pthread_mutex_lock(&g_wlock);
+    g_src_n = 0;
+    pthread_mutex_unlock(&g_wlock);
 
     g_in_rate = rate; g_in_ch = channels; g_in_bits = bits;
     g_out_ch = channels == 1 ? 1 : 2;
@@ -746,11 +777,20 @@ size_t kl_audio_write(const void *pcm, size_t bytes) {
     return kl_audio_write_src(NULL, pcm, bytes);
 }
 
+int kl_audio_peak(void) { return g_peak; }
+
+void kl_audio_set_tap(kl_audio_tap_fn fn, int mute_local) {
+    g_tap = fn;
+    atomic_store_explicit(&g_mute_local, mute_local ? 1 : 0, memory_order_relaxed);
+}
+
 size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     if (!g_open || !pcm || !bytes) return 0;
     unsigned in_frame = g_in_ch * 2;              // 16-bit, checked at open
     size_t n = bytes / in_frame;
     if (!n) return 0;
+    kl_audio_tap_fn tap = g_tap;
+    if (tap) tap(src, (const int16_t *)pcm, n, g_in_rate, g_in_ch);
 
     int peak = 0;
     const int16_t *s16 = (const int16_t *)pcm;

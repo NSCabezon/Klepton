@@ -42,3 +42,16 @@
 // the user's real Steam account through a backend the app registers
 // (KleptonSteamBridge.swift), and the app says "playing off" on teardown.
 #import "kl_steam_bridge.h"
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) visionos/Sources/Klepton-Bridging-Header.h.
+// One call, declared here rather than importing kl_mediandk.h: that header is
+// the guest-facing media table and wants <stdio.h> and CoreVideo context the
+// Swift side has no other use for.
+void kl_mediandk_set_video_default(int on);
+// ...and by two for the in-game quick settings and performance overlay
+// (KleptonQuickSettings.swift): kl_gpu_time's live timing switch and running
+// total (the overlay's GPU ms, the session record's average), and kl_openvr's
+// console entry point (Alyx's antialiasing changed live via vr_fidelity_level).
+// Foveation's live switch is in kl_vulkan.h, already above.
+#import "kl_gpu_time.h"
+#import "kl_openvr.h"
+#import "kl_stream_client.h"

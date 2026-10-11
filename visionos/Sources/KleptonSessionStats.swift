@@ -58,6 +58,14 @@ struct KLSessionRecord: Codable, Identifiable, Equatable {
     var compositorFrames: UInt64
     var reprojectedFrames: UInt64
     var peakFootprintMB: Int
+    /// The guest's GPU ms per frame, averaged over the frames that were timed
+    /// (kl_gpu_time: KL_GPU_TIME, or while the performance overlay was on).
+    /// nil when nothing was timed. Added later: older lines decode without it.
+    /// "mac" for a "Jugar desde el Mac" session (the game ran on the Mac and the
+    /// frames counted are the stream's); nil for a game that ran here.
+    var source: String? = nil
+    var gpuMsAvg: Double? = nil
+    var gpuFrames: UInt64? = nil
 }
 
 /// The session files: Application Support/sessions/<target>.jsonl.
@@ -137,6 +145,7 @@ final class KLSessionStats {
         var pendingReused: UInt64 = 0      // reused since the last new guest frame
         var winNs: UInt64 = 0, winFrames: UInt64 = 0
         var winMin = Double.infinity, winMax = 0.0
+        var maxIntervalNs: UInt64 = 0      // worst play interval since the overlay last read it
     }
 
     private let lock: UnsafeMutablePointer<os_unfair_lock> = {
@@ -153,8 +162,12 @@ final class KLSessionStats {
     private var ticks = 0
     private var peakFootprint: UInt64 = 0
     private var finished = false
-    private let id = UUID().uuidString
+    private var id = UUID().uuidString
     private var target = ""
+    private var source: String?
+    /// Set by prepareStream before the immersive space opens; read by begin().
+    private var pendingStream: String?
+    private var atexitArmed = false
 
     private init() {
         hist.initialize(repeating: 0, count: Self.bins)
@@ -173,8 +186,10 @@ final class KLSessionStats {
         if first { c.started = true; c.startNs = Self.nowNs(); c.startWall = Date() }
         os_unfair_lock_unlock(lock)
         guard first else { return }
-        target = klTargetName()
-        atexit { KLSessionStats.shared.finish(reason: "exit") }
+        os_unfair_lock_lock(lock); let stream = pendingStream; pendingStream = nil; os_unfair_lock_unlock(lock)
+        target = stream ?? klTargetName()
+        source = stream != nil ? "mac" : nil
+        if !atexitArmed { atexitArmed = true; atexit { KLSessionStats.shared.finish(reason: "exit") } }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
         t.setEventHandler { [weak self] in self?.tick() }
@@ -210,6 +225,7 @@ final class KLSessionStats {
             } else {
                 c.playNs &+= d
                 c.guestFrames &+= 1
+                if d > c.maxIntervalNs { c.maxIntervalNs = d }
                 c.reprojected &+= c.pendingReused
                 let bin = min(Int(d / 250_000), Self.bins - 1)
                 hist[bin] &+= 1
@@ -224,6 +240,34 @@ final class KLSessionStats {
         }
         c.pendingReused = 0
         c.lastNewNs = now
+    }
+
+    // MARK: streams ("Jugar desde el Mac")
+
+    /// The immersive space about to open shows `target` streamed from the Mac: no
+    /// KL_TARGET is set in that mode, so the session is filed under `target` and
+    /// marked as a stream.
+    func prepareStream(target: String) {
+        os_unfair_lock_lock(lock); pendingStream = target; os_unfair_lock_unlock(lock)
+    }
+
+    /// The stream ended (the process goes back to the library and stays alive):
+    /// persist a final line and reset, so another stream is a session of its own.
+    func endStream(reason: String) {
+        queue.sync {
+            os_unfair_lock_lock(lock); let started = c.started; os_unfair_lock_unlock(lock)
+            guard started, !finished, source != nil else { return }
+            timer?.cancel(); timer = nil
+            persist(final: true, reason: reason, log: true)
+            os_unfair_lock_lock(lock)
+            c = Counters()
+            hist.update(repeating: 0, count: Self.bins)
+            pendingStream = nil
+            os_unfair_lock_unlock(lock)
+            id = UUID().uuidString
+            source = nil
+            ticks = 0
+        }
     }
 
     // MARK: checkpoints
@@ -257,6 +301,50 @@ final class KLSessionStats {
         guard !finished else { return }
         let log = ticks % 60 == 0
         if ticks % 30 == 0 || log { persist(final: false, reason: "periodic", log: log) }
+    }
+
+    /// The process's physical footprint and the kernel's lifetime peak, bytes.
+    static func footprint() -> (now: UInt64, peak: UInt64)? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return (info.phys_footprint, UInt64(max(0, info.ledger_phys_footprint_peak)))
+    }
+
+    /// The running counters the performance overlay differentiates (two reads
+    /// half a second apart give that half second's rates). One lock round trip.
+    struct Live {
+        var guestFrames: UInt64 = 0
+        var playNs: UInt64 = 0
+        var compFrames: UInt64 = 0
+        var compIntervalNs: UInt64 = 0
+        var compIntervals: UInt64 = 0
+        var reprojected: UInt64 = 0
+        var pendingReused: UInt64 = 0
+        var lastNewNs: UInt64 = 0
+    }
+    func live() -> Live {
+        os_unfair_lock_lock(lock)
+        let s = c
+        os_unfair_lock_unlock(lock)
+        return Live(guestFrames: s.guestFrames, playNs: s.playNs, compFrames: s.compFrames,
+                    compIntervalNs: s.compIntervalNs, compIntervals: s.compIntervals,
+                    reprojected: s.reprojected, pendingReused: s.pendingReused, lastNewNs: s.lastNewNs)
+    }
+    static var nowNsPublic: UInt64 { nowNs() }
+
+    /// The worst guest frame interval since the last call, ms (nil: none), and reset.
+    func takeMaxIntervalMs() -> Double? {
+        os_unfair_lock_lock(lock)
+        let m = c.maxIntervalNs
+        c.maxIntervalNs = 0
+        os_unfair_lock_unlock(lock)
+        return m > 0 ? Double(m) / 1e6 : nil
     }
 
     private func samplePeak() {
@@ -302,7 +390,9 @@ final class KLSessionStats {
         }
         func fps(_ ms: Double?) -> Double? { ms.map { 1000 / $0 } }
         let playS = Double(s.playNs) / 1e9
-        return KLSessionRecord(
+        var gpuSum = 0.0, gpuN: UInt64 = 0
+        kl_gpu_time_totals(&gpuSum, &gpuN)
+        var r = KLSessionRecord(
             id: id, target: target, build: Self.buildStamp,
             start: s.startWall, end: Date(), final: final, endReason: reason,
             durationS: Double(now &- s.startNs) / 1e9,
@@ -318,6 +408,9 @@ final class KLSessionStats {
             compositorFrames: s.compFrames,
             reprojectedFrames: s.reprojected,
             peakFootprintMB: Int(peakFootprint >> 20))
+        if gpuN > 0 { r.gpuMsAvg = gpuSum / Double(gpuN); r.gpuFrames = gpuN }
+        r.source = source
+        return r
     }
 
     private func persist(final: Bool, reason: String, log: Bool) {
@@ -333,11 +426,12 @@ final class KLSessionStats {
             ? String(format: "%llu of %llu (%.0f%%)", r.reprojectedFrames, r.compositorFrames,
                      100 * Double(r.reprojectedFrames) / Double(r.compositorFrames))
             : "0"
-        return "\(r.target) \(dur(r.durationS))\(r.final ? " FINAL (\(r.endReason))" : ""): "
+        return "\(r.target)\(r.source == "mac" ? " (stream from the Mac)" : "") \(dur(r.durationS))\(r.final ? " FINAL (\(r.endReason))" : ""): "
             + "guest \(f(r.fpsAvg)) fps avg, 1% low \(f(r.fps1Low)), 5% low \(f(r.fps5Low)), "
             + "5s min/max \(f(r.fpsMin5s))/\(f(r.fpsMax5s)), median frame \(f(r.frameMsP50)) ms; "
             + "play \(dur(r.playS)), loading \(dur(r.loadingS)); display \(f(r.displayHz)) Hz, "
             + "reprojected \(reproj) compositor frames; peak footprint \(r.peakFootprintMB) MB; "
+            + (r.gpuMsAvg.map { String(format: "GPU %.1f ms/frame over %llu timed frames; ", $0, r.gpuFrames ?? 0) } ?? "")
             + "build \(r.build)"
     }
 

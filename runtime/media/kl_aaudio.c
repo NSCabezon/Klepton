@@ -30,6 +30,7 @@
 
 #include "klepton.h"
 #include "kl_audio.h"
+#include "kl_opensl.h"
 
 // ---------------------------------------------------------------------------
 // The ABI's own numbers, transcribed from <aaudio/AAudio.h>. The guest tests
@@ -140,6 +141,10 @@ typedef struct klaa_stream {
 // measured does that; this counter is here so that if it ever happens the log
 // says so rather than the sound going strange.
 static int g_open_streams;      // OUTPUT streams sharing the one output device
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/media/kl_aaudio.c
+// (output-rate sharing with OpenSL, AC Nexus burst, KL_AAUDIO_TRACE)
+static unsigned g_output_rate;  // the rate they opened it at; 0 with none open
+unsigned kl_aaudio_output_rate(void) { return g_open_streams ? g_output_rate : 0; }
 static int g_input_streams;     // INPUT streams sharing the one capture device
 static unsigned long g_short_writes;
 static int g_input_refusals;    // input opens declined because the mic was off
@@ -151,7 +156,17 @@ static int klaa_burst_frames(void) {
     // is configured in multiples of. AAudio's real burst is the HAL's; the
     // guest only uses it to size its buffer, so any sane value works and a
     // small one keeps the callback rate close to Android's.
-    if (n < 32 || n > 8192) n = 240;
+    if (n < 32 || n > 8192) {
+        n = 240;
+        // AC Nexus's Wwise (2019.2) mixes in larger blocks than that and its
+        // AAudio sink runs dry between them when it is asked for 240 frames at
+        // a time: "Voice Starvation" 225 times a minute, a steady crackle, with
+        // the device ring itself never underrunning. Asked for 1024 it logged
+        // one starvation in a 50 s run and the crackle was gone.
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "x5812519008825194") == 0) n = 1024;
+    }
     return n;
 }
 
@@ -165,6 +180,16 @@ static int klaa_bytes_per_frame(const klaa_stream *s) {
 // ---------------------------------------------------------------------------
 // The feeder. One per started stream; the only thing on it besides guest code
 // is a format conversion and the blocking write that paces it.
+
+// KL_AAUDIO_TRACE=1: every state / buffer / underrun question a guest asks of a
+// stream, with the answer. A sink that closes and reopens its stream in a loop
+// is reacting to one of these, and nothing else says which.
+static int klaa_trace(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_AAUDIO_TRACE", 0);
+    return on;
+}
+#define KLAA_T(...) do { if (klaa_trace()) fprintf(stderr, "  [aaudio] " __VA_ARGS__); } while (0)
 
 static void *klaa_feeder(void *arg) {
     // Audio feeder at HIGH QoS. At default QoS this thread is throttled the
@@ -194,6 +219,7 @@ static void *klaa_feeder(void *arg) {
                                : AAUDIO_CALLBACK_RESULT_STOP;
         s->callbacks++;
         s->frames += (unsigned long)frames;
+        if (s->callbacks <= 3) KLAA_T("data callback #%lu (%d frames) -> %d\n", s->callbacks, frames, r);
 
         // Convert to the 16-bit PCM kl_audio takes. I16 is a straight handoff;
         // float is the other format this guest could plausibly ask for, and it
@@ -641,6 +667,10 @@ static aaudio_result_t klaa_openStream(klaa_builder *b, klaa_stream **out) {
     // paces with usleep, which is the null-audio behaviour every earlier
     // measurement was taken against.
     kl_audio_open((unsigned)rate, (unsigned)channels, 16);
+    // ...and it is ours now: an OpenSL player at another rate must stop
+    // feeding it (kl_opensl.c, "two APIs, one device").
+    g_output_rate = (unsigned)rate;
+    kl_opensl_yield_device((unsigned)rate);
 
     fprintf(stderr, "  [aaudio] openStream: %d Hz, %d ch, %s, burst %d frames%s\n",
             rate, channels,
@@ -794,7 +824,13 @@ static aaudio_result_t klaa_close(klaa_stream *s) {
         if (--g_input_streams <= 0) { g_input_streams = 0; kl_audio_mic_close(); }
         free(s->in_hold);
     } else {
-        if (--g_open_streams <= 0) { g_open_streams = 0; kl_audio_close(); }
+        kl_audio_src_release(s);
+        if (--g_open_streams <= 0) {
+            g_open_streams = 0;
+            g_output_rate = 0;
+            // Not while an OpenSL player still holds the device.
+            if (!kl_opensl_audio_users()) kl_audio_close();
+        }
     }
     pthread_mutex_destroy(&s->lock);
     free(s->scratch); free(s->staging); free(s);
@@ -868,6 +904,7 @@ static int32_t klaa_getState(klaa_stream *s) {
     pthread_mutex_lock(&s->lock);
     st = s->state;
     pthread_mutex_unlock(&s->lock);
+    KLAA_T("getState -> %d\n", st);
     return st;
 }
 
@@ -905,15 +942,20 @@ static int64_t klaa_getFramesRead(klaa_stream *s) {
 // force is what the ABI asks for — setBufferSizeInFrames returns the size it
 // SETTLED on, not the one requested.
 static int32_t klaa_getBufferCapacityInFrames(klaa_stream *s) {
+    KLAA_T("getBufferCapacityInFrames -> %d\n", s ? s->buffer_size : 0);
     return s ? s->buffer_size : 0;
 }
 static int32_t klaa_getBufferSizeInFrames(klaa_stream *s) {
+    KLAA_T("getBufferSizeInFrames -> %d\n", s ? s->buffer_size : 0);
     return s ? s->buffer_size : 0;
 }
 static int32_t klaa_setBufferSizeInFrames(klaa_stream *s, int32_t frames) {
     if (!s) return AAUDIO_ERROR_NULL;
+    int32_t asked = frames;
     if (frames < s->burst) frames = s->burst;               // clamped, as the HAL does
     if (frames > s->buffer_size) frames = s->buffer_size;
+    KLAA_T("setBufferSizeInFrames(%d) -> %d (burst %d, capacity %d)\n", asked, frames,
+           s->burst, s->buffer_size);
     return frames;
 }
 
@@ -933,6 +975,7 @@ static int32_t klaa_getSessionId(klaa_stream *s) { (void)s; return -1; /* AAUDIO
 // says "never underruns", which is a claim about a device we do not have.
 static int32_t klaa_getXRunCount(klaa_stream *s) {
     (void)s;
+    KLAA_T("getXRunCount -> %d\n", (int32_t)kl_audio_underruns());
     return (int32_t)kl_audio_underruns();
 }
 

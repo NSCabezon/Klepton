@@ -24,10 +24,12 @@
 #include "../runtime/gfx/kl_glfb.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/gfx/kl_egl.h"
+#include "../runtime/gfx/kl_vulkan.h"   // kl_foz_prewarm_env
 #include "../runtime/xr/kl_openxr.h"
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
 #include "../runtime/gfx/kl_view.h"
+#include "../runtime/net/kl_stream_host.h"
 #include "../runtime/gfx/kl_hostwin.h"
 #include "../runtime/diag/kl_sample.h"
 #include "../runtime/diag/kl_mprobe.h"
@@ -129,11 +131,12 @@ static int drm_call(const char *name) {
 //   fabricated answer in the sense the refusals below are about; it is the
 //   true state of affairs for the only way this project is used.
 //
-//   DLC is a different question and stays refused, because it is one we
-//   genuinely cannot answer: paid content here is out-of-band asset data plus
-//   a licence held by a platform that is absent, and neither half is on this
-//   host to check. Claiming ownership of content we cannot see IS the
-//   circumvention, so it keeps aborting by name.
+//   (Adapted from avp-play (MIT, github.com/myMartek/avp-play) mains/m_boot.c.)
+//   DLC delivery stays refused. Claiming ownership of content we cannot see
+//   is the circumvention, so DownloadById keeps aborting. Enumerating what is
+//   already on disk is not that claim: Walkabout reports a course only when
+//   its real track bundle is present (kl_ovrplat.c). This check does not
+//   require the list to be empty — it requires the call to return.
 //
 // The two are separable because the API separates them — the viewer-entitled
 // call is about the app, the AssetFile and IAP families are about content.
@@ -188,10 +191,10 @@ static int check_drm_guard(void) {
         return fail("DRM guard did NOT abort on ovr_AssetFile_DownloadById — a "
                     "content-delivery call must never be answered");
 
-    // 3. The carve-out, in the other direction: enumerating installed DLC is
-    //    answered with "none", because that grants nothing (kl_ovrplat.c,
-    //    g_plat_absent). If this ever starts aborting the game stops at the
-    //    language select again.
+    // 3. The carve-out, in the other direction: enumerating installed asset
+    //    files must return. An empty list is the answer when nothing is on
+    //    disk; Walkabout fills it only from real course bundles. If this
+    //    aborts, the game stops at the language select again.
     r = drm_call("ovr_AssetFile_GetList");
     if (r == KLDRM_UNRESOLVED) return fail("ovr_AssetFile_GetList resolved to nothing");
     if (r == KLDRM_ABORTED)
@@ -199,8 +202,8 @@ static int check_drm_guard(void) {
                     "is a fact about this host, not a licence decision");
 
     printf("  the app's own entitlement answers yes AND completes, DLC delivery\n"
-           "  refuses and aborts (guard verified); DLC enumeration answers\n"
-           "  \"none\" without granting anything\n");
+           "  refuses and aborts (guard verified); course enumeration is answered\n"
+           "  from files on disk and does not fetch anything\n");
     return 0;
 }
 
@@ -481,6 +484,9 @@ static int begin_and_pump(int view_pump) {
 }
 
 static int native_door_run(int view_pump) {
+    // KL_FOZ_PREWARM: warm the Metal cache on a device of our own before the guest exists
+    // (kl_fossilize.cpp; nothing without the knob or without `make fossilize`).
+    kl_foz_prewarm_env();
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
     if (kl_driver_gap_only()) return 0;
     return begin_and_pump(view_pump);
@@ -555,6 +561,14 @@ static int recon_run(int view_pump) {
     if (TARGET->kind == KL_GUEST_STEAMLINK) return steamlink_run(view_pump);
     if (TARGET->kind == KL_GUEST_UE4 || TARGET->kind == KL_GUEST_JKXR ||
         TARGET->kind == KL_GUEST_GLIBC)
+        return native_door_run(view_pump);
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) mains/m_boot.c.
+    // A GLES3JNILib guest owns its render thread too, so once its lifecycle is
+    // asked for it needs the same wall-clock pump (KL_NATIVE_WAIT) rather than
+    // the Unity frame count below, which returns at once and lets the report —
+    // and the process — end while the engine is still creating its session.
+    // Without KL_LIFECYCLE it keeps the boot-only gate it always had.
+    if (TARGET->kind == KL_GUEST_GLES3JNI && getenv("KL_LIFECYCLE"))
         return native_door_run(view_pump);
 
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
@@ -838,6 +852,58 @@ static int view_run(void) {
     return rc;
 }
 
+// KL_STREAM_HOST=1: "Jugar desde el Mac" — the headset is the frontend. Same
+// shape as view_run (in-process guest thread, no fork, no re-exec), but the
+// main thread serves a UDP client instead of a window: poses arrive from the
+// network and every completed guest frame leaves as HEVC (kl_stream_host.c).
+//
+// The display description (frustum, IPD, rate, eye size) arrives in the
+// client's HELLO, and the guest reads some of it ONCE at boot (the display
+// rate certainly, Alyx's projection very likely), so by default the guest is
+// not started until a client has said hello. KL_STREAM_WAIT=0 boots at once
+// with the built-in Vision Pro description instead; a client that then
+// differs is applied late and the log says what that means.
+static int stream_run(void) {
+    // Alyx: the poses and frame the hub gives a LOCAL Alyx (kl_app.c's
+    // defaults), so a streamed session hands the guest the same controller
+    // pose path — M1 bridge, symmetric offer, hand velocities (gravity-glove
+    // flick) and the Touch raw frame with the inward tracked origin (the
+    // 2026-10-11 hand fix). Never overwriting: the launch environment wins.
+    // Not taken from kl_app.c: foveation and the Glovebox mobile render
+    // profile (the Mac has the GPU for full-rate, full-quality frames) and
+    // KL_GUEST_PACE_HZ (the stream host paces with KL_STREAM_LOCK_FPS).
+    if (!strcmp(TARGET->name, "alyx")) {
+        setenv("KL_OPENVR_MINIMAL", "1", 0);
+        setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
+        setenv("KL_OPENVR_SYM_PROJ", "1", 0);
+        setenv("KL_OPENVR_HAND_VEL", "1", 0);
+        setenv("KL_OPENVR_TOUCH_FRAME", "1", 0);
+        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 3", 0);
+    }
+    if (kl_stream_host_start(TARGET->name) != 0) return fail("stream host: could not start");
+    if (kl_env_on("KL_STREAM_WAIT", 1)) {
+        fprintf(stderr, "[stream-host] waiting for a client's HELLO before booting the guest "
+                        "(KL_STREAM_WAIT=0 boots now with Vision Pro defaults)\n");
+        if (!kl_stream_host_wait_hello(-1.0, &g_view_quit)) return 1;
+    } else {
+        kl_stream_host_apply_defaults();
+    }
+    kl_stream_host_install_pacer();
+    pthread_t guest;
+    if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
+        fprintf(stderr, "stream: pthread_create failed\n");
+        return 1;
+    }
+    int rc = kl_stream_host_run(&g_view_quit);
+    g_view_quit = 1;
+    // The guest is inside its own main() and is not joined: the host stopping
+    // is the process ending, exactly as closing the viewer window is.
+    pthread_detach(guest);
+    kl_driver_report(stdout);
+    fflush(NULL);
+    _exit(rc);
+}
+
 int main(int argc, char **argv) {
     TARGET = kl_target_resolve(argc > 1 ? argv[1] : NULL);
     if (!TARGET) {
@@ -882,7 +948,7 @@ int main(int argc, char **argv) {
     // wait forever for a window nobody creates; its eyes reach the viewer
     // through IVRCompositor::Submit instead.
     if (TARGET->kind == KL_GUEST_GLIBC && !kl_env_on("KL_GLIBC_HEADLESS", 0) &&
-        !getenv("KL_VIEW"))
+        !getenv("KL_VIEW") && !kl_stream_host_enabled())
         kl_flatwin_set_backend(kl_hostwin_backend());
 
     // Re-entry of the re-exec'd recon child (see below).
@@ -891,6 +957,8 @@ int main(int argc, char **argv) {
 
     if (getenv("KL_VIEW"))
         return view_run();
+    if (kl_stream_host_enabled())
+        return stream_run();
 
     printf("=== DRM policy guard ===\n");
     // Under a debugger the forked child inherits the parent's Mach exception

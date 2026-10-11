@@ -370,7 +370,21 @@ int main(int argc, char **argv) {
     // against the sites, because it has to hold for a site anywhere in them.
     #define BR_REACH (1ull << 27)                 // +/-128 MB, `b`'s imm26 << 2
     uint64_t last_end = seg_vmend[ngrp - 1];
-    int pool_high = 0;
+    //
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) tools/klepton_ld.c:
+    // ...which is the right test while one end passes it, and too strict when
+    // neither does. Marvel's Deadpool VR ships a libUE4.so whose `.text` alone is
+    // 128.0 MB (0x6fbb000..0xefbf290): no address is within reach of ALL of it,
+    // so the span test refused the library outright (2026-10-09). But the pool
+    // does not have to reach all of `.text` — only the SITES, and in the UE4
+    // libraries met so far those sit in a narrow band (RE4's 8038 were all in
+    // the top 5.2 MB). So when the span fits neither end, the sites decide: emit
+    // against the pool ABOVE, and if any site is out of its reach, put the image
+    // back and emit against the pool BELOW. Only when both leave sites
+    // unreachable is the library refused — with the counts, because then the
+    // pool really would have to be split.
+    int pool_high = 0, pool_by_sites = 0;
+    double down_mb = 0, up_mb = 0;
     if (pool_cap) {
         // Below: the furthest site is the top of .text, reaching down to the
         // pool's first byte.
@@ -378,25 +392,32 @@ int main(int argc, char **argv) {
         // Above: the pool sits past the last segment, and the furthest site is
         // the BOTTOM of .text reaching up to the pool's last byte.
         uint64_t up = align_up(last_end, PAGE) + pool_cap - (image_shift + text_lo);
+        down_mb = (double)down / (1 << 20);
+        up_mb = (double)up / (1 << 20);
         if (down >= BR_REACH && up < BR_REACH) pool_high = 1;
-        else if (down >= BR_REACH)
-            die("%s: .text spans %#llx..%#llx (%.1f MB) and no single veneer pool "
-                "is within `b`'s +/-128 MB of all of it — %.1f MB below, %.1f MB "
-                "above. The pool would have to be split per region.",
-                in, (unsigned long long)text_lo, (unsigned long long)text_hi,
-                (double)(text_hi - text_lo) / (1 << 20),
-                (double)down / (1 << 20), (double)up / (1 << 20));
+        else if (down >= BR_REACH) pool_by_sites = pool_high = 1;
     }
     if (pool_high) pool_va = align_up(last_end, PAGE);
 
     uint8_t *pool = NULL;
     if (pool_cap) { pool = calloc(1, (size_t)pool_cap); if (!pool) die("out of memory"); }
+    // The image as it is now (TLS already rewritten), for the second attempt.
+    uint8_t *pristine = NULL;
+    if (pool_by_sites) {
+        pristine = malloc((size_t)sb.st_size);
+        if (!pristine) die("out of memory");
+        memcpy(pristine, img, (size_t)sb.st_size);
+    }
 
     // Pass 2: emit. Each section's veneers take the next slice of the pool, and
     // the addresses handed in are the ones the code will have once mapped — the
     // buffers here are a file image, not a mapping.
     kl_x18_stats x18st = {0};
     uint64_t pool_off = 0;
+    unsigned far_above = 0;
+    for (int attempt = 0; ; attempt++) {
+    x18st = (kl_x18_stats){0};
+    pool_off = 0;
     for (int i = 0; i < eh->e_shnum && pool_cap; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         uint64_t cursor = sh[i].sh_addr, cva;
@@ -416,9 +437,33 @@ int main(int argc, char **argv) {
             x18st.ctr_sites   += st.ctr_sites;
             x18st.ctr_patched += st.ctr_patched;
             x18st.ctr_refused += st.ctr_refused;
+            x18st.far_refused += st.far_refused;
             pool_off          += used;
         }
     }
+    if (!pool_by_sites || !x18st.far_refused) break;
+    if (attempt == 1)
+        die("%s: .text spans %#llx..%#llx (%.1f MB) and no single veneer pool "
+            "reaches every site — the pool above (%.1f MB from the bottom of "
+            ".text) leaves %u out of `b`'s +/-128 MB, the pool below (%.1f MB "
+            "from the top) leaves %u. The pool would have to be split per region.",
+            in, (unsigned long long)text_lo, (unsigned long long)text_hi,
+            (double)(text_hi - text_lo) / (1 << 20), up_mb, far_above, down_mb,
+            x18st.far_refused);
+    // Above did not reach them all. Back to the image as it was, and below.
+    far_above = x18st.far_refused;
+    memcpy(img, pristine, (size_t)sb.st_size);
+    memset(pool, 0, (size_t)pool_cap);
+    kl_x18_report_reset();
+    pool_high = 0;
+    pool_va = HDR_RESERVE;
+    }
+    free(pristine);
+    if (pool_by_sites && !quiet)
+        fprintf(stderr, "klepton-ld: %s: .text is %.1f MB, wider than one pool can "
+                        "span; the pool %s the image reaches all %u sites\n", in,
+                (double)(text_hi - text_lo) / (1 << 20), pool_high ? "above" : "below",
+                x18st.sites);
     if (x18st.refused) {
         // Same posture as the runtime loader: a refused site keeps its raw x18
         // reads Darwin's, so it is reported rather than hidden. The

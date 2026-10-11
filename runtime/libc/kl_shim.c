@@ -1885,7 +1885,7 @@ X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction
 X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
-X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
+X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename) X(klb_link)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
@@ -1914,6 +1914,7 @@ X(klb_sem_open) X(klb_sem_close)
 X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
+X(klb_clock_nanosleep) X(klb___poll_chk)
 // kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
 X(klb_getauxval)
 X(klb_fegetenv) X(klb_fesetenv) X(klb_feholdexcept) X(klb_feupdateenv)
@@ -1922,7 +1923,7 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klv___sprintf_chk) X(klv___snprintf_chk)
+X(klv___sprintf_chk) X(klv___snprintf_chk) X(klv_swprintf) X(kl_vswprintf_g)
 X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
 X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
@@ -1968,10 +1969,178 @@ static int klb_timer_getoverrun(void *t) { (void)t; return 0; }
 // host's, it only checks its own prologue value against its own epilogue value.
 uintptr_t klb_stack_chk_guard = (uintptr_t)0x00000aff0a0000ULL;  // NUL/newline bytes trap overruns
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_shim.c
+// ---------- free(), with Android's tolerance ----------
+//
+// A guest's free() is the host's free(), and the host's allocator is stricter
+// than the one the guest was written against. bionic's scudo keeps a freed
+// block in a QUARANTINE before reusing it, so a write that lands just after the
+// free — one thread still walking a buffer another thread has replaced — hits
+// memory nobody owns yet and nothing ever notices. Darwin's allocator checks a
+// free block when it hands it out again and stops the process:
+// "BUG IN CLIENT OF LIBMALLOC: memory corruption of free block", raised in
+// whichever host code allocates next (ANGLE, the Swift compositor, UIKit), which
+// is why the crash never names the guest.
+//
+// Doom3Quest does exactly this. Its renderer runs a front end and a back end on
+// two threads sharing idList<idImage*> queues: idImageManager::AddAllocList
+// appends under a critical section (and Append reallocates — new[], copy,
+// delete[] old), while GetNextAllocImage / GetNextPurgeImage remove WITHOUT it,
+// shifting elements down in a buffer the other thread may just have freed
+// (neo/renderer/Image_init.cpp, RenderSystem.cpp in the port's public source).
+// On device, 2026-10-06 and 2026-10-08: fourteen crash reports with that
+// message, all at the first frames of a level, each preceded by the back end's
+// "CAN NOT LOAD IMAGE FROM BIND" (its own AddAllocList calls).
+//
+// So a guest that asks for it gets the quarantine it was tested with: free()
+// parks the block and really frees the oldest ones once the park is over its
+// budget. The race is still the guest's — an entry can be lost exactly as on a
+// Quest — but the write lands in memory that is still allocated.
+//
+// KL_FREE_QUARANTINE_MB sets the budget (0 = plain free). OFF BY DEFAULT, for
+// every target, and for Doom3Quest in particular: it does stop that crash, and
+// on device it also broke the game's collision — invisible walls, a player who
+// could jump through ceilings, normal only while crouched (owner, 2026-10-08:
+// broken with the park, normal with KL_FREE_QUARANTINE_MB=0 on the same build,
+// still broken with the parked blocks zeroed). Why delaying reuse does that is
+// not known. What the default does instead for that guest is take the second
+// thread away (kl_gles3jni.c, r_multithread). The knob stays as an instrument.
+// Not a default to widen blindly either way: an IL2CPP guest stops its threads
+// by signal, and a thread stopped inside the lock below would hang the collector
+// (see kl_env.c for the same hazard).
+// Blocks over KLQ_MAX_BLOCK are freed at once: the park is for the small
+// buffers threads race over, not for a level's worth of image data.
+//
+// A parked block is zeroed, as Darwin's free() clears a small block it frees:
+// the park is meant to change WHEN a block becomes reusable and nothing else.
+#include <os/lock.h>
+extern const char *kl_driver_target_name(void);
+#define KLQ_SLOTS     (1u << 16)
+#define KLQ_MAX_BLOCK ((size_t)256 << 10)
+static void           *g_klq_ptr[KLQ_SLOTS];
+static uint32_t        g_klq_size[KLQ_SLOTS];
+static unsigned        g_klq_head, g_klq_n;
+static size_t          g_klq_bytes, g_klq_budget;
+static os_unfair_lock  g_klq_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic int     g_klq_on = -1;
+static uint64_t        g_klq_parked, g_klq_passed;
+
+static int klq_init(void) {
+    const char *t = kl_driver_target_name();
+    (void)t;
+    int mb = kl_env_int("KL_FREE_QUARANTINE_MB", 0);
+    if (mb < 0) mb = 0;
+    if (mb > 1024) mb = 1024;
+    g_klq_budget = (size_t)mb << 20;
+    if (mb)
+        fprintf(stderr, "  [libc] free() quarantine: %d MiB, blocks up to %zu KiB "
+                        "(KL_FREE_QUARANTINE_MB=0 for plain free)\n", mb, KLQ_MAX_BLOCK >> 10);
+    atomic_store(&g_klq_on, mb ? 1 : 0);
+    return mb ? 1 : 0;
+}
+
+static void klb_free(void *p) {
+    if (!p) return;
+    int on = atomic_load(&g_klq_on);
+    if (on < 0) on = klq_init();
+    size_t sz = on ? malloc_size(p) : 0;
+    if (!on || sz == 0 || sz > KLQ_MAX_BLOCK) {
+        if (on) g_klq_passed++;
+        free(p);
+        return;
+    }
+    memset(p, 0, sz);       // what free() would have done to it — see above
+    for (;;) {
+        void *out[16];
+        int nout = 0, parked = 0;
+        os_unfair_lock_lock(&g_klq_lock);
+        if (p && g_klq_n < KLQ_SLOTS) {
+            unsigned at = (g_klq_head + g_klq_n) % KLQ_SLOTS;
+            g_klq_ptr[at] = p;
+            g_klq_size[at] = (uint32_t)sz;
+            g_klq_n++;
+            g_klq_bytes += sz;
+            g_klq_parked++;
+            parked = 1;
+        }
+        while (nout < 16 && g_klq_n &&
+               (g_klq_bytes > g_klq_budget || g_klq_n == KLQ_SLOTS)) {
+            out[nout++] = g_klq_ptr[g_klq_head];
+            g_klq_bytes -= g_klq_size[g_klq_head];
+            g_klq_head = (g_klq_head + 1) % KLQ_SLOTS;
+            g_klq_n--;
+        }
+        int more = g_klq_n && g_klq_bytes > g_klq_budget;
+        os_unfair_lock_unlock(&g_klq_lock);
+        if (parked) p = NULL;
+        // Outside the lock: the host's free takes locks of its own.
+        for (int i = 0; i < nout; i++) free(out[i]);
+        if (!p && !more) return;
+    }
+}
+
+void kl_libc_free_report(FILE *f) {
+    if (atomic_load(&g_klq_on) <= 0) return;
+    fprintf(f, "  free() quarantine: %llu block(s) parked, %llu passed straight through; "
+               "holding %u block(s), %zu KiB\n",
+            (unsigned long long)g_klq_parked, (unsigned long long)g_klq_passed,
+            g_klq_n, g_klq_bytes >> 10);
+}
+
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
 #define E(n, f)   { n, (void *)(f) }
 #define KL_FWD(n) { #n, (void *)(n) },
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_shim.c
+// sched_setscheduler: bionic has it, Darwin does not (sched_setaffinity, the
+// sibling libvrlink_scene also calls, is already stubbed in kl_libc.c). Steam
+// Link asks for real-time scheduling on its streaming threads; visionOS owns
+// scheduling and exposes no equivalent, so this is advisory and reports success
+// without applying anything — the same shape as the perf-settings no-op. Was an
+// unresolved-import abort in the stream-setup phase.
+static int klb_sched_setscheduler(int pid, int policy, const void *param) {
+    (void)param;
+    // SCHED_FIFO(1)/SCHED_RR(2) is a real-time request; SCHED_OTHER(0) and the
+    // rest are "normal" and need nothing. visionOS has no RT policy, but it has
+    // QoS: map an RT request to USER_INTERACTIVE for that thread, through the
+    // same door the XR thread hint and Process.setThreadPriority(AUDIO) use.
+    // Steam Link's UDP-receive / decode / submit and audio threads flag
+    // THEMSELVES here; left a pure no-op their default QoS is coalesced behind
+    // the compositor, which reads to the sender as jitter (shaky view, pose and
+    // input timing) and drops audio buffers. pid 0 or our own tid is the self
+    // case; another tid goes through the live-thread registry.
+    if (policy == 1 || policy == 2) {
+        uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+        kl_pthread_boost_qos((pid == 0 || pid == (int)self_tid) ? self_tid
+                                                                : (uint32_t)pid);
+    }
+    return 0;
+}
+
+// pthread_attr_setinheritsched: whether a new thread takes its scheduling from
+// the attr or from the thread that creates it. Marvel's Deadpool VR (UE4) sets it
+// on every thread it starts, and with no answer the game aborted in
+// GameActivity.onCreate — "called unresolved import" — before its first frame
+// (2026-10-09). The policy and priority in a guest attr are not applied here at
+// all: thread creation reads the stack size and the detach state out of it and
+// visionOS owns scheduling, so both values lead to the same thread. Accepted for
+// bionic's two values (0 explicit, 1 inherit), EINVAL otherwise, as bionic does.
+static int klb_pthread_attr_setinheritsched(void *attr, int inherit) {
+    (void)attr;
+    return (inherit == 0 || inherit == 1) ? 0 : EINVAL;
+}
+
+// sched_getscheduler: the getter of the pair above. No thread here is ever given
+// a real-time policy (a request for one becomes a QoS boost, see
+// klb_sched_setscheduler), so SCHED_OTHER (0) is what every thread has.
+static int klb_sched_getscheduler(int pid) { (void)pid; return 0; }
+// sched_getparam: bionic's struct sched_param is ONE int; Darwin's carries
+// four more opaque bytes, so forwarding would write past the guest's struct.
+// Same answer as the getter above: priority 0 under SCHED_OTHER.
+static int klb_sched_getparam(int pid, int *param) { (void)pid; if (param) *param = 0; return 0; }
+// sched_getcpu: no Darwin equivalent; CPU 0 is a valid answer for "where am I".
+static int klb_sched_getcpu(void) { return 0; }
 
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
@@ -2007,7 +2176,7 @@ static const kl_entry g_shim[] = {
     E("send", kl_send), E("recv", kl_recv),
     E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
-    E("swprintf", klb_swprintf), E("execl", klb_execl), E("system", klb_system),
+    E("swprintf", klv_swprintf), E("vswprintf", kl_vswprintf_g), E("execl", klb_execl), E("system", klb_system),
     E("syscall", klb_syscall),
 
     // guest va_list consumers
@@ -2041,12 +2210,15 @@ static const kl_entry g_shim[] = {
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
+    E("link", klb_link),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
     E("scandir", klb_scandir), E("alphasort", klb_alphasort),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
     E("memrchr", klb_memrchr), E("memalign", klb_memalign),
+    // Not a plain forward: see klb_free.
+    E("free", klb_free),
     // Beat Saber 1.40: getrandom is Linux-only and getentropy is NOT a drop-in
     // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.
@@ -2212,6 +2384,18 @@ static const kl_entry g_shim[] = {
     E("pthread_kill", klb_pthread_kill), E("pthread_sigmask", klb_pthread_sigmask),
     E("sigprocmask", klb_sigprocmask),
     E("pthread_setname_np", klb_pthread_setname_np), E("pthread_atfork", klb_pthread_atfork),
+    // pthread_getname_np: same (pthread_t, char*, size_t) on Darwin and bionic
+    // (unlike the SETTER above), so a direct forward. sched_* below are stubs:
+    // Darwin lacks them and visionOS owns scheduling.
+    E("pthread_getname_np", pthread_getname_np),
+    E("sched_setscheduler", klb_sched_setscheduler),
+    E("sched_getscheduler", klb_sched_getscheduler),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
+    // Deadpool VR's other imports with a plain answer. fesetround: the rounding
+    // modes are FPCR bits and have the same values on both sides, so a direct
+    // forward. mkdtemp: forwarded like mkstemp next to it in the table.
+    E("clock_nanosleep", klb_clock_nanosleep), E("__poll_chk", klb___poll_chk),
+    E("fesetround", fesetround), E("mkdtemp", mkdtemp),
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),
@@ -2237,6 +2421,13 @@ static const kl_entry g_shim[] = {
     E("android_set_abort_message", kl_set_abort_message),
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
+
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_shim.c
+    // Tea For God (x6323807174332876): wide-string helpers it imports. wchar_t
+    // is 32-bit on both sides, so these forward unchanged.
+    E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
+    E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
+    E("quick_exit", klb__exit),
 
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
     E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),

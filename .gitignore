@@ -87,6 +87,13 @@ STYLE.md
 # vendored ANGLE toolchain + build, and MoltenVK
 vendor/
 vendor-moltenvk/
+# worktrees symlink it from the main checkout
+/vendor-moltenvk
+# Fossilize (make fossilize)
+/vendor-fossilize/
+vendor-moltenvk-fdm/
+# a worktree may symlink vendor/ (ANGLE) to the main checkout
+/vendor
 fbo_dump/
 tex_dump/
 metal_workload.trace/
@@ -100,3 +107,15 @@ visionos/*.xcodeproj/
 # Python bytecode from visionos/targets.py, imported by gen_xcodeproj.py
 visionos/__pycache__/
 tools/__pycache__/
+
+# Untracked guest/vendor dirs may be symlinks in worktrees; ignore links too
+/beatsaber
+/superhot
+/vendor-fossilize
+/vendor-moltenvk
+# Per-game artwork is never part of this tree: an installer writes the icon and
+# the start picture from the owner's own copy of the game at build time.
+visionos/Assets.xcassets/AppIcon-*.solidimagestack/
+visionos/Assets.xcassets/StartHero-*.imageset/
+/batman
+/batman/

@@ -1550,6 +1550,14 @@ const klj_binding klj_bind_android[] = {
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/app/Activity",   "getApplicationContext", "()Landroid/content/Context;",
      klj_Activity_getApplicationContext},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_android.c
+    // Declared on Context; libEOSSDK (Cave Crave) asks it of the Application it
+    // got from ActivityThread. Same application context either way.
+    {"android/content/Context", "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
+    // EOS voice probes for a hardware echo canceller. There is no capture path
+    // here (kl_aaudio refuses input streams), so there is none to offer.
+    {"android/media/audiofx/AcousticEchoCanceler", "isAvailable", "()Z", klj_false},
     {"android/util/DisplayMetrics", "<init>", "()V", klj_generic_init},
     // Unity's ReflectionHelper spells every reference return as Object, so it asks
     // for getClass with a signature real Java does not declare. Matching is on the

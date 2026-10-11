@@ -199,6 +199,13 @@ struct KLGameSettings: Codable, Equatable {
     var calibration: KLCalibration?
     /// Render performance (Alyx's OpenVR path only, for now).
     var performance: KLPerformance?
+    /// "Precompile graphics": replay the game's pipeline list (klfz/<target>.foz)
+    /// before it boots, so the Metal compiler is warm (KL_FOZ_PREWARM). nil = off.
+    var precompileGraphics: Bool?
+    /// "Performance overlay": the in-game fps/GPU/memory panel
+    /// (KleptonQuickSettings.swift), KL_HUD. nil = off. Siri and the in-game
+    /// quick settings write it too.
+    var perfOverlay: Bool?
 }
 
 /// See KLGameSettings.calibration and KleptonTuning. Degrees and metres, in the
@@ -220,6 +227,8 @@ struct KLPerformance: Codable, Equatable {
     var renderScale: Float?          // KL_OPENVR_RT_SCALE, 0.6–1.2 (default 1.0)
     var overscan: Float?             // KL_OPENVR_OVERSCAN, 0–0.2 (default 0.12 for alyx)
     var overscanRT: Bool?            // KL_OPENVR_OVERSCAN_RT (default on)
+    var msaa: Int?                   // KL_ALYX_MSAA, 2 or 4 (default 4; kl_app.c picks the fidelity level)
+    var foveate: Bool?               // KL_FOVEATE (default on; kl_app.c)
 }
 
 /// The languages a game can be told to boot in, and what each one means on the
@@ -238,7 +247,7 @@ enum KLGameLanguage: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .system: return "System"
+        case .system: return klL("System", "Sistema")
         case .en: return "English"
         case .es: return "Español"
         case .fr: return "Français"
@@ -319,6 +328,32 @@ enum KLGameSettingsStore {
     static let defaultRenderScale: Float = 1.0
     static let defaultOverscan: Float = 0.12
     static let defaultOverscanRT = true
+    // What kl_app.c sets for Alyx when neither the launch environment nor the
+    // hub says otherwise (4x MSAA + foveation: -36% GPU against 4x full rate on
+    // M2, 2026-10-11). The pickers show these when the setting is nil.
+    static let defaultMSAA = 4
+    static let defaultFoveate = true
+
+    /// Whether "Precompile graphics" applies (a Vulkan game with a pipeline list).
+    static func hasPrecompile(_ target: String) -> Bool { target == "alyx" }
+    /// The game's pipeline list, and the record of how it makes its Vulkan device
+    /// (written by the runtime at the game's vkCreateDevice), in the game's
+    /// container: Documents/games/<target>/klfz/ in the hub. Generated on the Mac
+    /// (tools/alyx_pipelines.py) and copied there (BUILDING.md, Fossilize).
+    static func fozDir(_ target: String) -> URL {
+        Paths.containerURL(for: target).appendingPathComponent("klfz", isDirectory: true)
+    }
+    static func fozURL(_ target: String) -> URL {
+        fozDir(target).appendingPathComponent("\(target).foz")
+    }
+    static func precompileGraphics(for target: String) -> Bool {
+        hasPrecompile(target) && (load(target).precompileGraphics ?? false)
+    }
+    /// The setting is on and the pipeline list is there: the boot window shows
+    /// "Preparing graphics… n/N" before the game starts.
+    static func willPrecompile(_ target: String) -> Bool {
+        precompileGraphics(for: target) && FileManager.default.fileExists(atPath: fozURL(target).path)
+    }
 
     // Defaults. The hub's are "a VR game, fully": every hub game draws its own
     // world and its own hands, so it opens .full with the real hands hidden.
@@ -336,9 +371,16 @@ enum KLGameSettingsStore {
         #if KL_HUB
         return false
         #else
-        return target != "alyx"
+        return target != "alyx" && targetHandMatting
         #endif
     }
+    /// A single-game build's own default (targets.py "hand_matting", baked into
+    /// Info.plist as KLHandMattingDefault). Anything but "0" is on, so every row
+    /// that does not state it keeps the old default; avp-play's rows whose games
+    /// draw their own hands say False. Adapted from avp-play (MIT,
+    /// github.com/myMartek/avp-play) visionos/Sources/KleptonChroma.swift.
+    static let targetHandMatting: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLHandMattingDefault") as? String) != "0"
 
     /// Environment (KL_FULL, for debugging) > saved > default.
     static func fullImmersion(for target: String) -> Bool {
@@ -372,14 +414,47 @@ enum KLGameSettingsStore {
         // The compositor reads KL_GHOST_CTRL (KleptonHUD); a value already in
         // the launch environment wins.
         if let g = load(target).ghostControllers { setenv("KL_GHOST_CTRL", g ? "1" : "0", 0) }
+        // The performance overlay (KleptonQuickSettings reads KL_HUD once, at
+        // its first use, which is after this).
+        if load(target).perfOverlay == true { setenv("KL_HUD", "1", 0) }
+        applyPrecompile(for: target)
         guard hasPerformance(target), let p = load(target).performance else { return }
         if let v = p.renderScale { setenv("KL_OPENVR_RT_SCALE", String(format: "%.3f", v), 0) }
         if let v = p.overscan    { setenv("KL_OPENVR_OVERSCAN", String(format: "%.3f", v), 0) }
         if let v = p.overscanRT  { setenv("KL_OPENVR_OVERSCAN_RT", v ? "1" : "0", 0) }
+        if let v = p.msaa        { setenv("KL_ALYX_MSAA", String(v), 0) }
+        if let v = p.foveate     { setenv("KL_FOVEATE", v ? "1" : "0", 0) }
         let env = ProcessInfo.processInfo.environment
         NSLog("[perf] \(target): KL_OPENVR_RT_SCALE=\(env["KL_OPENVR_RT_SCALE"] ?? "default") "
               + "KL_OPENVR_OVERSCAN=\(env["KL_OPENVR_OVERSCAN"] ?? "default") "
-              + "KL_OPENVR_OVERSCAN_RT=\(env["KL_OPENVR_OVERSCAN_RT"] ?? "default")")
+              + "KL_OPENVR_OVERSCAN_RT=\(env["KL_OPENVR_OVERSCAN_RT"] ?? "default") "
+              + "KL_ALYX_MSAA=\(env["KL_ALYX_MSAA"] ?? "default") "
+              + "KL_FOVEATE=\(env["KL_FOVEATE"] ?? "default")")
+    }
+
+    /// "Precompile graphics": KL_VK_DEVICE_INFO so the runtime records how the game
+    /// makes its device (the prewarm rebuilds that device on the next launch), and
+    /// KL_FOZ_PREWARM when the pipeline list is there. Never overwrites.
+    static func applyPrecompile(for target: String) {
+        guard precompileGraphics(for: target) else { return }
+        let dir = fozDir(target)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        setenv("KL_VK_DEVICE_INFO", dir.appendingPathComponent("device-info.json").path, 0)
+        let foz = fozURL(target)
+        if FileManager.default.fileExists(atPath: foz.path) {
+            setenv("KL_FOZ_PREWARM", foz.path, 0)
+        }
+        // Each session records the pipelines the list did not have into klfz/recorded/,
+        // and the next prewarm replays those too (kl_fossilize.cpp, KL_FOZ_AUTORECORD:
+        // only new pipelines are written; old sessions are merged, the folder is capped).
+        // KL_FOZ_AUTORECORD=0 in the launch environment turns it off.
+        let rec = dir.appendingPathComponent("recorded")
+        try? FileManager.default.createDirectory(at: rec, withIntermediateDirectories: true)
+        setenv("KL_FOZ_AUTORECORD", rec.path, 0)
+        let env = ProcessInfo.processInfo.environment
+        NSLog("[foz] \(target): KL_FOZ_PREWARM=\(env["KL_FOZ_PREWARM"] ?? "unset (no \(foz.path))") "
+              + "KL_FOZ_AUTORECORD=\(env["KL_FOZ_AUTORECORD"] ?? "") "
+              + "KL_VK_DEVICE_INFO=\(env["KL_VK_DEVICE_INFO"] ?? "")")
     }
 
     static func applyLanguage(for target: String) {

@@ -31,6 +31,18 @@ func klEnvFloat(_ name: String, _ dflt: Float) -> Float {
     return f
 }
 
+/// Whether the running target is one of the rows ported from avp-play
+/// (targets.py: beatsaber140, beatsaber128, walkabout, batman, wrath2, moss,
+/// doom3quest, or a Meta store row `x<digits>`). Behaviour changes that came
+/// with that port and would alter an EXISTING target default ON only here, and
+/// each stays reachable everywhere through its own KL_* knob.
+func klAvpPlayTarget() -> Bool {
+    let t = klTargetName()
+    if ["beatsaber140", "beatsaber128", "walkabout", "batman", "wrath2",
+        "moss", "doom3quest"].contains(t) { return true }
+    return t.count > 1 && t.first == "x" && t.dropFirst().allSatisfy(\.isNumber)
+}
+
 enum Immersive {
     static let id = "KleptonImmersive"
     // Default ON for Beat Saber, OFF for Steam Link, and the difference is not a
@@ -143,6 +155,9 @@ enum Lifecycle {
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        // A stream from the Mac says BYE first, so the host stops encoding
+        // for a headset that is gone. No-op when there is none.
+        KLStreamSession.shared.stop(reason: "background")
         // Flush before exit rather than relying on it. The guest's log is a
         // file in the container (kl_app.c redirects stdout/stderr there) and it
         // is the only account of the run that survives; `exit` does flush
@@ -264,18 +279,54 @@ enum Paths {
     }
 }
 
+/// English or Spanish by the headset's first preferred language. The hub has no
+/// string catalog (its UI is English); the session texts are the first that
+/// speak Spanish too, chosen here rather than through a catalog. Here rather
+/// than in KleptonHub.swift because the boot window uses it in every build.
+func klL(_ en: String, _ es: String) -> String {
+    (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
+}
+
+/// What the hub may show of a store account: Steam's public persona name ("Steam: NSCabezon"),
+/// never the login name used to sign in nor the SteamID; Meta only as signed in. Logs mask login
+/// names and ids the same way, since logs end up in bug reports.
+enum KLAccountPrivacy {
+    private static let personaKey = "kl.hub.steam.persona"
+    /// Steam's public persona name, from the last logon that reported it.
+    static var steamPersona: String? {
+        get { UserDefaults.standard.string(forKey: personaKey).flatMap { $0.isEmpty ? nil : $0 } }
+        set { UserDefaults.standard.set(newValue, forKey: personaKey) }
+    }
+    /// The header/settings text for a signed-in Steam account.
+    static var steamLabel: String { steamPersona.map { "Steam: \($0)" } ?? "Steam ✓" }
+    static var metaLabel: String { "Meta ✓" }
+    /// First two characters + •••, for login names and ids in logs.
+    static func mask(_ s: String?) -> String {
+        guard let s, !s.isEmpty else { return "?" }
+        return String(s.prefix(2)) + "•••"
+    }
+}
+
 /// The window's root: the hub's library until a game is picked (KleptonHub.swift),
 /// then the boot window for it. A single-game build goes straight to the boot window.
 struct KleptonRootView: View {
     #if KL_HUB
     @State private var picked = HubLaunch.scriptedGame()
+    /// "Jugar desde el Mac": the Mac being streamed from, while it lasts. No
+    /// guest boots in this mode, so ending it returns to the library.
+    @State private var streaming = HubLaunch.scriptedStream()
     var body: some View {
-        if picked != nil {
+        if let s = streaming {
+            StreamPlayView(target: s, onExit: { streaming = nil })
+        } else if picked != nil {
             BootView()
         } else {
             HubLibraryView(onPlay: { target in
                 HubLaunch.select(target)
                 picked = target
+            }, onPlayFromMac: { target, mac in
+                HubLaunch.selectForStream(target)
+                streaming = mac
             })
         }
     }
@@ -360,6 +411,12 @@ struct BootView: View {
     // mid-frame. A timer at 5 Hz costs nothing and cannot deadlock.
     @State private var showShell = false
     @State private var handedOff = false
+    // The pipeline prewarm before the game boots (KL_FOZ_PREWARM, the hub's
+    // "Precompile graphics"): kl_foz_progress, polled with the rest below.
+    @State private var fozState: Int32 = 0
+    @State private var fozDone: UInt32 = 0
+    @State private var fozTotal: UInt32 = 0
+    @State private var fozElapsed: Double = 0
     // The visionOS system keyboard for an immersive guest: there is no on-screen
     // keyboard in an immersive space, so when the guest asks for text entry
     // (kl_mono_text_input_wanted, set by SDLActivity.showTextInput) we focus a
@@ -376,6 +433,12 @@ struct BootView: View {
     // the fallback is inert (no such bookmark) for the runtime-debugging targets.
     @ObservedObject private var files = klActiveFiles() ?? LauncherFiles(bookmarkKey: "none", expected: "")
     private var isLauncher: Bool { klIsLauncher() }
+    /// Whether this target boots as soon as the window is up (targets.py
+    /// "autoboot", baked into Info.plist as KLAutoBootDefault; missing = yes).
+    /// Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+    /// visionos/Sources/KleptonApp.swift.
+    private static let targetAutoBoot: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLAutoBootDefault") as? String) != "0"
     // The microphone dial only appears where voice is actually used: Steam Link's
     // stream and the Xash titles that name a local server. Every other build hides it.
     private var showMic: Bool {
@@ -411,6 +474,12 @@ struct BootView: View {
         while !Task.isCancelled {
             let mono = kl_present_mode_now() == KL_PRESENT_MONO
             if mono != showShell { showShell = mono }
+
+            var fd: UInt32 = 0, ft: UInt32 = 0, fe: Double = 0
+            let fs = kl_foz_progress(&fd, &ft, &fe)
+            if fs != fozState || fd != fozDone || ft != fozTotal {
+                fozState = fs; fozDone = fd; fozTotal = ft; fozElapsed = fe
+            }
 
             // Raise the system keyboard on EACH text-entry request. The guest
             // calls showTextInput every time a field is clicked, so this is
@@ -470,6 +539,26 @@ struct BootView: View {
         kl_mono_key(0, code)
     }
 
+    /// "Preparando gráficos… n/N" while the prewarm replays (kl_foz_progress), and
+    /// what it did once done. Nothing when there is no prewarm this run.
+    @ViewBuilder private var fozLine: some View {
+        let waiting = fozState == 0 && running && KLGameSettingsStore.willPrecompile(klTargetName())
+        if fozState == 1 || waiting {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(fozTotal > 0
+                     ? klL("Preparing graphics… \(fozDone)/\(fozTotal)",
+                           "Preparando gráficos… \(fozDone)/\(fozTotal)")
+                     : klL("Preparing graphics…", "Preparando gráficos…"))
+                    .font(.headline)
+                ProgressView(value: fozTotal > 0 ? Double(fozDone) / Double(fozTotal) : 0)
+            }
+        } else if fozState == 2 {
+            Text(klL("Graphics prepared: \(fozDone) pipelines",
+                     "Gráficos preparados: \(fozDone) pipelines"))
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
     private var bootReport: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -491,6 +580,8 @@ struct BootView: View {
                         .foregroundStyle(succeeded ? .green : .red)
                 }
             }
+
+            fozLine
 
             ScrollView {
                 Text(log.isEmpty ? "Press Boot to load the guest chain." : log)
@@ -525,6 +616,11 @@ struct BootView: View {
             DisclosureGroup("Matting") { ChromaView() }
                 .font(.callout)
 
+            // ...and the rendering preferences (foveation, render scale, in-game
+            // video), read once at boot (KleptonTuning.swift, from avp-play).
+            DisclosureGroup("Rendering") { RenderingView() }
+                .font(.callout)
+
             // ...and the microphone opt-in, same window, collapsed by default.
             // Off unless a person turns it on: it is the one dial that opens a
             // privacy surface and changes the audio session out from under the
@@ -537,7 +633,7 @@ struct BootView: View {
             }
 
             HStack(spacing: 16) {
-                Button(running ? "Running…" : "Boot") {
+                Button(running ? "Running…" : (Self.targetAutoBoot ? "Boot" : "Start")) {
                     // A game build gathers its settings first: fold them into env
                     // (+ commandline.txt for hl1), and only boot if the chosen
                     // folder is ready.
@@ -595,7 +691,9 @@ struct BootView: View {
             // KL_AUTOBOOT=1 for scripted launches — because it must let the player
             // choose the game folder, set options, and press "Boot" first.
             // Only the runtime-debugging targets honour KL_AUTOBOOT (default on).
-            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: true) {
+            // ...and a target can ask to wait for the button too (targets.py
+            // "autoboot" False — only avp-play's rows do).
+            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: Self.targetAutoBoot) {
                 boot()
             }
         }
@@ -670,6 +768,8 @@ struct BootView: View {
             }
             RunLoop.current.add(poll, forMode: .common)
 
+            // The stored rendering preferences, before the runtime reads them.
+            KleptonRendering.shared.apply()
             var result = kl_app_boot()
 
             // The audio session, and the placement is deliberate on both sides.
@@ -754,9 +854,21 @@ struct BootView: View {
                     // compositor, which is indistinguishable in the log from a
                     // compositor that came up and died — and those want
                     // completely different next moves.
+                    // `.error` is retried, because it is not always final: a
+                    // launch that follows a reinstall over a running instance
+                    // got it once, nine seconds in, and the very next launch
+                    // of the same binary opened. `.userCancelled` is an answer,
+                    // not a failure, and is not asked again. Adapted from
+                    // avp-play (MIT, github.com/myMartek/avp-play)
+                    // visionos/Sources/KleptonApp.swift.
                     Task {
-                        let r = await openImmersiveSpace(id: Immersive.id)
-                        NSLog("[cp] openImmersiveSpace -> \(r)")
+                        for attempt in 1...3 {
+                            let r = await openImmersiveSpace(id: Immersive.id)
+                            NSLog("[cp] openImmersiveSpace -> \(r)"
+                                  + (attempt > 1 ? " (attempt \(attempt))" : ""))
+                            guard case .error = r, attempt < 3 else { break }
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        }
                     }
                 }
             }

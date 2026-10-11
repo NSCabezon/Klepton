@@ -708,7 +708,30 @@ static void kl_ue4_java_create(FILE *out) {
     kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
     char locale[40];
     snprintf(locale, sizeof locale, "%s_%s", lang, country);
-    void *jrel   = kl_jni_new_string(kl_jni_build_string("VERSION.RELEASE"));
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_ue4.c
+    // "RELEASE", not "VERSION.RELEASE": kl_jni_build_string matches the FIELD
+    // name within Build / Build$VERSION, and the dotted spelling matched nothing
+    // — so every UE4 guest was told its Android version was the empty string.
+    // Most never look. Moss does: its device-profile rules only enable Vulkan
+    // for `SRC_AndroidVersion` matching "([0-9]+).*" with a major >= 9, and ""
+    // matches nothing, leaving r.Android.DisableVulkanSupport at the base
+    // profile's 1 and the engine at "This device does not support Vulkan".
+    // In this fork the fix is gated (KL_UE4_OS_RELEASE): it can move a guest's
+    // device-profile choice (e.g. the RHI), so the UE4 targets this fork had
+    // before the port (intotheradius, re4, redmatter2, vampire) keep the old
+    // empty answer by default; every other UE4 guest gets the real one. metro
+    // NEEDS the real one: on its Steam path the device-profile rules enable
+    // Vulkan only for a parseable Android version (Moss's shape).
+    int rel_def = 1;
+    {
+        static const char *const k_old[] = { "intotheradius", "re4", "redmatter2", "vampire" };
+        extern const char *kl_driver_target_name(void);
+        const char *tn = kl_driver_target_name();
+        for (unsigned i = 0; tn && i < sizeof k_old / sizeof *k_old; i++)
+            if (strcmp(tn, k_old[i]) == 0) rel_def = 0;
+    }
+    void *jrel   = kl_jni_new_string(kl_jni_build_string(
+        kl_env_on("KL_UE4_OS_RELEASE", rel_def) ? "RELEASE" : "VERSION.RELEASE"));
     void *jmake  = kl_jni_new_string(kl_jni_build_string("MANUFACTURER"));
     void *jmodel = kl_jni_new_string(kl_jni_build_string("MODEL"));
     void *jbuild = kl_jni_new_string(kl_jni_build_string("DISPLAY"));
