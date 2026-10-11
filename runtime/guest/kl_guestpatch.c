@@ -537,6 +537,48 @@ static const kl_gp_word k_metro_fireant_nullspace[] = {
     { 0x3c40158, 0xb4000296, 0xf9400d16, "ldr x22, [x8, #0x18]" },
 };
 
+// Metro Awakening — the window present goes through Swappy, Swappy cannot init,
+// and the engine's answer to that is a fatal error it then survives.
+//
+// On the Steam path the OpenXR HMD does not claim a standalone stereo-only
+// device, so the RHI thread presents the Android window swapchain every frame.
+// a.UseSwappyForFramePacing is on (registered with default 1, 0x4cc7768), so
+// FVulkanAndroidPlatform::Present (0x4868314) hands it to SwappyVk_queuePresent
+// (0x77ebbf0). Swappy's own init never completes here (no Choreographer /
+// Display JNI is reached), so its per-swapchain implementation is disabled
+// (SwappyCommon+0x359 == 0) and doQueuePresent answers
+// VK_ERROR_INITIALIZATION_FAILED (-3, 0x77efa5c). FVulkanSwapChain::Present
+// (0x48bf380..) accepts only SUCCESS / SUBOPTIMAL / OUT_OF_DATE / SURFACE_LOST,
+// so -3 goes to VERIFYVULKANRESULT ("PresentResult", VulkanSwapChain.cpp) and
+// the shipping fatal path sets GIsCriticalError = 1 on the RHI thread
+// (0x48da22c, measured with a watchpoint) — and the process keeps running.
+//
+// That flag is what corrupted everything after it: ~UObjectBase (0x4c81f20)
+// skips GUObjectArray.FreeUObjectIndex while GIsCriticalError is set, so every
+// object the first GC destroys (on FAsyncPurge) leaves its array slot pointing
+// at freed memory. Measured on GUObjectArray index 26592: created by
+// FAsyncLoading, BeginDestroy/FinishDestroy on the game thread, destroyed and
+// freed on FAsyncPurge, slot never cleared, block reused and freed again by the
+// loader — then VGLoadingFacade's TObjectIterator (0x3d49b7c) reads it and
+// faults (libUnreal+0x4c753a0 / +0x3d49ce0), or the render thread reaches a
+// dead UMaterial through FMaterialRenderProxy's deferred uniform-expression set
+// (pc 0x1 from 0x6b8b0e8, or 0x6bacbe4). Same root, different victims.
+//
+// So Swappy is switched off where it is registered: a.UseSwappyForFramePacing's
+// default (0x4cc7778) goes from 1 to 0, and every reader of it (present, queue
+// registration, swapchain create/destroy, the pacer) takes its non-Swappy path.
+// Patching only the present (0x486832c) was tried first and is not enough: the
+// swapchain recreate then calls into the half-initialised Swappy
+// (SwappyVk_destroySwapchain, 0x77ebe44 -> 0x77e263c, null JNI object) and
+// faults on the render thread. With Swappy off, UE paces with
+// VK_GOOGLE_display_timing, which kl_vulkan.c now answers for our synthetic
+// swapchain. The words either side of the immediate are checked, not changed.
+static const kl_gp_word k_metro_noswappy[] = {
+    { 0x4cc7770, 0x91206021, 0x91206021, "add x1, x1, #0x818 (L\"a.UseSwappyForFramePacing\"; unchanged)" },
+    { 0x4cc7778, 0x52800022, 0x52800002, "mov w2, #1 -> mov w2, #0 (registered default: off)" },
+    { 0x4cc7780, 0x2a1f03e4, 0x2a1f03e4, "mov w4, wzr (flags; unchanged)" },
+};
+
 static const kl_gp_patch k_patches[] = {
     { "alyx-lua-arena-anywhere", "libvscript.so",
       "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
@@ -572,6 +614,9 @@ static const kl_gp_patch k_patches[] = {
     { "metro-fireant-null-trackingspace", "libUnreal.so",
       "the FireAnt loading screen skips a draw whose frame-state snapshot has no tracking space",
       k_metro_fireant_nullspace, sizeof k_metro_fireant_nullspace / sizeof *k_metro_fireant_nullspace },
+    { "metro-swappy-off", "libUnreal.so",
+      "a.UseSwappyForFramePacing defaults to 0 (Swappy cannot init here; its present error was a fatal that set GIsCriticalError)",
+      k_metro_noswappy, sizeof k_metro_noswappy / sizeof *k_metro_noswappy },
 
     { "wrath2-force-vulkan-available", "libUE4.so",
       "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
