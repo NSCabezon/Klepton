@@ -2594,7 +2594,7 @@ nothing, and prints the unresolved imports grouped by category.
   `oculus_quest2_controller_*`) and Alyx binds `/pose/raw` — the Touch's
   TRACKED origin, the render model's origin — so the published hilt `P`
   (`.grip` · T(`KL_SENSE_POS`) · Rx(5.037 + `KL_SENSE_PITCH` -37)) is turned
-  into it: `raw = P · Rx(+37) · T(0.007 mirrored, -0.0342, -0.0961) · Rx(-20.6)`
+  into it: `raw = P · Rx(+37) · T(-0.007 mirrored, -0.0342, -0.0961) · Rx(-20.6)`
   (the OpenXR grip, as `KL_XR_GRIP_PITCH` builds it, then the render model's
   grip->tracked row, `tools/rendermodel_frames.py`). Net: the reported origin
   moves 9.7 cm forward along `P`'s -Z and 3 cm up its +Y, turned 16.4 deg
@@ -2602,6 +2602,18 @@ nothing, and prints the unresolved imports grouped by category.
   handle and 16 deg too nose-down: the hand sat below and behind the real
   controller, at the wrong angle. OVRPlugin and OpenXR guests are unaffected
   (they never call this). Logged once: `[openvr] controller pose: ...`.
+  **The hub sets it to 1 for Alyx** (`kl_app.c`), since `KL_OPENVR_MINIMAL=1`
+  would otherwise turn it off — which it did on device until 2026-10-11:
+  the hands sat ~10 cm back up the handle and, with the controllers
+  converging in any two-handed reach, the wrists landed 6-8 cm further apart
+  than the real hands (pistol magazine release unreachable).
+- `KL_OPENVR_TOUCH_X_OUT=1` — (`kl_openvr.c`, `touch_frame_for`) put the
+  Touch's tracked origin 0.7 cm OUTWARD of the grip, the old sign. **Default
+  inward** (x = -0.007 on the right hand, +0.007 on the left): the right render
+  model's `openxr_grip` sits at x = +0.007 in the tracked frame, and Glovebox's
+  `make_raw_from_grip()` (Alyx on the same Sense controllers) takes that
+  inverse. The outward sign set the hands 2.8 cm too wide when held parallel.
+  OVRPlugin's `KLOVRP_TOUCH_TRACKED_X` (`KL_OVRP_TOUCH_FRAME`) is unchanged.
 - `KL_OPENVR_HAND_POS="x,y,z"` / `KL_OPENVR_HAND_ROT="x,y,z"` — metres /
   degrees (X then Y then Z), the OpenVR guest's hand calibration, in the
   **grip's** frame (+X right, +Y up, -Z along the handle through the fist),
