@@ -2629,6 +2629,30 @@ create call.
   the game's own device).
 - `KL_FOZ_DEVICE_INFO=<file>` — the device info the prewarm rebuilds the game's
   device from. Default: `device-info.json` beside the first `.foz`.
+- `KL_FOZ_AUTORECORD=<dir>` — each session records ONLY the pipelines no
+  known database has (a Fossilize concurrent database over the `KL_FOZ_PREWARM`
+  list and `<dir>`'s earlier files) into `<dir>/session.N.foz` (no new
+  pipeline, no file), and the prewarm replays `KL_FOZ_PREWARM` + every
+  `<dir>/*.foz` as one database (a session's pipelines name layouts that live
+  in the others). Foveated pipelines are recorded without the density-map flag
+  (the replay remakes the twins). Over `KL_FOZ_RECORD_KEEP` files (default 8)
+  the sessions are merged into `<dir>/merged.foz` at the next launch; over
+  `KL_FOZ_RECORD_MAX_MB` (default 256) in `<dir>` nothing more is recorded. An
+  explicit `KL_FOZ_RECORD` wins; `KL_FOZ_AUTORECORD=0` is off. Set by the hub
+  to `klfz/recorded/` whenever "Precompilar gráficos" is on. Mac, 2026-10-11:
+  session 1 recorded 2 new pipelines (72 KB, 1 stall of 54 ms), session 2
+  replayed them: 0 stalls.
+- `KL_FOZ_FDM=0` — with foveation on (`KL_FOVEATE=1` and the FDM fork), the
+  replay/prewarm also compiles a "foveated twin" of every multisampled
+  multiview dynamic-rendering pipeline (the scene pass): the same create info
+  plus `VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT`,
+  which is exactly what Alyx creates when it sees the density-map extension
+  (a recording with foveation: 88/88 scene pipelines = the .foz's own + that
+  flag). The fork compiles those with the gl_FragCoord remap, so they are
+  different MSL and missed the Metal cache: device 2026-10-11, 259 stalls /
+  ~101 s with the prewarm warm. The replay line then reads `N pipelines (...,
+  T of them foveated twins)`. `0` turns the twins off. Without foveation no
+  twin is made (the flag would compile to the plain pipeline's MSL).
 - `KL_VK_DEVICE_INFO=<file>` — (kl_vulkan.c) at the guest's vkCreateDevice,
   write its instance + device create info (extensions, queues, feature structs
   as bytes) as JSON. The hub sets it to `klfz/device-info.json` whenever
@@ -2687,7 +2711,12 @@ cleared/not stored and RESOLVED. Stock MoltenVK has no such extension. Two halve
   integer colour, >2 layers, a multiview pass split into several Metal passes)
   renders at full rate and says why ONCE: `[mvk-fov] ... FULL RATE — <reason>`.
   Needs the fork staged (`make mvk-fdm`); with stock MoltenVK it degrades to the
-  spoof and says so (`this MoltenVK cannot foveate`). **Default 0.**
+  spoof and says so (`this MoltenVK cannot foveate`). **Default 0** in the
+  runtime; the visionOS app sets **1 for Alyx** (kl_app.c, with `KL_ALYX_MSAA=4`)
+  unless the launch environment or the hub's "Foveated rendering" says
+  otherwise (device, M2, 2026-10-11: 4x + foveation 18.3 GPU ms/frame vs 28.8 at
+  4x full rate, -36%). Pipelines for a density-map pass are compiled with the
+  remap, so the prewarm compiles their twins (`KL_FOZ_FDM`).
 - `KL_FOVEATE_LEVEL=1|2|3` — the fixed profile (separable, same on both axes and
   both eyes; centre → edge, fraction of the half extent : rate). 1 = 45% : 1,
   30% : 0.75, 25% : 0.5 (~64% of fragments); **2 (default)** = 35% : 1,

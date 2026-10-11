@@ -629,6 +629,9 @@ static const struct { VkStructureType t; size_t size; } k_feature_structs[] = {
     // Alyx's own (Source 2 on MoltenVK, 2026-10-05): multiview, dynamic rendering, these two
     F(PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR),
     F(PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, VkPhysicalDeviceHostImageCopyFeaturesEXT),
+    // ...and with KL_FOVEATE=1 (the spoofed VK_EXT_fragment_density_map): without it the
+    // device info of a foveated launch was refused by the next prewarm (2026-10-11)
+    F(PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT, VkPhysicalDeviceFragmentDensityMapFeaturesEXT),
 #ifdef VK_VERSION_1_4
     F(PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features),
 #endif
@@ -3385,6 +3388,14 @@ static int klvk_fdm_passthrough(void) {
     }
     return v;
 }
+// For the pipeline replayer (kl_fossilize.cpp, kl_vk_pipe_hooks.h). With the fork foveating,
+// the game creates every scene-pass pipeline with
+// VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT, and the fork compiles
+// those with the gl_FragCoord remap (rasterization_rate_map_fragcoord): different MSL, so a
+// different Metal cache entry than the same pipeline without the flag. A .foz recorded without
+// foveation has none of them; the replay adds the flagged twin. Call only once MoltenVK is
+// loaded (the answer is latched).
+int klvk_fdm_pipeline_variants(void) { return g_mvk ? klvk_fdm_passthrough() : 0; }
 // The game picks its map texel size inside [min, max]; Steam Frame's Adreno
 // reports 32x32 for both, and so does this by default — the path the game
 // was tuned on. KL_FDM_TEXEL overrides (a power of two, 8..128).
