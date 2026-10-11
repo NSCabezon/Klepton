@@ -321,12 +321,25 @@ final class KleptonRendering: ObservableObject {
         let env = ProcessInfo.processInfo.environment["KL_VRR"]
         NSLog("[cp] foveated rendering: setting \(foveation ? "on" : "off")"
               + (env.map { " — overridden by KL_VRR=\($0)" } ?? ""))
-        kl_ovrp_set_render_scale_default(Float(renderScale))
+        var scale = renderScale
+        var targetScale = Self.targetRenderScale
+        #if KL_HUB
+        // The hub's Info.plist carries its own neutral 1.0; each game's default
+        // is its targets.py row's (KLHubGameRow.renderScale). It applies while
+        // the player has never moved the slider — a chosen value still wins,
+        // for every game, as before.
+        if let row = klHubGameRows.first(where: { $0.target == klTargetName() }),
+           (0.5...1.0).contains(row.renderScale) {
+            targetScale = row.renderScale
+            if UserDefaults.standard.object(forKey: Self.scaleKey) == nil { scale = row.renderScale }
+        }
+        #endif
+        kl_ovrp_set_render_scale_default(Float(scale))
         kl_mediandk_set_video_default(video ? 1 : -1)
         NSLog("[cp] in-game video: \(video ? "on" : "runtime default") (target default \(Self.targetVideo ? "on" : "off"))")
         let envScale = ProcessInfo.processInfo.environment["KL_OVRP_RENDER_SCALE"]
         NSLog(String(format: "[cp] render resolution: setting %.0f%% (target default %.0f%%)",
-                     renderScale * 100, Self.targetRenderScale * 100)
+                     scale * 100, targetScale * 100)
               + (envScale.map { " — overridden by KL_OVRP_RENDER_SCALE=\($0)" } ?? ""))
     }
 }
