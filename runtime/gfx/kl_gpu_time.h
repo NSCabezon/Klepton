@@ -8,8 +8,18 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 // 0 off, 1 log only, 2 log and report it to the game (GetFrameTiming).
 int kl_gpu_time_mode(void);
+// Timing is on: KL_GPU_TIME, or the live flag below. Cheap (one atomic load).
+int kl_gpu_time_active(void);
+// Turn timing on/off at runtime without the knob (the visionOS performance
+// overlay). Takes effect from the next submit; no log line per second.
+void kl_gpu_time_set_live(int on);
+// Running total of every final frame's GPU ms and how many frames that was,
+// since the process started (both 0 when timing never ran).
+void kl_gpu_time_totals(double *sum_ms, uint64_t *frames);
 // Time every command buffer committed on this MTLCommandQueue (the guest's:
 // kl_vulkan.c hands over each queue the guest submits on).
 void kl_gpu_time_watch(void *mtl_queue);

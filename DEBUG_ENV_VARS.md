@@ -2875,6 +2875,16 @@ except its own control vars (next section).
   missing (and that one was seen), to check the card without real controllers;
   with `:secs` it "comes back" that many seconds after the grace period, which
   shows the confirmation too.
+- `KL_HUD=1` — the performance overlay (`KleptonQuickSettings.swift`, device
+  only; the hub's per-game "Performance overlay" sets it at Play): a panel lower
+  left with guest fps, frame ms avg/max, GPU ms (kl_gpu_time switched on live
+  while it is up, no `[perf]` log lines), reprojected %, display Hz, footprint
+  and thermal state, refreshed 2×/s off the render thread. Siri toggles it
+  mid-game. Log: `[qs] performance overlay ON`.
+- `KL_QS_PAUSE=1` — the in-game quick settings (Siri: "Abre los ajustes en AVP
+  Hub") also send Alyx `setpause` / `unpause` on open / close. Off by default
+  (not verified to pause cleanly); controller input is swallowed either way.
+  Logs: `[qs] ...`, `[openvr] console: ...`, `[vk] foveation switched ...`.
 - `KL_STEAM_ICON_TIMEOUT=<ms>` — the bridge `icon` fetch per unlocked
   achievement (default 10000); a failure shows the toast with a placeholder.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
