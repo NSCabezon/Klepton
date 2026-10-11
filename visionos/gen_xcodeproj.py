@@ -362,16 +362,19 @@ swift.append({"name": "KleptonSessionStats.swift", "ref": _fixed("SESSTATF"), "b
 # driven by the controllers). Every target: the compositor and HUD call it.
 swift.append({"name": "KleptonQuickSettings.swift", "ref": _fixed("QSETF"), "bld": _fixed("QSETB")})
 # Siri / Shortcuts for the running game (App Intents), and the Spanish phrase
-# catalog for them — hub only: the phrases name the hub ("AVP Hub").
-F_SHORTCUTS, B_SHORTCUTS = _fixed("APPSCSTRF"), _fixed("APPSCSTRB")
+# catalog for them — hub only: the phrases name the hub ("AVP Game Hub").
+# Localizable.xcstrings carries the Spanish intent titles / short titles (what the
+# Shortcuts app lists); AppShortcuts.xcstrings only the phrases.
 if IS_HUB:
     swift.append({"name": "KleptonIntents.swift", "ref": _fixed("INTENTSF"), "bld": _fixed("INTENTSB")})
-SHORTCUTS_BUILDFILE = (f'\t\t{B_SHORTCUTS} /* AppShortcuts.xcstrings in Resources */ = '
-                       f'{{isa = PBXBuildFile; fileRef = {F_SHORTCUTS}; }};\n' if IS_HUB else "")
-SHORTCUTS_FILEREF = (f'\t\t{F_SHORTCUTS} = {{isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; '
-                     f'path = AppShortcuts.xcstrings; sourceTree = "<group>"; }};\n' if IS_HUB else "")
-SHORTCUTS_CHILD = f"\t\t\t\t{F_SHORTCUTS},\n" if IS_HUB else ""
-SHORTCUTS_RES = f"\t\t\t\t{B_SHORTCUTS},\n" if IS_HUB else ""
+_CATALOGS = ([("AppShortcuts.xcstrings", _fixed("APPSCSTRF"), _fixed("APPSCSTRB")),
+              ("Localizable.xcstrings", _fixed("LOCSTRF"), _fixed("LOCSTRB"))] if IS_HUB else [])
+SHORTCUTS_BUILDFILE = "".join(f'\t\t{b} /* {n} in Resources */ = {{isa = PBXBuildFile; fileRef = {f}; }};\n'
+                              for n, f, b in _CATALOGS)
+SHORTCUTS_FILEREF = "".join(f'\t\t{f} = {{isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; '
+                            f'path = {n}; sourceTree = "<group>"; }};\n' for n, f, b in _CATALOGS)
+SHORTCUTS_CHILD = "".join(f"\t\t\t\t{f},\n" for n, f, b in _CATALOGS)
+SHORTCUTS_RES = "".join(f"\t\t\t\t{b},\n" for n, f, b in _CATALOGS)
 
 # The two files apktool leaves beside assets/ — apktool.yml (versionCode /
 # versionName) and the decoded AndroidManifest.xml (package, <meta-data>,
@@ -556,6 +559,21 @@ def _plist_version(env, dflt):
 APP_VERSION = _plist_version("KLEPTON_APP_VERSION", "1.0")
 APP_BUILD = _plist_version("KLEPTON_APP_BUILD", "1")
 
+# The hub's Info.plist: visionos/Info.plist plus INAlternativeAppNames, so Siri also
+# takes "… en Hub" / "… en Game Hub" for \(.applicationName) in the App Shortcut
+# phrases (KleptonIntents.swift). An array of dicts has no INFOPLIST_KEY_ form, so
+# the hub reads a generated copy; every other target reads Info.plist as before.
+INFOPLIST_PATH = "Info.plist"
+HUB_ALT_NAMES = ["Hub", "Game Hub"]
+if IS_HUB:
+    import plistlib
+    _ip = plistlib.loads(pathlib.Path(__file__).with_name("Info.plist").read_bytes())
+    _ip["INAlternativeAppNames"] = [{"INAlternativeAppName": n} for n in HUB_ALT_NAMES]
+    _out = pathlib.Path(__file__).with_name("build") / "Info-hub.plist"
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_bytes(plistlib.dumps(_ip))
+    INFOPLIST_PATH = "build/Info-hub.plist"
+
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
@@ -563,7 +581,7 @@ COMMON = f"""
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-{ASSETCATALOG_SETTING}				INFOPLIST_FILE = Info.plist;
+{ASSETCATALOG_SETTING}				INFOPLIST_FILE = {INFOPLIST_PATH};
 				// One entry per runtime source directory: a runtime header is
 				// included by BARE NAME everywhere, including from
 				// Klepton-Bridging-Header.h, so each directory holding one has

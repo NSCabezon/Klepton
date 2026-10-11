@@ -10,8 +10,9 @@
 //
 // Phrases: English in the source; Spanish in AppShortcuts.xcstrings (the
 // per-locale phrase catalog). Each phrase carries \(.applicationName), which is
-// the hub's CFBundleDisplayName, "AVP Hub" (visionos/targets.py, hub row) —
-// "Activa el visor de FPS en AVP Hub". Phrases, intent type names and the
+// the hub's CFBundleDisplayName, "AVP Game Hub" (visionos/targets.py, hub row) —
+// "Activa el visor de FPS en AVP Game Hub" — or one of its INAlternativeAppNames,
+// "Hub" / "Game Hub" (gen_xcodeproj.py): "Abre ajustes del juego en Hub". Phrases, intent type names and the
 // AppEnum raw values are a public contract once shipped: add, do not rename.
 //
 // perform() is not main-actor isolated; KLQuickSettings is lock-protected and
@@ -25,8 +26,12 @@ private func klReply(_ r: KLQuickSettings.Reply) -> IntentDialog {
     IntentDialog("\(r.text)")
 }
 
+// The two settings-menu intents carry plain titles ("Open Game Settings" / "Abrir
+// ajustes del juego", Localizable.xcstrings) so a user can drop one into a personal
+// Shortcut named "Abre ajustes del juego": Siri runs a personal shortcut by its name
+// alone, with no app name in the sentence.
 struct KLOpenQuickSettingsIntent: AppIntent {
-    static let title: LocalizedStringResource = "Open In-Game Settings"
+    static let title: LocalizedStringResource = "Open Game Settings"
     static let description = IntentDescription("Opens the quick settings panel inside the running game.")
     static var supportedModes: IntentModes { .background }
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -35,7 +40,7 @@ struct KLOpenQuickSettingsIntent: AppIntent {
 }
 
 struct KLCloseQuickSettingsIntent: AppIntent {
-    static let title: LocalizedStringResource = "Close In-Game Settings"
+    static let title: LocalizedStringResource = "Close Game Settings"
     static let description = IntentDescription("Closes the quick settings panel inside the running game.")
     static var supportedModes: IntentModes { .background }
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -117,13 +122,11 @@ struct KLDisableFoveationIntent: AppIntent {
 struct KLAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(intent: KLOpenQuickSettingsIntent(),
-                    phrases: ["Open settings in \(.applicationName)",
-                              "Open the game settings in \(.applicationName)"],
-                    shortTitle: "Open Settings", systemImageName: "slider.horizontal.3")
+                    phrases: ["Open game settings in \(.applicationName)"],
+                    shortTitle: "Open Game Settings", systemImageName: "slider.horizontal.3")
         AppShortcut(intent: KLCloseQuickSettingsIntent(),
-                    phrases: ["Close settings in \(.applicationName)",
-                              "Close the game settings in \(.applicationName)"],
-                    shortTitle: "Close Settings", systemImageName: "xmark.circle")
+                    phrases: ["Close game settings in \(.applicationName)"],
+                    shortTitle: "Close Game Settings", systemImageName: "xmark.circle")
         AppShortcut(intent: KLShowPerformanceOverlayIntent(),
                     phrases: ["Turn on the FPS overlay in \(.applicationName)",
                               "Show the FPS counter in \(.applicationName)"],

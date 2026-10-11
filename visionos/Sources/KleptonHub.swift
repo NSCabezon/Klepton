@@ -778,12 +778,12 @@ struct HubGameSettingsView: View {
                 } header: { Text(klL("In-game", "Dentro del juego")) } footer: {
                     Text(klL("A small panel in the game's view with fps, frame and GPU time, reprojected "
                              + "frames, memory and temperature. Siri can turn it on and off while you play "
-                             + "(“Turn on the FPS overlay in AVP Hub”), and “Open settings in AVP Hub” opens "
+                             + "(“Turn on the FPS overlay in AVP Game Hub”), and “Open game settings in Hub” opens "
                              + "quick settings inside the game.",
                              "Un panel pequeño en la vista del juego con fps, tiempo de imagen y de GPU, "
                              + "imágenes reproyectadas, memoria y temperatura. Siri lo activa y desactiva "
-                             + "mientras juegas («Activa el visor de FPS en AVP Hub»), y «Abre los ajustes en "
-                             + "AVP Hub» abre los ajustes rápidos dentro del juego."))
+                             + "mientras juegas («Activa el visor de FPS en AVP Game Hub»), y «Abre ajustes del juego en "
+                             + "Hub» abre los ajustes rápidos dentro del juego."))
                 }
 
                 sessionsSection
