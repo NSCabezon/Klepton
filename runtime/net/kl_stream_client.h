@@ -125,7 +125,11 @@ typedef struct {
     // Totals.
     uint32_t frames_decoded, frames_lost, idr_requests, decode_errors,
              pose_misses, poses_sent;
-    char     line[256];         // the last [stream-client] stats line
+    // AUDIO: packets received, jitter-buffer depth now, times it ran dry,
+    // frames of silence put in for lost packets.
+    uint32_t audio_packets, audio_underruns, audio_gap_frames;
+    float    audio_ms;
+    char     line[384];         // the last [stream-client] stats line
 } kl_stream_client_status;
 
 void kl_stream_client_get_status(kl_stream_client *c, kl_stream_client_status *s);

@@ -39,6 +39,9 @@ int harness_publish_png(const char *path);
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    // Count the host's AUDIO, do not play it out of the Mac's speakers
+    // (KL_STREAM_AUDIO_PLAY=1 to listen).
+    setenv("KL_STREAM_AUDIO_PLAY", "0", 0);
     const char *host = "127.0.0.1";
     int port = 0, png_every = 90, expect_loss = 0, eye_w = 1888, eye_h = 1792;
     double seconds = 6, yaw_dps = 20;
@@ -131,6 +134,8 @@ int main(int argc, char **argv) {
            frames ? pub_gpu / frames : 0.0, frames ? pub_wall / frames : 0.0,
            st.decode_ms_mean + (frames ? pub_wall / frames : 0.0),
            st.interval_ms_mean, st.interval_sd_ms_all, st.fec_fixed);
+    printf("harness: audio %u packets, %u underruns, %u frames of gaps, %.0f ms buffered at the end\n",
+           st.audio_packets, st.audio_underruns, st.audio_gap_frames, (double)st.audio_ms);
     kl_stream_client_destroy(c);
     int ok = frames > 0 && mismatched == 0 && missing == 0 && st.decode_errors == 0 && pub_fail == 0;
     // Loss must have been SEEN and survived: recovered by parity, or by IDR.

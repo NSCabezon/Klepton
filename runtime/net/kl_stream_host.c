@@ -35,6 +35,9 @@
 //   KL_STREAM_TIMEOUT_MS=2000    no POSE for this long = client gone
 //   KL_STREAM_PREVIEW=1          local preview window of the encoded SBS frame
 //   KL_STREAM_BONJOUR=0          do not advertise (loopback tests)
+//   KL_STREAM_AUDIO=1            send the guest's sound to the headset (AUDIO)
+//   KL_STREAM_AUDIO_LOCAL=0      ...and also play it on the Mac (1); default
+//                                silent here while the tap is on
 #include "kl_stream_host.h"
 #include "kl_stream_proto.h"
 
@@ -56,6 +59,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "kl_audio.h"
 #include "kl_env.h"
 #include "kl_openvr.h"
 #include "kl_ovrp.h"
@@ -132,6 +136,7 @@ static struct {
     // frames actually handed to the encoder: the cadence the headset gets
     double   enc_sum, enc_sq, enc_max;
     unsigned enc_n;
+    unsigned audio_pkts, audio_frames;   // AUDIO sent this window
 } S;
 
 static void hdr_init(kl_stream_hdr *h, uint16_t type) {
@@ -456,6 +461,8 @@ static void stats_tick(double dt) {
                 S.enc_n / dt, m, var > 0 ? sqrt(var) : 0.0, S.enc_max,
                 g_pace_period <= 0 ? " [free]" : g_pace_off ? " [AB: free]" : " [locked]");
     }
+    if (S.audio_pkts) fprintf(stderr, SH "  audio: %u packets, %.1f kHz of guest PCM sent\n",
+                              S.audio_pkts, S.audio_frames / dt / 1000.0);
     if (S.queue_drops) fprintf(stderr, SH "  %u encoded frames dropped: the sender queue was full\n",
                                S.queue_drops);
     if (S.retries) fprintf(stderr, SH "  %u sends retried on a full interface queue (ENOBUFS)\n", S.retries);
@@ -468,6 +475,7 @@ static void stats_tick(double dt) {
     S.enc_ms = S.compose_ms = S.age_ms = S.render_ms = S.send_ms = 0;
     S.retries = S.skipped = S.untagged = 0;
     S.parity = S.dropped = S.queue_drops = 0;
+    S.audio_pkts = S.audio_frames = 0;
     S.iv_sum = S.iv_sq = S.iv_max = 0; S.iv_n = 0;
     S.wgp_sum = S.wgp_sq = S.wgp_max = 0; S.wgp_n = 0; S.wgp_late = S.wgp_wake_late = 0;
     S.enc_sum = S.enc_sq = S.enc_max = 0; S.enc_n = 0;
@@ -529,6 +537,72 @@ static void DNSSD_API dns_cb(DNSServiceRef ref, DNSServiceFlags flags, DNSServic
     else     fprintf(stderr, SH "Bonjour: '%s' %s%s\n", name, type, domain);
 }
 
+// ---- audio (KL_STREAM_AUDIO) ---------------------------------------------------
+//
+// kl_audio's tap hands us every guest buffer on the guest's audio thread, in
+// the guest's format (Alyx through SDL: s16 stereo, 48 kHz), before the
+// Mac's resampler. Cut into ~5 ms AUDIO packets and sent at once: the guest's
+// feeder already runs at the device's pace (kl_audio_write blocks), so the
+// packets leave at real time with no clock of our own. Mono is sent as mono,
+// more than two channels as the first two. Only the first producer is
+// streamed (Alyx has one; Steam Link's second stream would be mixed in the
+// Mac's ring, which is past the tap).
+static pthread_mutex_t g_au_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    const void *src;
+    unsigned rate, ch;
+    uint64_t next_frame;          // first_frame of the packet being filled
+    unsigned fill;                // frames in pkt
+    unsigned per_pkt;             // ~5 ms
+    struct { kl_stream_audio a; int16_t pcm[KL_STREAM_AUDIO_MAX_FRAMES * 2]; } pkt;
+} A;
+
+static void audio_flush_locked(void) {
+    if (!A.fill) return;
+    hdr_init(&A.pkt.a.h, KL_STREAM_AUDIO);
+    A.pkt.a.sample_rate = A.rate;
+    A.pkt.a.channels = (uint16_t)A.ch;
+    A.pkt.a.frames = (uint16_t)A.fill;
+    A.pkt.a.first_frame = A.next_frame;
+    size_t n = sizeof A.pkt.a + (size_t)A.fill * A.ch * sizeof(int16_t);
+    if (send_client(&A.pkt, n) == 0) { S.audio_pkts++; S.audio_frames += A.fill; }
+    A.next_frame += A.fill;
+    A.fill = 0;
+}
+
+static void audio_tap(const void *src, const int16_t *pcm, size_t frames,
+                      unsigned rate, unsigned channels) {
+    if (!rate || !channels) return;
+    pthread_mutex_lock(&g_mu);
+    int on = C.active;
+    pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_au_mu);
+    if (!A.src) A.src = src;
+    if (src != A.src || !on) {          // a second producer, or nobody to hear it
+        if (!on) { A.fill = 0; }
+        pthread_mutex_unlock(&g_au_mu);
+        return;
+    }
+    unsigned ch = channels > 2 ? 2 : channels;
+    if (rate != A.rate || ch != A.ch) {
+        A.fill = 0;
+        A.rate = rate; A.ch = ch; A.next_frame = 0;
+        A.per_pkt = rate / 200;          // 5 ms
+        if (A.per_pkt < 32) A.per_pkt = 32;
+        if (A.per_pkt > KL_STREAM_AUDIO_MAX_FRAMES) A.per_pkt = KL_STREAM_AUDIO_MAX_FRAMES;
+        fprintf(stderr, SH "audio: streaming the guest's %u Hz, %u ch (s16) in %u-frame packets\n",
+                rate, ch, A.per_pkt);
+    }
+    for (size_t i = 0; i < frames; i++) {
+        const int16_t *f = pcm + i * channels;
+        int16_t *o = A.pkt.pcm + (size_t)A.fill * ch;
+        o[0] = f[0];
+        if (ch == 2) o[1] = f[1];
+        if (++A.fill >= A.per_pkt) audio_flush_locked();
+    }
+    pthread_mutex_unlock(&g_au_mu);
+}
+
 int kl_stream_host_start(const char *guest) {
     if (guest) snprintf(g_guest, sizeof g_guest, "%s", guest);
     g_port = kl_env_int("KL_STREAM_PORT", KL_STREAM_PORT_DEFAULT);
@@ -579,6 +653,13 @@ int kl_stream_host_start(const char *guest) {
     if (pthread_create(&t, NULL, net_thread, NULL)) { perror(SH "pthread_create"); return -1; }
     pthread_detach(t);
     fprintf(stderr, SH "listening on UDP :%d (%s), guest '%s'\n", g_port, KL_STREAM_BONJOUR, g_guest);
+    if (kl_env_on("KL_STREAM_AUDIO", 1)) {
+        int local = kl_env_on("KL_STREAM_AUDIO_LOCAL", 0);
+        kl_audio_set_tap(audio_tap, !local);
+        fprintf(stderr, SH "audio to the headset on (KL_STREAM_AUDIO=0: off); %s\n",
+                local ? "also playing on the Mac (KL_STREAM_AUDIO_LOCAL=1)"
+                      : "the Mac stays silent (KL_STREAM_AUDIO_LOCAL=1 plays it here too)");
+    }
     return 0;
 }
 

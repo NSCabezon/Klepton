@@ -3518,6 +3518,12 @@ keeps the old behaviour for targets that existed before the port, unless noted.
   Measured in the harness (M1 Max, loaded): 6144x2912 decode 5.7–7.8 ms BGRA vs
   2.6–2.7 ms native; the split pass ~0.2 ms GPU (same as the blit).
 - `KL_STREAM_LOG=0` — silence the once-a-second `[stream-client]` stats line.
+- `KL_STREAM_AUDIO=0` — ignore the host's AUDIO. `KL_STREAM_AUDIO_PLAY=0` —
+  receive and count it without opening an output (the harness's default).
+  `KL_STREAM_AUDIO_PREBUFFER_MS` (40) — jitter buffer filled before playing
+  (and again after running dry); `KL_STREAM_AUDIO_MAX_MS` (150) — more than
+  this buffered (clock drift) drops the oldest down to the prebuffer. A lost
+  packet is filled with silence (gaps up to 100 ms).
 - `KL_STREAM_SIM_YAW_DPS=<deg/s>` — Simulator only (no world tracking there): the
   fixed standing head the stream sends yaws at this rate. Default 0.
 
@@ -3563,6 +3569,12 @@ parity packets; host and hub must both be v2 (a v1 hub is refused at HELLO).
   requests, 1168 frames decoded; FEC 10 → 89 IDR, 3593; FEC 5 → 45 IDR, 3914.
 - `KL_STREAM_TEST_DROP=<p>` — drop this fraction of VIDEO packets (data and
   parity) before sending: loss tests.
+- `KL_STREAM_AUDIO=1` — **default on**: the guest's PCM (kl_audio's tap, before
+  the Mac's resampler; Alyx = s16 stereo 44.1 kHz) goes to the headset as AUDIO
+  packets of ~5 ms (additive message type in v2, no FEC). `0` = sound stays on
+  the Mac. `KL_STREAM_AUDIO_LOCAL=1` — also play it on the Mac (default: the
+  Mac's output plays silence while the tap is on; the device still paces the
+  guest). Loopback (Alyx, 150 s): ~200 packets/s, 0 gaps.
 
 ## "Jugar desde el Mac" — test host (`tools/kl_stream_testhost.m`, `build/kl_stream_testhost`)
 
