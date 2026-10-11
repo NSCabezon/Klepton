@@ -1634,6 +1634,8 @@ final class KleptonCompositor {
         NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
         // The session's performance summary starts with the loop (KleptonSessionStats.swift).
         KLSessionStats.shared.begin()
+        // The performance overlay and the quick settings (Siri) may run now.
+        KLQuickSettings.shared.gameStarted(device: device)
         loop: while true {
             switch layerRenderer.state {
             case .invalidated:
@@ -1683,6 +1685,7 @@ final class KleptonCompositor {
         // Not final: the process may open another immersive space, and the
         // guest may still be running; backgrounding and exit write the final line.
         KLSessionStats.shared.checkpoint(reason: "render loop ended")
+        KLQuickSettings.shared.gameEnded()
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.

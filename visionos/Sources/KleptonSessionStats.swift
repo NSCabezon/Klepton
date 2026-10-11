@@ -58,6 +58,11 @@ struct KLSessionRecord: Codable, Identifiable, Equatable {
     var compositorFrames: UInt64
     var reprojectedFrames: UInt64
     var peakFootprintMB: Int
+    /// The guest's GPU ms per frame, averaged over the frames that were timed
+    /// (kl_gpu_time: KL_GPU_TIME, or while the performance overlay was on).
+    /// nil when nothing was timed. Added later: older lines decode without it.
+    var gpuMsAvg: Double? = nil
+    var gpuFrames: UInt64? = nil
 }
 
 /// The session files: Application Support/sessions/<target>.jsonl.
@@ -137,6 +142,7 @@ final class KLSessionStats {
         var pendingReused: UInt64 = 0      // reused since the last new guest frame
         var winNs: UInt64 = 0, winFrames: UInt64 = 0
         var winMin = Double.infinity, winMax = 0.0
+        var maxIntervalNs: UInt64 = 0      // worst play interval since the overlay last read it
     }
 
     private let lock: UnsafeMutablePointer<os_unfair_lock> = {
@@ -210,6 +216,7 @@ final class KLSessionStats {
             } else {
                 c.playNs &+= d
                 c.guestFrames &+= 1
+                if d > c.maxIntervalNs { c.maxIntervalNs = d }
                 c.reprojected &+= c.pendingReused
                 let bin = min(Int(d / 250_000), Self.bins - 1)
                 hist[bin] &+= 1
@@ -259,6 +266,50 @@ final class KLSessionStats {
         if ticks % 30 == 0 || log { persist(final: false, reason: "periodic", log: log) }
     }
 
+    /// The process's physical footprint and the kernel's lifetime peak, bytes.
+    static func footprint() -> (now: UInt64, peak: UInt64)? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return (info.phys_footprint, UInt64(max(0, info.ledger_phys_footprint_peak)))
+    }
+
+    /// The running counters the performance overlay differentiates (two reads
+    /// half a second apart give that half second's rates). One lock round trip.
+    struct Live {
+        var guestFrames: UInt64 = 0
+        var playNs: UInt64 = 0
+        var compFrames: UInt64 = 0
+        var compIntervalNs: UInt64 = 0
+        var compIntervals: UInt64 = 0
+        var reprojected: UInt64 = 0
+        var pendingReused: UInt64 = 0
+        var lastNewNs: UInt64 = 0
+    }
+    func live() -> Live {
+        os_unfair_lock_lock(lock)
+        let s = c
+        os_unfair_lock_unlock(lock)
+        return Live(guestFrames: s.guestFrames, playNs: s.playNs, compFrames: s.compFrames,
+                    compIntervalNs: s.compIntervalNs, compIntervals: s.compIntervals,
+                    reprojected: s.reprojected, pendingReused: s.pendingReused, lastNewNs: s.lastNewNs)
+    }
+    static var nowNsPublic: UInt64 { nowNs() }
+
+    /// The worst guest frame interval since the last call, ms (nil: none), and reset.
+    func takeMaxIntervalMs() -> Double? {
+        os_unfair_lock_lock(lock)
+        let m = c.maxIntervalNs
+        c.maxIntervalNs = 0
+        os_unfair_lock_unlock(lock)
+        return m > 0 ? Double(m) / 1e6 : nil
+    }
+
     private func samplePeak() {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
@@ -302,7 +353,9 @@ final class KLSessionStats {
         }
         func fps(_ ms: Double?) -> Double? { ms.map { 1000 / $0 } }
         let playS = Double(s.playNs) / 1e9
-        return KLSessionRecord(
+        var gpuSum = 0.0, gpuN: UInt64 = 0
+        kl_gpu_time_totals(&gpuSum, &gpuN)
+        var r = KLSessionRecord(
             id: id, target: target, build: Self.buildStamp,
             start: s.startWall, end: Date(), final: final, endReason: reason,
             durationS: Double(now &- s.startNs) / 1e9,
@@ -318,6 +371,8 @@ final class KLSessionStats {
             compositorFrames: s.compFrames,
             reprojectedFrames: s.reprojected,
             peakFootprintMB: Int(peakFootprint >> 20))
+        if gpuN > 0 { r.gpuMsAvg = gpuSum / Double(gpuN); r.gpuFrames = gpuN }
+        return r
     }
 
     private func persist(final: Bool, reason: String, log: Bool) {
@@ -338,6 +393,7 @@ final class KLSessionStats {
             + "5s min/max \(f(r.fpsMin5s))/\(f(r.fpsMax5s)), median frame \(f(r.frameMsP50)) ms; "
             + "play \(dur(r.playS)), loading \(dur(r.loadingS)); display \(f(r.displayHz)) Hz, "
             + "reprojected \(reproj) compositor frames; peak footprint \(r.peakFootprintMB) MB; "
+            + (r.gpuMsAvg.map { String(format: "GPU %.1f ms/frame over %llu timed frames; ", $0, r.gpuFrames ?? 0) } ?? "")
             + "build \(r.build)"
     }
 

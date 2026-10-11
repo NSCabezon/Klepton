@@ -3058,6 +3058,69 @@ static void alyx_cmd_at(void) {
     }
 }
 
+// kl_openvr_console: commands queued from any thread (the visionOS quick
+// settings, Siri), run on the game's thread from in_update — the engine's
+// console is not thread-safe, and the input update is where the game expects
+// its own menu's commands. g_con_ready is published once libclient checks out
+// (build 10919) and its engine client pointer is set; until then a command is
+// refused rather than queued for a game that may never answer.
+static pthread_mutex_t g_con_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_con_q[8][128];
+static _Atomic int g_con_n;
+static _Atomic int g_con_ready;
+
+int kl_openvr_console_ready(void) { return atomic_load(&g_con_ready); }
+
+int kl_openvr_console(const char *cmd) {
+    if (!cmd || !*cmd) return -1;
+    if (!atomic_load(&g_con_ready)) {
+        fprintf(stderr, "  [openvr] console: \"%s\" refused (no Alyx engine client yet)\n", cmd);
+        return -1;
+    }
+    pthread_mutex_lock(&g_con_mu);
+    int r = -2;
+    if (g_con_n < 8) {
+        snprintf(g_con_q[g_con_n], sizeof g_con_q[0], "%s", cmd);
+        g_con_n++;
+        r = 0;
+    }
+    pthread_mutex_unlock(&g_con_mu);
+    fprintf(stderr, "  [openvr] console: \"%s\" %s\n", cmd, r ? "refused (queue full)" : "queued");
+    return r;
+}
+
+// Game thread, every input update. Resolves the engine client at most once a
+// second until it is found, then drains the queue.
+static void alyx_console_drain(void) {
+    static double next_try;
+    static void *eng;
+    if (!eng) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (now < next_try) return;
+        next_try = now + 1.0;
+        const uint8_t *cl = alyx_client();
+        if (!cl) return;
+        memcpy(&eng, cl + 0x26b94a8, sizeof eng);     // IVEngineClient * (0xf81c44)
+        if (!eng) return;
+        atomic_store(&g_con_ready, 1);
+        fprintf(stderr, "  [openvr] console: Alyx engine client found; runtime commands available\n");
+    }
+    if (!g_con_n) return;           // racy peek; a command missed now runs next update
+    char q[8][128];
+    pthread_mutex_lock(&g_con_mu);
+    int n = g_con_n;
+    memcpy(q, g_con_q, sizeof q[0] * (size_t)n);
+    g_con_n = 0;
+    pthread_mutex_unlock(&g_con_mu);
+    void **vt = *(void ***)eng;
+    void (*cmd)(void *, int, const char *, int, int) = (void (*)(void *, int, const char *, int, int))vt[0xd0 / 8];
+    for (int i = 0; i < n; i++) {
+        fprintf(stderr, "  [openvr] console: running \"%s\"\n", q[i]);
+        cmd(eng, 0, q[i], 0, 0);
+    }
+}
+
 static const uint8_t *alyx_client(void) {
     static const uint8_t *cl;
     static int bad;
@@ -3081,6 +3144,7 @@ static void alyx_gate_trace(void) {
     static int32_t last[8];
     static int have;
     alyx_cmd_at();
+    alyx_console_drain();
     if (on < 0) on = kl_env_on("KL_OPENVR_GATE_TRACE", 0);
     if (!on) return;
     if (!cl) {

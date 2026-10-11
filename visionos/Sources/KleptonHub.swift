@@ -215,15 +215,31 @@ enum HubSessionText {
         return String(format: "%d h %02d min", m / 60, m % 60)
     }
 
-    /// The card's line: "Última sesión: 52 fps (5% peor 38) · 12 min".
+    /// The card's line: "Última sesión: 52 fps (1% peor 31) · 12 min · 8 oct".
     static func card(_ r: KLSessionRecord) -> String {
         let head = klL("Last session", "Última sesión")
+        let when = r.start.formatted(.dateTime.day().month(.abbreviated))
         guard let avg = r.fpsAvg else {
-            return "\(head): \(klL("no game frames", "sin imagen del juego")) · \(duration(r.durationS))"
+            return "\(head): \(klL("no game frames", "sin imagen del juego")) · \(duration(r.durationS)) · \(when)"
         }
-        let low = r.fps5Low.map { " (\(klL("5% low", "5% peor")) \(Int($0.rounded())))" } ?? ""
-        return "\(head): \(Int(avg.rounded())) fps\(low) · \(duration(r.durationS))"
+        let low = r.fps1Low.map { " (\(klL("1% low", "1% peor")) \(Int($0.rounded())))" } ?? ""
+        return "\(head): \(Int(avg.rounded())) fps\(low) · \(duration(r.playS)) · \(when)"
     }
+
+    /// Why the session ended, in words.
+    static func endReason(_ r: KLSessionRecord) -> String {
+        if !r.final { return klL("did not close cleanly (killed or crashed)", "no se cerró limpiamente (cierre forzado o fallo)") }
+        switch r.endReason {
+        case "exit": return klL("game exited", "el juego terminó")
+        case "background": return klL("app closed or backgrounded", "app cerrada o en segundo plano")
+        case "render loop ended": return klL("immersive view closed", "vista inmersiva cerrada")
+        default: return r.endReason
+        }
+    }
+
+    static func ms(_ v: Double?) -> String { v.map { String(format: "%.1f ms", $0) } ?? "—" }
+    static func fps(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "—" }
+    static func memory(_ mb: Int) -> String { mb > 0 ? String(format: "%.1f GB", Double(mb) / 1024) : "—" }
 }
 
 // MARK: - Library model
@@ -574,6 +590,21 @@ struct HubGameSettingsView: View {
                     }
                 }
 
+                Section {
+                    Toggle(klL("Performance overlay", "Visor de rendimiento"), isOn: Binding(
+                        get: { s.perfOverlay ?? false },
+                        set: { s.perfOverlay = $0 ? true : nil; save() }))
+                } header: { Text(klL("In-game", "Dentro del juego")) } footer: {
+                    Text(klL("A small panel in the game's view with fps, frame and GPU time, reprojected "
+                             + "frames, memory and temperature. Siri can turn it on and off while you play "
+                             + "(“Turn on the FPS overlay in AVP Hub”), and “Open settings in AVP Hub” opens "
+                             + "quick settings inside the game.",
+                             "Un panel pequeño en la vista del juego con fps, tiempo de imagen y de GPU, "
+                             + "imágenes reproyectadas, memoria y temperatura. Siri lo activa y desactiva "
+                             + "mientras juegas («Activa el visor de FPS en AVP Hub»), y «Abre los ajustes en "
+                             + "AVP Hub» abre los ajustes rápidos dentro del juego."))
+                }
+
                 sessionsSection
 
                 Section {
@@ -590,50 +621,82 @@ struct HubGameSettingsView: View {
         .frame(minWidth: 560, minHeight: 640)
         .onAppear {
             s = KLGameSettingsStore.load(game.target)
-            sessions = Array(KLSessionHistory.load(game.target).suffix(10).reversed())
+            sessions = Array(KLSessionHistory.load(game.target).suffix(6).reversed())
         }
     }
 
-    /// The last ten sessions, newest first, and a way to forget them.
+    /// The last session in detail, then the five before it, and a way to forget them.
     @ViewBuilder private var sessionsSection: some View {
+        if let r = sessions.first {
+            Section {
+                LabeledContent(klL("Date", "Fecha"),
+                               value: r.start.formatted(date: .abbreviated, time: .shortened))
+                LabeledContent(klL("Play time", "Tiempo de juego"),
+                               value: HubSessionText.duration(r.playS)
+                                   + (r.loadingS >= 1 ? " · " + klL("loading", "cargando") + " "
+                                      + HubSessionText.duration(r.loadingS) : ""))
+                LabeledContent(klL("Frame rate (avg / median)", "Imágenes por segundo (media / mediana)"),
+                               value: "\(HubSessionText.fps(r.fpsAvg)) / \(HubSessionText.fps(r.frameMsP50.map { 1000 / $0 })) fps")
+                LabeledContent(klL("1% low", "1% peor"), value: "\(HubSessionText.fps(r.fps1Low)) fps")
+                if let g = r.gpuMsAvg {
+                    LabeledContent(klL("GPU per frame", "GPU por imagen"), value: HubSessionText.ms(g))
+                }
+                if r.compositorFrames > 0 {
+                    LabeledContent(klL("Reprojected", "Reproyectadas"),
+                                   value: String(format: "%.0f %%", 100 * Double(r.reprojectedFrames) / Double(r.compositorFrames))
+                                       + (r.displayHz.map { String(format: " · %.0f Hz", $0) } ?? ""))
+                }
+                LabeledContent(klL("Peak memory", "Memoria máxima"), value: HubSessionText.memory(r.peakFootprintMB))
+                LabeledContent(klL("Ended", "Final"), value: HubSessionText.endReason(r))
+            } header: { Text(klL("Last session", "Última sesión")) }
+            .monospacedDigit()
+        }
         Section {
             if sessions.isEmpty {
                 Text(klL("No sessions recorded yet.", "Aún no hay sesiones registradas."))
+                    .foregroundStyle(.secondary)
+            } else if sessions.count == 1 {
+                Text(klL("No earlier sessions.", "No hay sesiones anteriores."))
                     .foregroundStyle(.secondary)
             } else {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     GridRow {
                         Text(klL("Date", "Fecha"))
-                        Text(klL("Duration", "Duración"))
+                        Text(klL("Play", "Juego"))
                         Text(klL("Avg", "Media"))
-                        Text(klL("5% low", "5% peor"))
+                        Text(klL("1% low", "1% peor"))
+                        Text("GPU")
                         Text(klL("Peak mem.", "Memoria máx."))
                     }
                     .font(.caption.bold()).foregroundStyle(.secondary)
-                    ForEach(sessions) { r in
+                    ForEach(sessions.dropFirst()) { r in
                         GridRow {
                             Text(r.start.formatted(date: .abbreviated, time: .shortened))
                                 + Text(r.final ? "" : " *").foregroundStyle(.orange)
-                            Text(HubSessionText.duration(r.durationS))
+                            Text(HubSessionText.duration(r.playS))
                             Text(r.fpsAvg.map { String(format: "%.0f fps", $0) } ?? "—")
-                            Text(r.fps5Low.map { String(format: "%.0f", $0) } ?? "—")
-                            Text(r.peakFootprintMB > 0
-                                 ? String(format: "%.1f GB", Double(r.peakFootprintMB) / 1024) : "—")
+                            Text(HubSessionText.fps(r.fps1Low))
+                            Text(r.gpuMsAvg.map { String(format: "%.1f ms", $0) } ?? "—")
+                            Text(HubSessionText.memory(r.peakFootprintMB))
                         }
                         .font(.callout).monospacedDigit()
                     }
                 }
+            }
+            if !sessions.isEmpty {
                 Button(klL("Clear history", "Borrar historial"), role: .destructive) {
                     KLSessionHistory.clear(game.target)
                     sessions = []
                 }
             }
-        } header: { Text(klL("Sessions", "Sesiones")) } footer: {
+        } header: { Text(klL("Earlier sessions", "Sesiones anteriores")) } footer: {
             Text(klL("Frame rate the game delivered while playing (loading screens excluded). "
-                     + "5% low: the slowest 5% of frames ran at or below this. "
+                     + "1% low: the slowest 1% of frames ran at or below this. GPU: the game's own GPU time "
+                     + "per frame, recorded only while the performance overlay (or KL_GPU_TIME) was on. "
                      + "* = the session did not close cleanly; its figures are from up to 30 s before the end.",
                      "Imágenes por segundo que dio el juego mientras se jugaba (sin pantallas de carga). "
-                     + "5% peor: el 5% más lento de las imágenes fue a esta velocidad o menos. "
+                     + "1% peor: el 1% más lento de las imágenes fue a esta velocidad o menos. GPU: tiempo de "
+                     + "GPU del juego por imagen, solo registrado con el visor de rendimiento (o KL_GPU_TIME) activo. "
                      + "* = la sesión no se cerró limpiamente; sus datos son de hasta 30 s antes del final."))
         }
     }
