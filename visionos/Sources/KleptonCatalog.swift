@@ -50,6 +50,9 @@ enum KLCatalog {
         // Meta only (Steam's Beat Saber is Windows-only): the Quest build 1.40.8_7379 — APK, main OBB
         // and the DLC song packs the account bought.
         KLCatalogEntry(target: "beatsaber", display: "Beat Saber", steamApp: nil, metaRecipe: "beatsaber"),
+        // Meta only (a Quest 3 exclusive): the Quest build 1.4.1-350961 — APK, main OBB, audio OBBs,
+        // videos and the 69 Addressables bundles (18.3 GB); voice-language packs are opt-in.
+        KLCatalogEntry(target: "batman", display: "Batman: Arkham Shadow", steamApp: nil, metaRecipe: "batman"),
     ]
 
     static func entry(_ target: String) -> KLCatalogEntry? { entries.first { $0.target == target } }
