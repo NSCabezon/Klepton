@@ -1049,6 +1049,21 @@ static float klovrp_forced_hz(void) {
     return forced;
 }
 
+static int g_submit_wh[2][2];
+void kl_ovrp_note_submit_size(int eye, int w, int h) {
+    if (eye < 0 || eye > 1 || w <= 0 || h <= 0) return;
+    __atomic_store_n(&g_submit_wh[eye][0], w, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_submit_wh[eye][1], h, __ATOMIC_RELAXED);
+}
+int kl_ovrp_submit_size(int eye, int *w, int *h) {
+    if (eye < 0 || eye > 1) return 0;
+    int ww = __atomic_load_n(&g_submit_wh[eye][0], __ATOMIC_RELAXED);
+    int hh = __atomic_load_n(&g_submit_wh[eye][1], __ATOMIC_RELAXED);
+    if (w) *w = ww;
+    if (h) *h = hh;
+    return ww > 0 && hh > 0;
+}
+
 void kl_ovrp_set_display_frequency(float hz) {
     // An explicit override wins over a measurement — the whole point of forcing
     // a rate is a guest that mishandles the real one, so letting the compositor's
@@ -1940,13 +1955,17 @@ typedef struct {
     // dates nothing (the macOS viewer). Rides in the struct for the reason the
     // motion does: every latch copies a klovrp_pose by value, so the time the
     // guest's frame was drawn at is coherent with the pose it was drawn with.
-    // Read only by the depth-reprojection modes (kl_ovrp_render_pose.pose_time).
+    // Read by the depth-reprojection modes (kl_ovrp_render_pose.pose_time) and
+    // echoed by the streaming host (head_time).
     double t;
+    // The frontend's own name for this sample (kl_ovrp_set_head_pose_tag),
+    // HEAD only, inside the pose for the same reason: the streaming host
+    // echoes the tag of the pose a frame was RENDERED with. 0 = never named.
+    uint64_t tag;
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-    0,   // motion_valid: nothing has been published, so there is nothing to know
-    0,   // t: and it is about no instant
+    0, 0, 0,   // motion_valid, t, tag: nothing has been published, so there is nothing to know
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -2433,6 +2452,13 @@ void kl_ovrp_set_head_pose_time(double t) {
     g_head_pose_time = t;
 }
 
+// The tag the NEXT published head pose carries into the frame record; same
+// thread and same call order as kl_ovrp_set_head_pose_time.
+static uint64_t g_head_pose_tag;
+void kl_ovrp_set_head_pose_tag(uint64_t tag) {
+    g_head_pose_tag = tag;
+}
+
 // How far ahead of "now" the frontend predicts the head it publishes — the
 // compositor's own lead (its presentation time minus the moment it queried),
 // smoothed. A guest predicting its frame to when it will be SEEN adds this:
@@ -2460,9 +2486,10 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     g_head_raw_y = py; g_head_raw_seen = 1;
     if (g_eye_origin_want) klovrp_eye_origin_capture(py, "first head pose after the guest selected EyeLevel");
     py -= klovrp_origin_y();
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     v.t = g_head_pose_time;
+    v.tag = g_head_pose_tag;
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
     // Pose trace, once a second: the pushed head Y + tracking-origin frame
@@ -2943,6 +2970,8 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     r->stage = -1;
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
+    r->head_tag = h.tag;
+    r->head_time = h.t;
     // Unity's own frame counter — the number it picks its stage from.
     g_frames.pending_index = guest_frame_index;
     pthread_mutex_unlock(&g_frames.mu);
@@ -3499,6 +3528,8 @@ void kl_ovrp_frame_begin_external(void) {
     r->stage = -1;
     r->complete = 0;
     r->submit_ns = klovrp_mono_ns();
+    r->head_tag = h.tag;
+    r->head_time = h.t;
     // The latched sample's own instant; a guest that predicts moves it with
     // kl_ovrp_frame_set_pose_time. No depth until the guest files one.
     r->pose_time = h.t;
@@ -3781,7 +3812,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
     py -= klovrp_origin_y();
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
@@ -3800,7 +3831,7 @@ void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
     py -= klovrp_origin_y();
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);

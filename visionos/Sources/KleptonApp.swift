@@ -155,6 +155,9 @@ enum Lifecycle {
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        // A stream from the Mac says BYE first, so the host stops encoding
+        // for a headset that is gone. No-op when there is none.
+        KLStreamSession.shared.stop(reason: "background")
         // Flush before exit rather than relying on it. The guest's log is a
         // file in the container (kl_app.c redirects stdout/stderr there) and it
         // is the only account of the run that survives; `exit` does flush
@@ -309,13 +312,21 @@ enum KLAccountPrivacy {
 struct KleptonRootView: View {
     #if KL_HUB
     @State private var picked = HubLaunch.scriptedGame()
+    /// "Jugar desde el Mac": the Mac being streamed from, while it lasts. No
+    /// guest boots in this mode, so ending it returns to the library.
+    @State private var streaming = HubLaunch.scriptedStream()
     var body: some View {
-        if picked != nil {
+        if let s = streaming {
+            StreamPlayView(target: s, onExit: { streaming = nil })
+        } else if picked != nil {
             BootView()
         } else {
             HubLibraryView(onPlay: { target in
                 HubLaunch.select(target)
                 picked = target
+            }, onPlayFromMac: { target, mac in
+                HubLaunch.selectForStream(target)
+                streaming = mac
             })
         }
     }
