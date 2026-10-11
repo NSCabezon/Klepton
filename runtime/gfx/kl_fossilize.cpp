@@ -22,6 +22,23 @@
 //       boots) the same replay, blocking, on a device of our own made as the game makes its own
 //       (device-info.json, KL_VK_DEVICE_INFO), retired before the guest starts.
 //
+// Foveation (KL_FOVEATE=1 with the MoltenVK FDM fork): the game then creates each scene-pass
+// pipeline with VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT, and the
+// fork compiles those with a gl_FragCoord remap: different MSL, a Metal cache miss, a stall per
+// pipeline even after a warm replay (device, 2026-10-11: 259 stalls, ~101 s, with the prewarm
+// warm). A recording made with foveation shows those pipelines are the .foz's own with only
+// that flag added, so the replay compiles each multisampled multiview dynamic-rendering
+// pipeline twice, with and without it (fdm_twin). Without foveation the flag would compile to
+// the same MSL as the plain pipeline, so no twin is made. KL_FOZ_FDM=0 turns the twins off.
+//
+//   KL_FOZ_AUTORECORD=<dir>   (the hub, with "Precompilar gráficos") each session records into
+//       <dir>/session.N.foz ONLY what no known database has (a Fossilize concurrent database
+//       over the KL_FOZ_PREWARM list and <dir>'s earlier files), and the prewarm replays
+//       KL_FOZ_PREWARM + every <dir>/*.foz, so each session makes the next one smoother. Over
+//       KL_FOZ_RECORD_KEEP files (default 8) the sessions are merged into <dir>/merged.foz;
+//       over KL_FOZ_RECORD_MAX_MB (default 256) in <dir> nothing more is recorded. An explicit
+//       KL_FOZ_RECORD wins; KL_FOZ_AUTORECORD=0 is off.
+//
 // Neither set: kl_fossilize_install installs nothing and the layer's hooks stay NULL.
 #include "fossilize.hpp"
 #include "fossilize_db.hpp"
@@ -38,6 +55,7 @@
 #include <thread>
 #include <vector>
 #include <dirent.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <stdio.h>
@@ -71,8 +89,9 @@ std::atomic<double> g_prog_t0{0};
 // Pipelines compiled and those over 100 ms, over every database of one prewarm.
 std::atomic<unsigned> g_sum_compiled{0}, g_sum_slow{0};
 
-void rec_init(const char *path) {
-    g_rec_db = create_stream_archive_database(path, DatabaseMode::Append);
+// Records into `db` (a stream archive, or KL_FOZ_AUTORECORD's concurrent database); takes it.
+void rec_start(DatabaseInterface *db, const char *path) {
+    g_rec_db = db;
     if (!g_rec_db || !g_rec_db->prepare()) {
         fprintf(stderr, "  [foz] cannot open %s for recording; recording off\n", path);
         delete g_rec_db;
@@ -93,6 +112,10 @@ void rec_init(const char *path) {
             sync ? "synchronized: flushed per record" : "recording thread");
 }
 
+void rec_init(const char *path) { rec_start(create_stream_archive_database(path, DatabaseMode::Append), path); }
+
+bool fdm_twin(const VkGraphicsPipelineCreateInfo *ci);
+
 void note_pipe(bool ok) {
     unsigned n = ok ? ++g_rec_pipes : g_rec_pipes.load();
     if (!ok) ++g_rec_fail;
@@ -107,7 +130,17 @@ void h_shader_module(VkShaderModule h, const VkShaderModuleCreateInfo *ci) { if 
 void h_render_pass(VkRenderPass h, const VkRenderPassCreateInfo *ci) { if (g_rec) (void)g_rec->record_render_pass(h, *ci); }
 void h_render_pass2(VkRenderPass h, const VkRenderPassCreateInfo2 *ci) { if (g_rec) (void)g_rec->record_render_pass2(h, *ci); }
 void h_graphics_pipeline(VkPipeline h, const VkGraphicsPipelineCreateInfo *ci) {
-    if (g_rec) note_pipe(g_rec->record_graphics_pipeline(h, *ci, nullptr, 0));
+    if (!g_rec) return;
+    // A foveated pipeline is recorded as its plain self: the replay remakes the twin when
+    // foveation is on (fdm_twin), and the plain one is what the .foz already holds (so it is
+    // not recorded again) and what a run without foveation asks for.
+    VkGraphicsPipelineCreateInfo plain;
+    if (ci->flags & VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT) {
+        plain = *ci;
+        plain.flags &= ~(VkPipelineCreateFlags)VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
+        if (fdm_twin(&plain)) ci = &plain;
+    }
+    note_pipe(g_rec->record_graphics_pipeline(h, *ci, nullptr, 0));
 }
 void h_compute_pipeline(VkPipeline h, const VkComputePipelineCreateInfo *ci) {
     if (g_rec) note_pipe(g_rec->record_compute_pipeline(h, *ci, nullptr, 0));
@@ -138,7 +171,24 @@ struct Fns {
     PFN_vkDestroyPipeline DestroyPipeline;
 };
 
-struct Job { bool graphics; const void *ci; };
+struct Job { bool graphics; const void *ci; bool fdm = false; };
+
+// The foveated twin of a replayed pipeline: what the game creates for its density-map pass when
+// it sees VK_EXT_fragment_density_map (the scene pass: dynamic rendering, multiview, MSAA). On a
+// recording made with foveation every such pipeline carried the flag and no other pipeline did.
+bool fdm_twin(const VkGraphicsPipelineCreateInfo *ci) {
+    if (ci->renderPass != VK_NULL_HANDLE) return false;
+    if (ci->flags & VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT) return false;
+    if (!ci->pMultisampleState || ci->pMultisampleState->rasterizationSamples <= VK_SAMPLE_COUNT_1_BIT) return false;
+    uint32_t view_mask = 0;
+    for (auto *b = (const VkBaseInStructure *)ci->pNext; b; b = b->pNext) {
+        // flags there override ci->flags; Alyx does not send it
+        if (b->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO) return false;
+        if (b->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+            view_mask = ((const VkPipelineRenderingCreateInfo *)b)->viewMask;
+    }
+    return view_mask != 0;
+}
 
 // Creates the dependency objects inline (the parse thread) and queues the pipelines for the
 // compile threads. Fossilize keeps every parsed create info alive while the StateReplayer lives.
@@ -154,7 +204,8 @@ struct Creator : StateCreatorInterface {
     std::condition_variable cv;
     std::deque<Job> queue;
     bool closed = false;
-    unsigned queued = 0, compiled = 0, failed = 0, slow = 0;
+    bool fdm_variants = false;   // also queue each pipeline's foveated twin (fdm_twin)
+    unsigned queued = 0, compiled = 0, failed = 0, slow = 0, twins = 0;
     double compile_s = 0;
     unsigned dep_fails = 0;
 
@@ -199,15 +250,20 @@ struct Creator : StateCreatorInterface {
         passes.push_back(*out);
         return true;
     }
-    void push(bool graphics, const void *ci) {
+    void push(bool graphics, const void *ci, bool fdm = false) {
         std::lock_guard<std::mutex> l(mu);
-        queue.push_back({ graphics, ci });
+        queue.push_back({ graphics, ci, fdm });
         queued++;
+        if (fdm) twins++;
         cv.notify_one();
     }
     bool enqueue_create_graphics_pipeline(Hash, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out) override {
         *out = VK_NULL_HANDLE;
         push(true, ci);
+        if (fdm_variants && fdm_twin(ci)) {
+            g_prog_total.fetch_add(1, std::memory_order_relaxed);
+            push(true, ci, true);
+        }
         return true;
     }
     bool enqueue_create_compute_pipeline(Hash, const VkComputePipelineCreateInfo *ci, VkPipeline *out) override {
@@ -233,8 +289,14 @@ struct Creator : StateCreatorInterface {
             }
             double t0 = now_s();
             VkPipeline p = VK_NULL_HANDLE;
+            VkGraphicsPipelineCreateInfo twin;
+            if (j.fdm) {
+                twin = *(const VkGraphicsPipelineCreateInfo *)j.ci;
+                twin.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
+            }
             VkResult r = j.graphics
-                ? f.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, (const VkGraphicsPipelineCreateInfo *)j.ci, nullptr, &p)
+                ? f.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1,
+                      j.fdm ? &twin : (const VkGraphicsPipelineCreateInfo *)j.ci, nullptr, &p)
                 : f.CreateComputePipelines(dev, VK_NULL_HANDLE, 1, (const VkComputePipelineCreateInfo *)j.ci, nullptr, &p);
             double dt = now_s() - t0;
             if (p) f.DestroyPipeline(dev, p, nullptr);
@@ -285,8 +347,19 @@ std::vector<std::string> replay_files(const char *e = getenv("KL_FOZ_REPLAY")) {
     return out;
 }
 
-void replay_db(VkDevice dev, const Fns &f, const std::string &path, unsigned nthreads, bool background) {
-    DatabaseInterface *db = create_stream_archive_database(path.c_str(), DatabaseMode::ReadOnly);
+// One replay over every database at once: a session recording (KL_FOZ_AUTORECORD) holds only
+// what the others lacked, so its pipelines name layouts and modules that live in them.
+void replay_db(VkDevice dev, const Fns &f, const std::vector<std::string> &paths, unsigned nthreads, bool background) {
+    DatabaseInterface *db;
+    std::string path = paths[0];
+    if (paths.size() == 1) {
+        db = create_stream_archive_database(path.c_str(), DatabaseMode::ReadOnly);
+    } else {
+        std::vector<const char *> p;
+        for (const auto &s : paths) p.push_back(s.c_str());
+        db = create_concurrent_database(nullptr, DatabaseMode::ReadOnly, p.data(), p.size());
+        path += " + " + std::to_string(paths.size() - 1) + " more";
+    }
     if (!db || !db->prepare()) {
         fprintf(stderr, "  [foz] replay: cannot open %s\n", path.c_str());
         delete db;
@@ -295,6 +368,7 @@ void replay_db(VkDevice dev, const Fns &f, const std::string &path, unsigned nth
     double t0 = now_s();
     StateReplayer replayer;
     Creator creator(dev, f);
+    creator.fdm_variants = klvk_fdm_pipeline_variants() && !(getenv("KL_FOZ_FDM") && !strcmp(getenv("KL_FOZ_FDM"), "0"));
     std::vector<std::thread> workers;
     for (unsigned i = 0; i < nthreads; i++) workers.emplace_back([&] {
         pthread_setname_np("klfz replay");
@@ -332,10 +406,11 @@ void replay_db(VkDevice dev, const Fns &f, const std::string &path, unsigned nth
     for (auto &t : workers) t.join();
     creator.destroy_objects();
     delete db;
-    fprintf(stderr, "  [foz] replay %s: %u pipelines (%u failed, %u unparsed) in %.1f s on %u threads; "
+    fprintf(stderr, "  [foz] replay %s: %u pipelines (%u failed, %u unparsed%s) in %.1f s on %u threads; "
                     "%.1f s of compiles, %u over 100 ms\n",
-            path.c_str(), creator.compiled, creator.failed, parse_fail, now_s() - t0, nthreads,
-            creator.compile_s, creator.slow);
+            path.c_str(), creator.compiled, creator.failed, parse_fail,
+            creator.fdm_variants ? (", " + std::to_string(creator.twins) + " of them foveated twins").c_str() : "",
+            now_s() - t0, nthreads, creator.compile_s, creator.slow);
     g_sum_compiled.fetch_add(creator.compiled);
     g_sum_slow.fetch_add(creator.slow);
 }
@@ -366,7 +441,7 @@ void start_replay(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa, const std::vector<
         double t0 = now_s();
         g_prog_done.store(0); g_prog_total.store(0);
         g_prog_t0.store(t0); g_prog_state.store(1);
-        for (const auto &p : files) replay_db(dev, f, p, nthreads, !block);
+        replay_db(dev, f, files, nthreads, !block);
         g_prog_state.store(2);
         fprintf(stderr, "  [foz] replay done in %.1f s\n", now_s() - t0);
         klvk_set_replay_thread(0);
@@ -384,6 +459,10 @@ void h_device_created(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa) {
     once = true;
     start_replay(dev, gdpa, files, knob_on(getenv("KL_FOZ_REPLAY_BLOCK")));
 }
+
+// kl_fossilize_install and KL_FOZ_AUTORECORD: the hooks are installed once.
+std::mutex g_install_mu;
+bool g_installed;
 
 const klvk_pipe_hooks g_hooks = {
     h_device_created, h_sampler, h_set_layout, h_pipeline_layout, h_shader_module,
@@ -403,15 +482,13 @@ extern "C" int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed)
 }
 
 extern "C" void kl_fossilize_install(void) {
-    static std::mutex mu;
-    static bool done;
-    std::lock_guard<std::mutex> l(mu);
-    if (done) return;
+    std::lock_guard<std::mutex> l(g_install_mu);
+    if (g_installed) return;
     const char *r = getenv("KL_FOZ_RECORD");
     bool rec = knob_on(r), rep = knob_on(getenv("KL_FOZ_REPLAY"));
     if (!rec && !rep) return;   // not latched: kl_foz_prewarm_env may set KL_FOZ_REPLAY later
-    done = true;
-    if (rec) rec_init(r);
+    g_installed = true;
+    if (rec && !g_rec) rec_init(r);
     klvk_set_pipe_hooks(&g_hooks);
 }
 
@@ -575,32 +652,104 @@ int prewarm(const std::vector<std::string> &files, const char *info_path) {
 
 } // namespace
 
+namespace {
+
+// ---- KL_FOZ_AUTORECORD: each session records what the known databases lack ------------------
+unsigned env_uint(const char *k, unsigned dflt) {
+    const char *v = getenv(k);
+    return v && *v ? (unsigned)strtoul(v, nullptr, 10) : dflt;
+}
+
+// Over KL_FOZ_RECORD_KEEP session files, fold them into <dir>/merged.foz (Fossilize dedups by
+// hash) and delete them, so the folder holds a few files whatever the number of sessions.
+void autorecord_compact(const std::string &dir) {
+    std::string merged = dir + "/merged.foz";
+    std::vector<std::string> src;
+    for (const auto &f : replay_files(dir.c_str())) if (f != merged) src.push_back(f);
+    if (src.size() <= env_uint("KL_FOZ_RECORD_KEEP", 8)) return;
+    std::vector<const char *> p;
+    for (const auto &f : src) p.push_back(f.c_str());
+    if (!merge_concurrent_databases(merged.c_str(), p.data(), p.size(), true)) {
+        fprintf(stderr, "  [foz] autorecord: merging %zu sessions into %s failed; kept as they are\n",
+                src.size(), merged.c_str());
+        return;
+    }
+    for (const auto &f : src) unlink(f.c_str());
+    fprintf(stderr, "  [foz] autorecord: %zu sessions merged into %s\n", src.size(), merged.c_str());
+}
+
+// Records the guest's new pipelines into <dir>/session.N.foz: a concurrent database that knows
+// every hash in `known` writes only the rest, and makes no file at all when there is none.
+void autorecord_start(const std::string &dir, const std::vector<std::string> &known) {
+    if (knob_on(getenv("KL_FOZ_RECORD"))) {
+        fprintf(stderr, "  [foz] autorecord: off, KL_FOZ_RECORD names the recording\n");
+        return;
+    }
+    unsigned long long bytes = 0;
+    for (const auto &f : replay_files(dir.c_str())) {
+        struct stat st;
+        if (stat(f.c_str(), &st) == 0) bytes += (unsigned long long)st.st_size;
+    }
+    unsigned cap = env_uint("KL_FOZ_RECORD_MAX_MB", 256);
+    if (bytes > (unsigned long long)cap << 20) {
+        fprintf(stderr, "  [foz] autorecord: off, %s holds %.0f MB (cap %u MB, KL_FOZ_RECORD_MAX_MB)\n",
+                dir.c_str(), bytes / 1048576.0, cap);
+        return;
+    }
+    std::vector<const char *> p;
+    for (const auto &f : known) p.push_back(f.c_str());
+    std::string base = dir + "/session";
+    std::lock_guard<std::mutex> l(g_install_mu);
+    if (g_rec) return;
+    rec_start(create_concurrent_database(base.c_str(), DatabaseMode::Append, p.data(), p.size()), base.c_str());
+    if (!g_rec) return;
+    g_installed = true;
+    klvk_set_pipe_hooks(&g_hooks);
+    fprintf(stderr, "  [foz] autorecord: pipelines not in the %zu known database(s) go to %s.N.foz\n",
+            known.size(), base.c_str());
+}
+
+} // namespace
+
 extern "C" int kl_foz_prewarm_env(void) {
     const char *p = getenv("KL_FOZ_PREWARM");
-    if (!knob_on(p)) return 1;
+    const char *ar = getenv("KL_FOZ_AUTORECORD");
+    bool autorec = knob_on(ar);
+    if (!knob_on(p) && !autorec) return 1;
     static bool once;
     if (once) return 1;
     once = true;
     std::vector<std::string> files = replay_files(p);
-    if (files.empty()) { fprintf(stderr, "  [foz] prewarm: nothing to replay in %s\n", p); return -1; }
-    // KL_FOZ_DEVICE_INFO, else device-info.json beside the first database
-    std::string info;
-    if (const char *e = getenv("KL_FOZ_DEVICE_INFO")) info = e;
-    else {
-        info = files[0];
-        size_t slash = info.rfind('/');
-        info = (slash == std::string::npos ? std::string(".") : info.substr(0, slash)) + "/device-info.json";
+    std::string first = files.empty() ? "" : files[0];
+    if (autorec) {
+        autorecord_compact(ar);
+        for (const auto &f : replay_files(ar)) files.push_back(f);
     }
-    int rc = prewarm(files, info.c_str());
-    if (rc == -2 && !knob_on(getenv("KL_FOZ_REPLAY"))) {
-        // No way to make the game's device ahead of it: replay on the game's own device instead,
-        // holding its vkCreateDevice (the in-process replay measured on the Mac). The layer
-        // writes device-info.json there when KL_VK_DEVICE_INFO names it, for the next launch.
-        fprintf(stderr, "  [foz] prewarm: falling back to a blocking replay at the game's vkCreateDevice\n");
-        setenv("KL_FOZ_REPLAY", p, 1);
-        setenv("KL_FOZ_REPLAY_BLOCK", "1", 0);
-        kl_fossilize_install();
+    int rc = 1;
+    if (files.empty()) {
+        if (knob_on(p)) { fprintf(stderr, "  [foz] prewarm: nothing to replay in %s\n", p); rc = -1; }
+    } else {
+        // KL_FOZ_DEVICE_INFO, else device-info.json beside the first KL_FOZ_PREWARM database,
+        // else where the layer writes it (KL_VK_DEVICE_INFO)
+        std::string info;
+        if (const char *e = getenv("KL_FOZ_DEVICE_INFO")) info = e;
+        else if (!first.empty()) {
+            size_t slash = first.rfind('/');
+            info = (slash == std::string::npos ? std::string(".") : first.substr(0, slash)) + "/device-info.json";
+        } else if (const char *e = getenv("KL_VK_DEVICE_INFO")) info = e;
+        rc = prewarm(files, info.empty() ? nullptr : info.c_str());
+        if (rc == -2 && !knob_on(getenv("KL_FOZ_REPLAY"))) {
+            // No way to make the game's device ahead of it: replay on the game's own device instead,
+            // holding its vkCreateDevice (the in-process replay measured on the Mac). The layer
+            // writes device-info.json there when KL_VK_DEVICE_INFO names it, for the next launch.
+            fprintf(stderr, "  [foz] prewarm: falling back to a blocking replay at the game's vkCreateDevice\n");
+            std::string list;
+            for (const auto &f : files) list += (list.empty() ? "" : ":") + f;
+            setenv("KL_FOZ_REPLAY", list.c_str(), 1);
+            setenv("KL_FOZ_REPLAY_BLOCK", "1", 0);
+            kl_fossilize_install();
+        }
     }
+    if (autorec) autorecord_start(ar, files);
     return rc;
 }
-
