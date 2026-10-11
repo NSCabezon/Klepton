@@ -441,6 +441,16 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
 // `visible` is 0 for an eye this layer does not name (slot < 0), which is how a
 // one-view layer is expressed — the quad collapses instead of the caller having
 // to skip a draw.
+// The unwarp grid a projection layer is drawn with — bind it at vertex buffer
+// index 1 in place of the identity grid. KL_PROJ_LAYER_GRID_ENTRIES coordinates:
+// the header and one 1x1 block per eye, each block the corners of that eye's
+// part of the texture (kl_ovrp_proj_layer.rect). kl_proj_layer_build's uniforms
+// select the block, so the two go together: its result drawn against any other
+// grid reads eye 1 from past the end of it.
+// (Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/gfx/kl_reproject.h.)
+#define KL_PROJ_LAYER_GRID_ENTRIES 9
+void kl_proj_layer_grid(const kl_ovrp_proj_layer *pl, simd_float2 *out);
+
 kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
                                           simd_float4x4 origin_from_device,
                                           simd_float4x4 device_from_view,

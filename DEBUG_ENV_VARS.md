@@ -36,6 +36,10 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   0 instead of aborting. Read by `kl_jni.c` (via `kl_jni_set_permissive`),
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
   on with answers we invented. Does not apply to the DRM entitlement guard.
+- `KL_JNI_DROP_ANALYTICS=0` — (`runtime/kl_jni.c`) restore the abort for
+  unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`).
+  Default 1: such calls are dropped and answer zero/NULL/void, since there is
+  no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
 - `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
   (klepton-ld output) over the ELF when loading each guest library — how
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
@@ -45,9 +49,10 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 
 - `KL_GL_VENDOR=<s>`, `KL_GL_RENDERER=<s>` — what the null driver answers for
   `GL_VENDOR` / `GL_RENDERER` (default `Klepton` / `Klepton GLES`). Unreal
-  picks its Android device profile partly from the renderer string; tried as
-  `Qualcomm` / `Adreno (TM) 750` (the Steam Frame) for Metro Awakening, which
-  did not change its RHI choice. Diagnostic only.
+  picks its Android device profile partly from the renderer string. Per-target
+  defaults: moss `Qualcomm` / `Adreno (TM) 650`; metro `Qualcomm` /
+  `Adreno (TM) 750` (the Steam Frame's GPU — with the maker "Valve" and a real
+  Android version it selects the Vulkan profile; alone it did not).
 - `KL_DUMP_SHADERS=<dir>` — after the frame pump, write every captured
   `glShaderSource` text into `<dir>`. Read by m_boot; the dump runs in
   `kl_egl.c`. The only place Unity's GLSL ES exists in plain text.
@@ -282,6 +287,13 @@ answers GL and kl_glfb never initializes.
   the knob adds the *clean* lines, which is what makes two platforms diffable.
   Costs a `glGetIntegerv` per upload, hence opt-in. This is what exonerated
   the guest over the Simulator's ETC2 fault.
+- `KL_GLFB_RESOLVE_STAGE=0` — turn off the staged MSAA resolve. On by
+  default: when a guest's `glBlitFramebuffer` from a multisampled renderbuffer
+  fails with `GL_INVALID_OPERATION` (ES 3.0 forbids a resolve into a different
+  format; the Quest's driver allows it), the resolve is redone through a
+  same-format staging texture and then blitted to the guest's destination.
+  Keep Talking and Nobody Explodes resolves RGBA8 into its SRGB8_ALPHA8 eye
+  texture and showed solid pink without it.
 - `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
@@ -407,6 +419,9 @@ Built for the loading-pace investigation; all default off.
 - `KL_TRACE_THREADS=1` — one line per guest `pthread_create`: entry, arg, stack
   size, detached, result. The entry pointer symbolises against the load
   addresses phase 1 prints, so it names which subsystem the thread belongs to.
+  Also one `[thr] tid=N named "..."` line per `pthread_setname_np`, with the
+  same id the fault report prints — so "a guest worker thread" in a fault can
+  be read as the engine's own thread name (UE: "RenderThread 0", ...).
 - `KL_TRACE_TSD=1` — one line per guest `pthread_key_create`: index handed out,
   destructor, and how many keys are live. The guest TSD table is Klepton's own
   (512 keys, indices recycled on delete) rather than one Darwin key apiece, and
@@ -510,6 +525,25 @@ The guest's own memory management, and the three seams that used to disable it.
   no SMT. Source 2's tier0 counts PHYSICAL cores as distinct (package, core)
   pairs; without these files it saw 1, and Alyx's VR menu warned "CPU below
   the minimum requirements" (fires at <= 3 physical cores).
+- `KL_GUEST_FRESH_POSE=0|1` — start each guest frame on a freshly offered
+  pose: one offered while the previous frame was still running is dropped
+  (unless that frame ended within 2.5 ms of it) and the loop waits for the
+  next. A guest frame then always lasts a whole number of display frames
+  instead of beating against them.
+  Default 1 for `x5812519008825194`, else 0 (start at once on any pending pose).
+- `KL_NEXUS_FRAME_BUDGET=0|1` — AC Nexus spins every frame out to a fixed
+  length for Application SpaceWarp, a per-headset constant (21.25 ms as a
+  Quest 2 at 80 Hz), which held it at 46.7 fps here where nothing synthesises
+  the frames between. With this on, that one managed value is rewritten to
+  `KL_NEXUS_FRAME_BUDGET_MS` and the game runs as fast as it can (100 fps in
+  menus, 70-98 in a level on device). Default 1 for `x5812519008825194`, else 0.
+- `KL_NEXUS_FRAME_BUDGET_MS=<ms>` — the length to spin to instead, default 0
+  (no spin). 17.0 is the game's own rule (85% of two display periods) at
+  100 Hz and, with `KL_GUEST_FRESH_POSE`, gives exactly half the display rate.
+- `KL_FS_REL_SDCARD=0|1` — resolve a relative path that begins with `sdcard/`
+  (or another spelling of external storage) as the absolute one, as it is on a
+  device where the app's working directory is `/`. AC Nexus opens its animator
+  controller bundle that way. Default 1 for `x5812519008825194`, else 0.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -660,6 +694,12 @@ CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
 
 - `KL_TRACE_TIME=1` — log the first 40 `clock_gettime`/`gettimeofday` calls
   with caller address and result. How the unchecked-failure sites were found.
+- `KL_CLOCK_RES_LINUX=1` — `clock_getres` answers 1 ns for the realtime,
+  monotonic, raw and boottime clocks, as a Linux kernel with high-resolution
+  timers does, instead of Darwin's 1000 ns / 42 ns. For a guest that turns the
+  resolution into a clock frequency. Read by `kl_libc.c`. Default on for
+  `x5812519008825194` (AC Nexus, whose UbiServices clock otherwise runs 1000×
+  fast), off elsewhere; `=0` turns it off there too.
 - `KL_TRACE_CONDWAIT=1` — log the first 60 guest `pthread_cond_timedwait`
   calls: tid, return address, ts and delta-from-now. A delta of hours is the
   signature of the poisoned abstime; sane runs read 1 ms – 1 s.
@@ -801,7 +841,7 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   between the two is the measurement — `VRLaserPointer=0/1` means the laser
   exists and is switched off.
 
-- `KL_PROBE_FIELDS=<Ns.Type:static.field.field,...>` — follow a chain from a
+- `KL_PROBE_STATIC=<Ns.Type:static.field.field,...>` — follow a chain from a
   static field through instance fields (base classes searched, so private
   fields of a parent resolve) and print where it ends: a reference prints its
   runtime class, a value its first word as int/float plus three floats (a
@@ -1029,7 +1069,9 @@ puts the camera on the ground with its hands underneath it.
   is what makes frames arrive. On device the compositor measures and pushes the
   real offsets, so this stays what it has always been there: the A/B for "is the
   compositor's number the wrong one".
-- `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3, clamped to
+- `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3 — 2 for
+  `x5812519008825194`, whose per-stage multisampled targets are real memory
+  here and put a level load at the jetsam limit with three — clamped to
   1..max). `=1` restores the earlier single-buffered behaviour, which every
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
@@ -1068,6 +1110,58 @@ puts the camera on the ground with its hands underneath it.
   back full width, and the only instrument left is a person in the headset.
   Pairs with `KL_VIEW_EYE=1`. Read on the same path as the union below, so it
   overrides the compositor on device too.
+- `KL_STALL_MS=<ms>` — the stall watch (`runtime/diag/kl_stall.c`): when an
+  OpenXR guest submits no frame for that long, every thread is sampled while the
+  gap lasts and, when frames resume, the gap's length and the stacks of the
+  threads that were not waiting are printed. Off unless set, for every target
+  (avp-play defaults it to 250 for its own Linux-process `alyx`; ours does not).
+- `KL_OVRP_HEAD=x,y,z[,yaw]` — a head pose for a run with no frontend (metres,
+  yaw in degrees). Without it an OpenXR guest's head is on the floor at the
+  origin, which Half-Life: Alyx answers with its orange out-of-bounds fade.
+- `KL_VK_ASYNC_PIPES=0|1|2` — graphics pipelines are compiled on worker threads
+  instead of in the call that creates them (default 0 everywhere; avp-play turns
+  it on for its Linux-process Alyx, ours uses the Fossilize prewarm instead). The
+  creating call waits at most `KL_VK_ASYNC_WAIT_MS` (default 8, and a tenth of
+  elapsed time across all creations); a compile that takes longer is answered
+  with a handle of the layer's own, a bind of it binds nothing until the
+  pipeline is there, and the draws that follow on that command buffer are
+  dropped. 1 = only pipelines that render with a depth attachment (views of the
+  scene and shadow maps, redrawn every frame); 2 = every graphics pipeline (test
+  only: an interface panel rendered once would keep the hole).
+  `KL_VK_ASYNC_DELAY_MS=<ms>` makes every compile that much slower, to see the
+  cold case on a machine whose Metal shader cache is warm.
+- `KL_VK_PIPE_REC=<file>` — one line per graphics pipeline the guest creates:
+  FNV hash of each stage's SPIR-V, sample count, attachment formats, view mask,
+  compile time. (How it was established that the game's shipped
+  `vulkan_shader_cache.foz` holds none of this build's shaders.)
+- `KL_VK_VIN_FILL=0|1` — a graphics pipeline MoltenVK refuses because its
+  vertex shader reads an input location the pipeline's vertex input state does
+  not supply ("Vertex attribute N is not defined in the vertex descriptor",
+  "Function requires stage_in attributes but no descriptor was set") is created
+  again with those locations reading zeroes from a buffer of the layer's own.
+  Pipelines that compile are untouched. Default 1 for `x24882487241367228`
+  (Alien: Rogue Incursion), else 0.
+- `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
+  recorded INSIDE a dynamic-rendering pass that only makes colour attachments
+  readable as input attachments. MoltenVK answers one by ending the Metal pass
+  and opening another (store everything, load everything). `1` keeps it
+  (default). `0` drops it and stores the pass's multisampled colour as the pass
+  ends, so that whatever reads it reads the previous frame (avp-play's Alyx:
+  its exposure meter; not a default here). `2` holds it back until a pipeline that reads a subpass input
+  is bound. `KL_VK_SUBPASS_DUMP=<dir>` writes the SPIR-V of every shader that
+  reads one.
+- `KL_VK_WIDEN_AREA=1` — give a multisampled pass that loads nothing its whole
+  attachments as render area, so MoltenVK can clear and discard instead of load
+  and store. Default 0 for every target (avp-play: 1 for its Alyx). `KL_VK_WIDEN_TRACE=1` says what it saw.
+- `KL_VK_HEAP_MB=<n>` — tell the guest the GPU has at most `n` MB (heap size and
+  `VK_EXT_memory_budget`), instead of MoltenVK's figure, which on a headset is
+  more than the app may use in total. Off unless set.
+- `KL_VK_NO_QUERY=1` — drop `vkCmdBeginQuery`/`vkCmdEndQuery`. A diagnostic.
+- `KL_OVRP_EYE_TAN_MAX=<t>` — tell no eye a cone wider than tangent `t` in any
+  direction (Vision Pro's temporal side is 1.73 = 60 degrees; `1.3` is 52). The
+  eye texture is narrowed in proportion, so density is kept and the far
+  periphery's pixels are not drawn; beyond the picture the composite shows its
+  clear colour. Ignored while `KL_OVRP_UNIFY_FRUSTUM` is on.
 - `KL_OVRP_UNIFY_FRUSTUM=1` — tell **both** eyes the union of the two cones.
   **Default 0 as of 2026-08-13**; it used to default to on for a multiview
   guest, which was the stopgap for BONELAB's warped right eye. That is now
@@ -1196,7 +1290,66 @@ puts the camera on the ground with its hands underneath it.
   (`kl_ovrp_set_eye_texture_size`); with nothing pushed the size stays the
   Quest 2's 2290x2400 and this does nothing. The cheapest resolution knob
   there is — Unity then applies its **own** ~1.2x on top of the result.
-- `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072,
+- `KL_OVRP_ADAPTIVE_RES=0|1` — `ovrp_GetLayerRecommendedResolution` for the eye
+  layer follows the GPU instead of always answering the full size: the time the
+  guest's frame still had to go on the GPU at frame end, averaged over 30
+  frames, is steered toward `KL_OVRP_ADAPTIVE_GPU_MS` (default 14) by scaling
+  the recommendation between 70 % and 100 %. Only a title that implements Meta's
+  dynamic resolution reads it. Default 1 for `x24882487241367228` (Alien: Rogue
+  Incursion), else 0.
+- `KL_OVRP_VIEWPORT_TOP=0|1` — read the eye layer's submitted render viewport as
+  counted from the picture's top (the rect is moved to the texture's last rows
+  before the compositors see it), which is where Unreal on Vulkan puts a
+  viewport shorter than the texture. Makes no difference to a full-height rect.
+  Default 1 for `x24882487241367228`, else 0.
+- `KL_OVRP_TEXPTR_INDIRECT=0|1` — on a Vulkan guest, `ovrp_GetLayerTexturePtr`
+  hands back a pointer to the layer's `VkImage` rather than the `VkImage`
+  itself, which is what Unity's `Texture2D.CreateExternalTexture` reads a
+  native texture pointer as. With 0, Unity dereferences the image object and
+  builds its overlay textures on the "wild handle" `kl_vulkan.c` substitutes a
+  scratch for. Default 1 for `x5812519008825194` (AC Nexus), else 0.
+- `KL_LOADVID_FOLLOW_SUBMIT=0` — keep the host-played loading video (AC Nexus's
+  Equirect loading layer) up for as long as that layer EXISTS. The default takes
+  it down once six eye frames have ended without the guest submitting the layer,
+  because the guest hides its loading screen by no longer submitting it, not by
+  destroying it.
+- `KL_LOADVID_OFF=1` — never draw the host-played loading video.
+- `KL_OVERLAY_TEXL=0|1` — composite a guest quad layer from the texture handle
+  it SUBMITTED (`ovrp_EnqueueSubmitLayer2`'s texL, resolved to the guest's own
+  render texture) rather than from the layer's swapchain image. Default 1,
+  except 0 for `x5812519008825194`, where `KL_OVRP_TEXPTR_INDIRECT` makes the
+  swapchain image the valid one and the submitted handle is a recycled
+  render texture.
+- `KL_OVRP_SPACEWARP_TEX=0|1` — when the guest's eye layer asks for Application
+  SpaceWarp (`ovrpLayerFlag_SpaceWarpDataAllocation`), give it a motion-vector
+  texture size and answer `ovrp_GetLayerTextureSpaceWarp` with real images
+  instead of "unsupported". Nothing here consumes the vectors; the point is that
+  the Oculus XR provider in AC Nexus fails its eye-texture creation without
+  them and Unity then stops the XR display after one frame. Default 1 for
+  `x5812519008825194`, else 0.
+- `KL_PLAT_LANGPACK_LIST=0|1` — answer `ovr_AssetFile_GetList` (and the status
+  calls) with the `<tag>.lang` voice packs that are really in the game's OBB
+  directory, as installed language packs, instead of an empty list. AC Nexus
+  greys out every audio language it is not told is installed. Nothing is
+  downloaded, deleted or reported as purchased. Default 1 for
+  `x5812519008825194`, else 0.
+- `KL_OVRP_ENQ_OWNS_OVERLAYS=0|1` — while the guest is filing panels through
+  `ovrp_EnqueueSubmitLayer`, an `ovrp_EndFrame4` whose own list carries no
+  overlay leaves the published set alone instead of emptying it (which blinked
+  AC Nexus's cards off every few seconds). Default 1 for `x5812519008825194`,
+  else 0.
+- `KL_OVRP_POSE_TIME=0|1` — fill `ovrpPoseStatef.Time` in
+  `ovrp_GetNodePoseState` with the moment the step's sample was latched instead
+  of leaving it 0. AC Nexus moves its physical hand bodies only when the
+  controller pose time advances, so with 0 the hands that touch things never
+  left the rig's origin. Default 1 for `x5812519008825194`, else 0.
+- `KL_VK_MAX_SAMPLES=<1|2|4>` — the highest multisample count a Vulkan guest
+  is told the device supports (limits and image-format properties), 0 for the
+  truth. A guest's multisampled eye targets are real memory here, so this is
+  what a larger eye is paid for with. Default 2 for `x5812519008825194`
+  (with `KL_OVRP_EYE_MAX` 3840), else 0.
+- `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072
+  (4000 for `doom3quest`, 3840 for `x5812519008825194`),
   0 to disable. Vision Pro's logical per-eye resolution is far larger than a
   Quest's, and the guest allocates stages x eyes of RGBA16F at whatever it is
   told, so an uncapped number turns straight into hundreds of MiB and into fill
@@ -1637,6 +1790,63 @@ The composite/timewarp pass — one file, compiled by both compositors
   publish a velocity, and SteamVR predicts again to the PC's photon time), none
   lags. The app logs the measured interval and whether the cap binds; if
   presentation is nearer than the cap, the cap does nothing and wants lowering.
+  Default 0 for Steam Link (SteamVR re-predicts; avp-play), else 50.
+
+### Controller knobs from avp-play (`KleptonControllers.swift`)
+
+Adapted from avp-play (MIT, github.com/myMartek/avp-play). Defaults keep every
+pre-existing target as it was; "avp-play's targets" = beatsaber140,
+beatsaber128, walkabout, batman, wrath2, moss, doom3quest and store rows
+`x<digits>` (`klAvpPlayTarget()`).
+
+- `KL_SENSE_VEL_GATE=<m/s>` / `KL_SENSE_VEL_GATE_ANG=<rad/s>` — noise gate on
+  the published Sense velocity (zero below, minus the threshold above). 0 = off.
+  Default 0.06 / 0.35 for Steam Link, else 0.
+- `KL_GAMEPAD=0` — ignore a plain (non-spatial) gamepad. Default on: its sticks,
+  face buttons, triggers and shoulders are merged into the two Touch
+  controllers alongside the hands (only does anything with a gamepad connected).
+- `KL_GAMEPAD_PINCH=0` — with a gamepad connected, a pinch no longer pulls the
+  trigger. Default 1.
+- `KL_GAMEPAD_MAP=square=b,circle=x` — which Touch face button each gamepad
+  face button stands for; default from targets.py `gamepad_map` (Info.plist
+  `KLGamepadMap`), "" = positional (cross=a, circle=b, square=x, triangle=y).
+- `KL_HANDS_WITH_CONTROLLER=0|1` — 1 keeps hand tracking on a hand with no
+  controller while the other hand holds one (the old per-hand fallback); 0
+  parks that hand (no spurious pinch-clicks). Default 1 everywhere except
+  avp-play's targets (0).
+- `KL_SENSE_STICK_TOUCH=0|1` — report the thumbstick capacitive-touch bit
+  (element touch, or the stick off-centre). Default 1 except `alyx` (0).
+- `KL_SENSE_RIGHT_START=0|1` — the right Sense controller's Options pill sets
+  Start as well as Back (OVRPlugin guests read Start for pause). Default 1
+  except `alyx` (0).
+
+### Rendering preferences (`KleptonTuning.swift`, avp-play)
+
+- Boot window "Rendering" panel, stored per app in UserDefaults
+  (`klepton.foveation`, `klepton.renderScale`, `klepton.video`), defaults from
+  targets.py `foveation` (on), `render_scale` (1.0), `video` (off = the
+  runtime decides). Applied before `kl_app_boot` through
+  `kl_glfb_set_foveation_default`, `kl_ovrp_set_render_scale_default`,
+  `kl_mediandk_set_video_default`; `KL_VRR`, `KL_OVRP_RENDER_SCALE`,
+  `KL_MEDIA_EXTRACTOR` still override. In the hub they are shared by all games.
+- `KL_VRR_FILL=0|1` — fill the valley between the two eyes' display-quality
+  peaks in the guest rate map (only ever adds samples; removes a vertical
+  crease at the centre). Default 1 for avp-play's targets, else 0.
+- `KL_AUTOBOOT` — its default is now the target's `autoboot` (Info.plist
+  `KLAutoBootDefault`; on unless the row says False — only avp-play's rows do).
+
+### Build / run (avp-play)
+
+- `KLEPTON_GENERIC_TARGET=x<store id>` (+ `KLEPTON_GENERIC_DISPLAY=<title>`) —
+  an experimental target read off the unpacked APK at `<root>/<name>/`
+  (`targets.py`, `_generic_row`); `run.sh` rewrites
+  `runtime/kl_target_table.h` for it (and back on the next build of anything
+  else). Store defaults in `STORE_DEFAULTS` (AC Nexus: video on).
+- `KLEPTON_APP_VERSION` / `KLEPTON_APP_BUILD` — CFBundleShortVersionString /
+  CFBundleVersion (`gen_xcodeproj.py`), else 1.0 / 1.
+- `KL_SKIP_LAUNCH=1` — `run.sh device`: build, install, stage, do not launch.
+- `KLEPTON_SIM_UDID=<udid>` — `run.sh` simulator to use instead of the first
+  booted one.
 
 - `KL_REPROJECT_NOCANT=1` — treat `device_from_view` as having no rotation;
   the A/B for the eye-cant handling.
@@ -1815,6 +2025,12 @@ reads no knobs).
 - `KL_AUDIO_TRACE=1` — one line every 200 writes: input/output frame counts,
   ring fill in frames and ms, underruns. What to turn on when the sound is
   present but wrong.
+- `KL_SL_SILENT_YIELD=0` — (`runtime/media/kl_opensl.c`) keep feeding the
+  device from an OpenSL player that has only ever produced silence while
+  another same-rate player is audible. Default 1 only for Max Mustard (`x5269080709783454`), else 0: such a player stops writing
+  (it paces itself) until it hands over a non-silent buffer, because its
+  back-to-back writes starved the audible player's turn at the mix lock — Max
+  Mustard's FMOD output beside Unity's own silent one, heard as choppy audio.
 - `KL_AUDIO_SPATIAL=1` — visionOS only. Leave the system's spatialiser in the
   path. The default is `setIntendedSpatialExperience(.bypassed)` plus two
   preferred output channels (`KleptonAudio.directStereo`, imported from ALVR's
@@ -2408,7 +2624,7 @@ nothing, and prints the unresolved imports grouped by category.
   `oculus_quest2_controller_*`) and Alyx binds `/pose/raw` — the Touch's
   TRACKED origin, the render model's origin — so the published hilt `P`
   (`.grip` · T(`KL_SENSE_POS`) · Rx(5.037 + `KL_SENSE_PITCH` -37)) is turned
-  into it: `raw = P · Rx(+37) · T(0.007 mirrored, -0.0342, -0.0961) · Rx(-20.6)`
+  into it: `raw = P · Rx(+37) · T(-0.007 mirrored, -0.0342, -0.0961) · Rx(-20.6)`
   (the OpenXR grip, as `KL_XR_GRIP_PITCH` builds it, then the render model's
   grip->tracked row, `tools/rendermodel_frames.py`). Net: the reported origin
   moves 9.7 cm forward along `P`'s -Z and 3 cm up its +Y, turned 16.4 deg
@@ -2416,6 +2632,18 @@ nothing, and prints the unresolved imports grouped by category.
   handle and 16 deg too nose-down: the hand sat below and behind the real
   controller, at the wrong angle. OVRPlugin and OpenXR guests are unaffected
   (they never call this). Logged once: `[openvr] controller pose: ...`.
+  **The hub sets it to 1 for Alyx** (`kl_app.c`), since `KL_OPENVR_MINIMAL=1`
+  would otherwise turn it off — which it did on device until 2026-10-11:
+  the hands sat ~10 cm back up the handle and, with the controllers
+  converging in any two-handed reach, the wrists landed 6-8 cm further apart
+  than the real hands (pistol magazine release unreachable).
+- `KL_OPENVR_TOUCH_X_OUT=1` — (`kl_openvr.c`, `touch_frame_for`) put the
+  Touch's tracked origin 0.7 cm OUTWARD of the grip, the old sign. **Default
+  inward** (x = -0.007 on the right hand, +0.007 on the left): the right render
+  model's `openxr_grip` sits at x = +0.007 in the tracked frame, and Glovebox's
+  `make_raw_from_grip()` (Alyx on the same Sense controllers) takes that
+  inverse. The outward sign set the hands 2.8 cm too wide when held parallel.
+  OVRPlugin's `KLOVRP_TOUCH_TRACKED_X` (`KL_OVRP_TOUCH_FRAME`) is unchanged.
 - `KL_OPENVR_HAND_POS="x,y,z"` / `KL_OPENVR_HAND_ROT="x,y,z"` — metres /
   degrees (X then Y then Z), the OpenVR guest's hand calibration, in the
   **grip's** frame (+X right, +Y up, -Z along the handle through the fist),
@@ -2504,6 +2732,34 @@ nothing, and prints the unresolved imports grouped by category.
   register, so a genuine call through a NULL pointer looks the same, and
   recovering it turns a named crash into a silent spin — this is how the
   libpangoft2 dependency-dlsym gap was found.
+- `KL_ALYX_PROFILE=glovebox` — (`runtime/guest/kl_glibc.c`) append Glovebox's
+  validated Alyx render convars (adapted from its MIT
+  `packages/alyx/defaults`: DEMO.txt, video2-visionpro-demo.txt,
+  vr_fidelity_fixed_1.0.csv) after `KL_GLIBC_ARGS`, on host and device alike:
+  `r_texture_stream_throttle_count 6`, `r_texture_stream_throttle_amount 20`,
+  `r_texture_stream_max_resolution 2048`,
+  `r_texture_stream_resolution_bias_min 0.8`, `r_texturefilteringquality 4`,
+  `gpu_mem_level 1`, `vr_aoproxy_enable 0`, `vr_depth_prepass 0`,
+  `vr_stencil_hidden_pixels 1`, `vr_hidden_pixels_use_depth 1`,
+  `r_high_quality_shadows 0`, `sc_disable_spotlight_shadows 1`,
+  `vr_single_light_fast_path_sun_cascade_0_texels_per_world 3`,
+  `vr_single_light_fast_path_sun_cascade_1_texels_per_world 0`,
+  `vr_enable_cached_lights 1`, `vr_fast_hologram 1`, `volume_fog_width 128`,
+  `volume_fog_height 128`, `volume_fog_depth 64`,
+  `r_particle_max_detail_level 1`, `cl_particle_fallback_base 1`,
+  `cl_particle_fallback_multiplier 2`, `g_ragdoll_maxcount 5`. Convar names and
+  values only — no Valve file. Left OUT on purpose: resolution, `vr_msaa`,
+  `vr_render_target_scale`, `vr_symmetric_fov` and the fidelity level (we stay
+  level 0 / 2x MSAA on M2), plus their `r_ssao 1` / `r_post_bloom 1` (they
+  raise cost) and the Steam Audio CPU convars. Any other value is logged and
+  ignored; unset appends nothing. Pairs with an A/B of `KL_CP_QUALITY=0.40`
+  (Glovebox's compositor quality; ours defaults to 1.0) and with
+  `KL_GUEST_PACE_HZ=45`.
+- `KL_TKILL_PROBE=1` — (`runtime/libc/kl_libc.c`) answer the raw
+  `tkill(tid, 0)` liveness probe (aarch64 syscall 130) "alive", the way
+  `tgkill(getpid(), tid, 0)` already is for libvideo; a real signal is still
+  refused. Unset, tkill stays on the refused-and-warned-once path. Adapted from
+  Glovebox's `g_syscall`.
 
 ## Spikes (`spikes/`)
 
@@ -2581,6 +2837,180 @@ vendored the whole path refuses by name and none of these do anything.
 - `KL_MVK_DIR=<dir>` — where to load MoltenVK from (default
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
+- `KL_GPU_TIME=1|2` — (`runtime/gfx/kl_gpu_time.m`, adapted from Glovebox's)
+  the GPU's own time per guest frame. Each queue the guest submits on is
+  exported to its MTLCommandQueue, and `-[MTLCommandBuffer commit]` of that
+  queue's buffer class is swizzled to add a completed handler; a frame's GPU
+  time is the union of its buffers' `[GPUStartTime, GPUEndTime]`, closed when
+  OpenVR's second eye is submitted. `1` logs
+  `[perf] gpu time over N frames: A ms avg / W ms worst per frame` (the GPU
+  half of the `[perf] frame seam` line); `2` also reports it to the game as
+  `GetFrameTiming`'s `m_flTotalRenderGpuMs` instead of the CPU work
+  (WaitGetPoses -> Submit) it gets otherwise. Unset or `0`: the swizzle is
+  never installed and nothing is exported. Other queues (compositor, ANGLE)
+  are not timed.
+- `KL_GPU_TIME_LOG=<s>` — the `[perf] gpu time` interval (default 1 s).
+
+### Pipeline record / replay (`runtime/gfx/kl_fossilize.cpp`, needs `make fossilize`)
+
+Source 2 creates pipelines lazily; through MoltenVK each one the Metal
+compiler has not seen costs 300-1000 ms on the render thread. Adapted from
+Glovebox (MIT). Both unset: no hooks installed, one NULL-pointer branch per
+create call.
+
+- `KL_FOZ_RECORD=<file.foz>` — append every sampler, set/pipeline layout,
+  shader module, render pass and pipeline the guest creates (its own create
+  infos, before our fix-ups) to a Fossilize stream archive. Flushed per record;
+  `KL_FOZ_RECORD_SYNC=0` uses Fossilize's background writer instead.
+- `KL_FOZ_REPLAY=<file.foz|dir>[:...]` — at the guest's first vkCreateDevice,
+  replay those archives through the layer's own entry points (same fix-ups,
+  same MSL) on `KL_FOZ_THREADS` threads (default 4), destroying each pipeline
+  at once: only Metal's compiler cache stays warm. Logs `[foz] replay ...:
+  N pipelines (failed, unparsed) in X s; Y s of compiles, Z over 100 ms`.
+- `KL_FOZ_REPLAY_BLOCK=1` — hold vkCreateDevice until the replay is done
+  (load time instead of racing the guest). Default: background, utility QoS.
+- `KL_FOZ_PREWARM=<file.foz|dir>[:...]` — just before the guest boots
+  (`kl_app_boot` on visionOS, `native_door_run` in m_boot), make a Vulkan
+  instance and device of our own exactly as the game makes its own, replay the
+  databases on it (`KL_FOZ_THREADS`), blocking, then retire it so the game's
+  device is the layer's first. Same process as the game, on purpose: a replay in
+  an earlier process did not warm a later one. Logs `[foz] prewarm done in X s:
+  N pipelines, M over 100 ms`; progress for the boot window is
+  `kl_foz_progress()` ("Preparando gráficos… n/N"). Set by the hub's per-game
+  "Precompilar gráficos" (Alyx, default off) when
+  `Documents/games/alyx/klfz/alyx.foz` exists. Without usable device info it
+  falls back to `KL_FOZ_REPLAY` + `KL_FOZ_REPLAY_BLOCK=1` (a blocking replay on
+  the game's own device).
+- `KL_FOZ_DEVICE_INFO=<file>` — the device info the prewarm rebuilds the game's
+  device from. Default: `device-info.json` beside the first `.foz`.
+- `KL_FOZ_AUTORECORD=<dir>` — each session records ONLY the pipelines no
+  known database has (a Fossilize concurrent database over the `KL_FOZ_PREWARM`
+  list and `<dir>`'s earlier files) into `<dir>/session.N.foz` (no new
+  pipeline, no file), and the prewarm replays `KL_FOZ_PREWARM` + every
+  `<dir>/*.foz` as one database (a session's pipelines name layouts that live
+  in the others). Foveated pipelines are recorded without the density-map flag
+  (the replay remakes the twins). Over `KL_FOZ_RECORD_KEEP` files (default 8)
+  the sessions are merged into `<dir>/merged.foz` at the next launch; over
+  `KL_FOZ_RECORD_MAX_MB` (default 256) in `<dir>` nothing more is recorded. An
+  explicit `KL_FOZ_RECORD` wins; `KL_FOZ_AUTORECORD=0` is off. Set by the hub
+  to `klfz/recorded/` whenever "Precompilar gráficos" is on. Mac, 2026-10-11:
+  session 1 recorded 2 new pipelines (72 KB, 1 stall of 54 ms), session 2
+  replayed them: 0 stalls.
+- `KL_FOZ_FDM=0` — with foveation on (`KL_FOVEATE=1` and the FDM fork), the
+  replay/prewarm also compiles a "foveated twin" of every multisampled
+  multiview dynamic-rendering pipeline (the scene pass): the same create info
+  plus `VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT`,
+  which is exactly what Alyx creates when it sees the density-map extension
+  (a recording with foveation: 88/88 scene pipelines = the .foz's own + that
+  flag). The fork compiles those with the gl_FragCoord remap, so they are
+  different MSL and missed the Metal cache: device 2026-10-11, 259 stalls /
+  ~101 s with the prewarm warm. The replay line then reads `N pipelines (...,
+  T of them foveated twins)`. `0` turns the twins off. Without foveation no
+  twin is made (the flag would compile to the plain pipeline's MSL).
+- `KL_VK_DEVICE_INFO=<file>` — (kl_vulkan.c) at the guest's vkCreateDevice,
+  write its instance + device create info (extensions, queues, feature structs
+  as bytes) as JSON. The hub sets it to `klfz/device-info.json` whenever
+  "Precompilar gráficos" is on, so the headset's own record replaces any copy.
+  A feature struct the table does not know is written with size 0, and the
+  prewarm refuses that file (add the struct to `k_feature_structs`).
+- `KL_VK_STALL_MS=<ms>` — (kl_vulkan.c, always on) a guest
+  vkCreate*Pipelines call at or over this (default 50; 0 = off) logs
+  `pipeline stall: ... (stalls so far: N, T ms total)`; the running totals
+  also ride on the `pipeline warmup` line. Replay threads are not counted.
+- Measuring cold vs warm without wiping the shared Metal cache: any MoltenVK
+  option that changes the MSL or compile options is a fresh cache key
+  (`MVK_CONFIG_FAST_MATH_ENABLED=0`, `MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=0`,
+  `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`, and their combinations) — one
+  cold run per combination.
+- Two Alyx instances at once collide: the second exits on its
+  `source_engine_*.lock` in `$TMPDIR` (give it its own `TMPDIR`), and even then
+  can hang at Steam Audio init right after `semctl cmd 2 not translated`.
+
+## Foveated rendering (`runtime/gfx/kl_vulkan.c`, the `vendor-moltenvk-fdm` MoltenVK fork) — phase H
+
+Half-Life: Alyx (Steam Frame build) foveates through `VK_EXT_fragment_density_map`:
+its scene pass is a DYNAMIC-RENDERING pass (`vkCmdBeginRendering`, never a render
+pass object) with a CPU-built density map attached
+(`VkRenderingFragmentDensityMapAttachmentInfoEXT`, 32x32 texels: `Creating
+fragment density map with size: 69x75x2 (RT: 2208x2400x2)`), 2 views (viewMask
+0x3), MSAA colour B10G11R11 cleared/not stored and RESOLVED, D32S8 depth+stencil
+cleared/not stored and RESOLVED. Stock MoltenVK has no such extension. Two halves:
+
+- `KL_FDM_SPOOF=1` — (kl_vulkan.c) ADVERTISE the extension to the guest
+  (`fragmentDensityMap` + `NonSubsampledImages`, min = max texel 32x32, the
+  FRAGMENT_DENSITY_MAP format feature on R8G8_UNORM) and strip it on the way down:
+  the map image's usage bit (it becomes a plain SAMPLED R8G8 texture), the
+  SUBSAMPLED image flag (Alyx creates its scene targets subsampled), view and
+  sampler flags. The render-pass / rendering structs are left in the chain —
+  stock MoltenVK skips pNext nodes it does not know, the fork reads them. Legal:
+  full rate everywhere is always conformant and the attachments are full size, so
+  the picture is identical. **Default: = `KL_FOVEATE`.** Alyx then logs
+  `Vulkan extension enabled: VK_EXT_fragment_density_map` and builds its maps;
+  `vr_fdm` is on by default once the extension exists (no convar needed).
+- `KL_FDM_TRACE=1` — the spoof's evidence: every density-map image, and one line
+  per distinct density-map pass shape (`[fdm] vkCmdBeginRendering WITH density
+  map ...` + each attachment's format, size, load/store ops, resolve).
+- `KL_FDM_TEXEL=<n>` — the texel size reported (power of two 8..128, default 32,
+  what Steam Frame's Adreno reports).
+- `KL_FOVEATE=1` — use the fork: each density-map pass that passes the safety
+  checks renders through a Metal `MTLRasterizationRateMap` (2 layers, one per
+  eye) into PHYSICAL-size shadow attachments, and its stored/resolved
+  attachments are UNWARPED into the real images when the pass ends (one
+  full-screen pass per image, both layers instanced; depth through
+  `[[depth(any)]]`, stencil through `[[stencil]]`). Pipelines built for a
+  density-map pass remap `gl_FragCoord` back to framebuffer space (SPIRV-Cross
+  patch). The map is CENTRED on the render area (Alyx draws the eye into the
+  top-left 2208x2400 of a 2688x2880 image). A pass that cannot be foveated
+  safely (a LOADed or multisampled-and-stored attachment, a stored stencil,
+  integer colour, >2 layers, a multiview pass split into several Metal passes)
+  renders at full rate and says why ONCE: `[mvk-fov] ... FULL RATE — <reason>`.
+  Needs the fork staged (`make mvk-fdm`); with stock MoltenVK it degrades to the
+  spoof and says so (`this MoltenVK cannot foveate`). **Default 0** in the
+  runtime; the visionOS app sets **1 for Alyx** (kl_app.c, with `KL_ALYX_MSAA=4`)
+  unless the launch environment or the hub's "Foveated rendering" says
+  otherwise (device, M2, 2026-10-11: 4x + foveation 18.3 GPU ms/frame vs 28.8 at
+  4x full rate, -36%). Pipelines for a density-map pass are compiled with the
+  remap, so the prewarm compiles their twins (`KL_FOZ_FDM`).
+- `KL_FOVEATE_LEVEL=1|2|3` — the fixed profile (separable, same on both axes and
+  both eyes; centre → edge, fraction of the half extent : rate). 1 = 45% : 1,
+  30% : 0.75, 25% : 0.5 (~64% of fragments); **2 (default)** = 35% : 1,
+  30% : 0.5, 35% : 0.33 (~38%, 43% after Metal's 32-px tile rounding at
+  2688x2880); 3 = 25% : 1, 30% : 0.5, 45% : 0.25 (~26%). The game's own map is
+  NOT read (Metal maps are separable, Vulkan maps 2-D).
+- `KL_FOVEATE_PROFILE="f:r,f:r,..."` — a custom profile in that form (fractions
+  are normalised), overrides the level.
+- `KL_FOVEATE_UNWARP=nearest` — point-sample the unwarp (default bilinear, which
+  smooths the low-rate periphery).
+- `KL_FOVEATE_DEBUG=1` — tint unwarped colour red where the rate is below 1
+  (stronger below 0.4): the A/B that shows WHERE it foveates.
+- `KL_FOVEATE_DEPTH=0` — do not unwarp the resolved depth/stencil (diagnostic:
+  the A/B for what that unwarp costs; later passes then see a stale depth).
+- `KL_MVK_GPU_TIME=1` — (fork only) every 5 s, the GPU busy time — the union of
+  all MoltenVK MTLCommandBuffer [GPUStartTime, GPUEndTime] — in ms per second,
+  the density-map FRAMES (a suspended/resumed instance counts once) foveated / at
+  full rate, and GPU ms per frame. The measurement for a CPU-bound Mac; it does
+  not include Klepton's own compositor (plain Metal, not MoltenVK).
+- `KL_FOVEATE_AB=<s>` — (fork only, implies `KL_MVK_GPU_TIME`) the IN-PROCESS
+  A/B: foveation alternates ON / OFF every s seconds within one run (OFF = full
+  rate through an identity map, exactly the fallback path), and every 5 s
+  `[mvk-fov] A/B so far: foveated X GPU ms/frame at F fps | full rate Y ... |
+  ±Z% GPU time` accumulates both phases (the first second after each flip is not
+  attributed). Two separate runs on a shared GPU (another Alyx, SUPERHOT, a build)
+  are not comparable; two phases of one run interleaved for minutes are. 10 is a
+  good period. A suspended/resumed instance keeps the phase it began in.
+
+Which MoltenVK runs (stock or the fork). There is ONE slot, `vendor-moltenvk/out/`
+(`macos/libMoltenVK.dylib`, `xros|xrsim/MoltenVK.framework`); no runtime choice.
+`make mvk` fills it with the stock prebuilt; `make mvk-fdm` (tools/mvk_fdm_build.sh)
+builds the fork for macOS + visionOS + simulator and overwrites it (stamp
+`vendor-moltenvk/.klepton-fdm`; `rm vendor-moltenvk/.klepton-fdm && make mvk` puts
+stock back). The visionOS app embeds whatever is in the slot: `visionos/run.sh` runs
+`mkmvk.sh` on every build, which wraps `out/xros` + `out/xrsim` into
+`visionos/Frameworks/MoltenVK.xcframework`. So a hub built from a checkout whose slot
+holds the fork SHIPS the fork; with `KL_FOVEATE` unset the spoof is off, Alyx never
+sees the extension, no density-map pass exists and the fork's code is inert (verified
+on the Mac: same picture as stock). On the Mac, `KL_MVK_DYLIB=<path>` loads any
+other build for an A/B (e.g. the main checkout's stock dylib).
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
@@ -2713,8 +3143,42 @@ except its own control vars (next section).
   anything.
 - `KL_TOAST_SECS=<s>` — how long each toast stays up, fades included
   (default 5). Several unlocks queue and show one after another.
+- `KL_CTRL_WARN=0|1|2` — the "controller disconnected" card (`KleptonHUD.swift`,
+  device only). A PSVR2 Sense controller that is not connected while a game runs
+  (asleep at start, or dropped mid-game) leaves that hand on ARKit hand
+  tracking; a head-locked card 1 m ahead, 25 cm below the eyes, says "Mando
+  izquierdo desconectado / Pulsa el botón PS para despertarlo" (or derecho /
+  both; English unless the HEADSET language is Spanish) until it reconnects,
+  then "Mando izquierdo conectado" for 2 s. 5 s grace after the compositor
+  starts, 1 s debounce for a mid-game drop. `1` (default): only once a Sense
+  controller has been seen connected in this process, so a hands-only player
+  never sees it; `2`: always (a game that needs controllers); `0`: off. Read
+  live. Log: `[hud] controller warning: left missing` / `left back`.
+- `KL_CTRL_WARN_FORCE=left|right|both[:secs]` — pretend that controller is
+  missing (and that one was seen), to check the card without real controllers;
+  with `:secs` it "comes back" that many seconds after the grace period, which
+  shows the confirmation too.
+- `KL_HUD=1` — the performance overlay (`KleptonQuickSettings.swift`, device
+  only; the hub's per-game "Performance overlay" sets it at Play): a panel lower
+  left with guest fps, frame ms avg/max, GPU ms (kl_gpu_time switched on live
+  while it is up, no `[perf]` log lines), reprojected %, display Hz, footprint
+  and thermal state, refreshed 2×/s off the render thread. Siri toggles it
+  mid-game. Log: `[qs] performance overlay ON`.
+- `KL_QS_PAUSE=1` — the in-game quick settings (Siri: "Abre los ajustes en AVP
+  Hub") also send Alyx `setpause` / `unpause` on open / close. Off by default
+  (not verified to pause cleanly); controller input is swallowed either way.
+  Logs: `[qs] ...`, `[openvr] console: ...`, `[vk] foveation switched ...`.
 - `KL_STEAM_ICON_TIMEOUT=<ms>` — the bridge `icon` fetch per unlocked
   achievement (default 10000); a failure shows the toast with a placeholder.
+- `KL_OVERLAY_SUBMIT_ORDER=0|1` — composite the guest's quad layers in the
+  order it submitted them (no depth test between them, depth still written),
+  as a Quest's compositor does. Without it a quad's whole rectangle, transparent
+  parts included, hides whatever farther quad is submitted after it — and so
+  does the eye picture, which is drawn as a quad at `KL_REPROJECT_DEPTH`: a
+  panel the guest places beyond that distance fails the depth test against it
+  and is never seen. Default 1 for `x24882487241367228` (Alien: Rogue
+  Incursion) and `x5812519008825194` (AC Nexus, whose calibration card sits
+  2.3 m out), else 0.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
   **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
   two are one word apart and were briefly one name, which would have made each
@@ -2873,7 +3337,24 @@ its next launch; Reset returns to the environment/defaults and forgets it.
   foveation).
 - `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
   ceiling costs memory and per-frame GPU time; the *running* quality is set
-  separately by the render loop.
+  separately by the render loop. For Alyx, A/B try `KL_CP_QUALITY=0.40`
+  (Glovebox's validated value) against the default.
+- `KL_GUEST_PACE_HZ=<fps>` — (`kl_app.c` guest_pace_wait, adapted from
+  Glovebox's) pace the guest to at most `<fps>`: it starts a frame only once N
+  compositor poses have been published since the last one, N =
+  ceil(display rate / fps) measured over ~1 s windows (a new N needs two
+  windows in a row; each change is logged as `[guest] display … Hz: pacing
+  1/N`). `45` on the M2's 90 Hz is 1/2: a fixed 45 fps the compositor
+  reprojects. For Alyx this installs a pacer in OpenVR's `WaitGetPoses`
+  (`kl_openvr_set_frame_pacer`), BEFORE the pose latch and `ft_wait`, so the
+  frame is still declared with the head it rendered from (mode 1 reprojection
+  is unaffected) and the time held is not counted as frame work. Unset, Alyx's
+  `WaitGetPoses` does not wait at all (the old behaviour) and the OpenXR/
+  OVRPlugin guests' pacer waits for one publish as before.
+- `KL_GUEST_PACE_DIV=N` — the fixed form: every Nth published pose (`2` = 45
+  fps at 90 Hz) whatever the display rate. With both set, `KL_GUEST_PACE_HZ`
+  takes over from this N once the display rate has been measured (~2 s). Each wait still gives up after 1 s, so a compositor that stops
+  publishing cannot wedge the guest.
 
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 
@@ -3003,3 +3484,170 @@ Not knobs — the shim reads these to answer the guest with host truth.
   the host's first preferred language (CFLocale — what a visionOS app launched
   from the Home View has, since it has no `LANG`; before, the headset reported
   en/US there), then en/US.
+
+### Ported from avp-play (2026-10-11), knobs added or re-defaulted here
+
+Adapted from avp-play (MIT, github.com/myMartek/avp-play). Every one of these
+keeps the old behaviour for targets that existed before the port, unless noted.
+
+- `KL_ENV_LOCKED=1` — (`runtime/kl_env.c`) read knobs with libc `getenv`
+  again instead of the lock-free walk of `environ` (the walk fixes an IL2CPP
+  stop-the-world deadlock in getenv). Default 0.
+- `KL_SL_TAKE_DEVICE=0|1` — (`kl_opensl.c`) a near-silent OpenSL player may take
+  the output device from a silent one. Default 1 only for Deadpool
+  (`x3240283705987790`).
+- `KL_UE4_OS_RELEASE=0|1` — (`kl_jni_ue4.c`) tell a UE4 guest the real Android
+  version string (avp-play's fix; Moss needs it for Vulkan). Default 1, except 0
+  for intotheradius, re4, redmatter2, vampire (renderer choice could move).
+  metro needs 1: its Steam-path device profile enables Vulkan only with a real
+  Android version (together with the Adreno 750 GL identity, kl_egl.c).
+- `KL_GLFB_ESSL_COMPAT=0` — (`kl_glfb.c`) turn off the shader rewrites for
+  sources ANGLE refuses (clip-distance rename, `fma` define, whitespace before
+  `#version`). Default 1.
+- `KL_GLFB_INVARIANT`, `KL_GLFB_MV_SHADOW`, `KL_VRR_MIRROR` — Doom3Quest's GL
+  workarounds; default 1 only for `doom3quest`.
+- `KL_JNI_RECLAIM_STRINGS=0|1` — retire frameless guest strings by age. Default
+  1 only for `doom3quest`.
+- `KL_SONGS=0|1` — Beat Saber custom levels, listing only (`kl_songs.c`).
+  Default 1 for `beatsaber128`/`beatsaber140`, 0 for our `beatsaber`.
+- `KL_VK_INPUT_ATT_FIX`, `KL_VK_EYE_CHECK` — avp-play defaults these on; here
+  both default 0. (`KL_VK_INPUT_ATT_FIX=1` is worth an A/B on Alyx's exposure.)
+- `KL_FREE_QUARANTINE_MB=<n>` — delay guest `free()` by a quarantine of n MB.
+  Default 0 (off).
+- `KL_OVRP_EYE_ORIGIN`, `KL_OVRP_ORIGIN_HEIGHTS`, `KL_OVRP_FILE_AFTER_GPU`,
+  `KL_OVRP_ENQ_STRICT`, `KL_OVRP_RECORD_LATE`, `KL_OVRP_RECORD_INDEXED`,
+  `KL_LOADVID_FOLLOW_SUBMIT`, `KL_XR_EQUIRECT`, `KL_XR_CYL_CHORD`,
+  `KL_XR_AVPPLAY_EXTS`, `KL_PLAT_CHECKOUT_ERROR` — avp-play's OVRPlugin /
+  OpenXR / platform behaviour changes. Default 1 only for avp-play's titles
+  (`kl_ovrp_avpplay_title()`: wrath2, batman, beatsaber140/128, moss, walkabout,
+  steamlink-vr, doom3quest, and x<store id> rows), else 0.
+- `KL_HANDS_WITH_CONTROLLER`, `KL_VRR_FILL` — visionOS input/foveation tweaks;
+  default on only for avp-play's targets (`klAvpPlayTarget()`).
+- `KL_SENSE_STICK_TOUCH`, `KL_SENSE_RIGHT_START` — report thumbstick touch, and
+  make the right Options pill also send Start. Default 1, 0 for `alyx`
+  (behaviour fix for OVRPlugin games; Beat Saber/SUPERHOT get it).
+
+## "Jugar desde el Mac" — headset client (`runtime/net/kl_stream_client.c`, `visionos/Sources/KleptonStreamClient.swift`)
+
+- `KL_STREAM_HOST_ADDR=ip[:port]` — a Mac to stream from without Bonjour (also
+  shown in the hub's list). IPv6 with a port goes in brackets:
+  `[fe80::1%en0]:9944`. Default port `KL_STREAM_PORT_DEFAULT` (9944).
+- `KL_STREAM_HOST_NAME=<name>` — the display name for that address (default: the address).
+- `KL_STREAM_AUTOCONNECT=1` — hub only: skip the library and go straight to
+  "Jugar desde el Mac" against `KL_STREAM_HOST_ADDR` (`KL_HUB_GAME` names the
+  game, default `alyx`). The scripted/simulator test path.
+- `KL_STREAM_MAX_KBPS=<n>` — HELLO's `max_bitrate_kbps` hint (default 0 = host decides).
+- `KL_STREAM_IDR_MIN_S=<s>` — minimum gap between IDR_REQUESTs (default 0.25);
+  an unanswered one is repeated every 2x this.
+- `KL_STREAM_NOSIGNAL_S=<s>` — seconds without a decoded frame before the state
+  is "no signal" ("Sin señal del Mac" card). Default 1.
+- `KL_STREAM_RCVBUF=<bytes>` — UDP receive buffer (default 8 MiB; a keyframe is
+  a burst of hundreds of fragments).
+- `KL_STREAM_DECODE_BGRA=1` — decode to BGRA and blit the eyes (the v1 path).
+  Default: the decoder's native biplanar 4:2:0 (`420v`, `x420` for a 10-bit
+  stream), converted to RGB while the eyes are split, by `kl_stream_yuv_msl()`
+  (one render pass per eye into a `bgra8Unorm` view of the stage texture).
+  Measured in the harness (M1 Max, loaded): 6144x2912 decode 5.7–7.8 ms BGRA vs
+  2.6–2.7 ms native; the split pass ~0.2 ms GPU (same as the blit).
+- `KL_STREAM_LOG=0` — silence the once-a-second `[stream-client]` stats line.
+- `KL_STREAM_AUDIO=0` — ignore the host's AUDIO. `KL_STREAM_AUDIO_PLAY=0` —
+  receive and count it without opening an output (the harness's default).
+  `KL_STREAM_AUDIO_PREBUFFER_MS` (40) — jitter buffer filled before playing
+  (and again after running dry); `KL_STREAM_AUDIO_MAX_MS` (150) — more than
+  this buffered (clock drift) drops the oldest down to the prebuffer. A lost
+  packet is filled with silence (gaps up to 100 ms).
+- `KL_STREAM_SIM_YAW_DPS=<deg/s>` — Simulator only (no world tracking there): the
+  fixed standing head the stream sends yaws at this rate. Default 0.
+
+## "Jugar desde el Mac" — Mac host (`runtime/net/kl_stream_host.c`, `KL_STREAM_HOST=1 ./build/m_boot alyx`)
+
+Protocol v2 (`runtime/net/kl_stream_proto.h`): VIDEO carries `fec_n` and XOR
+parity packets; host and hub must both be v2 (a v1 hub is refused at HELLO).
+
+- `KL_STREAM_HOST=1` — this frontend instead of the viewer.
+- `KL_STREAM_PORT` (9944), `KL_STREAM_NAME` (Bonjour instance), `KL_STREAM_BONJOUR=0`
+  (do not advertise — loopback tests), `KL_STREAM_WAIT` (1: boot the guest
+  after the first HELLO), `KL_STREAM_TIMEOUT_MS` (2000), `KL_STREAM_PREVIEW=1`,
+  `KL_STREAM_BITRATE_KBPS` (100000), `KL_STREAM_MAX_INFLIGHT` (2).
+- `KL_STREAM_LOCK_FPS=45` — **default on**: `WaitGetPoses` is paced to a fixed
+  1/45 s grid (`kl_openvr_set_frame_pacer`; an overrun re-anchors the grid,
+  never catches up) and the guest is told a 45 Hz display; the encoder expects
+  45 fps. The headset reprojects to 90 Hz. `0` = free-running at the client's
+  rate (v1). Measured on loopback (fidelity 0): per-second fps 50.0 ± 8.3
+  (min 31) free vs 44.5 ± 1.9 locked; per-frame interval sd ~3.3 ms either way
+  on a loaded Mac (wake-up jitter).
+- `KL_STREAM_LOCK_AB=<s>` — alternate locked/free every `<s>` seconds in one run
+  (A/B; the 1 s lines are tagged `[locked]` / `[AB: free]`).
+- `KL_STREAM_PACE_SPIN_MS=1.5` — the pacer sleeps to this long before the slot
+  and spins the rest. `KL_STREAM_PACE_RT=1` — also put the guest's frame thread
+  under a Mach real-time policy (experimental; no measurable gain on a loaded Mac).
+- `KL_STREAM_FPS` — encoder ExpectedFrameRate / HELLO_ACK target (default: the
+  lock, or 60 with the lock off).
+- `KL_STREAM_SCALE=<f>` — encode at HELLO eye size × f (v1 behaviour). **Unset
+  (default)**: encode at what the guest actually SUBMITS (its rendered rect,
+  `kl_ovrp_submit_size`), the max over ~60 frames, adopted after 30 stable
+  frames, then capped by:
+  - `KL_STREAM_MAX_MPIX=7.0` — megapixels of the side-by-side frame (0 = no cap).
+    VT HEVC on the M1 Max costs ~2.4 ms/MP and does not overlap frames
+    (4608x1920 22 ms, 5376x2208 29 ms, 6144x2400 35.6 ms), so 7 MP ≈ 17 ms keeps 45.
+  - `KL_STREAM_MAX_EYE=<px>` — cap on the longest side per eye (0 = none).
+  Alyx submits (HELLO eye 3072x2465): fidelity 0 → 2304x1920/eye (encoded
+  4100x1708 under the 7 MP cap), 3 → 2688x2208, 5 → 3072x2400.
+- Sender (frame drops / keyframe storms, 2026-10). Root cause of the periodic
+  "33 encoded frames dropped: the sender queue was full" + every frame a
+  keyframe: an UNconnected `sendto()` costs ~0.13-0.16 ms per datagram on this
+  Mac (route + NECP lookup with VPN/network extensions installed) = a ~6-8k
+  packets/s (~50-80 Mbit/s) ceiling; a head turn hit it, an encoded P-frame was
+  dropped, the keyframe that cost was 5-10x bigger, and it snowballed. Now:
+  - video goes out on a second socket on the same port, `connect()`ed to the
+    client (>200k packets/s). `KL_STREAM_CONNECTED_TX=0` = the old sendto.
+    `KL_STREAM_SNDBUF` (8 MiB).
+  - `KL_STREAM_TXQ_MAX=2` — while the sender has this many frames queued or in
+    flight, a new guest frame is NOT encoded ("busy skip"; the reference chain
+    stays whole, the headset reprojects). Encoded frames are dropped only when
+    the 8-slot queue is full (last resort).
+  - `KL_STREAM_IDR_MIN_MS=500` — at most one forced keyframe per this long;
+    requests in between fold into it ("IDR asked/forced/held" in the 1 s line).
+  - Adaptive bitrate, `KL_STREAM_ABR=1`: a congested second (busy skips, queue
+    drops, ENOBUFS) cuts the encoder target x`KL_STREAM_ABR_DOWN` (0.7) or
+    straight to 85% of what the sender got out; 2+ IDR requests (loss) x
+    `KL_STREAM_ABR_LOSS_DOWN` (0.85); +5% of the ceiling per
+    `KL_STREAM_ABR_UP_S` (2) clean seconds. Floor `KL_STREAM_MIN_KBPS` (15% of
+    the ceiling, >= 8000). Retargets the live session (no keyframe), with
+    `DataRateLimits` = `KL_STREAM_RATE_CAP` (1.5) x target over
+    `KL_STREAM_RATE_WIN_S` (0.5 s); `KL_STREAM_RATE_CAP=0` = AverageBitRate only.
+  - Pacing: each frame at `KL_STREAM_PACE_MBPS` (300) but over at most
+    `KL_STREAM_PACE_FRAC` (0.75) of the frame interval (a P-frame leaves in a
+    few ms; a keyframe is spread over ~17 ms at 45 fps). `KL_STREAM_PACE_MS=<ms>`
+    fixes the spread instead (0 = burst). A newer frame waiting sends the rest
+    at once.
+  - `KL_STREAM_TEST_LINK_MBPS=<n>` — the sender blocks as on a link of about
+    this rate (loopback tests of the busy skip + ABR; approximate).
+  - The 1 s line gains `sender: Mbit/s, P n avg/max KB, key n avg/max KB, queue
+    max, busy skips, queue drops, IDR asked/forced/held, pace ms, bitrate`.
+  Real Alyx, loopback, harness `--yaw 20` (a full turn per 18 s), 100 Mbit/s,
+  ~110 s: before p10 19.8 fps / min 12, 29 s under 40 fps, 642 frames lost,
+  304 keyframes; after p10 44.5 / min 43.9, 0 s under 40, 0 lost, 1 keyframe.
+- `KL_STREAM_FEC=10` — one XOR parity packet per N fragments (overhead 1/N);
+  any one lost fragment per group is rebuilt on the headset with no keyframe.
+  0 = off. Real Alyx, loopback, 1% simulated loss, 100 s: FEC 0 → 274 IDR
+  requests, 1168 frames decoded; FEC 10 → 89 IDR, 3593; FEC 5 → 45 IDR, 3914.
+- `KL_STREAM_TEST_DROP=<p>` — drop this fraction of VIDEO packets (data and
+  parity) before sending: loss tests.
+- `KL_STREAM_AUDIO=1` — **default on**: the guest's PCM (kl_audio's tap, before
+  the Mac's resampler; Alyx = s16 stereo 44.1 kHz) goes to the headset as AUDIO
+  packets of ~5 ms (additive message type in v2, no FEC). `0` = sound stays on
+  the Mac. `KL_STREAM_AUDIO_LOCAL=1` — also play it on the Mac (default: the
+  Mac's output plays silence while the tap is on; the device still paces the
+  guest). Loopback (Alyx, 150 s): ~200 packets/s, 0 gaps.
+
+## "Jugar desde el Mac" — test host (`tools/kl_stream_testhost.m`, `build/kl_stream_testhost`)
+
+- `KL_TESTHOST_PORT` (9944), `KL_TESTHOST_NAME` (Bonjour instance, default
+  "<Mac name> (test)"), `KL_TESTHOST_FPS` (72), `KL_TESTHOST_EYE` (cap on the
+  per-eye size, 1024), `KL_TESTHOST_KBPS` (30000), `KL_TESTHOST_GOP` (600),
+  `KL_TESTHOST_DROP` (probability of dropping each VIDEO packet, data or parity, 0),
+  plus the host's `KL_STREAM_FEC` (10) and `KL_STREAM_PACE_MS` (8),
+  `KL_TESTHOST_HAPTICS_S` (seconds between test buzzes, 0 = never),
+  `KL_TESTHOST_SECONDS` (run time then BYE, 0 = forever),
+  `KL_TESTHOST_LOWLAT` (1: try low-latency rate control).

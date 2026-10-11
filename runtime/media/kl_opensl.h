@@ -15,6 +15,12 @@ int   kl_opensl_is_handle(const void *h);
 void *kl_opensl_sym(const char *name);
 
 // What FMOD looked up and what it called. The work list, same as kl_egl_report.
+// One device, two APIs — see the note at the end of kl_opensl.c. How many
+// players hold the output device, and the call an AAudio stream makes when it
+// takes the device at `rate`.
+int  kl_opensl_audio_users(void);
+void kl_opensl_yield_device(unsigned rate);
+
 void kl_opensl_report(FILE *f);
 
 #endif

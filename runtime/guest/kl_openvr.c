@@ -56,6 +56,7 @@
 #include "kl_vulkan.h"
 #include "kl_openvr.h"
 #include "kl_reproject.h"
+#include "kl_gpu_time.h"     // KL_GPU_TIME: the frame close and GetFrameTiming
 
 #if __has_include(<vulkan/vulkan.h>)
 #define VK_NO_PROTOTYPES
@@ -280,11 +281,18 @@ static void pred_apply(const head_delta *d, float p[3], float q[4]) {
 // (KL_XR_GRIP_PITCH, confirmed by eye against the Quest 2 model SteamVR itself
 // draws through Steam Link), and the render model states the Touch's tracked
 // origin in that grip's frame (tools/rendermodel_frames.py on
-// oculus_quest2_controller_*.json, the same numbers kl_ovrp's
-// KLOVRP_TOUCH_TRACKED_* carry): 9.6 cm forward along the grip's -Z, 3.4 cm
-// down its -Y, 0.7 cm out, and pitched 20.6 degrees nose-down. So
+// oculus_quest2_controller_*.json): 9.6 cm forward along the grip's -Z, 3.4 cm
+// down its -Y, 0.7 cm IN (toward the other hand), and pitched 20.6 degrees
+// nose-down. So, for the right hand (X mirrored for the left)
 //
-//     raw = P · Rx(+37) · [T(HAND_POS) · R(HAND_ROT)] · T(0.007, -0.0342, -0.0961) · Rx(-20.6)
+//     raw = P · Rx(+37) · [T(HAND_POS) · R(HAND_ROT)] · T(-0.007, -0.0342, -0.0961) · Rx(-20.6)
+//
+// The X term is INWARD: the right model's `openxr_grip` sits at x = +0.007 in
+// the tracked frame, so the tracked origin is at -0.007 in the grip's — the
+// inverse Glovebox's klvr_core.cpp make_raw_from_grip() takes, which plays
+// Alyx on these same Sense controllers. This bridge had it OUTWARD (as kl_ovrp's
+// KLOVRP_TOUCH_TRACKED_X still does): 1.4 cm per hand, 2.8 cm too wide between
+// hands held parallel. KL_OPENVR_TOUCH_X_OUT=1 restores the outward sign.
 //
 // Handing P over as the raw pose (what this bridge did) puts the Touch's origin
 // at the grip — about 10 cm back down the handle, which on a held controller
@@ -299,7 +307,7 @@ static void pred_apply(const head_delta *d, float p[3], float q[4]) {
 // does. KL_OPENVR_TOUCH_FRAME=0 hands the published pose over unchanged (the
 // old behaviour, the A/B). OVRPlugin and OpenXR guests never come through here.
 #define KLOVR_HILT_UNDO_DEG   37.0f       // = -KLSenseTune.hiltPitch's default
-#define KLOVR_TOUCH_X         0.007000f   // tracked origin in the Touch's OpenXR grip
+#define KLOVR_TOUCH_X        (-0.007000f) // tracked origin in the RIGHT Touch's OpenXR grip (inward)
 #define KLOVR_TOUCH_Y        (-0.034157f)
 #define KLOVR_TOUCH_Z        (-0.096073f)
 #define KLOVR_TOUCH_PITCH_DEG (-20.60f)
@@ -341,6 +349,7 @@ static const touch_frame *touch_frame_for(int hand) {
     pthread_mutex_lock(&mu);
     if (!init) {
         int on = ovr_stage("KL_OPENVR_TOUCH_FRAME", 1);
+        float xs = kl_env_on("KL_OPENVR_TOUCH_X_OUT", 0) ? -1.0f : 1.0f;
         for (int h = 0; h < 2; h++) {
             touch_frame *t = &tf[h];
             t->on = on;
@@ -353,7 +362,7 @@ static const touch_frame *touch_frame_for(int hand) {
             hand_triple("KL_OPENVR_HAND_ROT", h, 1, rot);
             quat_euler_xyz(rot, qr);
             quat_mul(qu, qr, t->pre);
-            float pos[3] = { 0, 0, 0 }, tr[3] = { mx * KLOVR_TOUCH_X, KLOVR_TOUCH_Y, KLOVR_TOUCH_Z };
+            float pos[3] = { 0, 0, 0 }, tr[3] = { xs * mx * KLOVR_TOUCH_X, KLOVR_TOUCH_Y, KLOVR_TOUCH_Z };
             hand_triple("KL_OPENVR_HAND_POS", h, 0, pos);
             // offset from P's origin, in P's frame:
             //   Rx(37)·pos + Rx(37)·R(rot)·tracked
@@ -365,9 +374,11 @@ static const touch_frame *touch_frame_for(int hand) {
             quat_euler_xyz(pitch, qp);
             quat_mul(t->pre, qp, t->post);           // P-relative orientation of raw
         }
-        fprintf(stderr, "  [openvr] controller pose: %s (KL_OPENVR_TOUCH_FRAME); right hand raw = P + "
+        fprintf(stderr, "  [openvr] controller pose: %s (KL_OPENVR_TOUCH_FRAME), tracked origin %s "
+                        "(KL_OPENVR_TOUCH_X_OUT); right hand raw = P + "
                         "(%.4f, %.4f, %.4f) m in P's frame, turned (%.4f, %.4f, %.4f, %.4f)\n",
                 on ? "Oculus Touch raw (tracked origin) from the published hilt" : "published pose unchanged",
+                xs > 0 ? "0.7 cm inward (render model, Glovebox)" : "0.7 cm OUTWARD (old sign)",
                 (double)tf[1].off[0], (double)tf[1].off[1], (double)tf[1].off[2],
                 (double)tf[1].post[0], (double)tf[1].post[1], (double)tf[1].post[2], (double)tf[1].post[3]);
         init = 1;
@@ -953,7 +964,10 @@ static int co_frame_timing(void *s, uint8_t *t, uint32_t frames_ago) {
     memcpy(t + 16, &dropped, 4);
     memcpy(t + 24, &f->t_submit, 8);
     memcpy(t + 32, &work, 4);            // PreSubmitGpuMs
-    memcpy(t + 40, &work, 4);            // TotalRenderGpuMs
+    // KL_GPU_TIME=2: the GPU's own time for the frame (kl_gpu_time.m) instead
+    // of the CPU work, once one is known. Any other value leaves it as it was.
+    float gpu = kl_gpu_time_mode() == 2 ? kl_gpu_time_frame_ms(frames_ago) : 0;
+    memcpy(t + 40, gpu > 0 ? &gpu : &work, 4);   // TotalRenderGpuMs
     memcpy(t + 56, &interval, 4);        // ClientFrameIntervalMs
     if (size >= 96 + sizeof(TrackedDevicePose_t)) memcpy(t + 96, &g_last[0], sizeof(TrackedDevicePose_t));
     return 1;
@@ -1215,9 +1229,20 @@ static void hand_trace_frame(void) {
     t0 = now;
 }
 
+// The guest frame pacer (KL_GUEST_PACE_HZ / KL_GUEST_PACE_DIV): the visionOS
+// app installs one only when a knob is set, and it blocks here until the
+// compositor has published enough poses. NULL — the default, and always on the
+// host — and WaitGetPoses returns at once, as it always has. Before ft_wait, so
+// the time spent held is neither "frame work" (which the head prediction reads
+// as how far ahead the frame is seen) nor anything the frame's pose was taken
+// before: the latch below is the head after the wait.
+static void (*g_frame_pacer)(void);
+void kl_openvr_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
+
 static int co_wait_get_poses(void *s, TrackedDevicePose_t *render, uint32_t n,
                              TrackedDevicePose_t *game, uint32_t gn) {
     (void)s;
+    if (g_frame_pacer) g_frame_pacer();
     ovr_pipeline_report();
     ft_wait();
     // The frame starts here, exactly as xrWaitFrame starts an OpenXR one: pin
@@ -1753,6 +1778,7 @@ static int vk_copy_eye(int eye, int stage, const VRVulkanTextureData_t *t, const
     uint32_t w, h;
     eye_size(&w, &h);
     if (!w || !h || x1 <= x0 || y1 <= y0) return -1;
+    kl_ovrp_note_submit_size(eye, x1 - x0, y1 - y0);
     // KL_OPENVR_STAGE_SCALE=0 (KL_OPENVR_MINIMAL): no rescale. The stage image
     // is exactly the rendered rect, copied 1:1, and the compositor slot is
     // pointed at it for this frame — the picture reaches the compositor with
@@ -2040,6 +2066,7 @@ static int co_submit_impl(int eye, const Texture_t *tex, const VRTextureBounds_t
         kl_ovrp_frame_end_external(g_stage, g_frame_pose, g_frame_tan);
         pose_trace_report(g_frame_pose);
         ft_submitted();
+        kl_gpu_time_frame_end();            // KL_GPU_TIME; returns at once when unset
 #ifdef KLOVR_VULKAN
         g_frames_for_dump++;
 #endif
@@ -3042,6 +3069,69 @@ static void alyx_cmd_at(void) {
     }
 }
 
+// kl_openvr_console: commands queued from any thread (the visionOS quick
+// settings, Siri), run on the game's thread from in_update — the engine's
+// console is not thread-safe, and the input update is where the game expects
+// its own menu's commands. g_con_ready is published once libclient checks out
+// (build 10919) and its engine client pointer is set; until then a command is
+// refused rather than queued for a game that may never answer.
+static pthread_mutex_t g_con_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_con_q[8][128];
+static _Atomic int g_con_n;
+static _Atomic int g_con_ready;
+
+int kl_openvr_console_ready(void) { return atomic_load(&g_con_ready); }
+
+int kl_openvr_console(const char *cmd) {
+    if (!cmd || !*cmd) return -1;
+    if (!atomic_load(&g_con_ready)) {
+        fprintf(stderr, "  [openvr] console: \"%s\" refused (no Alyx engine client yet)\n", cmd);
+        return -1;
+    }
+    pthread_mutex_lock(&g_con_mu);
+    int r = -2;
+    if (g_con_n < 8) {
+        snprintf(g_con_q[g_con_n], sizeof g_con_q[0], "%s", cmd);
+        g_con_n++;
+        r = 0;
+    }
+    pthread_mutex_unlock(&g_con_mu);
+    fprintf(stderr, "  [openvr] console: \"%s\" %s\n", cmd, r ? "refused (queue full)" : "queued");
+    return r;
+}
+
+// Game thread, every input update. Resolves the engine client at most once a
+// second until it is found, then drains the queue.
+static void alyx_console_drain(void) {
+    static double next_try;
+    static void *eng;
+    if (!eng) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (now < next_try) return;
+        next_try = now + 1.0;
+        const uint8_t *cl = alyx_client();
+        if (!cl) return;
+        memcpy(&eng, cl + 0x26b94a8, sizeof eng);     // IVEngineClient * (0xf81c44)
+        if (!eng) return;
+        atomic_store(&g_con_ready, 1);
+        fprintf(stderr, "  [openvr] console: Alyx engine client found; runtime commands available\n");
+    }
+    if (!g_con_n) return;           // racy peek; a command missed now runs next update
+    char q[8][128];
+    pthread_mutex_lock(&g_con_mu);
+    int n = g_con_n;
+    memcpy(q, g_con_q, sizeof q[0] * (size_t)n);
+    g_con_n = 0;
+    pthread_mutex_unlock(&g_con_mu);
+    void **vt = *(void ***)eng;
+    void (*cmd)(void *, int, const char *, int, int) = (void (*)(void *, int, const char *, int, int))vt[0xd0 / 8];
+    for (int i = 0; i < n; i++) {
+        fprintf(stderr, "  [openvr] console: running \"%s\"\n", q[i]);
+        cmd(eng, 0, q[i], 0, 0);
+    }
+}
+
 static const uint8_t *alyx_client(void) {
     static const uint8_t *cl;
     static int bad;
@@ -3065,6 +3155,7 @@ static void alyx_gate_trace(void) {
     static int32_t last[8];
     static int have;
     alyx_cmd_at();
+    alyx_console_drain();
     if (on < 0) on = kl_env_on("KL_OPENVR_GATE_TRACE", 0);
     if (!on) return;
     if (!cl) {

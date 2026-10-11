@@ -11,7 +11,7 @@ MVK_INC := -Ivendor-moltenvk/out/include
 # too. One -I per source directory is what buys that; gen_xcodeproj.py carries
 # the same list as HEADER_SEARCH_PATHS.
 RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr \
-               -Iruntime/media -Iruntime/guest -Iruntime/diag
+               -Iruntime/media -Iruntime/guest -Iruntime/diag -Iruntime/net
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
@@ -63,12 +63,14 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_driver.c \
            runtime/kl_tls.c runtime/kl_tlsdesc.S \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gpu_time.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c \
+           runtime/guest/kl_songs.c \
+           runtime/net/kl_stream_client.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -91,7 +93,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest x18casp glibcipc
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -328,6 +330,54 @@ build/t_hevc: tests/t_hevc.c $(RUNTIME) $(RUNTIME_HDRS)
 hevc: build/t_hevc
 	./build/t_hevc
 
+# "Jugar desde el Mac" (runtime/net/kl_stream_proto.h). The headset client's C
+# half (kl_stream_client.c) is in the shipping runtime above; these are its
+# two Mac-side test tools:
+#
+#   build/kl_stream_testhost   a HOST with a synthetic world-locked scene
+#                              (HEVC over UDP, Bonjour) — point the hub at it
+#   build/kl_stream_harness    the CLIENT's C code, headless, against a host:
+#                              POSE at 90 Hz, reassembly, decode, ring-pose
+#                              check, PNGs in build/stream/
+#
+# `make streamtest` runs one against the other on loopback, clean, then with
+# 1% packet loss twice: with the default FEC (losses rebuilt from parity) and
+# with KL_STREAM_FEC=0 (recovered by IDR requests). Not in `make
+# check`: it needs the hardware HEVC encoder and a free UDP port.
+.PHONY: testhost streamtest
+build/kl_stream_testhost: tools/kl_stream_testhost.m runtime/net/kl_stream_proto.h \
+                          runtime/net/kl_stream_tx.c runtime/net/kl_stream_tx.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O2 -fobjc-arc -o $@ tools/kl_stream_testhost.m runtime/net/kl_stream_tx.c \
+	  -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	  -framework CoreGraphics -framework CoreText -framework Foundation
+
+testhost: build/kl_stream_testhost
+
+build/kl_stream_harness: tools/kl_stream_harness.c tools/kl_stream_harness_mtl.m $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/kl_stream_harness.c tools/kl_stream_harness_mtl.m $(RUNTIME) $(LDLIBS) \
+	  -framework CoreGraphics -framework ImageIO -framework Metal -framework Foundation
+
+STREAMTEST_PORT ?= 19944
+streamtest: build/kl_stream_testhost build/kl_stream_harness
+	@rm -rf build/stream && mkdir -p build/stream/clean build/stream/lossy build/stream/lossy-nofec
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_HAPTICS_S=2 ./build/kl_stream_testhost > build/stream/clean/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 \
+	    --out build/stream/clean > build/stream/clean/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness:|HELLO_ACK|decoder up' build/stream/clean/client.log; wait; exit $$rc
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_DROP=0.01 ./build/kl_stream_testhost > build/stream/lossy/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
+	    --out build/stream/lossy > build/stream/lossy/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy/client.log; wait; exit $$rc
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=9 \
+	  KL_TESTHOST_DROP=0.01 KL_STREAM_FEC=0 ./build/kl_stream_testhost > build/stream/lossy-nofec/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
+	    --out build/stream/lossy-nofec > build/stream/lossy-nofec/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy-nofec/client.log; wait; exit $$rc
+
 # The video TEXTURE gate: a natively-decoded biplanar frame through
 # CVMetalTextureCache + EGL_METAL_TEXTURE_ANGLE to sampled pixels, compared
 # against the same picture through the BGRA path. This is what proves the
@@ -398,18 +448,66 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
+# Valve's Fossilize (ValveSoftware/Fossilize, MIT), fetched by `make fossilize` into
+# vendor-fossilize/ (gitignored) at a pinned revision: the pipeline recorder/replayer behind
+# runtime/gfx/kl_fossilize.cpp (KL_FOZ_RECORD / KL_FOZ_REPLAY). Optional like ANGLE and
+# MoltenVK: with no checkout m_boot links without it and kl_vulkan.c's weak
+# kl_fossilize_install keeps the hooks off. Rules adapted from Glovebox (MIT,
+# github.com/glovebox-vr/glovebox) klepton/Makefile.
+FZ_DIR ?= vendor-fossilize
+FZ_REV := 556da9f
+FZ_SRC := $(FZ_DIR)/fossilize.cpp $(FZ_DIR)/fossilize_db.cpp $(FZ_DIR)/varint.cpp $(FZ_DIR)/path.cpp \
+          $(FZ_DIR)/fossilize_application_filter.cpp
+FZ_INC := -I$(FZ_DIR) -I$(FZ_DIR)/rapidjson/include -I$(FZ_DIR)/khronos -I$(FZ_DIR)/miniz -Iruntime/gfx
+FZ_CXX := clang++ -std=c++17 -g -O2 -arch arm64 -fno-exceptions -Wno-unused-parameter $(FZ_INC)
+ifneq ($(wildcard $(FZ_DIR)/fossilize.hpp),)
+FZ_OBJ := $(patsubst $(FZ_DIR)/%.cpp,build/fz/%.o,$(FZ_SRC)) build/fz/miniz.o build/fz/kl_fossilize.o
+FZ_LIBS := -lc++
+endif
+build/fz/%.o: $(FZ_DIR)/%.cpp
+	@mkdir -p build/fz
+	$(FZ_CXX) -c -o $@ $<
+build/fz/miniz.o: $(FZ_DIR)/miniz/miniz.c
+	@mkdir -p build/fz
+	clang -g -O2 -arch arm64 -c -o $@ $<
+build/fz/kl_fossilize.o: runtime/gfx/kl_fossilize.cpp runtime/gfx/kl_vk_pipe_hooks.h
+	@mkdir -p build/fz
+	$(FZ_CXX) -Wall -c -o $@ $<
+.PHONY: fossilize
+fossilize:
+	@[ -d $(FZ_DIR)/.git ] || git clone -q https://github.com/ValveSoftware/Fossilize.git $(FZ_DIR)
+	git -C $(FZ_DIR) checkout -q $(FZ_REV) && git -C $(FZ_DIR) submodule -q update --init --recursive
+	@echo "Fossilize $(FZ_REV) in $(FZ_DIR); rebuild m_boot to link it"
+
+# runtime/net/kl_stream_host.{c,m} is the KL_STREAM_HOST=1 frontend ("Jugar
+# desde el Mac"): host-only like the viewer, so it is named here and nowhere in
+# RUNTIME_SHIP.
+STREAM_HOST := runtime/net/kl_stream_host.c runtime/net/kl_stream_host_mtl.m runtime/net/kl_stream_tx.c
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
+              runtime/gfx/kl_view_mtl.m $(STREAM_HOST) $(RUNTIME_HDRS) $(FZ_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c runtime/gfx/kl_hostwin.c \
-	  runtime/gfx/kl_view_mtl.m \
+	  runtime/gfx/kl_view_mtl.m $(STREAM_HOST) $(FZ_OBJ) $(FZ_LIBS) \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  -framework CoreText -framework CoreGraphics -framework ImageIO \
 	  $(shell pkg-config --libs sdl3)
 
 boot: build/m_boot
 	./build/m_boot $(LIBS)
+
+# The headset stand-in for KL_STREAM_HOST=1 (runtime/net/kl_stream_host.c):
+# HELLO with a Vision Pro-like display, POSE at 90 Hz with a yawing head, VIDEO
+# reassembled and decoded with VideoToolbox, every Nth frame written as PNG.
+#   KL_STREAM_HOST=1 KL_GLIBC_CONTENT=... ./build/m_boot alyx      (host)
+#   ./build/kl_stream_fakeclient -o build/stream-png -t 30           (client)
+build/kl_stream_fakeclient: tools/kl_stream_fakeclient.m runtime/net/kl_stream_proto.h
+	@mkdir -p build
+	$(CC) -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 -fobjc-arc -Iruntime/net -o $@ \
+	  tools/kl_stream_fakeclient.m -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	  -framework CoreGraphics -framework ImageIO -framework Foundation
+.PHONY: stream-fakeclient
+stream-fakeclient: build/kl_stream_fakeclient
 
 # ---- guest payloads we build ourselves ----
 #
@@ -459,6 +557,26 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The casp pair veneer (KLX_HZ_CASP), EXECUTED, under preemption pressure. Same
+# shape as t_ctr: the decoder and emitter alone, no loader.
+build/t_x18_casp: tests/t_x18_casp.c tests/t_x18_casp.S runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18_casp.c tests/t_x18_casp.S runtime/kl_x18.c runtime/kl_env.c
+
+x18casp: build/t_x18_casp
+	./build/t_x18_casp
+
+# CASP with x18:x19 as one of its register pairs, EXECUTED (KLX_HZ_PAIR).
+# Adapted from avp-play (MIT, github.com/myMartek/avp-play) Makefile. Keep only
+# while tests/t_casp.c is kept (decided with the runtime/kl_x18.c port).
+build/t_casp: tests/t_casp.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_casp.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: casp
+casp: build/t_casp
+	./build/t_casp
+
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
@@ -469,6 +587,15 @@ build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 
 bcast: build/t_bcast
 	./build/t_bcast
+
+# The glibc personality's in-process SysV semaphores and fault-signal masks,
+# through the same kl_glibc_lookup entry points a glibc guest binds.
+build/t_glibc_ipc: tests/t_glibc_ipc.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_glibc_ipc.c $(RUNTIME) $(LDLIBS)
+
+glibcipc: build/t_glibc_ipc
+	./build/t_glibc_ipc
 
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
@@ -550,7 +677,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_x18_casp build/t_bcast build/t_glibc_ipc build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
@@ -564,8 +691,12 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/softinput.log && tail -1 build/softinput.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
+	@./build/t_x18_casp > build/x18casp.log 2>&1 || { cat build/x18casp.log; exit 1; }
+	@head -1 build/x18casp.log && tail -1 build/x18casp.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
 	@head -1 build/bcast.log && tail -1 build/bcast.log
+	@./build/t_glibc_ipc > build/glibcipc.log 2>&1 || { cat build/glibcipc.log; exit 1; }
+	@head -1 build/glibcipc.log && tail -1 build/glibcipc.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@$(MAKE) -s ovrpabi
@@ -790,21 +921,46 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+# Fossilize in the visionOS runtime, when vendored (make fossilize), as on the host: the
+# pipeline recorder/replayer and KL_FOZ_PREWARM (runtime/gfx/kl_fossilize.cpp) compiled per
+# slice into the archive. kl_vulkan.c gets -DKL_HAVE_FOSSILIZE so it carries no weak stubs:
+# from a static archive a weak definition satisfies the reference and kl_fossilize.o would
+# never be pulled in. The app links -lc++ (gen_xcodeproj.py). Without the checkout nothing
+# changes. Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) klepton/Makefile.
+XR_TARGET_xros  := -target arm64-apple-xros1.0 -isysroot $(XROS_SDK)
+XR_TARGET_xrsim := -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK)
+XROS_FZ_DEF := $(if $(FZ_OBJ),-DKL_HAVE_FOSSILIZE)
+XROS_FZ_LIBS := $(if $(FZ_OBJ),-lc++)
+define XROS_FZ_RULE
+XROS_FZ_OBJ_$(1) := $(if $(FZ_OBJ),$(patsubst $(FZ_DIR)/%.cpp,build/$(1)/fz_%.o,$(FZ_SRC)) \
+                    build/$(1)/fz_miniz.o build/$(1)/fz_kl_fossilize.o)
+build/$(1)/fz_%.o: $(FZ_DIR)/%.cpp
+	@mkdir -p build/$(1)
+	@$(FZ_CXX) $(XR_TARGET_$(1)) -c -o $$@ $$<
+build/$(1)/fz_miniz.o: $(FZ_DIR)/miniz/miniz.c
+	@mkdir -p build/$(1)
+	@clang -g -O2 -arch arm64 $(XR_TARGET_$(1)) -c -o $$@ $$<
+build/$(1)/fz_kl_fossilize.o: runtime/gfx/kl_fossilize.cpp runtime/gfx/kl_vk_pipe_hooks.h
+	@mkdir -p build/$(1)
+	@$(FZ_CXX) -Wall $(XR_TARGET_$(1)) -c -o $$@ $$<
+endef
+$(foreach p,xros xrsim,$(eval $(call XROS_FZ_RULE,$(p))))
+
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(XROS_FZ_OBJ_xros)
 	@mkdir -p build/xros
-	@rm -f $@
+	@rm -f $@ $(if $(FZ_OBJ),,build/xros/fz_*.o)
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
+	  $(CC) $(XROS_CFLAGS) $(XROS_FZ_DEF) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(XROS_FZ_OBJ_xrsim)
 	@mkdir -p build/xrsim
-	@rm -f $@
+	@rm -f $@ $(if $(FZ_OBJ),,build/xrsim/fz_*.o)
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
+	  $(CC) $(XROS_CFLAGS) $(XROS_FZ_DEF) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xrsim/*.o
 
@@ -813,14 +969,14 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz $(XROS_FZ_LIBS) -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz $(XROS_FZ_LIBS) -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
@@ -1146,6 +1302,14 @@ mvk-retarget:
 # idempotent, so re-running is a fast no-op.
 mvk: mvk-fetch
 	@./tools/mvk_retarget.sh
+
+# Phase H: the FOVEATING fork, built from source (v1.4.2 + mvk-patches/), staged
+# into the same vendor-moltenvk/out the prebuilt uses. KL_FOVEATE=1 turns it on;
+# off, it renders as stock. See tools/mvk_fdm_build.sh and DEBUG_ENV_VARS.md
+# ("Foveated rendering").
+.PHONY: mvk-fdm
+mvk-fdm:
+	@./tools/mvk_fdm_build.sh
 
 MVK_OUT := vendor-moltenvk/out
 

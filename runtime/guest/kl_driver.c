@@ -25,6 +25,7 @@
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_mprobe.h"
+#include "kl_songs.h"
 #include "kl_sample.h"
 #include "kl_slink.h"
 #include "kl_ue4.h"
@@ -124,6 +125,17 @@ static void kl_driver_env_defaults(const kl_target *t) {
         // are not coalesced — same fix class as olar's audio-thread QoS starvation.
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
+    }
+    else if (!strcmp(t->name, "x5269080709783454")) {
+        // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_driver.c
+        // Max Mustard (Unity 2022.3 + FMOD Studio over OpenSL). FMOD produced
+        // sound in only a small fraction of its buffers — heard as near-silence
+        // with the odd quiet stutter — while the banks loaded fine. wrath2's fix
+        // class: at default QoS visionOS coalesces the mixer's short timed waits
+        // to ~33 ms, longer than one 512-frame block at 48 kHz (10.7 ms), so the
+        // output starves between blocks.
+        setenv("KL_USLEEP_CAP", "250", 0);
+        setenv("KL_GUEST_QOS",  "1",   0);
     }
 }
 
@@ -686,6 +698,12 @@ int kl_driver_frame(void) {
     // pump). Between frames on the thread that just ran one, which is where
     // managed calls are safe.
     kl_mprobe_tick(g_frames);
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/guest/kl_driver.c
+    // AC Nexus's own half-rate spin, taken out (self-gated on the target).
+    kl_mprobe_nexus_frame_budget(g_frames);
+    // Custom levels, from the same seat and for the same reason. Self-gated on a
+    // CustomLevels directory existing, so every other guest pays one stat().
+    kl_songs_tick(g_frames);
     if (g_alarm) alarm(0);
     g_frames++;
     return r;

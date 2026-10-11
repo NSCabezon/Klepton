@@ -241,3 +241,137 @@ struct TuningView: View {
         }
     }
 }
+
+// ---- Rendering: foveated guest rendering as a setting ----------------------
+//
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play)
+// visionos/Sources/KleptonTuning.swift.
+//
+// KL_VRR, with a memory. The default is the target's (targets.py "foveation",
+// KLFoveationDefault) and that is ON for every row unless it says otherwise —
+// the runtime's own default (kl_glfb, KL_VRR=1) — so an untouched setting
+// changes nothing. The guest's rate map is built once, before the guest boots,
+// and is fixed (not eye-tracked); turning it off renders every pixel at full
+// rate. It reaches only OpenGL guests' passes (an OpenGL guest's eye targets);
+// Alyx's MoltenVK FDM foveation (KL_FOVEATE) is separate and unaffected.
+//
+// Applied at boot, because that is when the map is built; flipping the toggle
+// in a running session is recorded for the next one.
+final class KleptonRendering: ObservableObject {
+    static let shared = KleptonRendering()
+    private static let key = "klepton.foveation"
+
+    private static let scaleKey = "klepton.renderScale"
+    private static let videoKey = "klepton.video"
+
+    /// Try in-game video even where the runtime would refuse it (a Vulkan
+    /// guest — see klm_extractor_enabled). Starts at the target's own default.
+    @Published var video: Bool {
+        didSet { UserDefaults.standard.set(video, forKey: Self.videoKey) }
+    }
+
+    /// Missing key = on, like the runtime's KL_VRR default.
+    static let targetFoveation: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLFoveationDefault") as? String) != "0"
+
+    /// The target's default (targets.py "video", baked into Info.plist as
+    /// KLVideoDefault). Off for a bundle without the key.
+    static let targetVideo: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLVideoDefault") as? String) == "1"
+
+    @Published var foveation: Bool {
+        didSet { UserDefaults.standard.set(foveation, forKey: Self.key) }
+    }
+
+    /// Fraction of the eye-texture size the guest is told, 0.5...1.0. See
+    /// kl_ovrp_set_render_scale_default for why this and not foveation is the
+    /// lever for a Vulkan guest.
+    @Published var renderScale: Double {
+        didSet { UserDefaults.standard.set(renderScale, forKey: Self.scaleKey) }
+    }
+
+    /// The target's own default (targets.py "render_scale", baked into
+    /// Info.plist as KLRenderScaleDefault). 1.0 for a bundle without the key.
+    static let targetRenderScale: Double = {
+        let s = Bundle.main.object(forInfoDictionaryKey: "KLRenderScaleDefault") as? String
+        let v = s.flatMap(Double.init) ?? 1.0
+        return (0.5...1.0).contains(v) ? v : 1.0
+    }()
+
+    private init() {
+        // Never chosen means the target's default (targets.py "foveation",
+        // KLFoveationDefault in Info.plist), which is on unless the target
+        // says otherwise.
+        foveation = (UserDefaults.standard.object(forKey: Self.key) as? Bool)
+            ?? Self.targetFoveation
+        // object(forKey:), so that "never chosen" is the target's default
+        // rather than off.
+        video = (UserDefaults.standard.object(forKey: Self.videoKey) as? Bool)
+            ?? Self.targetVideo
+        // object(forKey:) rather than double(forKey:): 0 is "never set" there,
+        // and never set has to mean the target's default, not the minimum.
+        let stored = UserDefaults.standard.object(forKey: Self.scaleKey) as? Double
+        renderScale = stored.map { min(max($0, 0.5), 1.0) } ?? Self.targetRenderScale
+    }
+
+    /// Hand the stored choice to the runtime. Before kl_app_boot, so every
+    /// reader of kl_glfb_foveation_wanted sees one answer for the whole run.
+    func apply() {
+        kl_glfb_set_foveation_default(foveation ? 1 : 0)
+        let env = ProcessInfo.processInfo.environment["KL_VRR"]
+        NSLog("[cp] foveated rendering: setting \(foveation ? "on" : "off")"
+              + (env.map { " — overridden by KL_VRR=\($0)" } ?? ""))
+        var scale = renderScale
+        var targetScale = Self.targetRenderScale
+        #if KL_HUB
+        // The hub's Info.plist carries its own neutral 1.0; each game's default
+        // is its targets.py row's (KLHubGameRow.renderScale). It applies while
+        // the player has never moved the slider — a chosen value still wins,
+        // for every game, as before.
+        if let row = klHubGameRows.first(where: { $0.target == klTargetName() }),
+           (0.5...1.0).contains(row.renderScale) {
+            targetScale = row.renderScale
+            if UserDefaults.standard.object(forKey: Self.scaleKey) == nil { scale = row.renderScale }
+        }
+        #endif
+        kl_ovrp_set_render_scale_default(Float(scale))
+        kl_mediandk_set_video_default(video ? 1 : -1)
+        NSLog("[cp] in-game video: \(video ? "on" : "runtime default") (target default \(Self.targetVideo ? "on" : "off"))")
+        let envScale = ProcessInfo.processInfo.environment["KL_OVRP_RENDER_SCALE"]
+        NSLog(String(format: "[cp] render resolution: setting %.0f%% (target default %.0f%%)",
+                     scale * 100, targetScale * 100)
+              + (envScale.map { " — overridden by KL_OVRP_RENDER_SCALE=\($0)" } ?? ""))
+    }
+}
+
+struct RenderingView: View {
+    @ObservedObject private var rendering = KleptonRendering.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Foveated rendering (sharp centre, cheaper edges)",
+                   isOn: $rendering.foveation)
+            Text("Fixed, not eye-tracked: the sharp region stays in place. Off "
+                 + "renders the whole picture at full rate. Takes effect the "
+                 + "next time the app starts.")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("In-game videos", isOn: $rendering.video)
+            Text("Tutorial and cutscene clips in Vulkan games. On by default "
+                 + "where it has been confirmed to work; turn it off if a game "
+                 + "crashes at a clip. Takes effect the next time the app "
+                 + "starts.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("Render resolution")
+                Slider(value: $rendering.renderScale, in: 0.5...1.0, step: 0.05)
+                Text(String(format: "%.0f%%", rendering.renderScale * 100))
+                    .monospacedDigit().frame(width: 52, alignment: .trailing)
+            }
+            Text("Size of the picture the game renders, per axis. Lower it if "
+                 + "looking around stutters: a game that saturates the GPU "
+                 + "halves the rate head movement is corrected at. Takes "
+                 + "effect the next time the app starts.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}

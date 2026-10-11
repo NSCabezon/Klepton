@@ -148,6 +148,14 @@ const klj_binding klj_bind_lang[] = {
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_lang.c
+    // The same loader and the same lookup reached the way native SDKs do it:
+    // libEOSSDK (Cave Crave) takes ActivityThread.getApplication()
+    // .getClassLoader() and then loadClass()es its Java half. Application
+    // inherits getClassLoader from Context (g_supers), so one row covers every
+    // Context. loadClass is findClass with the delegation we do not have.
+    {"android/content/Context", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    {"java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
 
     {"java/lang/StringBuilder", "<init>",   "()V",                  klj_SB_init},
     {"java/lang/StringBuilder", "toString", "()Ljava/lang/String;", klj_SB_toString},
