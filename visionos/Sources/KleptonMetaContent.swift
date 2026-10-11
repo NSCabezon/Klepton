@@ -80,7 +80,7 @@ final class MetaAccountModel: ObservableObject {
                                                          gate: gate, force: force)
                 userId = r.userId
                 owned = r.apps
-                NSLog("[meta] user \(r.userId): " + r.apps.map { "\($0.key)=\($0.value.owned ? "owned" : "not owned")" }.sorted().joined(separator: ", "))
+                NSLog("[meta] user \(KLAccountPrivacy.mask(r.userId)): " + r.apps.map { "\($0.key)=\($0.value.owned ? "owned" : "not owned")" }.sorted().joined(separator: ", "))
             } catch MetaError.tokenRejected(let why) {
                 NSLog("[meta] token rejected: \(why)")
                 error = "Meta rejected the saved sign-in. On the Mac: metastore login, then metastore push-token."
@@ -258,7 +258,7 @@ struct MetaContentView: View {
                 Button { onBack() } label: { Label("Library", systemImage: "chevron.left") }
                 Text(model.recipe.title).font(.largeTitle.bold())
                 Spacer()
-                if let u = account.userId { Text("Meta: \(u)").font(.footnote).foregroundStyle(.secondary) }
+                if account.signedIn { Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary) }
             }
             Text("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))")
                 .foregroundStyle(.secondary)
@@ -348,7 +348,7 @@ struct MetaAccountSection: View {
     var body: some View {
         Section {
             if account.signedIn {
-                LabeledContent("Signed in", value: account.userId.map { "Meta user \($0)" } ?? "(not checked yet)")
+                LabeledContent("Signed in", value: account.userId != nil ? KLAccountPrivacy.metaLabel : "(not checked yet)")
                 HStack {
                     Button(account.checking ? "Checking…" : "Check Meta library now") { account.refresh(force: true) }
                         .disabled(account.checking)
