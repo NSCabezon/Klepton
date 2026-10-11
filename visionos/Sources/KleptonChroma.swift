@@ -223,8 +223,8 @@ struct KLPerformance: Codable, Equatable {
     var renderScale: Float?          // KL_OPENVR_RT_SCALE, 0.6–1.2 (default 1.0)
     var overscan: Float?             // KL_OPENVR_OVERSCAN, 0–0.2 (default 0.12 for alyx)
     var overscanRT: Bool?            // KL_OPENVR_OVERSCAN_RT (default on)
-    var msaa: Int?                   // KL_ALYX_MSAA, 2 or 4 (default 2; kl_app.c picks the fidelity level)
-    var foveate: Bool?               // KL_FOVEATE (default off)
+    var msaa: Int?                   // KL_ALYX_MSAA, 2 or 4 (default 4; kl_app.c picks the fidelity level)
+    var foveate: Bool?               // KL_FOVEATE (default on; kl_app.c)
 }
 
 /// The languages a game can be told to boot in, and what each one means on the
@@ -324,8 +324,11 @@ enum KLGameSettingsStore {
     static let defaultRenderScale: Float = 1.0
     static let defaultOverscan: Float = 0.12
     static let defaultOverscanRT = true
-    static let defaultMSAA = 2
-    static let defaultFoveate = false
+    // What kl_app.c sets for Alyx when neither the launch environment nor the
+    // hub says otherwise (4x MSAA + foveation: -36% GPU against 4x full rate on
+    // M2, 2026-10-11). The pickers show these when the setting is nil.
+    static let defaultMSAA = 4
+    static let defaultFoveate = true
 
     /// Whether "Precompile graphics" applies (a Vulkan game with a pipeline list).
     static func hasPrecompile(_ target: String) -> Bool { target == "alyx" }
@@ -427,8 +430,16 @@ enum KLGameSettingsStore {
         if FileManager.default.fileExists(atPath: foz.path) {
             setenv("KL_FOZ_PREWARM", foz.path, 0)
         }
+        // Each session records the pipelines the list did not have into klfz/recorded/,
+        // and the next prewarm replays those too (kl_fossilize.cpp, KL_FOZ_AUTORECORD:
+        // only new pipelines are written; old sessions are merged, the folder is capped).
+        // KL_FOZ_AUTORECORD=0 in the launch environment turns it off.
+        let rec = dir.appendingPathComponent("recorded")
+        try? FileManager.default.createDirectory(at: rec, withIntermediateDirectories: true)
+        setenv("KL_FOZ_AUTORECORD", rec.path, 0)
         let env = ProcessInfo.processInfo.environment
         NSLog("[foz] \(target): KL_FOZ_PREWARM=\(env["KL_FOZ_PREWARM"] ?? "unset (no \(foz.path))") "
+              + "KL_FOZ_AUTORECORD=\(env["KL_FOZ_AUTORECORD"] ?? "") "
               + "KL_VK_DEVICE_INFO=\(env["KL_VK_DEVICE_INFO"] ?? "")")
     }
 
