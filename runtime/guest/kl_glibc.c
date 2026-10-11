@@ -356,6 +356,34 @@ static void build_args(void) {
     // to anything here (MoltenVK). KL_GLIBC_ARGS replaces the list outright.
     snprintf(argbuf, sizeof argbuf, "%s",
              kl_env_str("KL_GLIBC_ARGS", "-novr -vulkan -console +sv_cheats 1"));
+    // KL_ALYX_PROFILE=glovebox appends Glovebox's validated Alyx render convars
+    // after whatever KL_GLIBC_ARGS says; none of them is one the default
+    // KL_GLIBC_ARGS sets. Names and values only — no Valve file is shipped. Resolution, MSAA, the fidelity
+    // level and the frustum are deliberately NOT in it: those stay KL_GLIBC_ARGS'
+    // (level 0, 2x MSAA on M2). Unset, nothing is appended.
+    // Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox)
+    // packages/alyx/defaults/{DEMO.txt,video2-visionpro-demo.txt,vr_fidelity_fixed_1.0.csv}.
+    const char *profile = kl_env_str("KL_ALYX_PROFILE", NULL);
+    if (profile && !strcmp(profile, "glovebox")) {
+        static const char glovebox[] =
+            " +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20"
+            " +r_texture_stream_max_resolution 2048 +r_texture_stream_resolution_bias_min 0.8"
+            " +r_texturefilteringquality 4 +gpu_mem_level 1"
+            " +vr_aoproxy_enable 0 +vr_depth_prepass 0"
+            " +vr_stencil_hidden_pixels 1 +vr_hidden_pixels_use_depth 1"
+            " +r_high_quality_shadows 0 +sc_disable_spotlight_shadows 1"
+            " +vr_single_light_fast_path_sun_cascade_0_texels_per_world 3"
+            " +vr_single_light_fast_path_sun_cascade_1_texels_per_world 0"
+            " +vr_enable_cached_lights 1 +vr_fast_hologram 1"
+            " +volume_fog_width 128 +volume_fog_height 128 +volume_fog_depth 64"
+            " +r_particle_max_detail_level 1 +cl_particle_fallback_base 1"
+            " +cl_particle_fallback_multiplier 2 +g_ragdoll_maxcount 5";
+        size_t used = strlen(argbuf);
+        snprintf(argbuf + used, sizeof argbuf - used, "%s", glovebox);
+        fprintf(stderr, "  [glibc] KL_ALYX_PROFILE=glovebox: appended its render convars\n");
+    } else if (profile && *profile) {
+        fprintf(stderr, "  [glibc] KL_ALYX_PROFILE=%s is not a profile (only \"glovebox\"); ignored\n", profile);
+    }
     for (char *save = NULL, *t = strtok_r(argbuf, " ", &save); t && g_argc < 63;
          t = strtok_r(NULL, " ", &save))
         g_argv[g_argc++] = t;

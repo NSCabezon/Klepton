@@ -228,7 +228,56 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # always defined so expansion never leaves a literal
                         # "$(...)" in the bundle; the placeholder names no stack
                         # and behaves exactly like the old no-icon build.
-                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
+                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n"
+                        # Per-target defaults (targets.py), adapted from avp-play
+                        # (MIT, github.com/myMartek/avp-play) visionos/gen_xcodeproj.py.
+                        # A hub build bakes the hub row's (neutral) values; its
+                        # games' own defaults come from KLGameSettings.
+                        # Same route for the target's hand-matting default
+                        # (targets.py "hand_matting"): Info.plist's
+                        # KLHandMattingDefault is $(KL_HAND_MATTING_DEFAULT).
+                        + f"\t\t\t\tKL_HAND_MATTING_DEFAULT = {1 if KLT['hand_matting'] else 0};\n"
+                        # The target's gamepad face-button layout (targets.py
+                        # "gamepad_map"), KLGamepadMap in Info.plist. Quoted: the
+                        # value carries '=' and ','.
+                        + f"\t\t\t\tKL_GAMEPAD_MAP = \"{KLT['gamepad_map']}\";\n"
+                        # ...and its render-scale default (targets.py
+                        # "render_scale"), KLRenderScaleDefault in Info.plist.
+                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {float(KLT['render_scale']):.2f};\n"
+                        # ...and whether in-game video is tried by default
+                        # (targets.py "video"), KLVideoDefault in Info.plist.
+                        + f"\t\t\t\tKL_VIDEO_DEFAULT = {1 if KLT['video'] else 0};\n"
+                        # ...whether the guest boots by itself or waits for the
+                        # Start button (targets.py "autoboot"), and what the
+                        # foveated-rendering setting starts at ("foveation").
+                        + f"\t\t\t\tKL_AUTOBOOT_DEFAULT = {1 if KLT['autoboot'] else 0};\n"
+                        + f"\t\t\t\tKL_FOVEATION_DEFAULT = {1 if KLT['foveation'] else 0};\n")
+
+# The privacy strings, as BUILD SETTINGS and from here. Adapted from avp-play
+# (MIT, github.com/myMartek/avp-play) visionos/gen_xcodeproj.py.
+#
+# They used to live only in Info.plist, and that is not a safe place for them:
+# open the generated project in Xcode, touch the target's Info tab, and Xcode
+# MOVES every usage description it recognises out of the plist and into the
+# project file as INFOPLIST_KEY_* (it is consolidating them where
+# GENERATE_INFOPLIST_FILE reads them). The plist is left without them — and the
+# project file is rewritten by this script on the next build. So the strings
+# vanish from both, nothing fails, and the app is killed by TCC two seconds
+# after launch the moment it asks for accessory tracking (twice now: Beat Saber
+# 1.40, then batman). Emitted here, they are in every project this writes,
+# wherever else they do or do not survive. visionos/run.sh checks the product.
+USAGE_DESCRIPTIONS = {
+    "NSMicrophoneUsageDescription": "Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.",
+    "NSWorldSensingUsageDescription": "Klepton reads the headset's own pose, which is the head pose the guest renders from.",
+    "NSHandsTrackingUsageDescription": "Klepton maps your hands onto the guest's two Touch controllers.",
+    "NSAccessoryTrackingUsageDescription": "Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.",
+    "NSBluetoothAlwaysUsageDescription": "Klepton connects to spatial controllers that are not visible to the system as standard game controllers.",
+    "NSLocalNetworkUsageDescription": "Finds the Mac that streams your game to the headset (Play from Mac), and the PCs Steam Link streams from.",
+}
+_usage_settings = "".join(
+    '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
+    for k, v in USAGE_DESCRIPTIONS.items())
+ASSETCATALOG_SETTING += _usage_settings
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -258,7 +307,8 @@ for _stack in (_icon_base, f"{_icon_base}-launcher"):
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
-         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonHUD.swift"]
+         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonHUD.swift",
+         "KleptonStreamClient.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 # The alyx build downloads its own game content from Steam (Sources/KleptonSteamContent.swift)
@@ -275,6 +325,15 @@ if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package
           "(set KL_STEAMDEPOT_PKG) - the in-app Steam download is left out", file=sys.stderr)
     STEAMDEPOT = False
 PKG_REF, PKG_PROD, B_PKG = _fixed("SDPKGREF"), _fixed("SDPKGPROD"), _fixed("SDPKGBLD")
+# The hub's Meta store source (Sources/KleptonMetaContent.swift): the MetaStore Swift package,
+# a sibling of SteamDepot in the AlyxAVP checkout. Hub only; KL_METASTORE_PKG overrides the path
+# (relative to visionos/). Without it the hub has no Meta source (Steam and the catalog still work).
+METASTORE_PKG = os.environ.get("KL_METASTORE_PKG", "../../../MetaStore")
+METASTORE = IS_HUB
+if METASTORE and not os.path.isfile(os.path.join(HERE, METASTORE_PKG, "Package.swift")):
+    print(f"!! hub: no MetaStore package at {os.path.join(HERE, METASTORE_PKG)} "
+          "(set KL_METASTORE_PKG) - the Meta store source is left out", file=sys.stderr)
+    METASTORE = False
 if STEAMDEPOT:
     swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
     # ...and the guest's Steamworks stand-in answered from the real account
@@ -290,10 +349,33 @@ if IS_HUB:
     # Derives what an APK game's runtime reads (<game>.apk, <tree>/assets, the
     # metadata below) from the data the headset downloaded, before boot.
     swift.append({"name": "KleptonHubPrep.swift", "ref": _fixed("HUBPREPF"), "bld": _fixed("HUBPREPB")})
+    # Steam Cloud saves per game (experimental, off by default); compiled out without SteamDepot.
+    swift.append({"name": "KleptonCloudSaves.swift", "ref": _fixed("HUBCLOUDF"), "bld": _fixed("HUBCLOUDB")})
+    # The closed catalog of games and their store sources (Steam / Meta), and the Meta source
+    # itself (compiled out without the MetaStore package).
+    swift.append({"name": "KleptonCatalog.swift", "ref": _fixed("HUBCATF"), "bld": _fixed("HUBCATB")})
+    swift.append({"name": "KleptonMetaContent.swift", "ref": _fixed("HUBMETAF"), "bld": _fixed("HUBMETAB")})
     swift.append({"name": "../" + HUB_MANIFEST_REL, "ref": _fixed("HUBMANF"), "bld": _fixed("HUBMANB")})
 # Per-session performance summary (the compositor measures, the hub shows it).
 # Every target: the compositor calls it. Fixed ids, so the numbering above is kept.
 swift.append({"name": "KleptonSessionStats.swift", "ref": _fixed("SESSTATF"), "bld": _fixed("SESSTATB")})
+# The in-game performance overlay and quick settings menu (drawn by KleptonHUD,
+# driven by the controllers). Every target: the compositor and HUD call it.
+swift.append({"name": "KleptonQuickSettings.swift", "ref": _fixed("QSETF"), "bld": _fixed("QSETB")})
+# Siri / Shortcuts for the running game (App Intents), and the Spanish phrase
+# catalog for them — hub only: the phrases name the hub ("AVP Game Hub").
+# Localizable.xcstrings carries the Spanish intent titles / short titles (what the
+# Shortcuts app lists); AppShortcuts.xcstrings only the phrases.
+if IS_HUB:
+    swift.append({"name": "KleptonIntents.swift", "ref": _fixed("INTENTSF"), "bld": _fixed("INTENTSB")})
+_CATALOGS = ([("AppShortcuts.xcstrings", _fixed("APPSCSTRF"), _fixed("APPSCSTRB")),
+              ("Localizable.xcstrings", _fixed("LOCSTRF"), _fixed("LOCSTRB"))] if IS_HUB else [])
+SHORTCUTS_BUILDFILE = "".join(f'\t\t{b} /* {n} in Resources */ = {{isa = PBXBuildFile; fileRef = {f}; }};\n'
+                              for n, f, b in _CATALOGS)
+SHORTCUTS_FILEREF = "".join(f'\t\t{f} = {{isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; '
+                            f'path = {n}; sourceTree = "<group>"; }};\n' for n, f, b in _CATALOGS)
+SHORTCUTS_CHILD = "".join(f"\t\t\t\t{f},\n" for n, f, b in _CATALOGS)
+SHORTCUTS_RES = "".join(f"\t\t\t\t{b},\n" for n, f, b in _CATALOGS)
 
 # The two files apktool leaves beside assets/ — apktool.yml (versionCode /
 # versionName) and the decoded AndroidManifest.xml (package, <meta-data>,
@@ -319,9 +401,12 @@ def hub_manifest():
     for g in HUB_GAMES:
         t = targets_mod.TARGETS[g]
         rows.append('    KLHubGameRow(target: "%s", display: "%s", kind: "%s", entry: "%s", bundled: %s,\n'
-                    '                 tree: "%s", apk: "%s", meta: %s),'
+                    '                 tree: "%s", apk: "%s", renderScale: %.2f, meta: %s),'
                     % (g, t["display"].replace('"', '\\"'), t["kind"], t["entry"],
-                       "false" if HUB_NO_GUESTS else "true", t["tree"], t["apk"], hub_meta(t)))
+                       "false" if HUB_NO_GUESTS else "true", t["tree"], t["apk"],
+                       # The game's own render-scale default (targets.py
+                       # "render_scale"); the hub bakes neutral Info.plist values.
+                       float(t.get("render_scale", 1.0)), hub_meta(t)))
     return ("// GENERATED by visionos/gen_xcodeproj.py from visionos/targets.py (hub \"%s\")"
             " - do not edit.\n// Add a game to the hub's \"games\" list in targets.py and regenerate.\n"
             "let klHubGameRows: [KLHubGameRow] = [\n%s\n]\n"
@@ -335,28 +420,34 @@ def git_commit():
                               text=True, timeout=10).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
-PKG_BUILDFILE = (f'\t\t{B_PKG} /* SteamDepot in Frameworks */ = {{isa = PBXBuildFile; productRef = {PKG_PROD}; }};\n'
-                 if STEAMDEPOT else "")
-PKG_FRAMEWORK = f'\t\t\t\t{B_PKG} /* SteamDepot in Frameworks */,\n' if STEAMDEPOT else ""
-PKG_TARGET_DEPS = (f'\t\t\tpackageProductDependencies = (\n\t\t\t\t{PKG_PROD} /* SteamDepot */,\n\t\t\t);\n'
-                   if STEAMDEPOT else "")
-PKG_PROJECT_REFS = (f'\t\t\tpackageReferences = (\n\t\t\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */,\n\t\t\t);\n'
-                    if STEAMDEPOT else "")
-PKG_SECTIONS = (f'''/* Begin XCLocalSwiftPackageReference section */
-\t\t{PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */ = {{
-\t\t\tisa = XCLocalSwiftPackageReference;
-\t\t\trelativePath = "{STEAMDEPOT_PKG}";
-\t\t}};
-/* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-\t\t{PKG_PROD} /* SteamDepot */ = {{
-\t\t\tisa = XCSwiftPackageProductDependency;
-\t\t\tpackage = {PKG_REF} /* XCLocalSwiftPackageReference "SteamDepot" */;
-\t\t\tproductName = SteamDepot;
-\t\t}};
-/* End XCSwiftPackageProductDependency section */
-''' if STEAMDEPOT else "")
+# Local Swift packages linked into the app: (name, relative path, ref id, product id, build-file id).
+PACKAGES = []
+if STEAMDEPOT:
+    PACKAGES.append(("SteamDepot", STEAMDEPOT_PKG, PKG_REF, PKG_PROD, B_PKG))
+if METASTORE:
+    PACKAGES.append(("MetaStore", METASTORE_PKG, _fixed("MSPKGREF"), _fixed("MSPKGPROD"), _fixed("MSPKGBLD")))
+PKG_BUILDFILE = "".join(f'\t\t{b} /* {n} in Frameworks */ = {{isa = PBXBuildFile; productRef = {prod}; }};\n'
+                        for n, _, _, prod, b in PACKAGES)
+PKG_FRAMEWORK = "".join(f'\t\t\t\t{b} /* {n} in Frameworks */,\n' for n, _, _, _, b in PACKAGES)
+PKG_TARGET_DEPS = ('\t\t\tpackageProductDependencies = (\n'
+                   + "".join(f'\t\t\t\t{prod} /* {n} */,\n' for n, _, _, prod, _ in PACKAGES)
+                   + '\t\t\t);\n') if PACKAGES else ""
+PKG_PROJECT_REFS = ('\t\t\tpackageReferences = (\n'
+                    + "".join(f'\t\t\t\t{ref} /* XCLocalSwiftPackageReference "{n}" */,\n' for n, _, ref, _, _ in PACKAGES)
+                    + '\t\t\t);\n') if PACKAGES else ""
+PKG_SECTIONS = ("/* Begin XCLocalSwiftPackageReference section */\n"
+                + "".join(f'\t\t{ref} /* XCLocalSwiftPackageReference "{n}" */ = {{\n'
+                          f'\t\t\tisa = XCLocalSwiftPackageReference;\n'
+                          f'\t\t\trelativePath = "{path}";\n'
+                          f'\t\t}};\n' for n, path, ref, _, _ in PACKAGES)
+                + "/* End XCLocalSwiftPackageReference section */\n\n"
+                + "/* Begin XCSwiftPackageProductDependency section */\n"
+                + "".join(f'\t\t{prod} /* {n} */ = {{\n'
+                          f'\t\t\tisa = XCSwiftPackageProductDependency;\n'
+                          f'\t\t\tpackage = {ref} /* XCLocalSwiftPackageReference "{n}" */;\n'
+                          f'\t\t\tproductName = {n};\n'
+                          f'\t\t}};\n' for n, _, ref, prod, _ in PACKAGES)
+                + "/* End XCSwiftPackageProductDependency section */\n") if PACKAGES else ""
 
 swift_buildfiles = "\n".join(
     f'\t\t{s["bld"]} /* {s["name"]} in Sources */ = {{isa = PBXBuildFile; fileRef = {s["ref"]}; }};'
@@ -458,14 +549,43 @@ _conds = (["KL_CUSTOM_LAUNCHER"] if _launcher_on else []) + (["KL_HUB"] if IS_HU
 LAUNCHER_COND = (f'\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "{" ".join(_conds)} $(inherited)";\n'
                  if _conds else "")
 
+# What the installed app says about itself (adapted from avp-play, MIT,
+# github.com/myMartek/avp-play visionos/gen_xcodeproj.py): CFBundleShortVersionString and
+# CFBundleVersion. An installer sets these (KLEPTON_APP_VERSION — the guest's own
+# version — and KLEPTON_APP_BUILD — which build of it this is), because the app
+# list of a headset is the only place a Mac can ask what is installed, and "1.0
+# (1)" for every guest answers nothing. Up to three dot-separated integers each,
+# which is all the two keys take; anything else keeps the old constant.
+import re as _re
+def _plist_version(env, dflt):
+    v = os.environ.get(env, "")
+    return v if _re.fullmatch(r"\d{1,9}(\.\d{1,9}){0,2}", v) else dflt
+APP_VERSION = _plist_version("KLEPTON_APP_VERSION", "1.0")
+APP_BUILD = _plist_version("KLEPTON_APP_BUILD", "1")
+
+# The hub's Info.plist: visionos/Info.plist plus INAlternativeAppNames, so Siri also
+# takes "… en Hub" / "… en Game Hub" for \(.applicationName) in the App Shortcut
+# phrases (KleptonIntents.swift). An array of dicts has no INFOPLIST_KEY_ form, so
+# the hub reads a generated copy; every other target reads Info.plist as before.
+INFOPLIST_PATH = "Info.plist"
+HUB_ALT_NAMES = ["Hub", "Game Hub"]
+if IS_HUB:
+    import plistlib
+    _ip = plistlib.loads(pathlib.Path(__file__).with_name("Info.plist").read_bytes())
+    _ip["INAlternativeAppNames"] = [{"INAlternativeAppName": n} for n in HUB_ALT_NAMES]
+    _out = pathlib.Path(__file__).with_name("build") / "Info-hub.plist"
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_bytes(plistlib.dumps(_ip))
+    INFOPLIST_PATH = "build/Info-hub.plist"
+
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = {APP_BUILD};
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-{ASSETCATALOG_SETTING}				INFOPLIST_FILE = Info.plist;
+{ASSETCATALOG_SETTING}				INFOPLIST_FILE = {INFOPLIST_PATH};
 				// One entry per runtime source directory: a runtime header is
 				// included by BARE NAME everywhere, including from
 				// Klepton-Bridging-Header.h, so each directory holding one has
@@ -487,9 +607,11 @@ COMMON = f"""
 					"$(SRCROOT)/../runtime/libc",
 					"$(SRCROOT)/../runtime/gfx",
 					"$(SRCROOT)/../runtime/xr",
+					"$(SRCROOT)/../runtime/net",
 					"$(SRCROOT)/../runtime/media",
 					"$(SRCROOT)/../runtime/guest",
 					"$(SRCROOT)/../runtime/diag",
+					"$(SRCROOT)/../runtime/net",
 					"$(inherited)",
 				);
 				// Two levels of escaping, and the first attempt had one. The
@@ -517,7 +639,7 @@ COMMON = f"""
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = {APP_VERSION};
 				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because
@@ -525,7 +647,9 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
+				// -lc++: Fossilize (kl_fossilize.cpp) rides in the runtime archive
+				// when vendored (make fossilize); harmless when it does not.
+				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
@@ -555,7 +679,7 @@ PBX = f"""// !$*UTF8*$!
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
-{PKG_BUILDFILE}{buildfiles}
+{PKG_BUILDFILE}{SHORTCUTS_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -566,7 +690,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
-{filerefs}
+{SHORTCUTS_FILEREF}{filerefs}
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -612,7 +736,7 @@ PBX = f"""// !$*UTF8*$!
 				{F_C},
 				{F_H},
 				{F_BRIDGE},
-			);
+{SHORTCUTS_CHILD}			);
 			path = Sources;
 			sourceTree = "<group>";
 		}};
@@ -669,7 +793,7 @@ PBX = f"""// !$*UTF8*$!
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
-			knownRegions = (en, Base, );
+			knownRegions = (en, es, Base, );
 			mainGroup = {G_ROOT};
 			productRefGroup = {G_PROD};
 {PKG_PROJECT_REFS}			projectDirPath = "";
@@ -686,7 +810,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_ASSETS},
-			);
+{SHORTCUTS_RES}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
 /* End PBXResourcesBuildPhase section */
@@ -808,6 +932,8 @@ def main():
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     if STEAMDEPOT:
         print(f"  Swift package SteamDepot: {STEAMDEPOT_PKG} (in-app Steam content download)")
+    if METASTORE:
+        print(f"  Swift package MetaStore: {METASTORE_PKG} (in-app Meta store download)")
     if IS_HUB:
         for game, libs in GUEST_SETS:
             print(f"  hub game {game:<14} -> Frameworks/{game}/: "

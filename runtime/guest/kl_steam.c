@@ -149,6 +149,14 @@ static int  account_init(char *err, size_t n);
 // SteamAPI_Init's verdict, reached once: 0 = not yet, 1 = OK, -rc = failed with
 // that ESteamAPIInitResult (1 FailedGeneric: not owned; 2 NoSteamClient: the
 // bridge is required and did not answer).
+/* A SteamID for the log: its first two digits + "•••" (logs end up in bug reports). One
+ * static buffer per call site is enough: each log line formats at most one. */
+static const char *kl_mask_sid(uint64_t sid) {
+    static __thread char buf[24];
+    char full[24]; snprintf(full, sizeof full, "%llu", (unsigned long long)sid);
+    snprintf(buf, sizeof buf, "%.2s\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2", full);
+    return buf;
+}
 static int g_init_state;
 static char g_init_err[256];
 static pthread_mutex_t g_initmu = PTHREAD_MUTEX_INITIALIZER;
@@ -167,11 +175,11 @@ static int  st_init(const char *versions, void *err) {
         fprintf(stderr, "  [steam] SteamAPI_Init -> FAILED (result %d): %s\n", -state, g_init_err);
         return -state;
     }
-    fprintf(stderr, "  [steam] SteamAPI_Init -> OK (%s: user %llu \"%s\", app %u)\n",
+    fprintf(stderr, "  [steam] SteamAPI_Init -> OK (%s: user %s \"%s\", app %u)\n",
             g_acct.real ? (g_acct.offline ? "real Steam account, offline (cached answers)"
                                           : "real Steam account")
                         : "stub client",
-            (unsigned long long)USER_ID, steam_persona(), APP_ID);
+            kl_mask_sid(USER_ID), steam_persona(), APP_ID);
     // SDK 1.61 dropped RequestCurrentStats: the client loads the user's stats
     // itself at init and announces them with UserStatsReceived_t, and a game
     // that waits for that before touching achievements (Steamworks.NET's
@@ -1164,8 +1172,8 @@ static int account_init(char *err, size_t n) {
     g_acct.offline = kj_is_true(kj_get(j, "offline"));
     g_acct.real = 1;
     kj_free(j);
-    fprintf(stderr, "  [steam] bridge (%s): hello -> steamid %llu, name \"%s\", app %u %s%s\n",
-            bridge_where(), (unsigned long long)g_acct.steamid, g_acct.name, APP_ID,
+    fprintf(stderr, "  [steam] bridge (%s): hello -> steamid %s, name \"%s\", app %u %s%s\n",
+            bridge_where(), kl_mask_sid(g_acct.steamid), g_acct.name, APP_ID,
             g_acct.owned ? "OWNED" : "NOT OWNED", g_acct.offline ? " (offline: cached answer)" : "");
     if (getenv("KL_STEAM_ID") || getenv("KL_STEAM_NAME"))
         fprintf(stderr, "  [steam] KL_STEAM_ID/KL_STEAM_NAME override the account's: reporting user %llu \"%s\"\n",

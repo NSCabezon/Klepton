@@ -21,4 +21,9 @@
 // KL_PROBE_EVERY frames (default 120). No-op unless KL_PROBE_INPUT=1.
 void kl_mprobe_tick(unsigned frame);
 
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/diag/kl_mprobe.h.
+// AC Nexus VR only, self-gated on the target: take out the fixed frame length
+// the game spins itself out to for SpaceWarp. See kl_mprobe.c.
+void kl_mprobe_nexus_frame_budget(unsigned frame);
+
 #endif

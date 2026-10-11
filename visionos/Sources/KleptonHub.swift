@@ -19,10 +19,14 @@
 // shows this library again. The UI says so.
 #if KL_HUB
 import SwiftUI
+import UIKit
 import Foundation
 import Combine
 #if canImport(SteamDepot)
 import SteamDepot
+#endif
+#if canImport(MetaStore)
+import MetaStore
 #endif
 
 /// One game the hub carries (generated from targets.py; see gen_xcodeproj.py).
@@ -37,6 +41,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// container root, for <tree>/assets, the metadata beside it, and the APK.
     let tree: String
     let apk: String
+    /// targets.py's "render_scale" for this game: what the "Render resolution"
+    /// setting means until the player moves it (KleptonRendering.apply).
+    let renderScale: Double
     /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
     /// for a guest that has none). Written beside <tree>/assets by HubPrep.
     let meta: [String: String]
@@ -61,6 +68,30 @@ enum HubLaunch {
         if let err = HubPrep.prepare(row) { NSLog("[hub] \(t): could not prepare its data: \(err)") }
         select(t)
         return t
+    }
+
+    /// KL_STREAM_AUTOCONNECT=1 (+ KL_STREAM_HOST_ADDR=ip[:port], and
+    /// KL_HUB_GAME for the game, default alyx) skips the library and goes
+    /// straight to "Jugar desde el Mac" — the scripted/simulator test path.
+    static func scriptedStream() -> KLStreamTarget? {
+        guard klEnvOn("KL_STREAM_AUTOCONNECT", default: false),
+              let t = KLStreamTarget.fromEnvironment() else { return nil }
+        selectForStream(ProcessInfo.processInfo.environment["KL_HUB_GAME"] ?? "alyx")
+        NSLog("[hub] KL_STREAM_AUTOCONNECT: streaming from \(t.name) (\(t.host ?? "?"):\(t.port))")
+        return t
+    }
+
+    /// "Jugar desde el Mac" for `target`: the game's presentation settings
+    /// (immersion, hand matting) and controller calibration, as Play applies
+    /// them — and nothing else. No KL_TARGET, no Steam, no guest: the game
+    /// runs on the Mac. Backgrounding ends the process (and the stream) as in
+    /// any game session.
+    static func selectForStream(_ target: String) {
+        KleptonChroma.shared.loadGame(target)
+        KleptonTuning.shared.loadGame(target)
+        KLSessionStats.shared.prepareStream(target: target)
+        Lifecycle.keepAlive = false
+        NSLog("[hub] \(target): Jugar desde el Mac")
     }
 
     /// The selected game becomes the runtime's target. Must run before BootView is
@@ -114,14 +145,19 @@ enum HubStorage {
     /// Library/Application Support (a glibc game's saves and config).
     static func dataURLs(_ row: KLHubGameRow) -> [URL] {
         var urls: [URL] = []
+        let c = Paths.containerURL(for: row.target)
+        let derived = [c.appendingPathComponent(row.apk), c.appendingPathComponent(row.tree, isDirectory: true)]
         #if canImport(SteamDepot)
         if let game = SteamGames.descriptor(for: row.target) {
             urls.append(game.root)
-            if game.apk != nil {
-                let c = Paths.containerURL(for: row.target)
-                urls.append(c.appendingPathComponent(row.apk))
-                urls.append(c.appendingPathComponent(row.tree, isDirectory: true))
-            }
+            if game.apk != nil { urls += derived }
+        }
+        #endif
+        #if canImport(MetaStore)
+        // The Meta recipe's own files only (meta/, the OBB and add-on packs) — never the rest of android-files/.
+        if let r = KLCatalog.metaRecipe(row.target) {
+            urls += KLCatalog.metaStore(row.target).ownedURLs(r)
+            urls += derived.filter { !urls.contains($0) }
         }
         #endif
         return urls
@@ -163,6 +199,9 @@ enum HubStorage {
 
     /// A download or verify is running for the game.
     @MainActor static func isBusy(_ model: HubLibraryModel, _ target: String) -> Bool {
+        #if canImport(MetaStore)
+        if model.meta[target]?.isBusy == true { return true }
+        #endif
         #if canImport(SteamDepot)
         return model.content[target]?.isBusy ?? false
         #else
@@ -202,12 +241,8 @@ enum HubStorage {
 
 // MARK: - Session summaries
 
-/// English or Spanish by the headset's first preferred language. The hub has no
-/// string catalog (its UI is English); the session texts are the first that
-/// speak Spanish too, chosen here rather than through a catalog.
-func klL(_ en: String, _ es: String) -> String {
-    (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
-}
+// klL (English or Spanish by the headset's language) lives in KleptonApp.swift:
+// the boot window uses it too, in every build.
 
 enum HubSessionText {
     /// "12 min", "45 s", "1 h 05 min".
@@ -219,15 +254,41 @@ enum HubSessionText {
         return String(format: "%d h %02d min", m / 60, m % 60)
     }
 
-    /// The card's line: "Última sesión: 52 fps (5% peor 38) · 12 min".
+    /// The card's line: "Última sesión: 52 fps (1% peor 31) · 12 min · 8 oct", or for a
+    /// stream "Última sesión: desde el Mac · 45 fps · 12 min · 8 oct".
     static func card(_ r: KLSessionRecord) -> String {
         let head = klL("Last session", "Última sesión")
+        let when = r.start.formatted(.dateTime.day().month(.abbreviated))
+        let from = r.source == "mac" ? klL("from the Mac", "desde el Mac") + " · " : ""
         guard let avg = r.fpsAvg else {
-            return "\(head): \(klL("no game frames", "sin imagen del juego")) · \(duration(r.durationS))"
+            return "\(head): \(from)\(klL("no game frames", "sin imagen del juego")) · \(duration(r.durationS)) · \(when)"
         }
-        let low = r.fps5Low.map { " (\(klL("5% low", "5% peor")) \(Int($0.rounded())))" } ?? ""
-        return "\(head): \(Int(avg.rounded())) fps\(low) · \(duration(r.durationS))"
+        let low = r.fps1Low.map { " (\(klL("1% low", "1% peor")) \(Int($0.rounded())))" } ?? ""
+        return "\(head): \(from)\(Int(avg.rounded())) fps\(low) · \(duration(r.playS)) · \(when)"
     }
+
+    /// The card shows the latest session that has figures: one with no game frames at all (a
+    /// stream that never showed a picture, a boot that never drew) says nothing about how the
+    /// game runs — the settings sheet still lists it.
+    static func cardRecord(_ history: [KLSessionRecord]) -> KLSessionRecord? {
+        history.last { $0.fpsAvg != nil }
+    }
+
+    /// Why the session ended, in words.
+    static func endReason(_ r: KLSessionRecord) -> String {
+        if !r.final { return klL("did not close cleanly (killed or crashed)", "no se cerró limpiamente (cierre forzado o fallo)") }
+        switch r.endReason {
+        case "exit": return klL("game exited", "el juego terminó")
+        case "background": return klL("app closed or backgrounded", "app cerrada o en segundo plano")
+        case "render loop ended": return klL("immersive view closed", "vista inmersiva cerrada")
+        case "stream ended": return klL("stream from the Mac ended", "terminó la transmisión desde el Mac")
+        default: return r.endReason
+        }
+    }
+
+    static func ms(_ v: Double?) -> String { v.map { String(format: "%.1f ms", $0) } ?? "—" }
+    static func fps(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "—" }
+    static func memory(_ mb: Int) -> String { mb > 0 ? String(format: "%.1f GB", Double(mb) / 1024) : "—" }
 }
 
 // MARK: - Library model
@@ -243,8 +304,19 @@ final class HubLibraryModel: ObservableObject {
     @Published var latest: [String: [UInt32: UInt64]] = [:]
     /// The account's other Steam VR games, classified (information only).
     @Published var owned: [LibraryEntry]?
+    /// Every app the signed-in Steam account owns (nil = library not read yet): which
+    /// catalog games Steam can install (KleptonCatalog.swift).
+    @Published var steamOwned: Set<UInt32>?
     #endif
+    #if canImport(MetaStore)
+    /// One Meta download model per catalog game with a Meta recipe.
+    private(set) var meta: [String: MetaContentModel] = [:]
+    let metaAccount = MetaAccountModel.shared
+    #endif
+    /// The login name (never shown or logged; nil = not signed in to Steam).
     @Published var account: String?
+    /// What the header shows for Steam: the public persona name, or just "signed in".
+    @Published var steamLabel = KLAccountPrivacy.steamLabel
     /// Per game: why Play was refused (not owned), or the check in progress.
     @Published var playBlock: [String: String] = [:]
     @Published var verifying: String?
@@ -273,21 +345,238 @@ final class HubLibraryModel: ObservableObject {
         }
         account = (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load())?.accountName
         #endif
+        #if canImport(MetaStore)
+        var mm: [String: MetaContentModel] = [:]
+        for g in klHubGameRows {
+            if let r = KLCatalog.metaRecipe(g.target) { mm[g.target] = MetaContentModel(target: g.target, recipe: r) }
+        }
+        meta = mm
+        for m in mm.values {
+            relay.append(m.objectWillChange
+                .throttle(for: .milliseconds(500), scheduler: RunLoop.main, latest: true)
+                .sink { [weak self] _ in self?.objectWillChange.send() })
+        }
+        relay.append(metaAccount.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() })
+        #endif
         reloadSessions()
     }
 
+    // MARK: Sources (the catalog's stores, by ownership)
+
+    enum SourceState: Equatable {
+        /// The store says the account owns it.
+        case owned
+        /// Not known: not signed in to that store, or not checked yet.
+        case unknown(String)
+        case notOwned
+        /// The store sells a build this hub's port can't run.
+        case incompatible(String)
+    }
+
+    func sourceState(_ g: KLHubGameRow, _ store: KLStore) -> SourceState {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let app = KLCatalog.entry(g.target)?.steamApp else { return .incompatible(klL("no Steam source", "sin origen en Steam")) }
+            guard let lib = steamOwned else {
+                return .unknown(account == nil ? klL("Not signed in to Steam", "Sin sesión en Steam")
+                                               : klL("Steam library not read yet", "Biblioteca de Steam aún sin leer"))
+            }
+            return lib.contains(app) ? .owned : .notOwned
+            #else
+            return .incompatible(klL("Steam is not in this build", "Steam no está en esta versión"))
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            if let why = KLCatalog.metaIncompatibility(g) { return .incompatible(why) }
+            guard metaAccount.signedIn else { return .unknown(Self.metaSignInHint) }
+            guard let app = KLCatalog.metaRecipe(g.target)?.appId, let owns = metaAccount.owns(appId: app) else {
+                return .unknown(metaAccount.checking ? klL("Checking your Meta library…", "Comprobando tu biblioteca de Meta…")
+                                                     : klL("Meta library not checked yet", "Biblioteca de Meta aún sin comprobar"))
+            }
+            return owns ? .owned : .notOwned
+            #else
+            return .incompatible(klL("Meta is not in this build", "Meta no está en esta versión"))
+            #endif
+        }
+    }
+
+    /// What the store says about ownership, whether or not this port can run the build it sells:
+    /// true / false = the store answered; nil = not signed in there, or not checked yet.
+    func ownership(_ g: KLHubGameRow, _ store: KLStore) -> Bool? {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let app = KLCatalog.entry(g.target)?.steamApp, let lib = steamOwned else { return nil }
+            return lib.contains(app)
+            #else
+            return nil
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            guard metaAccount.signedIn, let app = KLCatalog.metaRecipe(g.target)?.appId else { return nil }
+            return metaAccount.owns(appId: app)
+            #else
+            return nil
+            #endif
+        }
+    }
+
+    /// One line per catalog game with what each store answered, when it changes (the pills and
+    /// the card's status come from exactly this).
+    func logSources(_ why: String) {
+        let line = games.filter { KLCatalog.entry($0.target) != nil }.map { g -> String in
+            let parts = KLCatalog.stores(g.target).map { st -> String in
+                let own = ownership(g, st).map { $0 ? "owned" : "not owned" } ?? "unknown"
+                if case .incompatible = sourceState(g, st) { return "\(st.rawValue)=\(own) (store build is not the port's)" }
+                if case .unknown(let w) = sourceState(g, st) { return "\(st.rawValue)=unknown (\(w))" }
+                return "\(st.rawValue)=\(own)"
+            }
+            return "\(g.target): " + (parts.isEmpty ? "no store" : parts.joined(separator: ", "))
+        }.joined(separator: "; ")
+        guard line != lastSourcesLine else { return }
+        lastSourcesLine = line
+        NSLog("[hub] sources (\(why)): \(line)")
+    }
+    private var lastSourcesLine = ""
+
+    /// The stores offered as install options: Steam unless Steam says it is not owned (signing in
+    /// happens from Download, as always); Meta only when Meta confirms ownership.
+    func offeredStores(_ g: KLHubGameRow) -> [KLStore] {
+        KLCatalog.stores(g.target).filter { st in
+            switch sourceState(g, st) {
+            case .owned: return true
+            case .unknown: return st == .steam
+            case .notOwned, .incompatible: return false
+            }
+        }
+    }
+
+    /// The store the card shows and Play/Download use: one with data on the headset first
+    /// (the player's pick when both), else the pick among the offered, else the only one offered.
+    func activeStore(_ g: KLHubGameRow) -> KLStore? {
+        let installed = KLCatalog.installedStores(g.target)
+        let offered = offeredStores(g)
+        let chosen = KLCatalog.chosenStore(g.target)
+        if let c = chosen, installed.contains(c) || offered.contains(c) { return c }
+        if let i = installed.first { return i }
+        if let o = offered.first { return o }
+        // Partial data from a store that is not offered (e.g. a Steam copy in progress): keep showing it.
+        #if canImport(SteamDepot)
+        if KLCatalog.stores(g.target).contains(.steam), SteamGames.descriptor(for: g.target)?.looksPresent == true { return .steam }
+        #endif
+        #if canImport(MetaStore)
+        if meta[g.target]?.hasAnything == true || meta[g.target]?.isBusy == true { return .meta }
+        #endif
+        return nil
+    }
+
+    /// The stores the card lets the player pick between (owned/offered, or with data).
+    func pickableStores(_ g: KLHubGameRow) -> [KLStore] {
+        let set = Set(offeredStores(g) + KLCatalog.installedStores(g.target))
+        return KLStore.allCases.filter(set.contains)
+    }
+
+    static var metaSignInHint: String {
+        klL("Sign in to Meta on your Mac (AVP Game Hub → Accounts)",
+            "Inicia sesión en Meta en tu Mac (AVP Game Hub → Cuentas)")
+    }
+
+    /// Why a game has no store to install from, in a few words for its card: a port that needs
+    /// rebuilding, a store not signed in or not checked yet, or (only once every store answered)
+    /// not owned. `title` replaces the card's status line; `detail` is one short line under it.
+    func unavailable(_ g: KLHubGameRow) -> (title: String, detail: String?) {
+        let states = KLCatalog.stores(g.target).map { ($0, sourceState(g, $0)) }
+        if states.isEmpty {
+            return (klL("Not available", "No disponible"), klL("No store this build can download from",
+                                                                 "Ninguna tienda de la que esta versión pueda descargar"))
+        }
+        // Ownership first. Owned somewhere, yet not installable (an owned store whose build this
+        // port can run would be offered, and the card would not be here): every store that owns it
+        // sells a build other than the one the port was translated from — the port needs updating.
+        let answers = states.map { (st: $0.0, owns: ownership(g, $0.0)) }
+        if answers.contains(where: { $0.owns == true }) {
+            return (klL("Update needed", "Hace falta actualizar"),
+                    klL("Use AVP Game Hub on your Mac to update it", "Usa AVP Game Hub en tu Mac para actualizarlo"))
+        }
+        // Owned nowhere that answered. A store that could not be asked (not signed in / not
+        // checked yet) wins over "not owned": that is only said once every store answered.
+        for (st, owns) in answers where owns == nil {
+            if st == .meta, !metaAccountSignedIn { return (klL("Sign in needed", "Falta iniciar sesión"), Self.metaSignInHint) }
+            if st == .steam, account == nil {
+                return (klL("Sign in needed", "Falta iniciar sesión"),
+                        klL("Sign in to Steam from Download", "Inicia sesión en Steam desde Descargar"))
+            }
+            if (st == .steam && checking) || (st == .meta && metaChecking) {
+                return (klL("Checking your library…", "Comprobando tu biblioteca…"), nil)
+            }
+            return (klL("Library not checked", "Biblioteca sin comprobar"),
+                    klL("\(st.label): couldn't check — use Retry at the top",
+                        "\(st.label): no se pudo comprobar — usa Reintentar arriba"))
+        }
+        return (klL("Not in your library", "No está en tu biblioteca"), nil)
+    }
+
+    private var metaAccountSignedIn: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.signedIn
+        #else
+        return false
+        #endif
+    }
+    var metaChecking: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.checking
+        #else
+        return false
+        #endif
+    }
+    /// The Meta ownership check failed (signed in, no answer).
+    var metaCheckFailed: Bool {
+        #if canImport(MetaStore)
+        return metaAccount.signedIn && !metaAccount.checking && metaAccount.error != nil
+        #else
+        return false
+        #endif
+    }
+
+    /// Header "Retry": both stores' library checks again.
+    func retryChecks() {
+        checkUpdates()
+        #if canImport(MetaStore)
+        metaAccount.refresh(force: true)
+        #endif
+    }
+
+    /// Per store, in full (technical) — the game's settings sheet shows it under Details.
+    func notInLibraryReason(_ g: KLHubGameRow) -> String {
+        let parts = KLCatalog.stores(g.target).map { st -> String in
+            switch sourceState(g, st) {
+            case .owned: return "\(st.label): " + klL("owned", "en tu biblioteca")
+            case .notOwned: return "\(st.label): " + klL("not owned", "no está en tu biblioteca")
+            case .unknown(let w): return "\(st.label): \(w)"
+            case .incompatible(let w):
+                let own = ownership(g, st).map { $0 ? klL("owned", "en tu biblioteca") : klL("not owned", "no está en tu biblioteca") }
+                return "\(st.label): " + (own.map { $0 + " · " } ?? "") + w
+            }
+        }
+        return parts.isEmpty ? klL("No store this build can download from", "Ninguna tienda de la que esta versión pueda descargar")
+                             : parts.joined(separator: "\n")
+    }
+
     enum Status: Equatable {
-        case notInBuild, notDownloaded, partial, working(String, Double?), verifyScheduled, updateAvailable, ready, manual
+        case notInBuild, notDownloaded, partial, working(String, Double?), verifyScheduled, updateAvailable, ready, manual, notInLibrary
         var label: String {
             switch self {
-            case .notInBuild: return "Not in this build"
-            case .notDownloaded: return "Not downloaded"
-            case .partial: return "Incomplete — not verified"
+            case .notInBuild: return klL("Not in this build", "No está en esta versión")
+            case .notDownloaded: return klL("Not downloaded", "Sin descargar")
+            case .partial: return klL("Incomplete — not verified", "Incompleto — sin verificar")
             case .working(let what, let f): return f.map { "\(what) \(Int(($0 * 100).rounded()))%" } ?? what
-            case .verifyScheduled: return "Verify scheduled"
-            case .updateAvailable: return "Update available"
-            case .ready: return "Ready"
-            case .manual: return "Data staged by hand"
+            case .verifyScheduled: return klL("Verify scheduled", "Verificación programada")
+            case .updateAvailable: return klL("Update available", "Actualización disponible")
+            case .ready: return klL("Ready", "Listo")
+            case .manual: return klL("Data staged by hand", "Datos copiados a mano")
+            case .notInLibrary: return klL("Not in your library", "No está en tu biblioteca")
             }
         }
         var color: Color {
@@ -295,7 +584,7 @@ final class HubLibraryModel: ObservableObject {
             case .ready, .manual: return .green
             case .updateAvailable, .verifyScheduled, .partial: return .orange
             case .working: return .blue
-            case .notDownloaded, .notInBuild: return .secondary
+            case .notDownloaded, .notInBuild, .notInLibrary: return .secondary
             }
         }
         var canPlay: Bool {
@@ -307,13 +596,24 @@ final class HubLibraryModel: ObservableObject {
     }
 
     func status(_ g: KLHubGameRow) -> Status {
+        if KLCatalog.entry(g.target) != nil {
+            switch activeStore(g) {
+            case .meta?:
+                #if canImport(MetaStore)
+                if let m = meta[g.target] { return metaStatus(m) }
+                #endif
+            case .steam?: break
+            case nil: return .notInLibrary
+            }
+        }
         #if canImport(SteamDepot)
         guard let m = content[g.target] else { return g.bundled ? .manual : .notInBuild }
         if m.isBusy {
             switch m.stage {
             case .working:
-                return .working(m.progress.phase == .verifying ? "Verifying" : "Downloading", m.activeFraction)
-            default: return .working("Signing in…", nil)
+                return .working(m.progress.phase == .verifying ? klL("Verifying", "Verificando") : klL("Downloading", "Descargando"),
+                                m.activeFraction)
+            default: return .working(klL("Signing in…", "Iniciando sesión…"), nil)
             }
         }
         let local = m.local
@@ -327,6 +627,28 @@ final class HubLibraryModel: ObservableObject {
         return m.game.looksPresent ? .partial : .notDownloaded
         #else
         return g.bundled ? .manual : .notInBuild
+        #endif
+    }
+
+    #if canImport(MetaStore)
+    private func metaStatus(_ m: MetaContentModel) -> Status {
+        if m.isBusy {
+            if case .working = m.stage, let p = m.progress {
+                return .working(p.verifying ? klL("Verifying", "Verificando") : klL("Downloading", "Descargando"), m.activeFraction)
+            }
+            return .working(klL("Checking with Meta…", "Comprobando con Meta…"), nil)
+        }
+        if m.complete { return .ready }
+        return m.hasAnything ? .partial : .notDownloaded
+    }
+    #endif
+
+    /// The game's Meta store app id (cover art for a game with no Steam header).
+    func metaAppId(_ g: KLHubGameRow) -> String? {
+        #if canImport(MetaStore)
+        return KLCatalog.metaRecipe(g.target)?.appId
+        #else
+        return nil
         #endif
     }
 
@@ -344,6 +666,13 @@ final class HubLibraryModel: ObservableObject {
     /// required on device, SteamAPI_Init then fails and the game shows its own
     /// "no Steam" behaviour).
     func checkOwnership(_ target: String, then play: @escaping () -> Void) {
+        #if canImport(MetaStore)
+        if let g = games.first(where: { $0.target == target }), KLCatalog.entry(target) != nil, activeStore(g) == .meta,
+           let app = KLCatalog.metaRecipe(target)?.appId {
+            checkMetaOwnership(target, app: app, then: play)
+            return
+        }
+        #endif
         #if canImport(SteamDepot)
         guard let app = SteamGames.descriptor(for: target)?.appID else { play(); return }
         guard verifying == nil else { return }
@@ -354,7 +683,7 @@ final class HubLibraryModel: ObservableObject {
             do {
                 let r = try await KleptonSteamBridge.owns(app: app)
                 NSLog("[hub] \(target): app \(app) \(r.owned ? "owned" : "NOT owned") by \(r.name)\(r.offline ? " (offline, cached)" : "")")
-                if r.owned { play() } else { playBlock[target] = "Not owned on this Steam account" }
+                if r.owned { play() } else { playBlock[target] = klL("Not owned on this Steam account", "No está en tu biblioteca de Steam") }
             } catch {
                 NSLog("[hub] \(target): ownership not verified (\(error)); booting, the runtime decides")
                 play()
@@ -364,6 +693,32 @@ final class HubLibraryModel: ObservableObject {
         play()
         #endif
     }
+
+    #if canImport(MetaStore)
+    /// Meta's answer (re-asked when older than a day; the last answer stands when Meta can't
+    /// be reached). Only a "yes" lets the game boot.
+    private func checkMetaOwnership(_ target: String, app: String, then play: @escaping () -> Void) {
+        guard verifying == nil else { return }
+        verifying = target
+        playBlock[target] = nil
+        metaAccount.refresh { [weak self] in
+            guard let self else { return }
+            self.verifying = nil
+            switch self.metaAccount.owns(appId: app) {
+            case true?:
+                NSLog("[hub] \(target): Meta app \(app) owned by user \(KLAccountPrivacy.mask(self.metaAccount.userId))")
+                play()
+            case false?:
+                self.playBlock[target] = klL("Not owned on this Meta account", "No está en tu biblioteca de Meta")
+            case nil:
+                self.playBlock[target] = self.metaAccount.signedIn
+                    ? klL("Could not confirm with Meta that you own it: ", "Meta no pudo confirmar que lo tienes: ")
+                        + (self.metaAccount.error ?? klL("no answer", "sin respuesta"))
+                    : Self.metaSignInHint
+            }
+        }
+    }
+    #endif
 
     /// Derive what the runtime reads from the downloaded data (HubPrep: the APK
     /// under the runtime's name, the small assets/ entries, the metadata), off the
@@ -377,7 +732,7 @@ final class HubLibraryModel: ObservableObject {
             preparing = nil
             if let err {
                 NSLog("[hub] \(target): could not prepare its data: \(err)")
-                playBlock[target] = "Could not prepare the game's files: \(err)"
+                playBlock[target] = klL("Could not prepare the game's files: ", "No se pudieron preparar los archivos del juego: ") + err
             } else {
                 play()
             }
@@ -390,16 +745,19 @@ final class HubLibraryModel: ObservableObject {
         for m in content.values { m.signOut() }
         try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").clear()
         owned = nil
+        steamOwned = nil
         latest = [:]
         #endif
         account = nil
+        KLAccountPrivacy.steamPersona = nil
+        steamLabel = KLAccountPrivacy.steamLabel
         NSLog("[hub] signed out of Steam")
     }
 
     /// Re-read every game's session history (after the settings sheet cleared one).
     func reloadSessions() {
         var m: [String: KLSessionRecord] = [:]
-        for g in games { if let r = KLSessionHistory.load(g.target).last { m[g.target] = r } }
+        for g in games { if let r = HubSessionText.cardRecord(KLSessionHistory.load(g.target)) { m[g.target] = r } }
         lastSession = m
     }
 
@@ -407,6 +765,10 @@ final class HubLibraryModel: ObservableObject {
     func refreshAfterDelete(_ target: String) {
         #if canImport(SteamDepot)
         content[target]?.refreshLocal()
+        #endif
+        #if canImport(MetaStore)
+        meta[target]?.refreshLocal()
+        if case .complete? = meta[target]?.stage { meta[target]?.stage = .idle }
         #endif
         objectWillChange.send()
     }
@@ -419,14 +781,28 @@ final class HubLibraryModel: ObservableObject {
         guard !checking, let creds = try? store.load() else { return }
         account = creds.accountName
         checking = true; checkError = nil
+        checkGen += 1
+        let gen = checkGen
         let games = content.values.map(\.game)
         let hubApps = Set(games.map(\.appID))
-        Task {
+        // Never spin forever: a Steam connection that hangs ends the check here (the card
+        // shows "couldn't check" + Retry); a late answer from that attempt is dropped.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.checkTimeout))
+            guard let self, self.checking, self.checkGen == gen else { return }
+            NSLog("[hub] update check timed out after \(Int(Self.checkTimeout)) s")
+            self.checkGen += 1
+            self.checking = false
+            self.checkError = klL("timed out", "sin respuesta")
+            self.checkTask?.cancel()
+        }
+        checkTask = Task {
             let session = SteamSession(log: { NSLog("[hub] %@", $0) })
             defer { Task { await session.disconnect() } }
             do {
                 try await session.connect()
                 try await session.logOn(creds)
+                if let p = await session.personaName { KLAccountPrivacy.steamPersona = p; steamLabel = KLAccountPrivacy.steamLabel }
                 let dl = SteamDepotDownloader(session: session)
                 var found: [String: [UInt32: UInt64]] = [:]
                 for g in games {
@@ -438,11 +814,16 @@ final class HubLibraryModel: ObservableObject {
                     }
                     found[g.target] = m
                 }
+                guard gen == checkGen else { return }
                 latest = found
                 for m in content.values { m.refreshLocal() }
                 let lib = try await SteamLibrary.fetch(session: session, log: { NSLog("[hub] library: %@", $0) })
+                guard gen == checkGen else { return }
+                steamOwned = Set(lib.map(\.appID))
                 owned = lib.filter { $0.isVR && !hubApps.contains($0.appID) }
+                logSources("Steam library read")
             } catch {
+                guard gen == checkGen else { return }
                 NSLog("[hub] update check failed: \(error)")
                 checkError = "\(error)"
             }
@@ -450,6 +831,11 @@ final class HubLibraryModel: ObservableObject {
         }
         #endif
     }
+
+    /// Seconds the Steam update/library check may take before it counts as failed.
+    static let checkTimeout: Double = 45
+    private var checkGen = 0
+    private var checkTask: Task<Void, Never>?
 }
 
 // MARK: - Per-game settings
@@ -461,6 +847,8 @@ final class HubLibraryModel: ObservableObject {
 /// on a scripted launch still win over everything here.
 struct HubGameSettingsView: View {
     let game: KLHubGameRow
+    /// Store availability in full (technical: versions, packages), when the card shows a short reason.
+    var details: String? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var s = KLGameSettings()
     @State private var sessions: [KLSessionRecord] = []
@@ -470,134 +858,243 @@ struct HubGameSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let details {
+                    Section {
+                        DisclosureGroup(klL("Details", "Detalles")) {
+                            Text(details).font(.footnote).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    } header: { Text(klL("Availability", "Disponibilidad")) }
+                }
                 Section {
-                    Picker("Language", selection: Binding(
+                    Picker(klL("Language", "Idioma"), selection: Binding(
                         get: { KLGameLanguage(rawValue: s.language ?? "system") ?? .system },
                         set: { s.language = $0 == .system ? nil : $0.rawValue; save() })) {
                         ForEach(KLGameSettingsStore.languages(for: game.target)) { l in
                             Text(l.label).tag(l)
                         }
                     }
-                } header: { Text("Language") } footer: {
-                    Text("Menus, text and subtitles. System follows the headset's language. "
-                         + "Spoken audio depends on what the game ships.")
+                } header: { Text(klL("Language", "Idioma")) } footer: {
+                    Text(klL("Menus, text and subtitles. System follows the headset's language. "
+                             + "Spoken audio depends on what the game ships.",
+                             "Menús, textos y subtítulos. Sistema sigue el idioma del visor. "
+                             + "El audio hablado depende de lo que traiga el juego."))
                 }
 
                 Section {
-                    Picker("Immersion", selection: Binding(
+                    Picker(klL("Immersion", "Inmersión"), selection: Binding(
                         get: { s.fullImmersion ?? KLGameSettingsStore.defaultFull(game.target) },
                         set: { s.fullImmersion = $0; save() })) {
-                        Text("Full VR").tag(true)
-                        Text("Mixed (see the room)").tag(false)
+                        Text(klL("Full VR", "RV completa")).tag(true)
+                        Text(klL("Mixed (see the room)", "Mixta (ves la habitación)")).tag(false)
                     }
-                    Toggle("Real hands visible", isOn: Binding(
+                    Toggle(klL("Real hands visible", "Manos reales visibles"), isOn: Binding(
                         get: { s.handMatting ?? KLGameSettingsStore.defaultMatting(game.target) },
                         set: { s.handMatting = $0; save() }))
-                    Toggle("Show controllers when not held", isOn: Binding(
+                    Toggle(klL("Show controllers when not held", "Mostrar los mandos cuando los sueltas"), isOn: Binding(
                         get: { s.ghostControllers ?? KLGameSettingsStore.defaultGhostControllers },
                         set: { s.ghostControllers = $0; save() }))
-                } header: { Text("Display") } footer: {
-                    Text("The game draws its own hands, so your real ones are hidden by default. "
-                         + "A controller you put down is shown as a grey outline where it rests, "
-                         + "and disappears again when you pick it up.")
+                } header: { Text(klL("Display", "Imagen")) } footer: {
+                    Text(klL("The game draws its own hands, so your real ones are hidden by default. "
+                             + "A controller you put down is shown as a grey outline where it rests, "
+                             + "and disappears again when you pick it up.",
+                             "El juego dibuja sus propias manos, así que las reales se ocultan por defecto. "
+                             + "Un mando que dejas se ve como un contorno gris donde está apoyado, "
+                             + "y desaparece al volver a cogerlo."))
                 }
 
                 Section {
-                    cm("Offset X (right)", 0)
-                    cm("Offset Y (up)", 1)
-                    cm("Offset Z (back)", 2)
-                    deg("Pitch", \.sensePitch, \.sensePitch, -90 ... 90)
-                    deg("Yaw", \.senseYaw, \.senseYaw, -180 ... 180)
-                    deg("Roll", \.senseRoll, \.senseRoll, -180 ... 180)
-                    Button("Reset calibration") { s.calibration = nil; save() }
-                } header: { Text("Controller calibration") } footer: {
-                    Text("Where the game puts your hands relative to the PlayStation VR2 Sense "
-                         + "controllers, in the controller's own frame (−Z points forward); X, yaw "
-                         + "and roll are mirrored for the left hand. The same values as Controller "
-                         + "alignment in the game's window — tuning there is saved here.")
+                    cm(klL("Offset X (right)", "Desplazamiento X (derecha)"), 0)
+                    cm(klL("Offset Y (up)", "Desplazamiento Y (arriba)"), 1)
+                    cm(klL("Offset Z (back)", "Desplazamiento Z (atrás)"), 2)
+                    deg(klL("Pitch", "Cabeceo"), \.sensePitch, \.sensePitch, -90 ... 90)
+                    deg(klL("Yaw", "Guiñada"), \.senseYaw, \.senseYaw, -180 ... 180)
+                    deg(klL("Roll", "Alabeo"), \.senseRoll, \.senseRoll, -180 ... 180)
+                    Button(klL("Reset calibration", "Restablecer calibración")) { s.calibration = nil; save() }
+                } header: { Text(klL("Controller calibration", "Calibración de los mandos")) } footer: {
+                    Text(klL("Where the game puts your hands relative to the PlayStation VR2 Sense "
+                             + "controllers, in the controller's own frame (−Z points forward); X, yaw "
+                             + "and roll are mirrored for the left hand. The same values as Controller "
+                             + "alignment in the game's window — tuning there is saved here.",
+                             "Dónde coloca el juego tus manos respecto a los mandos PlayStation VR2 Sense, "
+                             + "en el marco del propio mando (−Z apunta hacia delante); X, guiñada y alabeo "
+                             + "se reflejan para la mano izquierda. Son los mismos valores que Alineación "
+                             + "de mandos en la ventana del juego — lo que ajustes allí se guarda aquí."))
                 }
 
                 if KLGameSettingsStore.hasPerformance(game.target) {
                     Section {
-                        slider("Render scale", value: s.performance?.renderScale ?? KLGameSettingsStore.defaultRenderScale,
+                        slider(klL("Render scale", "Escala de render"), value: s.performance?.renderScale ?? KLGameSettingsStore.defaultRenderScale,
                                range: 0.6 ... 1.2, step: 0.05, format: "%.2f×") { v in
                             perf { $0.renderScale = v }
                         }
-                        slider("Overscan margin", value: s.performance?.overscan ?? KLGameSettingsStore.defaultOverscan,
+                        Picker(klL("Antialiasing", "Antialiasing"), selection: Binding(
+                            get: { s.performance?.msaa ?? KLGameSettingsStore.defaultMSAA },
+                            set: { v in perf { $0.msaa = v } })) {
+                            Text("2×").tag(2)
+                            Text("4×").tag(4)
+                        }
+                        Toggle(klL("Foveated rendering", "Renderizado foveado"), isOn: Binding(
+                            get: { s.performance?.foveate ?? KLGameSettingsStore.defaultFoveate },
+                            set: { v in perf { $0.foveate = v } }))
+                        slider(klL("Overscan margin", "Margen de overscan"), value: s.performance?.overscan ?? KLGameSettingsStore.defaultOverscan,
                                range: 0 ... 0.2, step: 0.01, format: "%.2f") { v in
                             perf { $0.overscan = v }
                         }
-                        Toggle("Extra pixels for the margin", isOn: Binding(
+                        Toggle(klL("Extra pixels for the margin", "Píxeles extra para el margen"), isOn: Binding(
                             get: { s.performance?.overscanRT ?? KLGameSettingsStore.defaultOverscanRT },
                             set: { v in perf { $0.overscanRT = v } }))
-                        Button("Reset performance") { s.performance = nil; save() }
-                    } header: { Text("Performance") } footer: {
-                        Text("Lower render scale = faster and blurrier. The overscan margin renders "
-                             + "past the edge of the view so fast head turns show picture instead of "
-                             + "black; extra pixels keep the centre sharp at a GPU cost.")
+                        Button(klL("Reset performance", "Restablecer rendimiento")) { s.performance = nil; save() }
+                    } header: { Text(klL("Performance", "Rendimiento")) } footer: {
+                        Text(klL("Lower render scale = faster and blurrier. The overscan margin renders "
+                                 + "past the edge of the view so fast head turns show picture instead of "
+                                 + "black; extra pixels keep the centre sharp at a GPU cost.\n\n",
+                                 "Menos escala de render = más rápido y más borroso. El margen de overscan "
+                                 + "dibuja más allá del borde de la vista para que al girar rápido la cabeza "
+                                 + "se vea imagen y no negro; los píxeles extra mantienen nítido el centro "
+                                 + "a costa de GPU.\n\n")
+                             + klL("Default: antialiasing 4× with foveated rendering. Foveation keeps the "
+                                   + "centre sharp and lowers the resolution at the edges: on M2 it cut GPU "
+                                   + "time by about a third at 4× (18 ms per frame instead of 29). 2× is "
+                                   + "lighter still; without foveation 4× runs at about 30 fps instead of 45.",
+                                   "Por defecto: antialiasing 4× con renderizado foveado. El foveado mantiene "
+                                   + "nítido el centro y baja la resolución en los bordes: en M2 recortó un "
+                                   + "tercio del tiempo de GPU a 4× (18 ms por imagen en vez de 29). 2× es "
+                                   + "aún más ligero; sin foveado, 4× va a unos 30 fps en vez de 45."))
                     }
+                }
+
+                #if canImport(SteamDepot)
+                KLCloudSaveSection(target: game.target)
+                #endif
+
+                if KLGameSettingsStore.hasPrecompile(game.target) {
+                    Section {
+                        Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
+                            get: { s.precompileGraphics ?? false },
+                            set: { s.precompileGraphics = $0 ? true : nil; save() }))
+                        let have = FileManager.default.fileExists(
+                            atPath: KLGameSettingsStore.fozURL(game.target).path)
+                        Text(have ? klL("Pipeline list found.", "Lista de pipelines encontrada.")
+                                  : klL("No pipeline list on the headset yet.",
+                                        "Aún no hay lista de pipelines en el visor."))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } header: { Text(klL("Graphics", "Gráficos")) } footer: {
+                        Text(klL("Before the game starts, compiles the shaders it will need, so walking "
+                                 + "into a new area does not freeze the picture. Takes a while each "
+                                 + "launch; the progress shows in the game's window.",
+                                 "Antes de arrancar el juego compila los shaders que va a usar, para "
+                                 + "que la imagen no se congele al entrar en una zona nueva. Tarda un "
+                                 + "rato en cada arranque; el progreso sale en la ventana del juego."))
+                    }
+                }
+
+                Section {
+                    Toggle(klL("Performance overlay", "Visor de rendimiento"), isOn: Binding(
+                        get: { s.perfOverlay ?? false },
+                        set: { s.perfOverlay = $0 ? true : nil; save() }))
+                } header: { Text(klL("In-game", "Dentro del juego")) } footer: {
+                    Text(klL("A small panel in the game's view with fps, frame and GPU time, reprojected "
+                             + "frames, memory and temperature. Siri can turn it on and off while you play "
+                             + "(“Turn on the FPS overlay in AVP Game Hub”), and “Open game settings in Hub” opens "
+                             + "quick settings inside the game.",
+                             "Un panel pequeño en la vista del juego con fps, tiempo de imagen y de GPU, "
+                             + "imágenes reproyectadas, memoria y temperatura. Siri lo activa y desactiva "
+                             + "mientras juegas («Activa el visor de FPS en AVP Game Hub»), y «Abre ajustes del juego en "
+                             + "Hub» abre los ajustes rápidos dentro del juego."))
                 }
 
                 sessionsSection
 
                 Section {
-                    Button("Reset all settings for this game", role: .destructive) {
+                    Button(klL("Reset all settings for this game", "Restablecer todos los ajustes de este juego"), role: .destructive) {
                         s = KLGameSettings(); save()
                     }
                 }
             }
             .navigationTitle(game.display)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button(klL("Done", "Hecho")) { dismiss() } }
             }
         }
         .frame(minWidth: 560, minHeight: 640)
         .onAppear {
             s = KLGameSettingsStore.load(game.target)
-            sessions = Array(KLSessionHistory.load(game.target).suffix(10).reversed())
+            sessions = Array(KLSessionHistory.load(game.target).suffix(6).reversed())
         }
     }
 
-    /// The last ten sessions, newest first, and a way to forget them.
+    /// The last session in detail, then the five before it, and a way to forget them.
     @ViewBuilder private var sessionsSection: some View {
+        if let r = sessions.first {
+            Section {
+                LabeledContent(klL("Date", "Fecha"),
+                               value: r.start.formatted(date: .abbreviated, time: .shortened))
+                LabeledContent(klL("Play time", "Tiempo de juego"),
+                               value: HubSessionText.duration(r.playS)
+                                   + (r.loadingS >= 1 ? " · " + klL("loading", "cargando") + " "
+                                      + HubSessionText.duration(r.loadingS) : ""))
+                LabeledContent(klL("Frame rate (avg / median)", "Imágenes por segundo (media / mediana)"),
+                               value: "\(HubSessionText.fps(r.fpsAvg)) / \(HubSessionText.fps(r.frameMsP50.map { 1000 / $0 })) fps")
+                LabeledContent(klL("1% low", "1% peor"), value: "\(HubSessionText.fps(r.fps1Low)) fps")
+                if let g = r.gpuMsAvg {
+                    LabeledContent(klL("GPU per frame", "GPU por imagen"), value: HubSessionText.ms(g))
+                }
+                if r.compositorFrames > 0 {
+                    LabeledContent(klL("Reprojected", "Reproyectadas"),
+                                   value: String(format: "%.0f %%", 100 * Double(r.reprojectedFrames) / Double(r.compositorFrames))
+                                       + (r.displayHz.map { String(format: " · %.0f Hz", $0) } ?? ""))
+                }
+                LabeledContent(klL("Peak memory", "Memoria máxima"), value: HubSessionText.memory(r.peakFootprintMB))
+                LabeledContent(klL("Ended", "Final"), value: HubSessionText.endReason(r))
+            } header: { Text(klL("Last session", "Última sesión")) }
+            .monospacedDigit()
+        }
         Section {
             if sessions.isEmpty {
                 Text(klL("No sessions recorded yet.", "Aún no hay sesiones registradas."))
+                    .foregroundStyle(.secondary)
+            } else if sessions.count == 1 {
+                Text(klL("No earlier sessions.", "No hay sesiones anteriores."))
                     .foregroundStyle(.secondary)
             } else {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     GridRow {
                         Text(klL("Date", "Fecha"))
-                        Text(klL("Duration", "Duración"))
+                        Text(klL("Play", "Juego"))
                         Text(klL("Avg", "Media"))
-                        Text(klL("5% low", "5% peor"))
+                        Text(klL("1% low", "1% peor"))
+                        Text("GPU")
                         Text(klL("Peak mem.", "Memoria máx."))
                     }
                     .font(.caption.bold()).foregroundStyle(.secondary)
-                    ForEach(sessions) { r in
+                    ForEach(sessions.dropFirst()) { r in
                         GridRow {
                             Text(r.start.formatted(date: .abbreviated, time: .shortened))
                                 + Text(r.final ? "" : " *").foregroundStyle(.orange)
-                            Text(HubSessionText.duration(r.durationS))
+                            Text(HubSessionText.duration(r.playS))
                             Text(r.fpsAvg.map { String(format: "%.0f fps", $0) } ?? "—")
-                            Text(r.fps5Low.map { String(format: "%.0f", $0) } ?? "—")
-                            Text(r.peakFootprintMB > 0
-                                 ? String(format: "%.1f GB", Double(r.peakFootprintMB) / 1024) : "—")
+                            Text(HubSessionText.fps(r.fps1Low))
+                            Text(r.gpuMsAvg.map { String(format: "%.1f ms", $0) } ?? "—")
+                            Text(HubSessionText.memory(r.peakFootprintMB))
                         }
                         .font(.callout).monospacedDigit()
                     }
                 }
+            }
+            if !sessions.isEmpty {
                 Button(klL("Clear history", "Borrar historial"), role: .destructive) {
                     KLSessionHistory.clear(game.target)
                     sessions = []
                 }
             }
-        } header: { Text(klL("Sessions", "Sesiones")) } footer: {
+        } header: { Text(klL("Earlier sessions", "Sesiones anteriores")) } footer: {
             Text(klL("Frame rate the game delivered while playing (loading screens excluded). "
-                     + "5% low: the slowest 5% of frames ran at or below this. "
+                     + "1% low: the slowest 1% of frames ran at or below this. GPU: the game's own GPU time "
+                     + "per frame, recorded only while the performance overlay (or KL_GPU_TIME) was on. "
                      + "* = the session did not close cleanly; its figures are from up to 30 s before the end.",
                      "Imágenes por segundo que dio el juego mientras se jugaba (sin pantallas de carga). "
-                     + "5% peor: el 5% más lento de las imágenes fue a esta velocidad o menos. "
+                     + "1% peor: el 1% más lento de las imágenes fue a esta velocidad o menos. GPU: tiempo de "
+                     + "GPU del juego por imagen, solo registrado con el visor de rendimiento (o KL_GPU_TIME) activo. "
                      + "* = la sesión no se cerró limpiamente; sus datos son de hasta 30 s antes del final."))
         }
     }
@@ -654,9 +1151,9 @@ struct HubGameSettingsView: View {
         let lang = KLGameSettingsStore.language(for: target)
         let full = KLGameSettingsStore.fullImmersion(for: target)
         let hands = KLGameSettingsStore.handMatting(for: target)
-        let cal = KLGameSettingsStore.load(target).calibration != nil ? " · Calibrated" : ""
-        return "\(lang.label) · \(full ? "Full VR" : "Mixed") · "
-            + "\(hands ? "Real hands shown" : "Real hands hidden")\(cal)"
+        let cal = KLGameSettingsStore.load(target).calibration != nil ? " · " + klL("Calibrated", "Calibrado") : ""
+        return "\(lang.label) · \(full ? klL("Full VR", "RV completa") : klL("Mixed", "Mixta")) · "
+            + (hands ? klL("Real hands shown", "Manos reales visibles") : klL("Real hands hidden", "Manos reales ocultas")) + cal
     }
 }
 
@@ -676,14 +1173,19 @@ struct HubAppSettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    if let a = model.account {
-                        LabeledContent("Signed in as", value: a)
-                        Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
+                    if model.account != nil {
+                        LabeledContent(klL("Signed in", "Sesión iniciada"), value: model.steamLabel)
+                        Button(klL("Sign out of Steam", "Cerrar sesión de Steam"), role: .destructive) { confirmSignOut = true }
                     } else {
-                        Text("Not signed in. Signing in happens from a game's Download button.")
+                        Text(klL("Not signed in. Signing in happens from a game's Download button.",
+                                 "Sin sesión. Se inicia sesión desde el botón Descargar de un juego."))
                             .foregroundStyle(.secondary)
                     }
-                } header: { Text("Steam account") }
+                } header: { Text(klL("Steam account", "Cuenta de Steam")) }
+
+                #if canImport(MetaStore)
+                MetaAccountSection()
+                #endif
 
                 Section {
                     ForEach(model.games) { g in
@@ -691,46 +1193,51 @@ struct HubAppSettingsView: View {
                             VStack(alignment: .leading) {
                                 Text(g.display)
                                 Text(sizes[g.target].map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
-                                     ?? "Measuring…")
+                                     ?? klL("Measuring…", "Midiendo…"))
                                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                             }
                             Spacer()
-                            Button("Delete game data", role: .destructive) { confirmDelete = g }
+                            Button(klL("Delete game data", "Borrar datos del juego"), role: .destructive) { confirmDelete = g }
                                 .disabled((sizes[g.target] ?? 0) == 0 || HubStorage.isBusy(model, g.target))
                         }
                     }
                     if let error { Text(error).font(.caption).foregroundStyle(.red) }
-                } header: { Text("Storage") } footer: {
-                    Text("Deletes the files downloaded from Steam and those derived from them. "
-                         + "Saved games and settings are kept. Download again from the game's card.")
+                } header: { Text(klL("Storage", "Almacenamiento")) } footer: {
+                    Text(klL("Deletes the files downloaded from Steam or Meta and those derived from them. "
+                             + "Saved games and settings are kept. Download again from the game's card.",
+                             "Borra los archivos descargados de Steam o Meta y los derivados de ellos. "
+                             + "Las partidas guardadas y los ajustes se conservan. Vuelve a descargar desde la tarjeta del juego."))
                 }
             }
-            .navigationTitle("Settings")
+            .navigationTitle(klL("Settings", "Ajustes"))
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button(klL("Done", "Hecho")) { dismiss() } }
             }
         }
         .frame(minWidth: 560, minHeight: 480)
         .task { await measure() }
-        .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
-            Button("Sign out", role: .destructive) { model.signOut() }
+        .confirmationDialog(klL("Sign out of Steam?", "¿Cerrar sesión de Steam?"), isPresented: $confirmSignOut, titleVisibility: .visible) {
+            Button(klL("Sign out", "Cerrar sesión"), role: .destructive) { model.signOut() }
         } message: {
-            Text("Downloads and ownership checks will need you to sign in again.")
+            Text(klL("Downloads and ownership checks will need you to sign in again.",
+                     "Para descargar y comprobar tu biblioteca tendrás que volver a iniciar sesión."))
         }
-        .alert(confirmDelete.map { "Delete \($0.display) data?" } ?? "",
+        .alert(confirmDelete.map { klL("Delete \($0.display) data?", "¿Borrar los datos de \($0.display)?") } ?? "",
                isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                presenting: confirmDelete) { g in
-            Button("Delete \(sizeText(g))", role: .destructive) { delete(g) }
-            Button("Cancel", role: .cancel) {}
+            Button(klL("Delete \(sizeText(g))", "Borrar \(sizeText(g))"), role: .destructive) { delete(g) }
+            Button(klL("Cancel", "Cancelar"), role: .cancel) {}
         } message: { g in
-            Text("This permanently deletes \(sizeText(g)) of \(g.display) from this headset. "
-                 + "Playing it again means downloading it all again"
-                 + (g.target == "alyx" ? " — about 72 GB." : "."))
+            Text(klL("This permanently deletes \(sizeText(g)) of \(g.display) from this headset. "
+                     + "Playing it again means downloading it all again",
+                     "Esto borra para siempre \(sizeText(g)) de \(g.display) de este visor. "
+                     + "Para volver a jugarlo tendrás que descargarlo entero otra vez")
+                 + (g.target == "alyx" ? klL(" — about 72 GB.", " — unos 72 GB.") : "."))
         }
     }
 
     private func sizeText(_ g: KLHubGameRow) -> String {
-        sizes[g.target].map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? "the data"
+        sizes[g.target].map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? klL("the data", "los datos")
     }
 
     private func measure() async {
@@ -748,10 +1255,92 @@ struct HubAppSettingsView: View {
         sizes[g.target] = nil
         Task {
             let err = await Task.detached(priority: .userInitiated) { HubStorage.deleteData(g) }.value
-            if let err { error = "Could not delete all of \(g.display): \(err)" }
+            if let err { error = klL("Could not delete all of \(g.display): \(err)", "No se pudo borrar todo \(g.display): \(err)") }
             model.refreshAfterDelete(g.target)
             await measure()
         }
+    }
+}
+
+// MARK: - Meta cover art
+
+/// Cover art for a game whose only store is Meta: the first landscape image of its public store
+/// page (meta.com/experiences/<app id>, JSON-LD), fetched without any sign-in or cookie — the Meta
+/// token never goes to that host — and only from Meta's CDNs. Cached in Caches/hub-art; until it
+/// is there (or offline) the card keeps its plain tile.
+@MainActor
+final class HubMetaArt: ObservableObject {
+    static let shared = HubMetaArt()
+    @Published private(set) var images: [String: UIImage] = [:]
+    private var started: Set<String> = []
+
+    nonisolated private static var dir: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("hub-art", isDirectory: true)
+    }
+
+    /// The cached cover, or nil (and a fetch is started, once per app run).
+    func image(appId: String) -> UIImage? {
+        if let i = images[appId] { return i }
+        guard !appId.isEmpty, appId.allSatisfy(\.isNumber), !started.contains(appId) else { return nil }
+        started.insert(appId)
+        let file = Self.dir.appendingPathComponent("meta-\(appId).img")
+        Task {   // not from inside the view update that asked
+            let data = await Task.detached(priority: .utility) { () -> Data? in
+                if let d = try? Data(contentsOf: file), UIImage(data: d) != nil { return d }
+                guard let d = await Self.fetchCover(appId: appId) else { return nil }
+                try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
+                try? d.write(to: file, options: .atomic)
+                return d
+            }.value
+            if let data, let img = UIImage(data: data) { images[appId] = img }
+            else { NSLog("[hub] no Meta store cover for app \(appId)") }
+        }
+        return nil
+    }
+
+    nonisolated private static func fetchCover(appId: String) async -> Data? {
+        guard let page = URL(string: "https://www.meta.com/experiences/\(appId)/") else { return nil }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 30
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+        var req = URLRequest(url: page)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                     + "Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        guard let (html, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        // The page's first images are its covers (landscape, square, portrait), then screenshots.
+        var fallback: Data?
+        for url in imageURLs(String(decoding: html.prefix(400_000), as: UTF8.self)).prefix(4) {
+            guard let (img, r) = try? await session.data(from: url), (r as? HTTPURLResponse)?.statusCode == 200,
+                  let size = UIImage(data: img)?.size, size.width > 0 else { continue }
+            let ratio = size.width / max(size.height, 1)
+            if size.width >= 1024, ratio >= 1.5, ratio <= 2.1 { return img }
+            if fallback == nil, ratio >= 1 { fallback = img }
+        }
+        return fallback
+    }
+
+    nonisolated private static func imageURLs(_ html: String) -> [URL] {
+        guard let re = try? NSRegularExpression(pattern: #"<script type="application/ld\+json"[^>]*>(.*?)</script>"#,
+                                                options: [.dotMatchesLineSeparators]) else { return [] }
+        var out: [URL] = []
+        for m in re.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            guard let r = Range(m.range(at: 1), in: html),
+                  let json = try? JSONSerialization.jsonObject(with: Data(html[r].utf8)) else { continue }
+            let nodes: [Any] = (json as? [Any]) ?? ((json as? [String: Any])?["@graph"] as? [Any]) ?? [json]
+            for case let node as [String: Any] in nodes {
+                let images = (node["image"] as? [Any]) ?? node["image"].map { [$0] } ?? []
+                for image in images {
+                    let raw = (image as? String) ?? (image as? [String: Any]).flatMap { ($0["@id"] ?? $0["url"] ?? $0["contentUrl"]) as? String }
+                    guard let raw, let url = URL(string: raw), url.scheme == "https", let host = url.host?.lowercased(),
+                          host.hasSuffix(".oculuscdn.com") || host.hasSuffix(".fbcdn.net") else { continue }
+                    out.append(url)
+                }
+            }
+        }
+        return out
     }
 }
 
@@ -759,46 +1348,93 @@ struct HubAppSettingsView: View {
 
 struct HubLibraryView: View {
     let onPlay: (String) -> Void
+    /// "Jugar desde el Mac" (KleptonStreamClient.swift): the game, and the Mac.
+    var onPlayFromMac: (String, KLStreamTarget) -> Void = { _, _ in }
     @StateObject private var model = HubLibraryModel()
+    @ObservedObject private var art = HubMetaArt.shared
+    #if canImport(SteamDepot)
+    @ObservedObject private var cloud = KLCloudSaveModel.shared
+    @MainActor private static var openedOnce = false
+    #endif
+    /// The Macs advertising the stream service, live while the library is up.
+    @StateObject private var macs = KLStreamBrowser()
     @State private var detail: String?
+    /// Which store's download page `detail` shows.
+    @State private var detailStore: KLStore = .steam
     /// The game whose settings sheet is open.
     @State private var settingsFor: KLHubGameRow?
     @State private var showAppSettings = false
 
     var body: some View {
         Group {
-            #if canImport(SteamDepot)
-            if let t = detail, let m = model.content[t] {
-                SteamContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() })
+            if let t = detail, let page = detailPage(t) {
+                page
             } else {
                 library
             }
-            #else
-            library
-            #endif
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
-        .onAppear { Lifecycle.keepAlive = true; model.checkUpdates() }
-        .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in HubGameSettingsView(game: g) }
+        .onAppear {
+            Lifecycle.keepAlive = true; model.checkUpdates()
+            #if canImport(MetaStore)
+            model.logSources("library opened")
+            model.metaAccount.refresh { model.logSources("Meta check") }
+            #endif
+            #if canImport(SteamDepot)
+            // Once per app open: a game session ends by closing the app, so this is "after quit" —
+            // where a two-way sync sends that session's saves up.
+            if !Self.openedOnce { Self.openedOnce = true; KLCloudSaveModel.shared.syncAll(why: "app open") }
+            #endif
+            macs.start()
+        }
+        .onDisappear { macs.stop() }
+        .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in
+            HubGameSettingsView(game: g, details: model.status(g) == .notInLibrary ? model.notInLibraryReason(g) : nil)
+        }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
+    }
+
+    /// The download page of the store the card opened.
+    private func detailPage(_ t: String) -> AnyView? {
+        #if canImport(MetaStore)
+        if detailStore == .meta, let m = model.meta[t] {
+            return AnyView(MetaContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() }))
+        }
+        #endif
+        #if canImport(SteamDepot)
+        if detailStore == .steam, let m = model.content[t] {
+            return AnyView(SteamContentView(model: m, onPlay: { play(t) }, onBack: { detail = nil; m.refreshLocal() }))
+        }
+        #endif
+        return nil
     }
 
     private func play(_ target: String) {
         detail = nil          // back to the card, where a refusal is shown
+        #if canImport(SteamDepot)
+        // Steam Cloud saves (off unless turned on for this game): pulled in before the game's
+        // files are prepared, bounded, and finished or cancelled before boot (KleptonCloudSaves.swift).
+        model.checkOwnership(target) {
+            KLCloudSaveModel.shared.syncBeforePlay(target) { model.prepare(target) { onPlay(target) } }
+        }
+        #else
         model.checkOwnership(target) { model.prepare(target) { onPlay(target) } }
+        #endif
     }
 
     private var library: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 24)],
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 24, alignment: .top)],
                           alignment: .leading, spacing: 24) {
                     ForEach(model.games) { g in card(g) }
                 }
-                Label("One game per session: when a game ends, Klepton closes. Open Klepton again "
-                      + "to come back to this library and pick another game.",
+                Label(klL("One game per session: when a game ends, AVP Game Hub closes. Open AVP Game Hub again "
+                          + "to come back to this library and pick another game.",
+                          "Un juego por sesión: al terminar una partida, AVP Game Hub se cierra. Vuelve a abrir "
+                          + "AVP Game Hub para volver a esta biblioteca y elegir otro juego."),
                       systemImage: "info.circle")
                     .font(.footnote).foregroundStyle(.secondary)
                 ownedSection
@@ -808,103 +1444,292 @@ struct HubLibraryView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Klepton").font(.extraLargeTitle2.bold())
-            Text("Library").font(.title).foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 16) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("AVP Game Hub").font(.extraLargeTitle2.bold())
+                Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
+            }
             Spacer()
-            if let a = model.account {
-                Text("Steam: \(a)").font(.footnote).foregroundStyle(.secondary)
+            // Right side on one centred row: the library check first (left of the
+            // accounts), then the accounts, then the actions.
+            HStack(alignment: .center, spacing: 12) {
+                if model.checking || model.metaChecking {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.mini)
+                        Text(klL("Checking library…", "Comprobando biblioteca…"))
+                    }
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize()
+                } else if model.checkError != nil || model.metaCheckFailed {
+                    Button { model.retryChecks() } label: {
+                        Label(klL("Couldn't check · Retry", "No se pudo comprobar · Reintentar"),
+                              systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    }
+                    .font(.footnote).tint(.orange)
+                    .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
+                }
+                if model.account != nil {
+                    Text(model.steamLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                }
+                #if canImport(MetaStore)
+                if model.metaAccount.signedIn {
+                    Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                }
+                #endif
+                if !(model.checking || model.metaChecking), model.checkError == nil, !model.metaCheckFailed,
+                   model.account != nil {
+                    Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
+                }
+                Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
+                    .font(.footnote)
             }
-            if model.checking {
-                ProgressView().controlSize(.small)
-            } else if model.account != nil {
-                Button("Check for updates") { model.checkUpdates() }.font(.footnote)
-            }
-            Button { showAppSettings = true } label: { Label("Settings", systemImage: "gearshape") }
-                .font(.footnote)
         }
     }
 
+    /// Every card has the same sections at the same FIXED heights (art at 460:215, title + store
+    /// pills, status, a two-line message slot, buttons, the "Play from Mac" row — reserved on every
+    /// card — and two footer lines), so a row of cards shares its top and height whatever each one
+    /// has to say; long text is truncated (the full text is on hover / in Settings).
     private func card(_ g: KLHubGameRow) -> some View {
         let st = model.status(g)
+        let active = model.activeStore(g)
+        let pickable = model.pickableStores(g)
+        let unavailable = st == .notInLibrary ? model.unavailable(g) : nil
         return VStack(alignment: .leading, spacing: 10) {
             cover(g)
-            Text(g.display).font(.title3.bold()).lineLimit(1)
-            HStack(spacing: 6) {
-                Circle().fill(st.color).frame(width: 8, height: 8)
-                Text(st.label).font(.callout).foregroundStyle(st.color)
-                    .monospacedDigit()
-            }
-            if case .working(_, let f?) = st { ProgressView(value: f) }
-            if let why = model.playBlock[g.target] {
-                Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
-            } else if model.verifying == g.target {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Checking your Steam license…").font(.callout) }
-            } else if model.preparing == g.target {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Preparing the game's files…").font(.callout) }
-            }
-            if !g.bundled {
-                Text("This build carries no game code (library-only build).").font(.caption).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 12) {
-                Button { play(g.target) } label: { Label("Play", systemImage: "play.fill") }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil)
-                #if canImport(SteamDepot)
-                if model.content[g.target] != nil {
-                    Button(manageTitle(st)) { detail = g.target }
+            HStack(spacing: 8) {
+                Text(g.display).font(.title3.bold()).lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 4)
+                // One pill per store this game can come from: owned = highlighted, otherwise dimmed.
+                ForEach(KLCatalog.stores(g.target)) { store in
+                    storeBadge(store, owns: model.ownership(g, store), state: model.sourceState(g, store), active: store == active)
                 }
-                #endif
-                Spacer()
-                Button { settingsFor = g } label: { Label("Settings", systemImage: "gearshape") }
+            }
+            .frame(height: Self.titleRowHeight)
+            HStack(spacing: 6) {
+                Circle().fill(unavailable != nil ? Color.orange : st.color).frame(width: 8, height: 8)
+                Text(unavailable?.title ?? st.label).font(.callout)
+                    .foregroundStyle(unavailable != nil ? Color.orange : st.color)
+                    .monospacedDigit().lineLimit(1)
+            }
+            .frame(height: Self.statusRowHeight)
+            messageSlot(g, st, unavailable: unavailable)
+                .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48, alignment: .topLeading)
+                .clipped()
+            HStack(spacing: 12) {
+                Button { play(g.target) } label: { Label(klL("Play", "Jugar"), systemImage: "play.fill") }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!st.canPlay || !g.bundled || model.verifying != nil || model.preparing != nil || cloudBusy(g.target))
+                if let a = active, hasDownloadPage(g.target, a), st != .notInLibrary {
+                    Button(manageTitle(st)) { detailStore = a; detail = g.target }.lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                // Owned in more than one store: the player picks which one installs/plays it (remembered).
+                if pickable.count > 1, let a = active {
+                    Picker(klL("Store", "Tienda"), selection: Binding(get: { a }, set: { KLCatalog.choose($0, for: g.target); model.objectWillChange.send() })) {
+                        ForEach(pickable) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
+                    .disabled(HubStorage.isBusy(model, g.target))
+                }
+                Button { settingsFor = g } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
                     .labelStyle(.iconOnly)
-                    .help("Language and immersion for this game")
+                    .help(klL("Language and immersion for this game", "Idioma e inmersión de este juego"))
             }
-            Text(HubGameSettingsView.summary(g.target))
-                .font(.caption).foregroundStyle(.secondary)
-            if let r = model.lastSession[g.target] {
-                Text(HubSessionText.card(r))
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            .frame(height: Self.buttonRowHeight)
+            // The second way to play (the game runs on the Mac and streams here), one row tall
+            // on every card so a row of cards still lines up; empty for games the Mac can't host.
+            playFromMacRow(g)
+                .frame(maxWidth: .infinity, minHeight: Self.buttonRowHeight, maxHeight: Self.buttonRowHeight, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(HubGameSettingsView.summary(g.target)).lineLimit(1)
+                // Always two lines tall, with or without a last session.
+                Text(model.lastSession[g.target].map(HubSessionText.card) ?? " ").lineLimit(1).monospacedDigit()
             }
+            .font(.caption).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .opacity(st == .notInLibrary ? 0.7 : 1)
+    }
+
+    /// The card's variable part, at most two short lines: why Play was refused, a check or
+    /// preparation in progress, why the game can't be installed, download progress, cloud saves.
+    @ViewBuilder private func messageSlot(_ g: KLHubGameRow, _ st: HubLibraryModel.Status,
+                                          unavailable: (title: String, detail: String?)?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let why = model.playBlock[g.target] {
+                Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
+                    .lineLimit(2).help(why)
+            } else if model.verifying == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(klL("Checking your license…", "Comprobando tu licencia…")).font(.callout) }
+            } else if model.preparing == g.target {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(klL("Preparing the game's files…", "Preparando los archivos del juego…")).font(.callout) }
+            } else if let u = unavailable {
+                if let d = u.detail { Text(d).font(.callout).foregroundStyle(.secondary).lineLimit(2).help(d) }
+            } else if case .working(_, let f?) = st {
+                ProgressView(value: f)
+            }
+            #if canImport(SteamDepot)
+            if unavailable == nil, model.playBlock[g.target] == nil, let c = klCloudSaveCardLine(g.target) {
+                Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1).lineLimit(1)
+            }
+            #endif
+            if !g.bundled {
+                Text(klL("This build carries no game code (library-only build).",
+                         "Esta versión no incluye el código del juego (solo biblioteca)."))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+    }
+
+    static let titleRowHeight: CGFloat = 30
+    static let statusRowHeight: CGFloat = 22
+    static let buttonRowHeight: CGFloat = 44
+
+    /// A plain text pill per store (no logo artwork): Steam slate blue, Meta bright blue. Owned =
+    /// highlighted, even when this port can't install that store's build (the card says so);
+    /// not owned = dimmed; not known yet (not signed in, not checked) = neutral, never dimmed.
+    private func storeBadge(_ store: KLStore, owns: Bool?, state: HubLibraryModel.SourceState, active: Bool) -> some View {
+        let tint = store == .steam ? Color(red: 0.16, green: 0.29, blue: 0.48) : Color(red: 0.0, green: 0.42, blue: 0.95)
+        let owned = owns == true
+        let help: String
+        switch (owns, state) {
+        case (true?, .incompatible):
+            help = klL("In your \(store.label) library — this port is built from another version of the game",
+                       "En tu biblioteca de \(store.label) — esta adaptación sale de otra versión del juego")
+        case (true?, _): help = klL("In your \(store.label) library", "En tu biblioteca de \(store.label)")
+        case (false?, _): help = klL("Not in your \(store.label) library", "No está en tu biblioteca de \(store.label)")
+        case (nil, .unknown(let why)): help = "\(store.label): \(why)"
+        case (nil, _): help = klL("\(store.label): not checked yet", "\(store.label): aún sin comprobar")
+        }
+        return Label(store.label, systemImage: store == .steam ? "gamecontroller.fill" : "eyeglasses")
+            .labelStyle(.titleAndIcon)
+            .font(.caption.bold())
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle(owned ? Color.white : owns == nil ? Color.primary.opacity(0.75) : Color.secondary)
+            .background(owned ? tint : Color.gray.opacity(owns == nil ? 0.28 : 0.18), in: Capsule())
+            .overlay(Capsule().strokeBorder(active ? Color.white.opacity(0.8) : .clear, lineWidth: 1))
+            .opacity(owns == false ? 0.6 : 1)
+            .help(help)
+    }
+
+    private func hasDownloadPage(_ target: String, _ store: KLStore) -> Bool {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            return model.content[target] != nil
+            #else
+            return false
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            return model.meta[target] != nil
+            #else
+            return false
+            #endif
+        }
+    }
+
+    /// A cloud-save sync for this game is running (Play waits for it).
+    private func cloudBusy(_ target: String) -> Bool {
+        #if canImport(SteamDepot)
+        return cloud.running.contains(target)
+        #else
+        return false
+        #endif
+    }
+
+    /// Which games the Mac can run for the headset. The host side is verified
+    /// for Alyx only (the OpenVR guest); Metro (OpenXR) has the pacing hook in
+    /// the stream host but no verified session yet, so it is not offered. The
+    /// card shows nothing new for the rest.
+    static func streamable(_ g: KLHubGameRow) -> Bool { g.target == "alyx" }
+
+    /// The second way to play: the game runs on the Mac and streams here. It
+    /// needs no game data on the headset, so it ignores the card's download
+    /// state; it needs a Mac, so it is disabled until one is found. With
+    /// several, a menu picks one.
+    /// The card's "Play from Mac" row: the button for a game the Mac can host, nothing (same
+    /// height) for the rest.
+    @ViewBuilder private func playFromMacRow(_ g: KLHubGameRow) -> some View {
+        if Self.streamable(g) { playFromMacButton(g) } else { Color.clear }
+    }
+
+    @ViewBuilder private func playFromMacButton(_ g: KLHubGameRow) -> some View {
+        // Only the Macs hosting THIS game (the host's Bonjour TXT "guest"; a Mac
+        // that does not say is offered everywhere, as before).
+        let found = macs.macs.filter { $0.serves(g.target) }
+        let busy = model.verifying != nil || model.preparing != nil
+        let title = klL("Play from Mac", "Jugar desde el Mac")
+        HStack(spacing: 10) {
+            if found.count > 1 {
+                Menu {
+                    ForEach(found) { m in
+                        Button(m.name) { onPlayFromMac(g.target, m) }
+                    }
+                } label: { Label(title, systemImage: "desktopcomputer") }
+                .disabled(busy)
+            } else {
+                Button {
+                    if let m = found.first { onPlayFromMac(g.target, m) }
+                } label: { Label(title, systemImage: "desktopcomputer") }
+                .disabled(found.isEmpty || busy)
+            }
+            Text(found.isEmpty ? klL("Looking for your Mac…", "Buscando tu Mac…")
+                 : found.count == 1 ? found[0].name : klL("\(found.count) Macs", "\(found.count) Macs"))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+        }
+        .help(klL("The game runs on your Mac and streams to the headset; no download needed here.",
+                  "El juego corre en tu Mac y se ve en el visor; no hace falta descargarlo aquí."))
     }
 
     private func manageTitle(_ st: HubLibraryModel.Status) -> String {
         switch st {
-        case .notDownloaded: return "Download"
-        case .partial: return "Complete download"
-        case .updateAvailable: return "Update"
-        case .working: return "Show progress"
-        default: return "Manage"
+        case .notDownloaded: return klL("Download", "Descargar")
+        case .partial: return klL("Complete download", "Completar descarga")
+        case .updateAvailable: return klL("Update", "Actualizar")
+        case .working: return klL("Show progress", "Ver progreso")
+        default: return klL("Manage", "Gestionar")
         }
     }
 
     private func cover(_ g: KLHubGameRow) -> some View {
-        // Steam header art is 460x215.
-        ZStack {
-            RoundedRectangle(cornerRadius: 14).fill(.quaternary)
-            Text(g.display).font(.headline).foregroundStyle(.secondary).padding()
-            if let url = model.headerURL(g) {
-                AsyncImage(url: url) { phase in
-                    if let img = phase.image { img.resizable().scaledToFill() } else { Color.clear }
+        // Steam header art is 460x215; a Meta-only game gets its store page's landscape cover
+        // (16:9 or so). The 460:215 frame is set by an empty view and the art is only an overlay
+        // cropped to it: an image's own size never changes the card's height.
+        Color.clear
+            .aspectRatio(460.0 / 215.0, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14).fill(.quaternary)
+                    Text(g.display).font(.headline).foregroundStyle(.secondary).padding()
+                    if let url = model.headerURL(g) {
+                        AsyncImage(url: url) { phase in
+                            if let img = phase.image { img.resizable().scaledToFill() } else { Color.clear }
+                        }
+                    } else if let id = model.metaAppId(g), let img = art.image(appId: id) {
+                        Image(uiImage: img).resizable().scaledToFill()
+                    }
                 }
             }
-        }
-        .aspectRatio(460.0 / 215.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     @ViewBuilder private var ownedSection: some View {
         #if canImport(SteamDepot)
-        DisclosureGroup("Your other Steam VR games") {
+        DisclosureGroup(klL("Your other Steam VR games", "Tus otros juegos de RV en Steam")) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Information only: what your Steam account owns and whether it could run here "
-                     + "(an ARM64 build exists) — each game still needs its own port before it can join this library.")
+                Text(klL("Information only: what your Steam account owns and whether it could run here "
+                         + "(an ARM64 build exists) — each game still needs its own port before it can join this library.",
+                         "Solo informativo: lo que tiene tu cuenta de Steam y si podría funcionar aquí "
+                         + "(existe una versión ARM64) — cada juego necesita su propia adaptación antes de entrar en esta biblioteca."))
                     .font(.footnote).foregroundStyle(.secondary)
                 if let owned = model.owned {
-                    if owned.isEmpty { Text("No other VR games on this account.").foregroundStyle(.secondary) }
+                    if owned.isEmpty { Text(klL("No other VR games on this account.", "No hay más juegos de RV en esta cuenta.")).foregroundStyle(.secondary) }
                     ForEach(owned) { e in
                         HStack {
                             Text(e.name).lineLimit(1)
@@ -915,11 +1740,11 @@ struct HubLibraryView: View {
                         }
                     }
                 } else if model.checking {
-                    HStack { ProgressView(); Text("Reading your Steam library…") }
+                    HStack { ProgressView(); Text(klL("Reading your Steam library…", "Leyendo tu biblioteca de Steam…")) }
                 } else if let err = model.checkError {
-                    Text("Could not read your Steam library: \(err)").font(.footnote).foregroundStyle(.orange)
+                    Text(klL("Could not read your Steam library: \(err)", "No se pudo leer tu biblioteca de Steam: \(err)")).font(.footnote).foregroundStyle(.orange)
                 } else if model.account == nil {
-                    Text("Sign in to Steam (Download on any game) to see the rest of your library.")
+                    Text(klL("Sign in to Steam (Download on any game) to see the rest of your library.", "Inicia sesión en Steam (Descargar en cualquier juego) para ver el resto de tu biblioteca."))
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
@@ -932,9 +1757,9 @@ struct HubLibraryView: View {
     #if canImport(SteamDepot)
     private func ownedLabel(_ e: LibraryEntry) -> String {
         switch e.status {
-        case .playable: return "Has a port (\(e.kleptonTarget ?? "?")), not in this build"
-        case .candidate: return "ARM64 build — candidate"
-        case .unsupported: return "x86 only"
+        case .playable: return klL("Has a port (\(e.kleptonTarget ?? "?")), not in this build", "Tiene adaptación (\(e.kleptonTarget ?? "?")), no en esta versión")
+        case .candidate: return klL("ARM64 build — candidate", "Versión ARM64 — candidato")
+        case .unsupported: return klL("x86 only", "Solo x86")
         }
     }
     private func ownedColor(_ e: LibraryEntry) -> Color {

@@ -1,6 +1,7 @@
 // See kl_app.h.
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>              // ceil — the pacer's divider (KL_GUEST_PACE_HZ)
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
 #include <pthread.h>
 #include <stdint.h>
@@ -19,11 +20,13 @@
 #include "kl_audio.h"     // kl_audio_set_latency_ms — streamed audio needs a deeper buffer
 #include "kl_ovrp.h"      // kl_ovrp_set_frame_pacer — the OVRPlugin frame clock
 #include "kl_openxr.h"    // kl_openxr_set_frame_pacer — the OpenXR one
+#include "kl_openvr.h"    // kl_openvr_set_frame_pacer — the OpenVR one (opt-in)
 #include "kl_slink.h"
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // claim the veneers' TSD slot before anything else can
 #include "kl_env.h"
+#include "kl_vulkan.h"    // kl_foz_prewarm_env — KL_FOZ_PREWARM, before the guest exists
 
 // --- Which guest ------------------------------------------------------------
 //
@@ -401,11 +404,24 @@ int kl_app_configure(const char *resources, const char *container) {
         mkdir(g_libdir, 0755);
         setenv("KL_GLIBC_MODDIRS", g_libdir, 0);
         setenv("KL_GLIBC_SYSROOT", "", 0);
-        // Fidelity level 0 (2x MSAA, 0.78 scale) fixed: on device 4x MSAA cost
-        // 38% fps and 1.7 GB at the same resolution and did not remove the
-        // jaggies (2026-10-08, D2/D3). The OpenVR knobs are the M1 pipeline,
-        // the best picture of the on-device bisect.
-        setenv("KL_GLIBC_ARGS", "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 0", 0);
+        // Default: fidelity level 1 (4x MSAA) WITH fixed foveated rendering
+        // (KL_FOVEATE=1, the MoltenVK FDM fork). Device, M2, 2026-10-11: 4x
+        // plus foveation cost 18.3 GPU ms/frame against 28.8 at 4x full rate
+        // (-36%), which pays for the smoother 4x picture; 4x alone had cost
+        // 38% fps and 1.7 GB over 2x (2026-10-08, D2/D3). With the pipeline
+        // prewarm the foveated pipelines are compiled too (kl_fossilize.cpp,
+        // the density-map twins), so foveation adds no stalls.
+        // Precedence, each a setenv that never overwrites: the launch
+        // environment (KL_ALYX_MSAA, KL_FOVEATE, or a whole KL_GLIBC_ARGS)
+        // > the hub's per-game Antialiasing / Foveated rendering (applied
+        // before configure) > these defaults. KL_ALYX_MSAA=2 picks level 0
+        // (2x MSAA, 0.78 scale); KL_FOVEATE=0 renders at full rate.
+        setenv("KL_ALYX_MSAA", "4", 0);
+        setenv("KL_FOVEATE", "1", 0);
+        const char *msaa = getenv("KL_ALYX_MSAA");
+        setenv("KL_GLIBC_ARGS", (msaa && atoi(msaa) >= 4)
+               ? "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 1"
+               : "-vr -vulkan -console +vr_fidelity_level_auto 0 +vr_fidelity_level 0", 0);
         setenv("KL_OPENVR_MINIMAL", "1", 0);
         setenv("KL_OPENVR_SUBMIT_PROJ", "1", 0);
         setenv("KL_REPROJECT_OFF", "0", 0);
@@ -413,6 +429,24 @@ int kl_app_configure(const char *resources, const char *container) {
         // its nasal strip undrawn — the timewarp swung it into view as a black
         // rectangle with a magenta edge (2026-10-08, device-confirmed).
         setenv("KL_OPENVR_SYM_PROJ", "1", 0);
+        // Controller velocities on, although M1 (KL_OPENVR_MINIMAL) turns them
+        // off: the gravity gloves' flick-to-pull reads the hand's velocity, and
+        // with zeros it never fires (device, 2026-10-11). The tremble they were
+        // dropped for was the Sense controllers being disconnected.
+        setenv("KL_OPENVR_HAND_VEL", "1", 0);
+        // ...and the Touch raw frame on too, which M1 also turned off: with it
+        // off Alyx hangs its hand off the published hilt pose, ~10 cm down
+        // the handle and 16 deg nose-down of the Touch's tracked origin, and
+        // with the controllers converging (any two-handed reach) that puts
+        // the wrists 6-8 cm further apart than the real hands (device,
+        // 2026-10-11: magazine release unreachable). KL_OPENVR_TOUCH_FRAME=0
+        // for the old pose.
+        setenv("KL_OPENVR_TOUCH_FRAME", "1", 0);
+        // Steady 45 fps (half the panel) plus Glovebox's render convars: the
+        // device test of 2026-10-11 had a median frame of 22.4 ms and peaked at
+        // 4.6 GB, against an uneven 40-42 fps and ~7 GB before.
+        setenv("KL_GUEST_PACE_HZ", "45", 0);
+        setenv("KL_ALYX_PROFILE", "glovebox", 0);
         // The drawable claims the anchor the guest rendered with and visionOS
         // does the correction (render anchor, mode 1). Mode 2 (real depth) also
         // removed the swim but haloed the hands on head motion — not yet.
@@ -853,6 +887,18 @@ int kl_app_boot(void) {
     // replace.
     if (kl_app_target_is_steamlink()) steamlink_policy();
 
+    // KL_FOZ_PREWARM (the hub's "Precompile graphics"): warm the Metal compiler on a
+    // device of our own, made as the game makes its own, before the guest exists.
+    // Blocks; the boot window reads kl_foz_progress meanwhile. Here, in the game's
+    // own process, because a replay in an earlier process did not warm a later one.
+    {
+        int rc = kl_foz_prewarm_env();
+        if (rc != 1) printf("  prewarm   : %s\n", rc == 0 ? "done" : rc == -2
+               ? "no usable device-info.json; the game's own device replays instead"
+               : "could not run (see [foz] lines)");
+        fflush(NULL);
+    }
+
     // The door's own sequence, in kl_driver: the chain and its entry point for
     // Steam Link, Unreal and OpenJK; libmain -> NativeLoader.load -> initJni for
     // a Unity guest. It stops before the guest is STARTED, which is what makes
@@ -1028,6 +1074,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     uint64_t        published;    // poses the compositor has offered
+    uint64_t        published_ns; // when the last one was (guest_now_ns)
     uint64_t        consumed;     // poses the guest has started a frame for
     unsigned        limit;        // KL_FRAMES, or 0 for "until stopped"
     // volatile because the Steam Link pump reads it WITHOUT the lock: that loop
@@ -1072,12 +1119,99 @@ static void guest_finished(void) {
 // render against the last pose it had, not wedge it. A wedged guest is
 // indistinguishable from a crashed one in a device log, and this is exactly the
 // path a backgrounded app takes.
+//
+// KL_GUEST_PACE_DIV=N starts a guest frame only once N poses have been
+// published since the last one: a fixed 1/N of the display rate (45 fps on a
+// 90 Hz panel with N=2) that the compositor reprojects, instead of an uneven
+// 35-45. A guest already N behind is not held.
+//
+// KL_GUEST_PACE_HZ=F instead picks N from the rate poses actually arrive at, so a
+// panel visionOS moves between 90 and 96/100 Hz keeps the guest at or under F
+// (N = ceil(rate / F), at least 1). The rate is measured over ~1 s of
+// publishes, a new N takes effect after two windows agree, and every change of
+// N is logged.
+//
+// Both unset (the default): N = 1, and the wait below is exactly the
+// "published == consumed" one it always was. Alyx (OpenVR) only gets this
+// pacer at all when one of them is set; see kl_app_guest_start.
+// Adapted from Glovebox (MIT, github.com/glovebox-vr/glovebox) visionos/Sources/kl_app.c
+// guest_pace_wait — without its pace governor and KL_GUEST_PACE_SWITCH.
+static int guest_pace_knobs(unsigned *div, double *hz) {
+    static int read;
+    static unsigned d = 1;
+    static double h;
+    if (!read) {
+        read = 1;
+        d = kl_env_uint("KL_GUEST_PACE_DIV", 1);
+        if (d < 1) d = 1;
+        const char *e = getenv("KL_GUEST_PACE_HZ");
+        h = e && *e ? atof(e) : 0;
+        if (h < 0) h = 0;
+        if (h > 0) printf("[guest] frames paced to ~%.0f fps from the measured display rate (KL_GUEST_PACE_HZ)\n", h);
+        else if (d > 1) printf("[guest] frames paced at 1/%u of the display rate (KL_GUEST_PACE_DIV)\n", d);
+    }
+    if (div) *div = d;
+    if (hz) *hz = h;
+    return h > 0 || d > 1;
+}
+
+// Adapted from avp-play (MIT, github.com/myMartek/avp-play) visionos/Sources/kl_app.c
+// (KL_GUEST_FRESH_POSE: guest_now_ns, guest_fresh_pose, published_ns) — default
+// on only for AC Nexus VR (x5812519008825194).
+static uint64_t guest_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+// See the frame loop. Default on for the one target measured.
+static int guest_fresh_pose(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_GUEST_FRESH_POSE", t && strcmp(t, "x5812519008825194") == 0);
+    }
+    return v;
+}
 static void guest_pace_wait(void) {
+    static unsigned div;
+    static double pace_hz, win_t0;
+    static uint64_t win_p0;
+    if (!div) guest_pace_knobs(&div, &pace_hz);
+    if (pace_hz > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double t = now.tv_sec + now.tv_nsec * 1e-9;
+        pthread_mutex_lock(&g_guest.mu);
+        uint64_t p = g_guest.published;
+        pthread_mutex_unlock(&g_guest.mu);
+        if (!win_t0) { win_t0 = t; win_p0 = p; }
+        else if (t - win_t0 >= 1.0) {
+            double rate = (double)(p - win_p0) / (t - win_t0);
+            unsigned want = (unsigned)ceil(rate / pace_hz - 0.05);
+            if (want < 1) want = 1;
+            // Hysteresis: a new N must hold for two windows in a row, so one
+            // window short of publishes (a hitch, a pose gap) does not flip it.
+            static unsigned pending, seen;
+            if (rate > 20 && want != div) {
+                seen = want == pending ? seen + 1 : 1;
+                pending = want;
+                if (seen >= 2) {
+                    printf("[guest] display %.1f Hz: pacing 1/%u (was 1/%u) -> %.1f fps\n", rate, want, div, rate / want);
+                    fflush(stdout);
+                    div = want;
+                    seen = 0;
+                }
+            } else {
+                seen = 0;
+            }
+            win_t0 = t; win_p0 = p;
+        }
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
     pthread_mutex_lock(&g_guest.mu);
-    while (!g_guest.stop && g_guest.published == g_guest.consumed)
+    while (!g_guest.stop && g_guest.published - g_guest.consumed < div)
         if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
@@ -1156,6 +1290,22 @@ static void *guest_thread(void *unused) {
             fflush(NULL);
             break;
         }
+        // KL_GUEST_FRESH_POSE: start each frame ON a display frame. A pose
+        // that was offered while the frame was still running is not carried
+        // into the next one; the loop waits for the next offer, so a guest
+        // frame lasts a whole number of display frames and is rendered from a
+        // pose that is new when it starts. Without it a guest whose frames run
+        // a little over one display period starts each on a pose already most
+        // of a period old and its own period beats against the display's
+        // (measured on AC Nexus). A frame that ended only just after an offer
+        // keeps it, so one long frame costs a late start and not a whole period.
+        if (guest_fresh_pose()) {
+            pthread_mutex_lock(&g_guest.mu);
+            if (g_guest.published != g_guest.consumed &&
+                guest_now_ns() - g_guest.published_ns > 2500000ull)
+                g_guest.consumed = g_guest.published;
+            pthread_mutex_unlock(&g_guest.mu);
+        }
         if (limit && kl_driver_frames() >= limit) {
             printf("[guest] reached KL_FRAMES=%u\n", limit);
             fflush(NULL);
@@ -1201,6 +1351,14 @@ int kl_app_guest_start(void) {
     // frame this driver already initiated, so a pacer there would be the
     // compositor waiting on itself.
     if (g_target->kind == KL_GUEST_UE4) kl_ovrp_set_frame_pacer(guest_pace_wait);
+    // ...and OpenVR's WaitGetPoses for Alyx, but ONLY when a pace knob is set:
+    // unpaced, Alyx's WaitGetPoses has never waited for a publish and still
+    // does not. Paced, the frame's pose is latched after the wait, so the
+    // drawable still carries the anchor the game rendered with
+    // (KL_REPROJECT_DEPTH_MODE=1) and the compositor reprojects the frames
+    // in between.
+    if (g_target->kind == KL_GUEST_GLIBC && guest_pace_knobs(NULL, NULL))
+        kl_openvr_set_frame_pacer(guest_pace_wait);
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the
@@ -1224,6 +1382,7 @@ int kl_app_guest_start(void) {
 void kl_app_guest_publish(void) {
     pthread_mutex_lock(&g_guest.mu);
     g_guest.published++;
+    g_guest.published_ns = guest_now_ns();
     pthread_cond_signal(&g_guest.cv);
     pthread_mutex_unlock(&g_guest.mu);
 }

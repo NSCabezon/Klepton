@@ -193,12 +193,13 @@ def defined_symbols(path):
     return out
 
 # Hand-written elsewhere. Keep in sync with the E(...) entries in kl_shim.c.
+# (vswprintf: Adapted from avp-play (MIT, github.com/myMartek/avp-play) tools/gen_libc_table.py)
 SPECIAL = set("""
 __errno environ gettid __system_property_find __system_property_get __system_property_read
 prctl sched_getaffinity sched_setaffinity stat fstat lstat statfs uname sigaction
 __FD_ISSET_chk __FD_SET_chk __ctype_get_mb_cur_max lseek64 getpwuid getpwuid_r
 opendir readdir closedir setjmp longjmp strtold wcstold strtold_l
-swprintf vprintf vsscanf execl system syscall sysconf fopen access mkdir unlink rename
+swprintf vswprintf vprintf vsscanf execl system syscall sysconf fopen access mkdir unlink rename
 dlopen dlsym dlclose dlerror dladdr dl_iterate_phdr
 memrchr memalign
 fputc fputs fwrite fread fclose fflush fgets getc feof ferror clearerr
