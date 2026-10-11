@@ -22,7 +22,15 @@
 //   KL_GPU_TIME=1      log the per-frame GPU ms every KL_GPU_TIME_LOG s (default 1)
 //   KL_GPU_TIME=2      ...and report it to the game as GetFrameTiming's
 //                      m_flTotalRenderGpuMs (kl_openvr.c) instead of the CPU work
+//
+// LIVE timing (kl_gpu_time_set_live): the visionOS performance overlay turns
+// timing on and off at runtime without KL_GPU_TIME — the same hook, no log
+// line. The swizzle stays installed once made; while neither the knob nor the
+// live flag is on, the hooked -commit is one relaxed atomic load and the
+// original call. Every final frame also feeds a running total
+// (kl_gpu_time_totals) that the session record and the overlay read.
 #include <os/lock.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +57,9 @@ static int g_nqueues;
 static uint32_t g_frame = 1;     // the open frame (0 means "none" in a slot)
 static slot g_slots[kRing];
 static IMP g_commit;             // the original -commit
+static _Atomic int g_live;       // kl_gpu_time_set_live
+static double g_total_ms;        // every final frame's GPU ms, summed (under g_lk)
+static uint64_t g_total_n;
 
 int kl_gpu_time_mode(void) {
     static int mode = -1;
@@ -58,6 +69,24 @@ int kl_gpu_time_mode(void) {
         mode = v <= 0 ? 0 : v == 2 ? 2 : 1;
     }
     return mode;
+}
+
+int kl_gpu_time_active(void) {
+    return kl_gpu_time_mode() || atomic_load_explicit(&g_live, memory_order_relaxed);
+}
+
+void kl_gpu_time_set_live(int on) {
+    int was = atomic_exchange(&g_live, on ? 1 : 0);
+    if (was != (on ? 1 : 0))
+        fprintf(stderr, "  [perf] gpu time: live timing %s (overlay)%s\n", on ? "ON" : "off",
+                kl_gpu_time_mode() ? "; KL_GPU_TIME keeps it on anyway" : "");
+}
+
+void kl_gpu_time_totals(double *sum_ms, uint64_t *frames) {
+    os_unfair_lock_lock(&g_lk);
+    if (sum_ms) *sum_ms = g_total_ms;
+    if (frames) *frames = g_total_n;
+    os_unfair_lock_unlock(&g_lk);
 }
 
 static double mono_s(void) {
@@ -93,6 +122,7 @@ static int watched(void *q) {
 
 static void kl_commit(id self, SEL sel) {
     id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)self;
+    if (!kl_gpu_time_active()) { ((void (*)(id, SEL))g_commit)(self, sel); return; }
     void *q = (__bridge void *)[cb commandQueue];
     os_unfair_lock_lock(&g_lk);
     int mine = watched(q);
@@ -108,7 +138,7 @@ static void kl_commit(id self, SEL sel) {
 }
 
 void kl_gpu_time_watch(void *mtl_queue) {
-    if (!mtl_queue || !kl_gpu_time_mode()) return;
+    if (!mtl_queue || !kl_gpu_time_active()) return;
     os_unfair_lock_lock(&g_lk);
     int have = watched(mtl_queue);
     if (!have && g_nqueues < kMaxQueues) g_queues[g_nqueues++] = mtl_queue;
@@ -131,7 +161,8 @@ void kl_gpu_time_watch(void *mtl_queue) {
         method_setImplementation(m, (IMP)kl_commit);
     fprintf(stderr, "  [perf] gpu time: timing %s -commit on the guest's queue (KL_GPU_TIME=%d%s)\n",
             class_getName(c), kl_gpu_time_mode(),
-            kl_gpu_time_mode() == 2 ? ": reported to the game as TotalRenderGpuMs" : "");
+            kl_gpu_time_mode() == 2 ? ": reported to the game as TotalRenderGpuMs"
+            : !kl_gpu_time_mode() ? ": live, for the overlay" : "");
 }
 
 // The guest's GPU ms of the latest final frame at least `frames_ago` closed
@@ -159,7 +190,7 @@ float kl_gpu_time_frame_ms(unsigned frames_ago) {
 }
 
 void kl_gpu_time_frame_end(void) {
-    if (!kl_gpu_time_mode()) return;
+    if (!kl_gpu_time_active()) return;
     os_unfair_lock_lock(&g_lk);
     int on = g_commit != NULL;
     if (on) { g_frame++; slot_of(g_frame); }
@@ -172,7 +203,13 @@ void kl_gpu_time_frame_end(void) {
     if (!every) { const char *e = getenv("KL_GPU_TIME_LOG"); every = e && atof(e) > 0 ? atof(e) : 1.0; }
     uint32_t f;
     float ms = latest_ms(0, &f);
-    if (f && f != last_f) { last_f = f; sum += ms; n++; if (ms > worst) worst = ms; }
+    if (f && f != last_f) {
+        last_f = f; sum += ms; n++; if (ms > worst) worst = ms;
+        os_unfair_lock_lock(&g_lk);
+        g_total_ms += ms; g_total_n++;
+        os_unfair_lock_unlock(&g_lk);
+    }
+    if (!kl_gpu_time_mode()) return;     // live only: no log line
     double now = mono_s();
     if (!since) since = now;
     if (now - since >= every) {
