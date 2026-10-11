@@ -345,6 +345,20 @@ if IS_HUB:
 # Per-session performance summary (the compositor measures, the hub shows it).
 # Every target: the compositor calls it. Fixed ids, so the numbering above is kept.
 swift.append({"name": "KleptonSessionStats.swift", "ref": _fixed("SESSTATF"), "bld": _fixed("SESSTATB")})
+# The in-game performance overlay and quick settings menu (drawn by KleptonHUD,
+# driven by the controllers). Every target: the compositor and HUD call it.
+swift.append({"name": "KleptonQuickSettings.swift", "ref": _fixed("QSETF"), "bld": _fixed("QSETB")})
+# Siri / Shortcuts for the running game (App Intents), and the Spanish phrase
+# catalog for them — hub only: the phrases name the hub ("AVP Hub").
+F_SHORTCUTS, B_SHORTCUTS = _fixed("APPSCSTRF"), _fixed("APPSCSTRB")
+if IS_HUB:
+    swift.append({"name": "KleptonIntents.swift", "ref": _fixed("INTENTSF"), "bld": _fixed("INTENTSB")})
+SHORTCUTS_BUILDFILE = (f'\t\t{B_SHORTCUTS} /* AppShortcuts.xcstrings in Resources */ = '
+                       f'{{isa = PBXBuildFile; fileRef = {F_SHORTCUTS}; }};\n' if IS_HUB else "")
+SHORTCUTS_FILEREF = (f'\t\t{F_SHORTCUTS} = {{isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; '
+                     f'path = AppShortcuts.xcstrings; sourceTree = "<group>"; }};\n' if IS_HUB else "")
+SHORTCUTS_CHILD = f"\t\t\t\t{F_SHORTCUTS},\n" if IS_HUB else ""
+SHORTCUTS_RES = f"\t\t\t\t{B_SHORTCUTS},\n" if IS_HUB else ""
 
 # The two files apktool leaves beside assets/ — apktool.yml (versionCode /
 # versionName) and the decoded AndroidManifest.xml (package, <meta-data>,
@@ -622,7 +636,7 @@ PBX = f"""// !$*UTF8*$!
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
-{PKG_BUILDFILE}{buildfiles}
+{PKG_BUILDFILE}{SHORTCUTS_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -633,7 +647,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
-{filerefs}
+{SHORTCUTS_FILEREF}{filerefs}
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -679,7 +693,7 @@ PBX = f"""// !$*UTF8*$!
 				{F_C},
 				{F_H},
 				{F_BRIDGE},
-			);
+{SHORTCUTS_CHILD}			);
 			path = Sources;
 			sourceTree = "<group>";
 		}};
@@ -736,7 +750,7 @@ PBX = f"""// !$*UTF8*$!
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
-			knownRegions = (en, Base, );
+			knownRegions = (en, es, Base, );
 			mainGroup = {G_ROOT};
 			productRefGroup = {G_PROD};
 {PKG_PROJECT_REFS}			projectDirPath = "";
@@ -753,7 +767,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_ASSETS},
-			);
+{SHORTCUTS_RES}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
 /* End PBXResourcesBuildPhase section */

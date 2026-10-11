@@ -19,6 +19,20 @@
 //     head-locked colour over the whole view, both eyes, drawn FIRST so the
 //     ghosts and panels stay readable over it. KL_OPENVR_FADE=0 files nothing.
 //
+//   * THE CONTROLLER CARD. A PSVR2 Sense controller that is not connected
+//     while a game runs — asleep at start, or dropped mid-game — leaves that
+//     hand on ARKit hand tracking, which reads as "buttons broken / hand
+//     jittery". So a head-locked card says "Mando izquierdo desconectado /
+//     Pulsa el botón PS para despertarlo" (system language, es/en) until it
+//     comes back, then "Mando izquierdo conectado" for ~2 s. See
+//     KleptonHUD.updateControllerPresence for the policy and the knobs
+//     (KL_CTRL_WARN, KL_CTRL_WARN_FORCE).
+//
+//   * THE PERFORMANCE OVERLAY and THE QUICK SETTINGS MENU
+//     (KleptonQuickSettings.swift): textures rastered off the render thread
+//     and picked up here each frame; the overlay lower left, 1 m ahead, the
+//     menu straight ahead at 0.9 m. Both follow the head like the prompt.
+//
 //   * THE GATE PROMPT. Alyx's "Pulsa Trigger para empezar" after every load
 //     (mailbox show_message -> kl_ovrp_set_prompt): a panel "Pulsa el gatillo
 //     para empezar" held in front of the eyes until the level starts
@@ -54,6 +68,7 @@ struct KLToast {
     let desc: String
     let icon: String          // a file path; "" a gold placeholder; "-" no icon at all
     var header: String? = nil // nil: the achievement header
+    var accent: SIMD3<Double>? = nil // edge + header colour; nil: the achievement gold
 }
 
 /// The unlocks waiting to be shown. Filled from kl_steam.c's store worker
@@ -127,7 +142,8 @@ enum KLToastRaster {
         c.setFillColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 0.92)
         c.fillPath()
         c.addPath(card)
-        c.setStrokeColor(red: 1.0, green: 0.80, blue: 0.35, alpha: 0.55)
+        let ac = t.accent ?? SIMD3(1.0, 0.80, 0.35)
+        c.setStrokeColor(red: ac.x, green: ac.y, blue: ac.z, alpha: 0.55)
         c.setLineWidth(4)
         c.strokePath()
         // Icon, 192 px, rounded, vertically centred; a gold square without one.
@@ -156,7 +172,7 @@ enum KLToastRaster {
             ?? CTFontCreateWithName("Helvetica-Bold" as CFString, 50, nil)
         let fd = CTFontCreateUIFontForLanguage(.system, 32, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, 32, nil)
-        let gold = CGColor(srgbRed: 1.0, green: 0.80, blue: 0.35, alpha: 1)
+        let gold = CGColor(srgbRed: ac.x, green: ac.y, blue: ac.z, alpha: 1)
         let white = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
         let grey = CGColor(srgbRed: 0.78, green: 0.80, blue: 0.84, alpha: 1)
         c.textPosition = CGPoint(x: x, y: Double(H - 78))
@@ -355,6 +371,54 @@ final class KleptonHUD {
     private let started = CACurrentMediaTime()
     private var testFired = !klEnvOn("KL_TOAST_TEST", default: false)
 
+    // The controller card (updateControllerPresence / prepareControllerCard).
+    /// A Sense controller was connected at some point in this process — the
+    /// "this person plays with controllers" evidence the default policy needs.
+    nonisolated(unsafe) static var senseEverSeen = false
+    private var ctrlT0: TimeInterval = 0
+    private var ctrlMissingSince: [TimeInterval?] = [nil, nil]
+    private var ctrlWarned = [false, false]
+    private var ctrlConfirmUntil: [TimeInterval] = [0, 0]
+    private var ctrlKey = ""
+    private var ctrlTex: MTLTexture?
+    private var ctrlAlpha: Float = 0
+    private var ctrlPos: SIMD3<Float>?
+    private var ctrlModel = matrix_identity_float4x4
+    // The overlay and the quick settings menu (KLQuickSettings).
+    private var perfTex: MTLTexture?, menuTex: MTLTexture?
+    private var perfAlpha: Float = 0, menuAlpha: Float = 0
+    private var perfPos: SIMD3<Float>?, menuPos: SIMD3<Float>?
+    private var perfModel = matrix_identity_float4x4, menuModel = matrix_identity_float4x4
+    private static let ctrlGrace = 5.0        // s after the compositor starts
+    private static let ctrlDebounce = 1.0     // s a mid-game drop must last
+    private static let ctrlConfirmSecs = 2.0
+    /// KL_CTRL_WARN_FORCE=left|right|both[:secs] — pretend that controller is
+    /// missing (and that one was seen), for checking the card without a
+    /// headset's controllers. With `:secs` it "comes back" that long after the
+    /// grace period, so the confirmation shows too.
+    private static let ctrlForce: (hands: [Bool], secs: Double)? = {
+        guard let v = ProcessInfo.processInfo.environment["KL_CTRL_WARN_FORCE"]?.lowercased(),
+              !v.isEmpty, v != "0" else { return nil }
+        let parts = v.split(separator: ":")
+        let w = String(parts[0])
+        let hands = [w == "left" || w == "both", w == "right" || w == "both"]
+        guard hands.contains(true) else { return nil }
+        let secs = parts.count > 1 ? Double(parts[1]) ?? 0 : 0
+        return (hands, secs)
+    }()
+    /// KL_CTRL_WARN: 0 off; 1 (default) only once a Sense controller has been
+    /// seen in this process; 2 always (a game that cannot be played with hands).
+    /// Read live, like KL_GHOST_CTRL, so the hub can set it per game at Play.
+    private var ctrlWarnMode: Int {
+        guard let p = getenv("KL_CTRL_WARN") else { return 1 }
+        let v = String(cString: p).lowercased()
+        if ["", "0", "no", "off", "false"].contains(v) { return 0 }
+        return v == "2" || v == "always" ? 2 : 1
+    }
+    /// The card follows the HEADSET's language, not the game's: it is about
+    /// the hardware, not the game.
+    private static let ctrlSpanish = Locale.preferredLanguages.first?.hasPrefix("es") ?? false
+
     static let msl = """
     #include <metal_stdlib>
     using namespace metal;
@@ -470,6 +534,10 @@ final class KleptonHUD {
         quad = device.makeBuffer(bytes: q, length: q.count * 4, options: .storageModeShared)
 
         KleptonToasts.register()
+        if let f = Self.ctrlForce {
+            NSLog("[hud] KL_CTRL_WARN_FORCE: left \(f.hands[0]) right \(f.hands[1])"
+                  + (f.secs > 0 ? ", back after \(f.secs) s" : ""))
+        }
         NSLog("[hud] ghost controllers \(ghostsEnabled ? "ON" : "off") (KL_GHOST_CTRL, now), toasts on"
               + (testFired ? "" : ", KL_TOAST_TEST in 5 s"))
     }
@@ -492,6 +560,99 @@ final class KleptonHUD {
         }
     }
 
+    /// Once per frame, from updatePoses: which hands have a Sense controller
+    /// connected (KleptonControllers.presentHands). Decides the card.
+    ///
+    /// Policy (KL_CTRL_WARN=1, the default): warn only once a Sense controller
+    /// has been seen connected in this process. Someone who plays with hands
+    /// never sees it; someone who plays with controllers is told when one is
+    /// asleep at start (after a 5 s grace for the pair to wake and connect) or
+    /// drops mid-game (after 1 s, so a reconnect blip does not flash it). If
+    /// both sleep from the very start nothing has been seen and nothing shows —
+    /// KL_CTRL_WARN=2 warns regardless, for a game that needs controllers.
+    func updateControllerPresence(_ raw: [Bool]) {
+        let now = CACurrentMediaTime()
+        if ctrlT0 == 0 { ctrlT0 = now }
+        var present = raw
+        if let f = Self.ctrlForce {
+            Self.senseEverSeen = true
+            let active = f.secs <= 0 || now - ctrlT0 < Self.ctrlGrace + f.secs
+            for h in 0...1 where f.hands[h] && active { present[h] = false }
+        }
+        if present.contains(true) && !Self.senseEverSeen {
+            Self.senseEverSeen = true
+            NSLog("[hud] controller warning: armed (a Sense controller was seen)")
+        }
+        let mode = ctrlWarnMode
+        let armed = mode != 0 && (mode == 2 || Self.senseEverSeen) && now - ctrlT0 >= Self.ctrlGrace
+        for h in 0...1 {
+            if present[h] { ctrlMissingSince[h] = nil }
+            else if ctrlMissingSince[h] == nil { ctrlMissingSince[h] = now }
+            let missingFor = ctrlMissingSince[h].map { now - $0 } ?? 0
+            let warn = armed && !present[h] && missingFor >= Self.ctrlDebounce
+            guard warn != ctrlWarned[h] else { continue }
+            ctrlWarned[h] = warn
+            let side = h == 0 ? "left" : "right"
+            if warn {
+                ctrlConfirmUntil[h] = 0
+                NSLog("[hud] controller warning: \(side) missing")
+            } else if present[h] {
+                ctrlConfirmUntil[h] = now + Self.ctrlConfirmSecs
+                NSLog("[hud] controller warning: \(side) back")
+            } else {
+                NSLog("[hud] controller warning: \(side) cleared (KL_CTRL_WARN off)")
+            }
+        }
+    }
+
+    /// The card's text for this frame: warnings first, then confirmations.
+    private func controllerCard(now: TimeInterval) -> KLToast? {
+        let es = Self.ctrlSpanish
+        let header = "PlayStation VR2 Sense"
+        let amber = SIMD3<Double>(1.0, 0.62, 0.22), green = SIMD3<Double>(0.45, 0.88, 0.55)
+        let side = { (h: Int) in es ? (h == 0 ? "izquierdo" : "derecho") : (h == 0 ? "Left" : "Right") }
+        if ctrlWarned[0] && ctrlWarned[1] {
+            return KLToast(api: "ctrl", name: es ? "Mandos desconectados" : "Both controllers disconnected",
+                           desc: es ? "Pulsa el botón PS de cada mando para despertarlos"
+                                    : "Press the PS button on each to wake them up",
+                           icon: "-", header: header, accent: amber)
+        }
+        if let h = ctrlWarned.firstIndex(of: true) {
+            return KLToast(api: "ctrl", name: es ? "Mando \(side(h)) desconectado" : "\(side(h)) controller disconnected",
+                           desc: es ? "Pulsa el botón PS para despertarlo" : "Press the PS button to wake it up",
+                           icon: "-", header: header, accent: amber)
+        }
+        let back = (0...1).filter { now < ctrlConfirmUntil[$0] }
+        if back.count == 2 {
+            return KLToast(api: "ctrl", name: es ? "Mandos conectados" : "Both controllers connected",
+                           desc: "", icon: "-", header: header, accent: green)
+        }
+        if let h = back.first {
+            return KLToast(api: "ctrl", name: es ? "Mando \(side(h)) conectado" : "\(side(h)) controller connected",
+                           desc: "", icon: "-", header: header, accent: green)
+        }
+        return nil
+    }
+
+    /// Re-raster when the text changes, fade 0.25 s, and hold the card 1 m
+    /// ahead, 25 cm below the eyes — under the gate prompt (5 cm below) and
+    /// the achievement toast (1.2 m / 15 cm below), so the three never overlap
+    /// — following the head closely like the prompt.
+    private func prepareControllerCard(originFromHead: simd_float4x4, dt: Float) {
+        let card = controllerCard(now: CACurrentMediaTime())
+        let key = card.map { $0.name + "|" + $0.desc } ?? ""
+        if !key.isEmpty && key != ctrlKey {
+            ctrlTex = KLToastRaster.texture(card!, device: device)
+            if ctrlTex == nil { NSLog("[hud] controller card raster FAILED") }
+        }
+        if !key.isEmpty { ctrlKey = key }
+        let step = dt / 0.25
+        ctrlAlpha = card == nil ? max(0, ctrlAlpha - step) : min(1, ctrlAlpha + step)
+        if ctrlAlpha <= 0 { ctrlPos = nil; ctrlTex = nil; ctrlKey = ""; return }
+        ctrlModel = Self.panelModel(originFromHead: originFromHead, dist: 1.0, drop: 0.25,
+                                    tau: 0.12, dt: dt, pos: &ctrlPos)
+    }
+
     /// The middle of the palm: halfway between the middle finger's metacarpal
     /// base and its knuckle, where a fist closes around a grip.
     private static func palm(_ a: HandAnchor) -> SIMD3<Float>? {
@@ -512,6 +673,8 @@ final class KleptonHUD {
         let dt = lastPrepare > 0 ? Float(min(now - lastPrepare, 0.1)) : 0
         lastPrepare = now
         preparePrompt(originFromHead: originFromHead, dt: dt)
+        prepareControllerCard(originFromHead: originFromHead, dt: dt)
+        prepareQuickSettings(originFromHead: originFromHead, dt: dt)
         var c: [Float] = [0, 0, 0, 0]
         let on = c.withUnsafeMutableBufferPointer { kl_ovrp_fade_color($0.baseAddress) } != 0
         let newFade = on ? SIMD4<Float>(c[0], c[1], c[2], c[3]) : SIMD4<Float>(0, 0, 0, 0)
@@ -580,16 +743,43 @@ final class KleptonHUD {
                                       tau: 0.12, dt: dt, pos: &promptPos)
     }
 
+    /// The overlay (lower left: 1 m ahead, 32 cm left, 18 cm below the eyes,
+    /// 20 cm wide) and the menu (0.9 m ahead, at eye level, 46 cm wide). A
+    /// texture that goes away fades out with the last one it showed.
+    private func prepareQuickSettings(originFromHead: simd_float4x4, dt: Float) {
+        let (p, m) = KLQuickSettings.shared.panels()
+        let step = dt / 0.2
+        if let p { perfTex = p }
+        perfAlpha = p == nil ? max(0, perfAlpha - step) : min(1, perfAlpha + step)
+        if perfAlpha <= 0 { perfTex = nil; perfPos = nil } else {
+            let o = KLPanelRaster.overlaySize
+            perfModel = Self.panelModel(originFromHead: originFromHead, dist: 1.0, drop: 0.18,
+                                        tau: 0.15, dt: dt, pos: &perfPos, side: -0.32,
+                                        width: 0.20, aspect: Float(o.h) / Float(o.w))
+        }
+        if let m { menuTex = m }
+        menuAlpha = m == nil ? max(0, menuAlpha - step) : min(1, menuAlpha + step)
+        if menuAlpha <= 0 { menuTex = nil; menuPos = nil } else {
+            let o = KLPanelRaster.menuSize
+            menuModel = Self.panelModel(originFromHead: originFromHead, dist: 0.9, drop: 0.02,
+                                        tau: 0.25, dt: dt, pos: &menuPos, side: 0,
+                                        width: 0.46, aspect: Float(o.h) / Float(o.w))
+        }
+    }
+
     /// A panel ahead of the head along its yaw, `drop` metres below the eyes,
     /// easing toward that spot with time constant `tau`, upright and facing
     /// the eyes. The toast's placement, shared with the prompt.
     private static func panelModel(originFromHead: simd_float4x4, dist: Float, drop: Float,
-                                   tau: Float, dt: Float, pos: inout SIMD3<Float>?) -> simd_float4x4 {
+                                   tau: Float, dt: Float, pos: inout SIMD3<Float>?,
+                                   side: Float = 0, width: Float = 0.40,
+                                   aspect: Float? = nil) -> simd_float4x4 {
         let h = SIMD3<Float>(originFromHead.columns.3.x, originFromHead.columns.3.y,
                              originFromHead.columns.3.z)
         var f = -SIMD3<Float>(originFromHead.columns.2.x, 0, originFromHead.columns.2.z)
         f = simd_length(f) > 1e-3 ? simd_normalize(f) : SIMD3(0, 0, -1)
-        let target = h + f * dist + SIMD3(0, -drop, 0)
+        let right = SIMD3<Float>(-f.z, 0, f.x)
+        let target = h + f * dist + right * side + SIMD3(0, -drop, 0)
         if let p = pos, dt > 0 {
             pos = p + (target - p) * (1 - exp(-dt / tau))
         } else {
@@ -601,13 +791,15 @@ final class KleptonHUD {
         var x = simd_cross(SIMD3<Float>(0, 1, 0), z)
         x = simd_length(x) > 1e-3 ? simd_normalize(x) : SIMD3(1, 0, 0)
         let y = simd_cross(z, x)
-        let w: Float = 0.40, ht = w * Float(KLToastRaster.height) / Float(KLToastRaster.width)
+        let w = width, ht = w * (aspect ?? Float(KLToastRaster.height) / Float(KLToastRaster.width))
         return simd_float4x4(SIMD4(x * w, 0), SIMD4(y * ht, 0), SIMD4(z, 0), SIMD4(p, 1))
     }
 
     var hasContent: Bool {
         (toastTex != nil && toastAlpha > 0) || ghosts.contains { $0.alpha > 0 }
             || fade.w > 0 || (promptTex != nil && promptAlpha > 0)
+            || (ctrlTex != nil && ctrlAlpha > 0)
+            || (perfTex != nil && perfAlpha > 0) || (menuTex != nil && menuAlpha > 0)
     }
 
     // MARK: Encode
@@ -687,6 +879,37 @@ final class KleptonHUD {
             enc.setFragmentSamplerState(sampler, index: 0)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
+
+        if let tex = ctrlTex, ctrlAlpha > 0, let quad, let sampler {
+            enc.setRenderPipelineState(texPipe)
+            if let toastDepth { enc.setDepthStencilState(toastDepth) }
+            enc.setCullMode(.none)
+            var o = KLHObj(model: ctrlModel, color: SIMD4(1, 1, 1, 1),
+                           params: SIMD4(0, ctrlAlpha, 0, 0))
+            enc.setVertexBuffer(quad, offset: 0, index: 0)
+            enc.setVertexBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 2)
+            enc.setFragmentBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 0)
+            enc.setFragmentTexture(tex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+
+        // The overlay, then the menu over everything.
+        func panel(_ tex: MTLTexture?, _ alpha: Float, _ model: simd_float4x4) {
+            guard let tex, alpha > 0, let quad, let sampler else { return }
+            enc.setRenderPipelineState(texPipe)
+            if let toastDepth { enc.setDepthStencilState(toastDepth) }
+            enc.setCullMode(.none)
+            var o = KLHObj(model: model, color: SIMD4(1, 1, 1, 1), params: SIMD4(0, alpha, 0, 0))
+            enc.setVertexBuffer(quad, offset: 0, index: 0)
+            enc.setVertexBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 2)
+            enc.setFragmentBytes(&o, length: MemoryLayout<KLHObj>.stride, index: 0)
+            enc.setFragmentTexture(tex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        panel(perfTex, perfAlpha, perfModel)
+        panel(menuTex, menuAlpha, menuModel)
     }
 
     // MARK: The controller model

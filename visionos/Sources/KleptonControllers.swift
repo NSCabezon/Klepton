@@ -482,6 +482,11 @@ final class KleptonControllers {
 
     private(set) var senseConnected = false
     private var tracked: [GCController] = []
+    /// Which hands have a Sense controller connected right now (left, right),
+    /// refreshed every frame by `spatialControllersChanged` from the same
+    /// GCController poll — the HUD's "controller disconnected" card reads it.
+    /// Render thread only, like that poll.
+    private(set) var presentHands = [false, false]
 
     // MARK: - Ghost controllers (KleptonHUD)
 
@@ -536,6 +541,9 @@ final class KleptonControllers {
     /// almost always empty or two long.
     func spatialControllersChanged() -> Bool {
         let now = Self.spatialControllers()
+        var hands = [false, false]
+        for c in now { hands[Self.hand(of: c)] = true }
+        presentHands = hands
         guard now != tracked else { return false }
         tracked = now
         return true
@@ -2207,9 +2215,7 @@ final class KleptonControllers {
                     mergePad(into: &st, hand: hand)
                 }
                 if st.fromController || padName != nil {
-                    kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
-                                                 st.indexTrigger, st.handTrigger,
-                                                 st.stick.x, st.stick.y)
+                    pushInput(hand, st)
                     lock.lock(); state[hand] = st; lock.unlock()
                 }
                 continue
@@ -2223,12 +2229,24 @@ final class KleptonControllers {
                                         st.angularVelocity.x, st.angularVelocity.y,
                                         st.angularVelocity.z)
             }
-            kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
-                                         st.indexTrigger, st.handTrigger,
-                                         st.stick.x, st.stick.y)
+            pushInput(hand, st)
 
             lock.lock(); state[hand] = st; lock.unlock()
         }
         reportPinch()
+        KLQuickSettings.shared.processInput()
+    }
+
+    /// The buttons, triggers and stick to the guest — unless the in-game quick
+    /// settings own them (KleptonQuickSettings.swift): then the guest sees a
+    /// released controller (the pose still goes through) and the menu reads it.
+    private func pushInput(_ hand: Int, _ st: KleptonHandState) {
+        if KLQuickSettings.shared.capture(hand: hand, st) {
+            kl_ovrp_set_controller_input(Int32(hand), 0, 0, 0, 0, 0, 0)
+            return
+        }
+        kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
+                                     st.indexTrigger, st.handTrigger,
+                                     st.stick.x, st.stick.y)
     }
 }
