@@ -416,6 +416,11 @@ int kl_app_configure(const char *resources, const char *container) {
         // its nasal strip undrawn — the timewarp swung it into view as a black
         // rectangle with a magenta edge (2026-10-08, device-confirmed).
         setenv("KL_OPENVR_SYM_PROJ", "1", 0);
+        // Steady 45 fps (half the panel) plus Glovebox's render convars: the
+        // device test of 2026-10-11 had a median frame of 22.4 ms and peaked at
+        // 4.6 GB, against an uneven 40-42 fps and ~7 GB before.
+        setenv("KL_GUEST_PACE_HZ", "45", 0);
+        setenv("KL_ALYX_PROFILE", "glovebox", 0);
         // The drawable claims the anchor the guest rendered with and visionOS
         // does the correction (render anchor, mode 1). Mode 2 (real depth) also
         // removed the swim but haloed the hands on head motion — not yet.
