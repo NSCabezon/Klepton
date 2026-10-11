@@ -131,8 +131,8 @@ final class KLCloudSaveModel: ObservableObject {
         let url = KLCloudSaves.stateDir(target).appendingPathComponent("state.json")
         var st = CloudSyncState.load(url)
         st.resolve(c, choice)
-        do { try st.save(url) } catch { NSLog("[cloud] \(target): could not save the resolution: \(error)") }
-        NSLog("[cloud] \(target): conflict \(c.key) resolved: \(choice.rawValue)")
+        do { try st.save(url) } catch { NSLog("%@", "[cloud] \(target): could not save the resolution: \(error)") }
+        NSLog("%@", "[cloud] \(target): conflict \(c.key) resolved: \(choice.rawValue)")
         reloadState(target)
     }
 
@@ -154,12 +154,12 @@ final class KLCloudSaveModel: ObservableObject {
             sync.log = { NSLog("[cloud] %@", $0) }
             let (report, _) = try await sync.run()
             await session.disconnect()
-            NSLog("[cloud] app \(app) (\(why), \(mode.rawValue)): \(report.summary); down \(report.downloaded), up \(report.uploaded), "
+            NSLog("%@", "[cloud] app \(app) (\(why), \(mode.rawValue)): \(report.summary); down \(report.downloaded), up \(report.uploaded), "
                   + "backups \(report.backedUp), held \(report.held), conflicts \(report.conflicts.map(\.key))")
             return klL("Synced ", "Sincronizado ") + Date().formatted(date: .omitted, time: .shortened) + ": " + report.summary
         } catch {
             await session.disconnect()
-            NSLog("[cloud] app \(app) (\(why)) failed: \(error)")
+            NSLog("%@", "[cloud] app \(app) (\(why)) failed: \(error)")
             return klL("Sync failed: ", "Error al sincronizar: ") + "\(error)"
         }
     }
