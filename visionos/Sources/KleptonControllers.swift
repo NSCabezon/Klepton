@@ -443,6 +443,11 @@ final class KleptonControllers {
 
     private(set) var senseConnected = false
     private var tracked: [GCController] = []
+    /// Which hands have a Sense controller connected right now (left, right),
+    /// refreshed every frame by `spatialControllersChanged` from the same
+    /// GCController poll — the HUD's "controller disconnected" card reads it.
+    /// Render thread only, like that poll.
+    private(set) var presentHands = [false, false]
 
     // MARK: - Ghost controllers (KleptonHUD)
 
@@ -497,6 +502,9 @@ final class KleptonControllers {
     /// almost always empty or two long.
     func spatialControllersChanged() -> Bool {
         let now = Self.spatialControllers()
+        var hands = [false, false]
+        for c in now { hands[Self.hand(of: c)] = true }
+        presentHands = hands
         guard now != tracked else { return false }
         tracked = now
         return true
