@@ -921,6 +921,8 @@ static const void *sanitize_features(VkPhysicalDevice phys, const VkDeviceCreate
     return req_head;
 }
 
+static int klvk_fdm_spoof(void);         // KL_FDM_SPOOF — the FDM block, below
+static int klvk_fdm_passthrough(void);
 static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -948,7 +950,12 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     for (uint32_t i = 0; ci && i < ci->enabledExtensionCount; i++) {
         const char *e = ci->ppEnabledExtensionNames[i];
         if (have && !ext_supported(have, nhave, e)) {
-            VKI("device ext %s NOT supported by MoltenVK — dropped\n", e);
+            if (!strcmp(e, "VK_EXT_fragment_density_map") && klvk_fdm_spoof())
+                VKI("device ext %s: ours (KL_FDM_SPOOF), not MoltenVK's — %s\n", e,
+                    klvk_fdm_passthrough() ? "render-pass maps go to the foveating fork"
+                                           : "maps are ignored, full rate");
+            else
+                VKI("device ext %s NOT supported by MoltenVK — dropped\n", e);
             continue;
         }
         ext_add(&keep, e);
@@ -3300,6 +3307,228 @@ static void VKAPI_CALL klvk_CmdPipelineBarrier(VkCommandBuffer cb,
     free(rew);
 }
 
+// ---------------------------------------------------------------------------
+// VK_EXT_fragment_density_map — the discovery spoof (KL_FDM_SPOOF) and the
+// hand-off to a foveating MoltenVK (KL_FOVEATE)
+// ---------------------------------------------------------------------------
+//
+// Half-Life: Alyx's Steam Frame build foveates through a fragment density map:
+// it builds the map on the CPU (librenderingpipelines: `vr_fdm`, `fove_level`,
+// "Creating fragment density map with size ..."), attaches it to its scene
+// render passes, and leaves honouring it to the driver. MoltenVK 1.4.2 has no
+// such extension, so the game sees none and renders every pixel at full rate.
+//
+// The spoof ADVERTISES the extension (name, `fragmentDensityMap` +
+// `fragmentDensityMapNonSubsampledImages`, texel-size properties, the
+// FRAGMENT_DENSITY_MAP format feature on R8G8_UNORM) and STRIPS what MoltenVK
+// would act on: the usage bit and SUBSAMPLED flag on images (Alyx creates its
+// scene targets SUBSAMPLED) and the image-view flags. What MoltenVK merely
+// ignores is left in place — the density-map nodes in a render pass's or a
+// VkRenderingInfo's pNext chain (MoltenVK skips sTypes it does not know), the
+// FDM image layout (MoltenVK never acts on layouts), the pipeline flag — so the
+// foveating fork below can read them. That is LEGAL Vulkan behaviour:
+// the spec lets an implementation shade at a HIGHER density than the map asks
+// for (full rate everywhere is always conformant), and in non-subsampled mode
+// the attachments are full size, so the picture must come out identical. The
+// map image itself survives as a plain R8G8 texture the game fills and nobody
+// reads.
+//
+// Subsampled mode (`vr_render_subsampled 1`) is NOT covered: there the game
+// samples its scene through subsampled samplers and expects the driver to know
+// the layout. With the flags stripped it reads a full-size image normally, which
+// is also correct — just no faster.
+//
+// What it is for: (1) discovery — which passes and images carry a map, at what
+// size and granularity (KL_FDM_TRACE=1). Measured on Alyx: the scene pass is a
+// DYNAMIC-RENDERING pass (vkCmdBeginRendering + VkRenderingFragmentDensityMap
+// AttachmentInfoEXT, never a render pass object), 2 views, MSAA colour and D32S8
+// cleared / not stored / resolved, map 69x75x2 for a 2208x2400x2 target (32x32
+// texels); (2) with KL_FOVEATE=1 and the vendor-moltenvk-fdm fork
+// (tools/mvk_fdm_build.sh), the fork turns each such pass into a Metal
+// rasterization-rate-map pass (MVKFoveation.{h,mm} in that fork).
+static int klvk_foveate(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_FOVEATE", 0);
+    return v;
+}
+static int klvk_fdm_spoof(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = kl_env_on("KL_FDM_SPOOF", klvk_foveate());
+        if (v) VKI("VK_EXT_fragment_density_map ADVERTISED to the guest (KL_FDM_SPOOF%s); "
+                   "image usage/flags stripped before MoltenVK, the map structs left for %s\n",
+                   klvk_foveate() ? ", via KL_FOVEATE" : "",
+                   klvk_foveate() ? "the foveating fork" : "MoltenVK to ignore (full rate)");
+    }
+    return v;
+}
+static int klvk_fdm_trace(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_FDM_TRACE", 0);
+    return v;
+}
+// The fork exports `klMVKFoveationABI` (returns its ABI version, 1) and reads
+// VkRenderPassFragmentDensityMapCreateInfoEXT itself. Stock MoltenVK has no
+// such symbol: the struct is stripped, and KL_FOVEATE=1 degrades to the spoof.
+static int klvk_fdm_passthrough(void) {
+    static int v = -1;
+    if (v < 0) {
+        int (*abi)(void) = (int (*)(void))mvk_sym("klMVKFoveationABI");
+        int a = abi ? abi() : 0;
+        v = klvk_foveate() && a == 1;
+        if (klvk_foveate())
+            VKI("KL_FOVEATE=1: %s\n", v ? "MoltenVK is the foveating fork (ABI 1) — density-map "
+                "render passes go through to it"
+                : a ? "MoltenVK foveation ABI mismatch — map stripped, full rate"
+                    : "this MoltenVK cannot foveate (no klMVKFoveationABI; stock build?) — "
+                      "map stripped, full rate");
+    }
+    return v;
+}
+// The game picks its map texel size inside [min, max]; Steam Frame's Adreno
+// reports 32x32 for both, and so does this by default — the path the game
+// was tuned on. KL_FDM_TEXEL overrides (a power of two, 8..128).
+static uint32_t klvk_fdm_texel(void) {
+    static uint32_t t;
+    if (!t) {
+        int v = kl_env_int("KL_FDM_TEXEL", 32);
+        t = (v >= 8 && v <= 128 && !(v & (v - 1))) ? (uint32_t)v : 32;
+    }
+    return t;
+}
+static const char kl_fdm_ext[] = "VK_EXT_fragment_density_map";
+
+// vkEnumerateDeviceExtensionProperties(layer NULL): MoltenVK's list + ours,
+// with the usual two-call contract (and VK_INCOMPLETE when the array is short).
+static VkResult klvk_fdm_enum_ext(PFN_vkEnumerateDeviceExtensionProperties real,
+        VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *props) {
+    uint32_t n = 0;
+    VkResult r = real(pd, layer, &n, NULL);
+    if (r != VK_SUCCESS || !count) return r;
+    VkExtensionProperties *all = calloc(n + 1, sizeof *all);
+    if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    r = real(pd, layer, &n, all);
+    int have = 0;
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(all[i].extensionName, kl_fdm_ext)) have = 1;
+    if (!have) {
+        snprintf(all[n].extensionName, sizeof all[n].extensionName, "%s", kl_fdm_ext);
+        all[n].specVersion = 1;    // v1: no SUBSAMPLED_COARSE_RECONSTRUCTION promises
+        n++;
+    }
+    if (!props) { *count = n; free(all); return VK_SUCCESS; }
+    uint32_t w = *count < n ? *count : n;
+    memcpy(props, all, w * sizeof *all);
+    *count = w;
+    free(all);
+    return w < n ? VK_INCOMPLETE : r;
+}
+static void klvk_fdm_features(VkPhysicalDeviceFeatures2 *f) {
+    if (!f || !klvk_fdm_spoof()) return;
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)f->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
+            VkPhysicalDeviceFragmentDensityMapFeaturesEXT *m = (void *)p;
+            m->fragmentDensityMap = VK_TRUE;
+            m->fragmentDensityMapDynamic = VK_FALSE;
+            m->fragmentDensityMapNonSubsampledImages = VK_TRUE;
+            static int said;
+            if (!said++) VKI("FDM features reported: fragmentDensityMap + NonSubsampledImages\n");
+        }
+}
+static void klvk_fdm_props(VkPhysicalDeviceProperties2 *pp) {
+    if (!pp || !klvk_fdm_spoof()) return;
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)pp->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT) {
+            VkPhysicalDeviceFragmentDensityMapPropertiesEXT *m = (void *)p;
+            uint32_t t = klvk_fdm_texel();
+            m->minFragmentDensityTexelSize = (VkExtent2D){ t, t };
+            m->maxFragmentDensityTexelSize = (VkExtent2D){ t, t };
+            m->fragmentDensityInvocations = VK_FALSE;
+        }
+}
+static void klvk_fdm_format(VkFormat fmt, VkFormatProperties *p) {
+    if (p && fmt == VK_FORMAT_R8G8_UNORM && klvk_fdm_spoof())
+        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_FRAGMENT_DENSITY_MAP_BIT_EXT;
+}
+// Image usage/flags the spoof answers for and MoltenVK must never see.
+#define KLVK_FDM_USAGE   VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT   /* 0x200 */
+#define KLVK_FDM_SUBSAMP 0x00004000u    /* VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT */
+#define KLVK_FDM_OFFSET  0x00008000u    /* VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT */
+
+// The map images, for the trace and for the copy hook: handle + size + layers.
+#define KLVK_FDM_MAPS 32
+static struct { VkImage img; uint32_t w, h, layers; } g_fdm_maps[KLVK_FDM_MAPS];
+static int g_fdm_nmaps;
+static int klvk_fdm_is_map(VkImage img, uint32_t *w, uint32_t *h, uint32_t *layers) {
+    for (int i = 0; i < g_fdm_nmaps; i++)
+        if (g_fdm_maps[i].img == img) {
+            if (w) *w = g_fdm_maps[i].w;
+            if (h) *h = g_fdm_maps[i].h;
+            if (layers) *layers = g_fdm_maps[i].layers;
+            return 1;
+        }
+    return 0;
+}
+// Rewrites `ci` into `mod` if it carries FDM bits; returns 1 if it did.
+static int klvk_fdm_image_ci(const VkImageCreateInfo *ci, VkImageCreateInfo *mod, int *is_map) {
+    *is_map = 0;
+    if (!ci || !klvk_fdm_spoof()) return 0;
+    if (!(ci->usage & KLVK_FDM_USAGE) && !(ci->flags & (KLVK_FDM_SUBSAMP | KLVK_FDM_OFFSET)))
+        return 0;
+    *mod = *ci;
+    *is_map = (ci->usage & KLVK_FDM_USAGE) != 0;
+    mod->usage &= ~KLVK_FDM_USAGE;
+    mod->flags &= ~(KLVK_FDM_SUBSAMP | KLVK_FDM_OFFSET);
+    // A map image the game only ever samples-by-driver may carry no other usage
+    // at all; MoltenVK refuses usage 0. SAMPLED keeps it an ordinary texture.
+    if (*is_map) mod->usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    static int said;
+    if (said < 16 && (klvk_fdm_trace() || *is_map || (ci->flags & KLVK_FDM_SUBSAMP))) {
+        said++;
+        VKI("[fdm] vkCreateImage %ux%u layers %u fmt %d: %s%s usage %#x flags %#x -> usage %#x flags %#x\n",
+            ci->extent.width, ci->extent.height, ci->arrayLayers, (int)ci->format,
+            *is_map ? "DENSITY MAP" : "", (ci->flags & KLVK_FDM_SUBSAMP) ? " SUBSAMPLED target" : "",
+            ci->usage, ci->flags, mod->usage, mod->flags);
+    }
+    return 1;
+}
+static void klvk_fdm_image_created(VkImage img, const VkImageCreateInfo *ci) {
+    if (!img || !ci) return;
+    pthread_mutex_lock(&g_lock);
+    if (g_fdm_nmaps < KLVK_FDM_MAPS) {
+        g_fdm_maps[g_fdm_nmaps].img = img;
+        g_fdm_maps[g_fdm_nmaps].w = ci->extent.width;
+        g_fdm_maps[g_fdm_nmaps].h = ci->extent.height;
+        g_fdm_maps[g_fdm_nmaps].layers = ci->arrayLayers;
+        g_fdm_nmaps++;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+// The map attachment named by a render pass's
+// VkRenderPassFragmentDensityMapCreateInfoEXT, or VK_ATTACHMENT_UNUSED. The
+// struct itself is LEFT in the chain either way: MoltenVK's render-pass
+// constructors skip pNext nodes they do not know (and the v2 one walks none),
+// so stock MoltenVK ignores it — the "stripped" of the header — and the fork
+// reads it. The map attachment's FRAGMENT_DENSITY_MAP_OPTIMAL layout is equally
+// inert: MoltenVK stores attachment layouts and never acts on them.
+static uint32_t klvk_fdm_rp_att(const void *pNext) {
+    for (const VkBaseInStructure *b = pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT)
+            return ((const VkRenderPassFragmentDensityMapCreateInfoEXT *)b)
+                       ->fragmentDensityMapAttachment.attachment;
+    return VK_ATTACHMENT_UNUSED;
+}
+static void klvk_fdm_rp_log(const char *which, VkRenderPass rp, uint32_t att, uint32_t natt,
+                            uint32_t nsub, uint32_t viewmask0, int color, int depth, int resolve) {
+    static int said;
+    if (said >= 64 && !klvk_fdm_trace()) return;
+    said++;
+    VKI("[fdm] %s %#llx: density map = attachment %u of %u, %u subpass(es), viewMask %#x, "
+        "subpass 0 color %d depth %d resolve %d -> %s\n", which,
+        (unsigned long long)(uintptr_t)rp, att, natt, nsub, viewmask0, color, depth, resolve,
+        klvk_fdm_passthrough() ? "to the foveating MoltenVK"
+                                : "ignored by MoltenVK (full rate)");
+}
+
 // A thin pass-through over MoltenVK's vkCreateImage that LOGS the handle it
 // hands back and the RESULT. A guest that ignores a failed create keeps an
 // uninitialised VkImage variable and later feeds it to vkCreateImageView, where
@@ -3386,6 +3615,10 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     int did_astc_sub = 0;
     VkImageCreateInfo mod;
+    // KL_FDM_SPOOF: the density-map usage and the SUBSAMPLED flag stop here.
+    VkImageCreateInfo fdm_mod;
+    int fdm_map = 0;
+    if (klvk_fdm_image_ci(ci, &fdm_mod, &fdm_map)) ci = &fdm_mod;
     if (ci && (ci->usage & 0x80u) && kl_env_on("KL_STRIP_INPUT_ATT", 0)) {
         // No render pass in this guest uses an input attachment (census: inputAtts 0),
         // yet its temp render targets carry INPUT_ATTACHMENT usage — which makes
@@ -3499,6 +3732,7 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     if (r == VK_SUCCESS && out && ci)
         klvk_img_info_add(*out, ci->format, ci->extent.width, ci->extent.height);
     if (r == VK_SUCCESS && out && *out && did_astc_sub) klvk_astc_sub_add(*out);
+    if (r == VK_SUCCESS && out && *out && fdm_map) klvk_fdm_image_created(*out, ci);
     if (klvk_trace() && ci && (ci->extent.width >= 480 || ci->extent.height >= 480)
         && (ci->usage & 0x30u))   // colour or depth attachment == a render target
         fprintf(stderr, "[TRACE] [thr] createRT %#llx %ux%u fmt %d usage %#x tid=%u\n",
@@ -3667,6 +3901,11 @@ static VkResult VKAPI_CALL klvk_CreateImageView(VkDevice dev,
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    // KL_FDM_SPOOF: FRAGMENT_DENSITY_MAP_DYNAMIC / _DEFERRED (0x1 / 0x2) view flags.
+    VkImageViewCreateInfo fdm_iv;
+    if (ci && (ci->flags & 0x3u) && klvk_fdm_spoof()) {
+        fdm_iv = *ci; fdm_iv.flags &= ~0x3u; ci = &fdm_iv;
+    }
     // KL_VK_ASTC_RGBA8 test: every ASTC image was created RGBA8, so ANY ASTC-format
     // view must be rewritten to match the store or Metal asserts. Keyed on the flag +
     // the requested format (not per-image tracking, which overflowed — olar has 500+
@@ -4046,6 +4285,26 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice dev,
     static PFN_vkCreateRenderPass real;
     if (!real && real_gdpa) real = (PFN_vkCreateRenderPass)real_gdpa(dev, "vkCreateRenderPass");
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (ci && r == VK_SUCCESS && out && klvk_fdm_spoof()) {
+        uint32_t fa = klvk_fdm_rp_att(ci->pNext);
+        if (fa != VK_ATTACHMENT_UNUSED) {
+            const VkSubpassDescription *d = ci->subpassCount ? &ci->pSubpasses[0] : NULL;
+            uint32_t vm = 0;
+            for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+                if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO &&
+                    ((const VkRenderPassMultiviewCreateInfo *)b)->subpassCount)
+                    vm = ((const VkRenderPassMultiviewCreateInfo *)b)->pViewMasks[0];
+            klvk_fdm_rp_log("vkCreateRenderPass", *out, fa, ci->attachmentCount, ci->subpassCount, vm,
+                d ? (int)d->colorAttachmentCount : -1, d ? d->pDepthStencilAttachment != NULL : -1,
+                d ? d->pResolveAttachments != NULL : -1);
+            if (klvk_fdm_trace())
+                for (uint32_t i = 0; i < ci->attachmentCount; i++)
+                    VKI("[fdm]   att[%u] fmt %d samples %d load %d store %d layout %d -> %d\n", i,
+                        (int)ci->pAttachments[i].format, (int)ci->pAttachments[i].samples,
+                        (int)ci->pAttachments[i].loadOp, (int)ci->pAttachments[i].storeOp,
+                        (int)ci->pAttachments[i].initialLayout, (int)ci->pAttachments[i].finalLayout);
+        }
+    }
     if (ci && (r != VK_SUCCESS || klvk_trace())) {
         unsigned inputs = 0;
         for (uint32_t i = 0; i < ci->subpassCount; i++)
@@ -4134,6 +4393,32 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice dev,
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (r == VK_SUCCESS && out && probe_att != VK_ATTACHMENT_UNUSED)
         klvk_clearpass_add(*out, probe_att);
+    if (ci && r == VK_SUCCESS && out && klvk_fdm_spoof()) {
+        uint32_t fa = klvk_fdm_rp_att(ci->pNext);
+        if (fa != VK_ATTACHMENT_UNUSED) {
+            const VkSubpassDescription2 *d = ci->subpassCount ? &ci->pSubpasses[0] : NULL;
+            klvk_fdm_rp_log("vkCreateRenderPass2", *out, fa, ci->attachmentCount, ci->subpassCount,
+                d ? d->viewMask : 0, d ? (int)d->colorAttachmentCount : -1,
+                d ? d->pDepthStencilAttachment != NULL : -1, d ? d->pResolveAttachments != NULL : -1);
+            if (klvk_fdm_trace()) {
+                for (uint32_t i = 0; i < ci->attachmentCount; i++)
+                    VKI("[fdm]   att[%u] fmt %d samples %d load %d store %d stencil load %d store %d layout %d -> %d\n", i,
+                        (int)ci->pAttachments[i].format, (int)ci->pAttachments[i].samples,
+                        (int)ci->pAttachments[i].loadOp, (int)ci->pAttachments[i].storeOp,
+                        (int)ci->pAttachments[i].stencilLoadOp, (int)ci->pAttachments[i].stencilStoreOp,
+                        (int)ci->pAttachments[i].initialLayout, (int)ci->pAttachments[i].finalLayout);
+                for (uint32_t sp = 0; sp < ci->subpassCount; sp++) {
+                    const VkSubpassDescription2 *q = &ci->pSubpasses[sp];
+                    VKI("[fdm]   subpass %u: viewMask %#x color %u input %u depth att %d\n", sp, q->viewMask,
+                        q->colorAttachmentCount, q->inputAttachmentCount,
+                        q->pDepthStencilAttachment ? (int)q->pDepthStencilAttachment->attachment : -1);
+                    for (uint32_t k = 0; k < q->colorAttachmentCount; k++)
+                        VKI("[fdm]     color[%u] att %u resolve %d\n", k, q->pColorAttachments[k].attachment,
+                            q->pResolveAttachments ? (int)q->pResolveAttachments[k].attachment : -1);
+                }
+            }
+        }
+    }
     if (ci && (r != VK_SUCCESS || klvk_trace())) {
         unsigned inputs = 0;
         for (uint32_t i = 0; i < ci->subpassCount; i++)
@@ -4246,6 +4531,71 @@ static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
                 m.flags &= ~0x6u;
                 if (real) real(cb, &m);
                 return;
+            }
+        }
+    }
+    // KL_FDM_SPOOF: Source 2 renders with dynamic rendering, so a density map
+    // arrives HERE (VkRenderingFragmentDensityMapAttachmentInfoEXT in the chain),
+    // never in a render pass. The struct is left in the chain like the render-pass
+    // one (stock MoltenVK skips it, the fork reads it). One line per distinct
+    // shape: area, layers, view mask and each attachment's load/store ops.
+    if (ri && klvk_fdm_spoof()) {
+        const VkRenderingFragmentDensityMapAttachmentInfoEXT *fi = NULL;
+        for (const VkBaseInStructure *b = ri->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT)
+                fi = (const VkRenderingFragmentDensityMapAttachmentInfoEXT *)b;
+        if (fi) {
+            static struct { uint32_t w, h, layers, vm, ncol, ops, flags; } seen[32];
+            static int nseen;
+            uint32_t ops = 0;
+            for (uint32_t i = 0; i < ri->colorAttachmentCount && i < 4 && ri->pColorAttachments; i++)
+                ops |= ((uint32_t)ri->pColorAttachments[i].loadOp & 3u) << (i * 6) |
+                       ((uint32_t)ri->pColorAttachments[i].storeOp & 3u) << (i * 6 + 2) |
+                       (ri->pColorAttachments[i].resolveImageView ? 1u : 0u) << (i * 6 + 4);
+            if (ri->pDepthAttachment && ri->pDepthAttachment->imageView)
+                ops |= (((uint32_t)ri->pDepthAttachment->loadOp & 3u) | ((uint32_t)ri->pDepthAttachment->storeOp & 3u) << 2 |
+                        (ri->pDepthAttachment->resolveImageView ? 1u : 0u) << 4) << 24;
+            int known = 0;
+            pthread_mutex_lock(&g_lock);
+            for (int i = 0; i < nseen; i++)
+                if (seen[i].w == ri->renderArea.extent.width && seen[i].h == ri->renderArea.extent.height &&
+                    seen[i].layers == ri->layerCount && seen[i].vm == ri->viewMask &&
+                    seen[i].ncol == ri->colorAttachmentCount && seen[i].ops == ops &&
+                    seen[i].flags == ri->flags) known = 1;
+            if (!known && nseen < 32) {
+                seen[nseen].w = ri->renderArea.extent.width; seen[nseen].h = ri->renderArea.extent.height;
+                seen[nseen].layers = ri->layerCount; seen[nseen].vm = ri->viewMask;
+                seen[nseen].ncol = ri->colorAttachmentCount; seen[nseen].ops = ops;
+                seen[nseen].flags = ri->flags; nseen++;
+            }
+            pthread_mutex_unlock(&g_lock);
+            if (!known) {
+                VKI("[fdm] vkCmdBeginRendering WITH density map (view %#llx): flags %#x%s%s, area %ux%u+%d+%d "
+                    "layers %u viewMask %#x, %u colour, depth %s — %s\n",
+                    (unsigned long long)(uintptr_t)fi->imageView, ri->flags,
+                    (ri->flags & VK_RENDERING_SUSPENDING_BIT) ? " SUSPENDING" : "",
+                    (ri->flags & VK_RENDERING_RESUMING_BIT) ? " RESUMING" : "", ri->renderArea.extent.width,
+                    ri->renderArea.extent.height, ri->renderArea.offset.x, ri->renderArea.offset.y,
+                    ri->layerCount, ri->viewMask, ri->colorAttachmentCount,
+                    ri->pDepthAttachment && ri->pDepthAttachment->imageView ? "yes" : "no",
+                    klvk_fdm_passthrough() ? "to the foveating MoltenVK" : "ignored by MoltenVK (full rate)");
+                for (uint32_t i = 0; i < ri->colorAttachmentCount && ri->pColorAttachments; i++) {
+                    const VkRenderingAttachmentInfo *a = &ri->pColorAttachments[i];
+                    VkFormat f = 0; uint32_t w = 0, h = 0;
+                    klvk_img_info_get(klvk_view_image(a->imageView), &f, &w, &h);
+                    VKI("[fdm]   colour[%u] fmt %d %ux%u load %d store %d resolve %s mode %d\n", i, (int)f, w, h,
+                        (int)a->loadOp, (int)a->storeOp, a->resolveImageView ? "yes" : "no", (int)a->resolveMode);
+                }
+                if (ri->pDepthAttachment && ri->pDepthAttachment->imageView) {
+                    const VkRenderingAttachmentInfo *a = ri->pDepthAttachment;
+                    VkFormat f = 0; uint32_t w = 0, h = 0;
+                    klvk_img_info_get(klvk_view_image(a->imageView), &f, &w, &h);
+                    VKI("[fdm]   depth fmt %d %ux%u load %d store %d resolve %s; stencil %s load %d store %d\n",
+                        (int)f, w, h, (int)a->loadOp, (int)a->storeOp, a->resolveImageView ? "yes" : "no",
+                        ri->pStencilAttachment && ri->pStencilAttachment->imageView ? "yes" : "no",
+                        ri->pStencilAttachment ? (int)ri->pStencilAttachment->loadOp : -1,
+                        ri->pStencilAttachment ? (int)ri->pStencilAttachment->storeOp : -1);
+                }
             }
         }
     }
@@ -4501,6 +4851,10 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties(
     if (!real && real_gipa) real = (PFN_vkGetPhysicalDeviceImageFormatProperties)
         real_gipa(g_instance, "vkGetPhysicalDeviceImageFormatProperties");
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceImageFormatProperties");
+    if (klvk_fdm_spoof()) {     // answer for the image the strip will actually create
+        if (usage & KLVK_FDM_USAGE) usage = (usage & ~KLVK_FDM_USAGE) | VK_IMAGE_USAGE_SAMPLED_BIT;
+        flags &= ~(KLVK_FDM_SUBSAMP | KLVK_FDM_OFFSET);
+    }
     VkResult r = real ? real(pd, fmt, type, tiling, usage, flags, out)
                       : VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (r != VK_SUCCESS || (klvk_trace() && (usage & 0x30u))) {
@@ -4574,6 +4928,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceProperties2(
         if (v1) v1(pd, &props->properties);
     }
     klvk_spoof_props(&props->properties);
+    klvk_fdm_props(props);
 
     // Make the deviceLUID Unity reads here EQUAL the one ovrp_GetDisplayAdapterId2
     // handed it, so OculusXR's "which enumerated device is the VR GPU?" match
@@ -4630,6 +4985,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures2(
             real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR"); } }
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFeatures2");
     if (real) real(pd, f);
+    klvk_fdm_features(f);
 }
 static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures(
         VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
@@ -4683,6 +5039,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFormatProperties");
     if (real) real(pd, fmt, p);
     klvk_astc_patch_features(fmt, p);
+    klvk_fdm_format(fmt, p);
 }
 static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties2(
         VkPhysicalDevice pd, VkFormat fmt, VkFormatProperties2 *p) {
@@ -4694,6 +5051,14 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties2(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFormatProperties2");
     if (real) real(pd, fmt, p);
     if (p) klvk_astc_patch_features(fmt, &p->formatProperties);
+    if (p) {
+        klvk_fdm_format(fmt, &p->formatProperties);
+        if (fmt == VK_FORMAT_R8G8_UNORM && klvk_fdm_spoof())
+            for (VkBaseOutStructure *n = (VkBaseOutStructure *)p->pNext; n; n = n->pNext)
+                if (n->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3)
+                    ((VkFormatProperties3 *)n)->optimalTilingFeatures |=
+                        VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
+    }
 }
 // The two device-enumeration queries Unity runs while VALIDATING a physical
 // device (layers, then extensions) — the phase where AC Nexus was passing NULL.
@@ -4715,6 +5080,7 @@ static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(
     if (!t) { t = 1; if (real_gipa) real = (PFN_vkEnumerateDeviceExtensionProperties)
         real_gipa(g_instance, "vkEnumerateDeviceExtensionProperties"); }
     pd = KLVK_PHYS_OR_SUB(pd, "EnumerateDeviceExtensionProperties");
+    if (real && !layer && klvk_fdm_spoof()) return klvk_fdm_enum_ext(real, pd, layer, count, props);
     if (real) return real(pd, layer, count, props);
     if (count) *count = 0;
     return VK_SUCCESS;
@@ -4758,6 +5124,15 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
             real_gipa(g_instance, "vkGetPhysicalDeviceImageFormatProperties2");
         if (!real) real = (PFN_vkGetPhysicalDeviceImageFormatProperties2)
             real_gipa(g_instance, "vkGetPhysicalDeviceImageFormatProperties2KHR");
+    }
+    VkPhysicalDeviceImageFormatInfo2 fdm_info;
+    if (info && klvk_fdm_spoof() &&
+        ((info->usage & KLVK_FDM_USAGE) || (info->flags & (KLVK_FDM_SUBSAMP | KLVK_FDM_OFFSET)))) {
+        fdm_info = *info;
+        if (fdm_info.usage & KLVK_FDM_USAGE)
+            fdm_info.usage = (fdm_info.usage & ~KLVK_FDM_USAGE) | VK_IMAGE_USAGE_SAMPLED_BIT;
+        fdm_info.flags &= ~(KLVK_FDM_SUBSAMP | KLVK_FDM_OFFSET);
+        info = &fdm_info;
     }
     VkResult r = real ? real(pd, info, props) : VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (info && (r != VK_SUCCESS || (klvk_trace() && (info->usage & 0x30u))))

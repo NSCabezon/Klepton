@@ -2648,6 +2648,87 @@ create call.
   `source_engine_*.lock` in `$TMPDIR` (give it its own `TMPDIR`), and even then
   can hang at Steam Audio init right after `semctl cmd 2 not translated`.
 
+## Foveated rendering (`runtime/gfx/kl_vulkan.c`, the `vendor-moltenvk-fdm` MoltenVK fork) — phase H
+
+Half-Life: Alyx (Steam Frame build) foveates through `VK_EXT_fragment_density_map`:
+its scene pass is a DYNAMIC-RENDERING pass (`vkCmdBeginRendering`, never a render
+pass object) with a CPU-built density map attached
+(`VkRenderingFragmentDensityMapAttachmentInfoEXT`, 32x32 texels: `Creating
+fragment density map with size: 69x75x2 (RT: 2208x2400x2)`), 2 views (viewMask
+0x3), MSAA colour B10G11R11 cleared/not stored and RESOLVED, D32S8 depth+stencil
+cleared/not stored and RESOLVED. Stock MoltenVK has no such extension. Two halves:
+
+- `KL_FDM_SPOOF=1` — (kl_vulkan.c) ADVERTISE the extension to the guest
+  (`fragmentDensityMap` + `NonSubsampledImages`, min = max texel 32x32, the
+  FRAGMENT_DENSITY_MAP format feature on R8G8_UNORM) and strip it on the way down:
+  the map image's usage bit (it becomes a plain SAMPLED R8G8 texture), the
+  SUBSAMPLED image flag (Alyx creates its scene targets subsampled), view and
+  sampler flags. The render-pass / rendering structs are left in the chain —
+  stock MoltenVK skips pNext nodes it does not know, the fork reads them. Legal:
+  full rate everywhere is always conformant and the attachments are full size, so
+  the picture is identical. **Default: = `KL_FOVEATE`.** Alyx then logs
+  `Vulkan extension enabled: VK_EXT_fragment_density_map` and builds its maps;
+  `vr_fdm` is on by default once the extension exists (no convar needed).
+- `KL_FDM_TRACE=1` — the spoof's evidence: every density-map image, and one line
+  per distinct density-map pass shape (`[fdm] vkCmdBeginRendering WITH density
+  map ...` + each attachment's format, size, load/store ops, resolve).
+- `KL_FDM_TEXEL=<n>` — the texel size reported (power of two 8..128, default 32,
+  what Steam Frame's Adreno reports).
+- `KL_FOVEATE=1` — use the fork: each density-map pass that passes the safety
+  checks renders through a Metal `MTLRasterizationRateMap` (2 layers, one per
+  eye) into PHYSICAL-size shadow attachments, and its stored/resolved
+  attachments are UNWARPED into the real images when the pass ends (one
+  full-screen pass per image, both layers instanced; depth through
+  `[[depth(any)]]`, stencil through `[[stencil]]`). Pipelines built for a
+  density-map pass remap `gl_FragCoord` back to framebuffer space (SPIRV-Cross
+  patch). The map is CENTRED on the render area (Alyx draws the eye into the
+  top-left 2208x2400 of a 2688x2880 image). A pass that cannot be foveated
+  safely (a LOADed or multisampled-and-stored attachment, a stored stencil,
+  integer colour, >2 layers, a multiview pass split into several Metal passes)
+  renders at full rate and says why ONCE: `[mvk-fov] ... FULL RATE — <reason>`.
+  Needs the fork staged (`make mvk-fdm`); with stock MoltenVK it degrades to the
+  spoof and says so (`this MoltenVK cannot foveate`). **Default 0.**
+- `KL_FOVEATE_LEVEL=1|2|3` — the fixed profile (separable, same on both axes and
+  both eyes; centre → edge, fraction of the half extent : rate). 1 = 45% : 1,
+  30% : 0.75, 25% : 0.5 (~64% of fragments); **2 (default)** = 35% : 1,
+  30% : 0.5, 35% : 0.33 (~38%, 43% after Metal's 32-px tile rounding at
+  2688x2880); 3 = 25% : 1, 30% : 0.5, 45% : 0.25 (~26%). The game's own map is
+  NOT read (Metal maps are separable, Vulkan maps 2-D).
+- `KL_FOVEATE_PROFILE="f:r,f:r,..."` — a custom profile in that form (fractions
+  are normalised), overrides the level.
+- `KL_FOVEATE_UNWARP=nearest` — point-sample the unwarp (default bilinear, which
+  smooths the low-rate periphery).
+- `KL_FOVEATE_DEBUG=1` — tint unwarped colour red where the rate is below 1
+  (stronger below 0.4): the A/B that shows WHERE it foveates.
+- `KL_FOVEATE_DEPTH=0` — do not unwarp the resolved depth/stencil (diagnostic:
+  the A/B for what that unwarp costs; later passes then see a stale depth).
+- `KL_MVK_GPU_TIME=1` — (fork only) every 5 s, the GPU busy time — the union of
+  all MoltenVK MTLCommandBuffer [GPUStartTime, GPUEndTime] — in ms per second,
+  the density-map FRAMES (a suspended/resumed instance counts once) foveated / at
+  full rate, and GPU ms per frame. The measurement for a CPU-bound Mac; it does
+  not include Klepton's own compositor (plain Metal, not MoltenVK).
+- `KL_FOVEATE_AB=<s>` — (fork only, implies `KL_MVK_GPU_TIME`) the IN-PROCESS
+  A/B: foveation alternates ON / OFF every s seconds within one run (OFF = full
+  rate through an identity map, exactly the fallback path), and every 5 s
+  `[mvk-fov] A/B so far: foveated X GPU ms/frame at F fps | full rate Y ... |
+  ±Z% GPU time` accumulates both phases (the first second after each flip is not
+  attributed). Two separate runs on a shared GPU (another Alyx, SUPERHOT, a build)
+  are not comparable; two phases of one run interleaved for minutes are. 10 is a
+  good period. A suspended/resumed instance keeps the phase it began in.
+
+Which MoltenVK runs (stock or the fork). There is ONE slot, `vendor-moltenvk/out/`
+(`macos/libMoltenVK.dylib`, `xros|xrsim/MoltenVK.framework`); no runtime choice.
+`make mvk` fills it with the stock prebuilt; `make mvk-fdm` (tools/mvk_fdm_build.sh)
+builds the fork for macOS + visionOS + simulator and overwrites it (stamp
+`vendor-moltenvk/.klepton-fdm`; `rm vendor-moltenvk/.klepton-fdm && make mvk` puts
+stock back). The visionOS app embeds whatever is in the slot: `visionos/run.sh` runs
+`mkmvk.sh` on every build, which wraps `out/xros` + `out/xrsim` into
+`visionos/Frameworks/MoltenVK.xcframework`. So a hub built from a checkout whose slot
+holds the fork SHIPS the fork; with `KL_FOVEATE` unset the spoof is off, Alyx never
+sees the extension, no density-map pass exists and the fork's code is inert (verified
+on the Mac: same picture as stock). On the Mac, `KL_MVK_DYLIB=<path>` loads any
+other build for an A/B (e.g. the main checkout's stock dylib).
+
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
 The Vulkan side of BONELAB. Not part of the runtime yet —
