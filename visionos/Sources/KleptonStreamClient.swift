@@ -196,6 +196,10 @@ final class KLStreamSession: @unchecked Sendable {
     /// compositor has measured the display (displayReady).
     func start(name: String, host: String, port: Int) -> Bool {
         stop(reason: "restart")
+        // The Mac's sound arrives as AUDIO and plays through kl_audio, which
+        // needs the configured AVAudioSession a local guest gets from BootView
+        // (idempotent; before the socket, so the first packet finds it ready).
+        KleptonAudio.start()
         guard let c = kl_stream_client_create(host, Int32(port)) else { return false }
         lock.lock()
         client = c
@@ -205,9 +209,9 @@ final class KLStreamSession: @unchecked Sendable {
         lock.unlock()
         lastFrameId = 0
         NSLog("[stream] session started: \(name) at \(host):\(port)")
-        KLHUDStatus.set(KLHUDStatus(header: "Jugar desde el Mac",
-                                    name: "Conectando a \(name)…",
-                                    desc: "Esperando respuesta del Mac (\(host))."))
+        KLHUDStatus.set(KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"),
+                                    name: klL("Connecting to \(name)…", "Conectando a \(name)…"),
+                                    desc: klL("Waiting for the Mac to answer (\(host)).", "Esperando respuesta del Mac (\(host)).")))
         return true
     }
 
@@ -308,20 +312,20 @@ final class KLStreamSession: @unchecked Sendable {
         let card: KLHUDStatus?
         switch Int32(s.state) {
         case Int32(KL_STREAM_CLIENT_CONNECTING):
-            card = KLHUDStatus(header: "Jugar desde el Mac", name: "Conectando a \(mac)…",
-                               desc: "Esperando respuesta del Mac (\(hostDesc)).")
+            card = KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"), name: klL("Connecting to \(mac)…", "Conectando a \(mac)…"),
+                               desc: klL("Waiting for the Mac to answer (\(hostDesc)).", "Esperando respuesta del Mac (\(hostDesc))."))
         case Int32(KL_STREAM_CLIENT_WAITING):
-            card = KLHUDStatus(header: "Jugar desde el Mac", name: "Conectando a \(mac)…",
-                               desc: "Conectado. Esperando la primera imagen.")
+            card = KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"), name: klL("Connecting to \(mac)…", "Conectando a \(mac)…"),
+                               desc: klL("Connected. Waiting for the first picture.", "Conectado. Esperando la primera imagen."))
         case Int32(KL_STREAM_CLIENT_NO_SIGNAL):
-            card = KLHUDStatus(header: "Jugar desde el Mac", name: "Sin señal del Mac",
-                               desc: "No llega vídeo de \(mac). Reintentando…")
+            card = KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"), name: klL("No signal from the Mac", "Sin señal del Mac"),
+                               desc: klL("No video from \(mac). Retrying…", "No llega vídeo de \(mac). Reintentando…"))
         case Int32(KL_STREAM_CLIENT_REFUSED):
-            card = KLHUDStatus(header: "Jugar desde el Mac", name: "\(mac) rechazó la conexión",
+            card = KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"), name: klL("\(mac) refused the connection", "\(mac) rechazó la conexión"),
                                desc: KLStreamSession.refusal(s.ack_status))
         case Int32(KL_STREAM_CLIENT_ENDED):
-            card = KLHUDStatus(header: "Jugar desde el Mac", name: "\(mac) cerró la sesión",
-                               desc: "Volviendo a la biblioteca.")
+            card = KLHUDStatus(header: klL("Play from Mac", "Jugar desde el Mac"), name: klL("\(mac) ended the session", "\(mac) cerró la sesión"),
+                               desc: klL("Back to the library.", "Volviendo a la biblioteca."))
         default:
             card = nil
         }
@@ -330,10 +334,10 @@ final class KLStreamSession: @unchecked Sendable {
 
     static func refusal(_ status: UInt32) -> String {
         switch Int32(status) {
-        case Int32(KL_STREAM_ERR_VERSION.rawValue): return "Versión de protocolo distinta: actualiza Klepton en el Mac y en el visor."
-        case Int32(KL_STREAM_ERR_BUSY.rawValue):    return "El Mac ya está transmitiendo a otro visor."
-        case Int32(KL_STREAM_ERR_GUEST.rawValue):   return "El juego no pudo arrancar en el Mac."
-        default: return "Código \(status)."
+        case Int32(KL_STREAM_ERR_VERSION.rawValue): return klL("Protocol version mismatch: update both the Mac and the headset.", "Versión de protocolo distinta: actualiza el Mac y el visor.")
+        case Int32(KL_STREAM_ERR_BUSY.rawValue):    return klL("The Mac is already streaming to another headset.", "El Mac ya está transmitiendo a otro visor.")
+        case Int32(KL_STREAM_ERR_GUEST.rawValue):   return klL("The game could not start on the Mac.", "El juego no pudo arrancar en el Mac.")
+        default: return klL("Code \(status).", "Código \(status).")
         }
     }
 }
@@ -535,7 +539,7 @@ struct StreamPlayView: View {
     let onExit: () -> Void
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
-    @State private var phase = "Buscando el Mac…"
+    @State private var phase = klL("Looking for the Mac…", "Buscando el Mac…")
     @State private var stats = ""
     @State private var state: Int32 = -1
     @State private var failed = false
@@ -544,7 +548,7 @@ struct StreamPlayView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Jugar desde el Mac").font(.largeTitle.bold())
+                Text(klL("Play from Mac", "Jugar desde el Mac")).font(.largeTitle.bold())
                 Text(target.name).font(.title2).foregroundStyle(.secondary)
                 Spacer()
             }
@@ -560,13 +564,13 @@ struct StreamPlayView: View {
             Spacer()
             HStack {
                 Button(role: .destructive) { Task { await exit("disconnect") } } label: {
-                    Label(failed ? "Volver a la biblioteca" : "Desconectar",
+                    Label(failed ? klL("Back to library", "Volver a la biblioteca") : klL("Disconnect", "Desconectar"),
                           systemImage: failed ? "chevron.backward" : "xmark.circle")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(exiting)
                 Spacer()
-                Text("Se juega en el Mac; el visor muestra la imagen y envía la cabeza y los mandos.")
+                Text(klL("The game runs on the Mac; the headset shows it and sends your head, controllers and hands.", "Se juega en el Mac; el visor muestra la imagen y envía la cabeza, los mandos y las manos."))
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }
@@ -588,24 +592,24 @@ struct StreamPlayView: View {
         var host = target.host
         var port = target.port
         if host == nil, let ep = target.endpoint {
-            phase = "Buscando \(target.name) en la red…"
+            phase = klL("Looking for \(target.name) on the network…", "Buscando \(target.name) en la red…")
             if let r = await KLStreamResolver.resolve(ep) { host = r.0; port = r.1 }
         }
         guard let host else {
-            phase = "No se encuentra \(target.name) en la red."
+            phase = klL("Can't find \(target.name) on the network.", "No se encuentra \(target.name) en la red.")
             failed = true
             return
         }
         guard KLStreamSession.shared.start(name: target.name, host: host, port: port) else {
-            phase = "No se pudo abrir la conexión con \(host):\(port)."
+            phase = klL("Couldn't open a connection to \(host):\(port).", "No se pudo abrir la conexión con \(host):\(port).")
             failed = true
             return
         }
-        phase = "Conectando a \(target.name)…"
+        phase = klL("Connecting to \(target.name)…", "Conectando a \(target.name)…")
         let r = await openImmersiveSpace(id: Immersive.id)
         NSLog("[stream] openImmersiveSpace -> \(r)")
         if case .opened = r {} else {
-            phase = "No se pudo abrir el espacio inmersivo."
+            phase = klL("Couldn't open the immersive space.", "No se pudo abrir el espacio inmersivo.")
             failed = true
             KLStreamSession.shared.stop(reason: "no immersive space")
         }
@@ -620,17 +624,17 @@ struct StreamPlayView: View {
                     String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
                 }
                 switch Int32(s.state) {
-                case Int32(KL_STREAM_CLIENT_CONNECTING): phase = "Conectando a \(target.name)…"
-                case Int32(KL_STREAM_CLIENT_WAITING):    phase = "Conectado. Esperando la primera imagen…"
+                case Int32(KL_STREAM_CLIENT_CONNECTING): phase = klL("Connecting to \(target.name)…", "Conectando a \(target.name)…")
+                case Int32(KL_STREAM_CLIENT_WAITING):    phase = klL("Connected. Waiting for the first picture…", "Conectado. Esperando la primera imagen…")
                 case Int32(KL_STREAM_CLIENT_STREAMING):
-                    phase = String(format: "Jugando desde %@ — %.0f fps, %.0f ms pose→fotón",
+                    phase = String(format: klL("Playing from %@ — %.0f fps, %.0f ms pose→photon", "Jugando desde %@ — %.0f fps, %.0f ms pose→fotón"),
                                    target.name, s.video_fps, s.p2p_ms)
-                case Int32(KL_STREAM_CLIENT_NO_SIGNAL):  phase = "Sin señal del Mac"
+                case Int32(KL_STREAM_CLIENT_NO_SIGNAL):  phase = klL("No signal from the Mac", "Sin señal del Mac")
                 case Int32(KL_STREAM_CLIENT_REFUSED):
-                    phase = "\(target.name) rechazó la conexión: \(KLStreamSession.refusal(s.ack_status))"
+                    phase = klL("\(target.name) refused the connection: ", "\(target.name) rechazó la conexión: ") + KLStreamSession.refusal(s.ack_status)
                     failed = true
                 case Int32(KL_STREAM_CLIENT_ENDED):
-                    phase = "\(target.name) cerró la sesión."
+                    phase = klL("\(target.name) ended the session.", "\(target.name) cerró la sesión.")
                     if endedAt == nil { endedAt = Date() }
                 default: break
                 }
