@@ -429,6 +429,11 @@ int kl_app_configure(const char *resources, const char *container) {
         // its nasal strip undrawn — the timewarp swung it into view as a black
         // rectangle with a magenta edge (2026-10-08, device-confirmed).
         setenv("KL_OPENVR_SYM_PROJ", "1", 0);
+        // Controller velocities on, although M1 (KL_OPENVR_MINIMAL) turns them
+        // off: the gravity gloves' flick-to-pull reads the hand's velocity, and
+        // with zeros it never fires (device, 2026-10-11). The tremble they were
+        // dropped for was the Sense controllers being disconnected.
+        setenv("KL_OPENVR_HAND_VEL", "1", 0);
         // Steady 45 fps (half the panel) plus Glovebox's render convars: the
         // device test of 2026-10-11 had a median frame of 22.4 ms and peaked at
         // 4.6 GB, against an uneven 40-42 fps and ~7 GB before.
