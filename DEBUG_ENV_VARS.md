@@ -85,6 +85,14 @@ answers GL and kl_glfb never initializes.
   `[glfb] ANGLE GL_OVR_multiview2:`). The vendored Metal ANGLE does not, and
   advertising it anyway made IEYTD bake num_views shaders ANGLE refused.
 
+- `KL_GL_ES_VERSION=<major>.<minor>` — override the GLES level `GL_VERSION`,
+  the GLSL version and `GL_MAJOR/MINOR_VERSION` describe (`kl_egl.c`). Default
+  3.2 (deliberately overstated, see the comment there), 2.0 for Steam Link,
+  and **3.0 for ieytd**: at 3.1+ Unity 2019.4 skins every SkinnedMeshRenderer
+  with its internal compute shader, whose 16 kernels this ES 3.0 ANGLE refuses
+  ("GLSL compilation failed, no infolog provided" x16, then "Kernel at index
+  (11) is invalid" every frame) — so IEYTD's gloved hands were never drawn.
+
 - `KL_EGL_TRACE=1` — log every EGL entry point the guest actually REACHES, in
   order, with the interesting arguments. A census, not a diagnostic: it says
   nothing about what we answered. It exists because every EGL symbol binds at

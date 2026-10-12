@@ -290,6 +290,32 @@ void kl_egl_set_gles_version(int major, int minor) {
     g_es_major = major; g_es_minor = minor;
 }
 
+// KL_GL_ES_VERSION=<major>.<minor> overrides the described level, read once at
+// the guest's first version query.
+//
+// I Expect You To Die is told the truth, 3.0. At 3.1+ Unity 2019.4 takes its
+// COMPUTE skinning path for every SkinnedMeshRenderer: its internal skinning
+// shader's 16 kernels go to glCreateShader(GL_COMPUTE_SHADER), which this
+// ES 3.0 ANGLE refuses ("GLSL compilation failed, no infolog provided" x16),
+// every dispatch then fails ("Kernel at index (11) is invalid", ~1 a frame)
+// and the skinned meshes — the player's gloved hands — are never drawn. At 3.0
+// Unity skins without compute and the hands appear. The costs the 3.2 note
+// above prices (B10G11R11 and the distortion-window path) were measured absent
+// here: same multi-pass stereo, no new Unity error over a 3600-frame run.
+static void klgl_es_version_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *t = kl_driver_target_name();
+    if (t && strcmp(t, "ieytd") == 0) { g_es_major = 3; g_es_minor = 0; }
+    const char *e = getenv("KL_GL_ES_VERSION");
+    int a, b;
+    if (e && *e && sscanf(e, "%d.%d", &a, &b) == 2) {
+        g_es_major = a; g_es_minor = b;
+        fprintf(stderr, "  [gl] KL_GL_ES_VERSION: describing OpenGL ES %d.%d\n", a, b);
+    }
+}
+
 // The extensions advertised here. Naming one is a promise and a broken promise
 // fails far from its cause — but an EMPTY list is its own broken promise to a
 // guest that reads capabilities from the string instead of from the version.
@@ -429,6 +455,7 @@ static const char *klgl_identity(int renderer) {
 
 static const char *klgl_GetString(uint32_t name) {
     static char ver[64], glsl[64], exts[256];
+    klgl_es_version_init();
     switch (name) {
     // KL_GL_VENDOR / KL_GL_RENDERER: what the null driver says it is. Unreal
     // picks its Android device profile — and with it Vulkan or GLES — from the
@@ -574,6 +601,7 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
 // owns the dynamic state (READ_BUFFER & co.) this table never described.
 int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (!params) return 1;
+    klgl_es_version_init();
     if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }
     if (pname == GL_MINOR_VERSION) { params[0] = g_es_minor; return 1; }
     // Answered from the list rather than from the table below, for the same
