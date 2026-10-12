@@ -121,14 +121,57 @@ enum KLCatalog {
 
     static func metaStore(_ target: String) -> GameStore { GameStore(root: Paths.containerURL(for: target)) }
 
-    /// The voice-language packs this game needs from Meta (Batman ships its dialogue as one OBB
-    /// per language and asks the platform whether the one for its language is installed — and
-    /// offers to download it, which it cannot do here). The game's own language setting, else the
-    /// headset's languages, matched against the recipe's packs, plus en-US: fetched with the base
-    /// game and part of "installed". Empty for a recipe without packs.
-    static func metaVoiceLocales(_ target: String, _ recipe: Recipe) -> Set<String> {
+    /// The default voice-language packs (Batman ships its dialogue as one OBB per language and
+    /// asks the platform whether the one for its language is installed — and offers to download
+    /// it, which it cannot do here): the game's own language setting, else the headset's
+    /// languages, matched against the recipe's packs, plus en-US. Empty for a recipe without packs.
+    static func metaDefaultVoiceLocales(_ target: String, _ recipe: Recipe) -> Set<String> {
         let preferred = KLGameSettingsStore.language(for: target).locale.map { [$0] } ?? Locale.preferredLanguages
         return recipe.defaultVoiceLocales(preferred: preferred)
+    }
+
+    /// The pack for the player's language (the "recommended" one on the game's page): the default
+    /// pick without en-US, or en-US itself when that is the player's language.
+    static func metaRecommendedVoiceLocale(_ target: String, _ recipe: Recipe) -> String? {
+        let d = metaDefaultVoiceLocales(target, recipe)
+        return d.subtracting(["en-US"]).first ?? d.first
+    }
+
+    private static func voiceLocalesKey(_ target: String) -> String { "klepton.meta.voicePacks.\(target)" }
+
+    /// The packs this game is installed with: fetched with the base game, part of "installed",
+    /// and what "Download all" fetches. The player's own choice on the game's page ("Voice
+    /// languages") once there is one, else the defaults (metaDefaultVoiceLocales).
+    static func metaVoiceLocales(_ target: String, _ recipe: Recipe) -> Set<String> {
+        if let stored = UserDefaults.standard.stringArray(forKey: voiceLocalesKey(target)) {
+            return Set(stored).intersection(recipe.voiceLocales)
+        }
+        return metaDefaultVoiceLocales(target, recipe)
+    }
+
+    static func hasStoredMetaVoiceLocales(_ target: String) -> Bool {
+        UserDefaults.standard.stringArray(forKey: voiceLocalesKey(target)) != nil
+    }
+
+    /// Remember the packs chosen for this game (nil = back to the defaults).
+    static func setMetaVoiceLocales(_ locales: Set<String>?, for target: String) {
+        if let locales { UserDefaults.standard.set(locales.sorted(), forKey: voiceLocalesKey(target)) }
+        else { UserDefaults.standard.removeObject(forKey: voiceLocalesKey(target)) }
+    }
+
+    /// A voice pack's language, as the game's page names it.
+    static func voicePackName(_ locale: String) -> String {
+        switch locale {
+        case "de-DE": return klL("German", "Alemán")
+        case "en-US": return klL("English", "Inglés")
+        case "es-ES": return klL("Spanish (Spain)", "Español (España)")
+        case "es-419": return klL("Spanish (Latin America)", "Español (Latinoamérica)")
+        case "fr-FR": return klL("French", "Francés")
+        case "it-IT": return klL("Italian", "Italiano")
+        case "ja-JP": return klL("Japanese", "Japonés")
+        case "ko-KR": return klL("Korean", "Coreano")
+        default: return Locale.current.localizedString(forIdentifier: locale) ?? locale
+        }
     }
     #endif
 

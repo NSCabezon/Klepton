@@ -2096,6 +2096,21 @@ struct HubLibraryView: View {
             } else if case .working(_, let f?) = st {
                 ProgressView(value: f)
             }
+            #if canImport(MetaStore)
+            // The game asked for a voice pack this headset does not have (the runtime's note):
+            // to the game's page, where "Voice languages" downloads it.
+            if unavailable == nil, model.playBlock[g.target] == nil, let m = model.meta[g.target],
+               let req = m.requestedVoiceLocale, hasDownloadPage(g.target, .meta) {
+                let name = KLCatalog.voicePackName(req)
+                Button { detailStore = .meta; detail = g.target } label: {
+                    Label(klL("The game asked for the \(name) voice pack — download it here",
+                              "El juego pidió el paquete de voz \(name) — descárgalo aquí"),
+                          systemImage: "exclamationmark.bubble.fill")
+                        .font(.callout).lineLimit(2).multilineTextAlignment(.leading)
+                }
+                .buttonStyle(.plain).foregroundStyle(.orange)
+            }
+            #endif
             #if canImport(SteamDepot)
             if unavailable == nil, model.playBlock[g.target] == nil, let c = klCloudSaveCardLine(g.target) {
                 Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1).lineLimit(1)
