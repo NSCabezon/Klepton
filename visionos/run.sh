@@ -170,6 +170,9 @@ if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 if [ -n "${KL_SKIP_GUEST:-}" ]; then
   echo "  guest translations: reused (KL_SKIP_GUEST=1)"
 elif [ "$KLT_KIND" = hub ]; then
+  # KLT_GAMES is the games this build CARRIES (targets.py hub_games: KLEPTON_HUB_GAMES,
+  # minus any whose files are not on this Mac — it said which, and how to get them).
+  [ -n "$KLT_GAMES" ] || echo "  guest translations: none — the hub is library-only (no game's files here, or KLEPTON_HUB_GAMES=none)"
   for G in $KLT_GAMES; do KLEPTON_TARGET="$G" ./mkguest.sh | tail -1; done
 else
   ./mkguest.sh | tail -1
@@ -189,7 +192,19 @@ echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*V
 if [ "$KLT_KIND" != hub ] && [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
   echo "  keeping existing $PRODUCT.xcodeproj (KL_REGEN_XCODEPROJ=1 to regenerate)"
 else
-  python3 gen_xcodeproj.py | head -1
+  # A device build needs a signing team; the generator stops with the fix when none is found.
+  KL_REQUIRE_TEAM="$([ "$MODE" = device ] && echo 1 || true)" python3 gen_xcodeproj.py | head -1
+fi
+# An incremental build never deletes what an earlier one embedded: a hub game this build no
+# longer carries (KLEPTON_HUB_GAMES, or its files gone) would ride along, dead weight, in the
+# old .app's Frameworks/<game>/. Drop those folders (games only: frameworks are *.framework).
+if [ "$KLT_KIND" = hub ]; then
+  for D in build/dd-*-"$KLT_NAME"*/Build/Products/*/"$PRODUCT".app/Frameworks/*/; do
+    [ -d "$D" ] || continue
+    G="$(basename "$D")"
+    case "$G" in *.*) continue ;; esac
+    case " $KLT_GAMES " in *" $G "*) ;; *) rm -rf "$D" ;; esac
+  done
 fi
 
 if [ "$MODE" = "device" ]; then
