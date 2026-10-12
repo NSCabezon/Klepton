@@ -120,6 +120,16 @@ enum KLCatalog {
     }
 
     static func metaStore(_ target: String) -> GameStore { GameStore(root: Paths.containerURL(for: target)) }
+
+    /// The voice-language packs this game needs from Meta (Batman ships its dialogue as one OBB
+    /// per language and asks the platform whether the one for its language is installed — and
+    /// offers to download it, which it cannot do here). The game's own language setting, else the
+    /// headset's languages, matched against the recipe's packs, plus en-US: fetched with the base
+    /// game and part of "installed". Empty for a recipe without packs.
+    static func metaVoiceLocales(_ target: String, _ recipe: Recipe) -> Set<String> {
+        let preferred = KLGameSettingsStore.language(for: target).locale.map { [$0] } ?? Locale.preferredLanguages
+        return recipe.defaultVoiceLocales(preferred: preferred)
+    }
     #endif
 
     // MARK: Which store's data a game boots from
@@ -131,7 +141,7 @@ enum KLCatalog {
         if stores(target).contains(.steam), let d = SteamGames.descriptor(for: target), d.status().isComplete { out.append(.steam) }
         #endif
         #if canImport(MetaStore)
-        if let r = metaRecipe(target), metaStore(target).isComplete(r) { out.append(.meta) }
+        if let r = metaRecipe(target), metaStore(target).isComplete(r, locales: metaVoiceLocales(target, r)) { out.append(.meta) }
         #endif
         return out
     }
