@@ -2211,9 +2211,15 @@ struct HubLibraryView: View {
             VStack(alignment: .leading, spacing: 24) {
                 header
                 if model.bulk.hasReport { bulkReport }
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 24, alignment: .top)],
-                          alignment: .leading, spacing: 24) {
-                    ForEach(model.games) { g in card(g) }
+                let groups = librarySections
+                cardGrid(groups.main)
+                if !groups.notOwned.isEmpty {
+                    sectionHeader(klL("Not in your library", "No están en tu biblioteca"))
+                    cardGrid(groups.notOwned, dimmed: true)
+                }
+                if !groups.notInBuild.isEmpty {
+                    sectionHeader(klL("Not included in this build", "No incluidos en esta compilación"))
+                    cardGrid(groups.notInBuild, dimmed: true)
                 }
                 Label(klL("One game per session: when a game ends, AVP Game Hub closes. Open AVP Game Hub again "
                           + "to come back to this library and pick another game.",
@@ -2230,6 +2236,37 @@ struct HubLibraryView: View {
             if phase == .background { model.noteBackground() }
             if phase == .active { model.resumeAfterForeground() }
         }
+    }
+
+    /// The library in three groups, each A–Z by title: the games to play or download (and those
+    /// whose ownership is not known yet: a store not signed in or not answered), then the games
+    /// every store said the account does not own, then the games this build does not carry.
+    private var librarySections: (main: [KLHubGameRow], notOwned: [KLHubGameRow], notInBuild: [KLHubGameRow]) {
+        let sorted = model.games.sorted { $0.display.localizedStandardCompare($1.display) == .orderedAscending }
+        var main: [KLHubGameRow] = [], notOwned: [KLHubGameRow] = [], notInBuild: [KLHubGameRow] = []
+        for g in sorted {
+            if model.status(g) == .notInBuild { notInBuild.append(g) }
+            else if ownedNowhere(g) { notOwned.append(g) }
+            else { main.append(g) }
+        }
+        return (main, notOwned, notInBuild)
+    }
+
+    /// Every store this game comes from answered, and none owns it.
+    private func ownedNowhere(_ g: KLHubGameRow) -> Bool {
+        let stores = KLCatalog.stores(g.target)
+        return !stores.isEmpty && stores.allSatisfy { model.ownership(g, $0) == false }
+    }
+
+    private func cardGrid(_ games: [KLHubGameRow], dimmed: Bool = false) -> some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 20, alignment: .top)],
+                  alignment: .leading, spacing: 20) {
+            ForEach(games) { g in card(g, dimmed: dimmed) }
+        }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title).font(.title3.bold()).foregroundStyle(.secondary).padding(.top, 8)
     }
 
     // Two rows: the title with Settings, then status, accounts and actions. On one row the
@@ -2370,18 +2407,31 @@ struct HubLibraryView: View {
         }
     }
 
-    /// Every card has the same sections at the same FIXED heights (art at 460:215, title + store
-    /// pills, status, a two-line message slot, buttons, the "Play from Mac" row — reserved on every
-    /// card — and two footer lines), so a row of cards shares its top and height whatever each one
-    /// has to say; long text is truncated (the full text is on hover / in Settings).
-    private func card(_ g: KLHubGameRow) -> some View {
+    /// A card is as tall as what it has to say: art at 460:215, title + store pills, the status
+    /// with the actions beside it (under it when they don't fit), then only the rows that have
+    /// something — a message, download progress, "Play from Mac" / "Add-ons", the last session.
+    /// A row of cards still lines up: each card stretches to the tallest one in its row.
+    /// `dimmed`: a game the account does not own or this build does not carry — greyed, no Play
+    /// or Download (its settings stay under "…").
+    private func card(_ g: KLHubGameRow, dimmed: Bool = false) -> some View {
         let st = model.status(g)
         let active = model.activeStore(g)
         let unavailable = st == .notInLibrary ? model.unavailable(g) : nil
         let dl = canDownload(g, st, active) ? model.cardDownload(g) : .none
         let paused = dl == .paused
-        return VStack(alignment: .leading, spacing: 10) {
-            cover(g)
+        let statusText = unavailable?.title ?? (paused ? klL("Paused", "En pausa") : st.label)
+        let statusColor = unavailable != nil || paused ? Color.orange : st.color
+        let status = HStack(spacing: 6) {
+            Circle().fill(statusColor).frame(width: 8, height: 8)
+            Text(statusText).font(.callout).foregroundStyle(statusColor)
+                .monospacedDigit().lineLimit(1).truncationMode(.tail)
+        }
+        .help(statusText)
+        let streamable = Self.streamable(g)
+        let addons = hasAddons(g, active)
+        let lastSession = model.lastSession[g.target].map(HubSessionText.card)
+        return VStack(alignment: .leading, spacing: 8) {
+            cover(g).saturation(dimmed ? 0.15 : 1)
             HStack(spacing: 8) {
                 Text(g.display).font(.title3.bold()).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 4)
@@ -2390,57 +2440,58 @@ struct HubLibraryView: View {
                     storeBadge(store, owns: model.ownership(g, store), state: model.sourceState(g, store), active: store == active)
                 }
             }
-            .frame(height: Self.titleRowHeight)
-            HStack(spacing: 6) {
-                Circle().fill(unavailable != nil || paused ? Color.orange : st.color).frame(width: 8, height: 8)
-                Text(unavailable?.title ?? (paused ? klL("Paused", "En pausa") : st.label)).font(.callout)
-                    .foregroundStyle(unavailable != nil || paused ? Color.orange : st.color)
-                    .monospacedDigit().lineLimit(1)
-            }
-            .frame(height: Self.statusRowHeight)
-            messageSlot(g, st, dl, unavailable: unavailable)
-                .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48, alignment: .topLeading)
-                .clipped()
-            // Play and the download in place (no page in between: the download page is under "…"),
-            // then the card's menu.
-            HStack(spacing: 12) {
-                mainButtons(g, st, dl, active: active)
-                Spacer(minLength: 0)
-                cardMenu(g, st, active: active)
-            }
-            .frame(height: Self.buttonRowHeight)
-            // The second row, one row tall on every card so a row of cards still lines up: "Play
-            // from Mac" for a game the Mac can host, "Add-ons" for a game with optional content.
-            HStack(spacing: 12) {
-                if Self.streamable(g) { playFromMacButton(g) }
-                Spacer(minLength: 0)
-                if hasAddons(g, active) {
-                    Button { addonsFor = SheetTarget(id: g.target) } label: {
-                        Label("Add-ons", systemImage: "puzzlepiece.extension")
+            // Status and actions on one row when they fit; else the actions go under the status.
+            // Play and the download in place (the download page is under "…"), then the menu.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    status.fixedSize()
+                    Spacer(minLength: 8)
+                    if !dimmed { mainButtons(g, st, dl, active: active) }
+                    cardMenu(g, st, active: active)
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    status
+                    HStack(spacing: 10) {
+                        if !dimmed { mainButtons(g, st, dl, active: active) }
+                        Spacer(minLength: 0)
+                        cardMenu(g, st, active: active)
                     }
-                    .help(klL("Optional content: voice languages", "Contenido opcional: idiomas de voz"))
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: Self.buttonRowHeight, maxHeight: Self.buttonRowHeight, alignment: .leading)
+            messageSlot(g, st, dl, unavailable: unavailable)
+            // "Play from Mac" for a game the Mac can host, "Add-ons" for a game with optional
+            // content — only on the cards that have one.
+            if streamable || addons {
+                HStack(spacing: 12) {
+                    if streamable { playFromMacButton(g) }
+                    Spacer(minLength: 0)
+                    if addons {
+                        Button { addonsFor = SheetTarget(id: g.target) } label: {
+                            Label("Add-ons", systemImage: "puzzlepiece.extension")
+                        }
+                        .help(klL("Optional content: voice languages", "Contenido opcional: idiomas de voz"))
+                    }
+                }
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(HubGameSettingsView.summary(g.target)).lineLimit(1)
-                // Always two lines tall, with or without a last session.
-                Text(model.lastSession[g.target].map(HubSessionText.card) ?? " ").lineLimit(1).monospacedDigit()
+                if let lastSession { Text(lastSession).lineLimit(1).monospacedDigit() }
             }
             .font(.caption).foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .padding(16)
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
-        .opacity(st == .notInLibrary ? 0.7 : 1)
+        .opacity(dimmed ? 0.6 : 1)
     }
 
     /// The card's variable part, at most two short lines: why Play was refused, a check or
     /// preparation in progress, why the game can't be installed, download progress, cloud saves.
     @ViewBuilder private func messageSlot(_ g: KLHubGameRow, _ st: HubLibraryModel.Status, _ dl: HubLibraryModel.CardDownload,
                                           unavailable: (title: String, detail: String?)?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        // A Group, not a stack: its rows join the card's own, and with none it takes no room.
+        Group {
             if let why = model.playBlock[g.target] {
                 Label(why, systemImage: "xmark.octagon").font(.callout).foregroundStyle(.red)
                     .lineLimit(2).help(why)
@@ -2496,10 +2547,6 @@ struct HubLibraryView: View {
             }
         }
     }
-
-    static let titleRowHeight: CGFloat = 30
-    static let statusRowHeight: CGFloat = 22
-    static let buttonRowHeight: CGFloat = 44
 
     /// A plain text pill per store (no logo artwork): Steam slate blue, Meta bright blue. Owned =
     /// highlighted, even when this port can't install that store's build (the card says so);
