@@ -151,6 +151,78 @@ TARGETS = {
         "product": "KleptonSuperhot",
         "display": "SUPERHOT",
     },
+    "ieytd": {
+        # I Expect You To Die (Schell Games), Quest build 1.2.174682
+        # (com.schellgames.ieytdquest, versionCode 74682). Unity 2019.4.21f1 +
+        # IL2CPP on the LEGACY built-in VR path: boot.config says
+        # `vr-enabled=1` / `vr-device-list=Oculus`, with no xrsdk-pre-init line,
+        # so Unity drives libOVRPlugin + libvrapi itself (Beat Saber 1.6's shape,
+        # not 1.40's OculusXRPlugin). All three Oculus libraries are REPLACED
+        # (kl_ovrp / kl_ovrplat); what is translated is the title's own set:
+        # libAudioPluginOculusSpatializer, libOVRLipSync and
+        # libovravatarloader beside libmain/libunity/libil2cpp.
+        #
+        # Not a split binary: no OBB, everything is in the 533 MB APK.
+        #
+        # Measured on the Mac host (2026-10-08):
+        #  - `--gap` and the boot gate were clean on the first run: libmain +
+        #     libunity bind with 0 unresolved, JNI_OnLoad and initJni reach
+        #     no unimplemented call, and 600 null-driver frames pump clean.
+        #     The spatializer, OVRLipSync and the avatar loader translate like
+        #     any guest library; the spatializer is loaded at boot, the other
+        #     two are never dlopened before the first room, so nothing of
+        #     theirs had to be stubbed. Entitlement: kl_ovrplat's existing
+        #     answer for the app's own check (`_entitlementCheckPassed` = 1).
+        #  - Black at full frame rate twice over, for two different reasons:
+        #     (1) GL_OVR_multiview was offered by name to "ieytd*" but the
+        #     vendored Metal ANGLE cannot compile it — now withheld unless
+        #     ANGLE exposes it, and Unity takes multi-pass stereo; (2) the game
+        #     never selects FloorLevel, so it runs on OVRPlugin's EyeLevel
+        #     origin, and the floor-frame head put its calibration panel 1.7 m
+        #     below the view — now anchored (KL_OVRP_EYELEVEL, and a real
+        #     ovrp_RecenterTrackingOrigin, which the calibration calls).
+        #  - First boot shows the seated calibration ("hold any button"), then
+        #     the language-select room. Spanish because the host locale is
+        #     es_ES. Unity 2019.4's texture-unit cap of 32 rejected ~100 binds
+        #     a frame there (black slabs, blank labels); this build's offsets
+        #     are measured and the raise to 64 is on (kl_guestpoke.c).
+        # Measured on the Mac host (2026-10-12):
+        #  - The 16 "GLSL compilation failed, no infolog" were Unity's compute
+        #     SKINNING kernels (we described ES 3.2; ANGLE/Metal is ES 3.0 and
+        #     has no compute), and every SkinnedMeshRenderer — the gloved hands
+        #     — went undrawn. ieytd is now told ES 3.0 (kl_egl.c), the kernels
+        #     are never built and the hands draw.
+        #  - Recenter now also takes out the head's yaw for this EyeLevel guest.
+        #  - A headless run plays through: calibration, language room ("Done"),
+        #     intro, the office tutorial (18 steps: leaning, radio button,
+        #     note + lighter, telekinesis, freezing three targets, the spy
+        #     gun, the drawer, the mission disc) and Start, into the first
+        #     mission (GameManager LevelState, the Car scene) — driven by
+        #     KL_OVRP_POKE + KL_OVRP_HAND_SCRIPT + KL_PROBE_* (DEBUG_ENV_VARS.md);
+        #     the script itself is AlyxAVP/local/ieytd/scripts/tutorial.sh, not in
+        #     this repo. Headless M1 Max: ~57 fps in the office, ~28 in the car.
+        "libs":    None,
+        "srcdir":  "ieytd/lib/arm64-v8a",
+        "tree":    "ieytd",
+        "apk":     "ieytd.apk",
+        "assets":  "ieytd/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonIEYTD",
+        "display": "I Expect You To Die",
+        # The game draws its own gloved hands where the user's are, so the
+        # system's matte of the real arms would be a second pair (beatsaber128).
+        "hand_matting": False,
+        # Default for an M2, not yet measured on the headset: Unity 2019 GLES
+        # through ANGLE/Metal with multi-pass stereo (each eye drawn twice
+        # over). On the Mac host (M1 Max, 1832x1920 per eye, with PNG capture
+        # on) the office ran ~55-60 fps but the first level (the car) ~28.
+        # 0.7 is half the pixels, Batman's value; the in-app "Render
+        # resolution" slider starts here and can go up if the headset allows.
+        "render_scale": 0.7,
+    },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
         # com.MightyCoconut.WalkaboutMiniGolf — Unity + IL2CPP through the stock
@@ -1029,6 +1101,11 @@ TARGETS = {
             # to android-files/obb/ — the row's obb_raw layout, as the game reads
             # them by name. Voice packs are opt-in (MetaStore recipe `locale`).
             "batman",
+            # I Expect You To Die 1.2.174682 (com.schellgames.ieytdquest 74682),
+            # Meta's store only (app 1987283631365460): one 533 MB APK, no OBB,
+            # to games/ieytd/meta/IEYTD.apk; the hub derives ieytd.apk and
+            # ieytd/assets from it (Sources/KleptonHubPrep.swift).
+            "ieytd",
             # Metro Awakening, the Steam Frame build (app 2669410, Android depot
             # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
             # chunk OBBs, 19.2 GB). The depot lands straight in the OBB
