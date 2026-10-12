@@ -8118,6 +8118,90 @@ static void klfb_Disable(uint32_t cap) {
     if (g_real_Disable) g_real_Disable(cap);
 }
 
+// ---- the indexed (per-draw-buffer) state family, on an ES 3.0 backend -------
+//
+// glColorMaski / glEnablei / glDisablei / glBlendFunc[Separate]i /
+// glBlendEquation[Separate]i are ES 3.2 (EXT_draw_buffers_indexed). kl_egl.c
+// describes the gateway as ES 3.2, so UE4 uses them; ANGLE's Metal context is
+// ES 3.0 and rejects every one with GL_INVALID_OPERATION. UE4 never checks, so
+// a colour mask it believes it wrote is simply not there, and a frame drawn
+// with the previous mask can be entirely black. An error scan named the five
+// that fire every frame on a UE4 title: glColorMaski, glEnablei, glDisablei,
+// glBlendFuncSeparatei and glBlendEquationSeparatei.
+//
+// For draw buffer 0 the indexed call means exactly what the unindexed one
+// means, and buffer 0 is what these targets have. So index 0 is served by the
+// ES 3.0 entry point and any other index is reported and dropped — which is
+// what ANGLE was doing anyway, silently.
+//
+// glEnablei/glDisablei go through klfb_Enable/klfb_Disable, so they read the
+// very pointers the thunk table fills for glEnable/glDisable. There is
+// deliberately no second "real glEnable" pointer here: one that the table did
+// not fill would turn every glEnable in the process into a silent no-op for a
+// guest that never resolves an indexed form first.
+static void (*g_real_ColorMask)(uint8_t, uint8_t, uint8_t, uint8_t);
+static void (*g_real_BlendFuncSeparate)(uint32_t, uint32_t, uint32_t, uint32_t);
+static void (*g_real_BlendEquationSeparate)(uint32_t, uint32_t);
+// The thunk table stores ANGLE's pointer unconditionally; these slots exist for
+// that and are never called (ANGLE rejects every one of them).
+static void *g_real_ColorMaski_, *g_real_ColorMaskiEXT_;
+static void *g_real_Enablei_, *g_real_EnableiEXT_;
+static void *g_real_Disablei_, *g_real_DisableiEXT_;
+static void *g_real_BlendFuncSeparatei_, *g_real_BlendFuncSeparateiEXT_;
+static void *g_real_BlendFunci_, *g_real_BlendFunciEXT_;
+static void *g_real_BlendEquationSeparatei_, *g_real_BlendEquationSeparateiEXT_;
+static void *g_real_BlendEquationi_, *g_real_BlendEquationiEXT_;
+static void klfb_indexed_resolve(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    g_real_ColorMask             = asym("glColorMask");
+    g_real_BlendFuncSeparate     = asym("glBlendFuncSeparate");
+    g_real_BlendEquationSeparate = asym("glBlendEquationSeparate");
+    // Only a fallback: a guest that resolved glEnable has these from the table.
+    if (!g_real_Enable)  g_real_Enable  = asym("glEnable");
+    if (!g_real_Disable) g_real_Disable = asym("glDisable");
+}
+static void klfb_indexed_drop(const char *what, uint32_t buf) {
+    static int said;
+    if (said++ < 4)
+        fprintf(stderr, "  [glfb] %s(draw buffer %u) dropped — ES 3.0 has no "
+                        "per-draw-buffer state and this target has one buffer\n",
+                what, buf);
+}
+static void klfb_ColorMaski(uint32_t buf, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glColorMaski", buf); return; }
+    if (g_real_ColorMask) g_real_ColorMask(r, g, b, a);
+}
+static void klfb_Enablei(uint32_t cap, uint32_t buf) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glEnablei", buf); return; }
+    klfb_Enable(cap);
+}
+static void klfb_Disablei(uint32_t cap, uint32_t buf) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glDisablei", buf); return; }
+    klfb_Disable(cap);
+}
+static void klfb_BlendFuncSeparatei(uint32_t buf, uint32_t sr, uint32_t dr,
+                                    uint32_t sa, uint32_t da) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glBlendFuncSeparatei", buf); return; }
+    if (g_real_BlendFuncSeparate) g_real_BlendFuncSeparate(sr, dr, sa, da);
+}
+static void klfb_BlendFunci(uint32_t buf, uint32_t src, uint32_t dst) {
+    klfb_BlendFuncSeparatei(buf, src, dst, src, dst);
+}
+static void klfb_BlendEquationSeparatei(uint32_t buf, uint32_t rgb, uint32_t alpha) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glBlendEquationSeparatei", buf); return; }
+    if (g_real_BlendEquationSeparate) g_real_BlendEquationSeparate(rgb, alpha);
+}
+static void klfb_BlendEquationi(uint32_t buf, uint32_t mode) {
+    klfb_BlendEquationSeparatei(buf, mode, mode);
+}
+
 static void (*g_real_GenerateMipmap)(uint32_t);
 static void klfb_GenerateMipmap(uint32_t t) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -8129,6 +8213,21 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glActiveTexture", (void *)klfb_ActiveTexture, (void **)&g_real_ActiveTexture},
     {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
     {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
+    // the indexed per-draw-buffer state family, served for draw buffer 0
+    {"glColorMaski", (void *)klfb_ColorMaski, (void **)&g_real_ColorMaski_},
+    {"glColorMaskiEXT", (void *)klfb_ColorMaski, (void **)&g_real_ColorMaskiEXT_},
+    {"glEnablei", (void *)klfb_Enablei, (void **)&g_real_Enablei_},
+    {"glEnableiEXT", (void *)klfb_Enablei, (void **)&g_real_EnableiEXT_},
+    {"glDisablei", (void *)klfb_Disablei, (void **)&g_real_Disablei_},
+    {"glDisableiEXT", (void *)klfb_Disablei, (void **)&g_real_DisableiEXT_},
+    {"glBlendFuncSeparatei", (void *)klfb_BlendFuncSeparatei, (void **)&g_real_BlendFuncSeparatei_},
+    {"glBlendFuncSeparateiEXT", (void *)klfb_BlendFuncSeparatei, (void **)&g_real_BlendFuncSeparateiEXT_},
+    {"glBlendFunci", (void *)klfb_BlendFunci, (void **)&g_real_BlendFunci_},
+    {"glBlendFunciEXT", (void *)klfb_BlendFunci, (void **)&g_real_BlendFunciEXT_},
+    {"glBlendEquationSeparatei", (void *)klfb_BlendEquationSeparatei, (void **)&g_real_BlendEquationSeparatei_},
+    {"glBlendEquationSeparateiEXT", (void *)klfb_BlendEquationSeparatei, (void **)&g_real_BlendEquationSeparateiEXT_},
+    {"glBlendEquationi", (void *)klfb_BlendEquationi, (void **)&g_real_BlendEquationi_},
+    {"glBlendEquationiEXT", (void *)klfb_BlendEquationi, (void **)&g_real_BlendEquationiEXT_},
     {"glTexBuffer",      (void *)klfb_TexBuffer,      (void **)&g_real_TexBuffer},
     {"glTexBufferRange", (void *)klfb_TexBufferRange, (void **)&g_real_TexBufferRange},
     {"glTexBufferEXT",   (void *)klfb_TexBuffer,      (void **)&g_real_TexBuffer},
