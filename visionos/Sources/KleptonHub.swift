@@ -47,6 +47,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// targets.py's "foveation" for this game: what "Foveated rendering" means
     /// until the player changes it (KLRenderPrefs).
     let foveation: Bool
+    /// targets.py's "gl_foveation": false for a Vulkan guest, where the
+    /// "Foveated rendering" setting has nothing to act on.
+    let glFoveation: Bool
     /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
     /// for a guest that has none). Written beside <tree>/assets by HubPrep.
     let meta: [String: String]
@@ -1366,15 +1369,18 @@ struct HubGameSettingsView: View {
             // Alyx foveates through MoltenVK (KL_FOVEATE, "Foveated rendering" under
             // Performance above); this one is the OpenGL guests' rate map (KL_VRR).
             if !KLGameSettingsStore.hasPerformance(t) {
+                let glFov = KLRenderPrefs.glFoveation(for: t)
                 HStack {
                     Toggle(klL("Foveated rendering", "Renderizado foveado"), isOn: Binding(
                         get: { fovChoice ?? dFov },
                         set: { fovChoice = $0; KLRenderPrefs.setFoveation($0, for: t) }))
-                    resetButton(disabled: fovChoice == nil) {
+                        .disabled(!glFov)
+                    resetButton(disabled: fovChoice == nil || !glFov) {
                         fovChoice = nil; KLRenderPrefs.setFoveation(nil, for: t)
                     }
                 }
-                Text(klL("Default: \(onOff(dFov))", "Por defecto: \(onOff(dFov))"))
+                Text(glFov ? klL("Default: \(onOff(dFov))", "Por defecto: \(onOff(dFov))")
+                           : klL("Not available in this game", "Deshabilitado en este juego"))
                     .font(.footnote).foregroundStyle(.secondary)
             }
             HStack {
