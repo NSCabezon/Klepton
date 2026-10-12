@@ -696,10 +696,153 @@ static int turned_off(const char *name) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// unity-texunit-mask: FOUND, not measured — the one row in this file that is.
+//
+// Unity's GLES backend caps texture units at min(GL_MAX_COMBINED_TEXTURE_IMAGE_
+// UNITS, 32) and sizes its GL state cache to that (bound name and target per
+// unit, 32 words each), while HLSLCC bakes sampler units ABOVE 31 into shaders
+// that carry many uniforms: a sampler's unit is its explicit location, and the
+// samplers come after everything else. Unity refuses those binds ("OpenGL
+// Error: Invalid texture unit!") and the sampler reads whatever unit 0 left
+// behind: black surfaces, tofu text. Raising the cap (kl_guestpoke.c) lets the
+// binds through and overruns the cache — Iron Rebellion bound draw framebuffer
+// 0xffffffff for it. Measured on six titles from 2019.1 to 2022.3.
+//
+// Every program's sampler units are ONE contiguous block (they are its last
+// locations), so `unit & 31` is collision-free inside any program. Applied at
+// both ends it keeps every unit under 32: here, in the function that owns the
+// reject — `mov wU, wArg` -> `and wU, wArg, #31` on its way in, before the cap
+// check and every cache write — and in kl_glfb's glUniform1i for sampler-typed
+// uniforms, which asks kl_gp_texunit_state() whether THIS image carries it.
+//
+// The same shape in every build measured (the rows in kl_guestpoke.c): the
+// error string, one adrp+add that loads it, a `cmp wCap, wU` / `b.ls` into
+// that block, and a `mov wU, w<arg>` earlier in the function. Anything else is
+// refused by name and the image is left alone. KL_GUEST_PATCH_OFF=
+// unity-texunit-mask turns it off.
+
+static const char k_texunit_msg[] = "OpenGL Error: Invalid texture unit!";
+
+static int gp_byte(kl_gp_at at, void *ctx, uint64_t va, uint8_t *out) {
+    uint32_t *w = at(ctx, va & ~3ull);
+    if (!w) return 0;
+    *out = (uint8_t)(*w >> (8 * (va & 3)));
+    return 1;
+}
+
+// The guard, located: where the unit register is defined, and what is there
+// now. 0 = not this shape (or no string), 1 = the original `mov`, 2 = already
+// masked. *def_va and *orig receive the site and the word to restore it to.
+static int texunit_find(kl_gp_at at, void *ctx, uint64_t *def_va, uint32_t *mov_word,
+                        uint32_t *and_word, const char **why) {
+    // 1. the string. It sits in the first LOAD with the code, which starts at 0.
+    const size_t n = sizeof k_texunit_msg;           // with the NUL: a whole string
+    uint64_t str = 0; int found = 0;
+    for (uint64_t va = 0; at(ctx, va & ~3ull); va++) {
+        size_t k = 0; uint8_t b;
+        while (k < n && gp_byte(at, ctx, va + k, &b) && b == (uint8_t)k_texunit_msg[k]) k++;
+        if (k == n) { str = va; found = 1; break; }
+    }
+    if (!found) { *why = "no \"Invalid texture unit\" string"; return 0; }
+
+    // 2. its one reference: add xD, xS, #lo12 with adrp xS, page a few words back.
+    uint64_t ref = 0;
+    for (uint64_t va = 0; at(ctx, va); va += 4) {
+        uint32_t w = *at(ctx, va);
+        if ((w & 0xFFC00000u) != 0x91000000u) continue;              // add x, x, #imm
+        if (((w >> 10) & 0xfff) != (str & 0xfff)) continue;
+        unsigned rn = (w >> 5) & 31;
+        for (int back = 1; back <= 8 && va >= (uint64_t)back * 4; back++) {
+            uint32_t *pw = at(ctx, va - back * 4);
+            if (!pw || (*pw & 0x9F000000u) != 0x90000000u || (*pw & 31) != rn) continue;
+            int64_t imm = (int64_t)((((*pw >> 5) & 0x7FFFF) << 2) | ((*pw >> 29) & 3));
+            if (imm & (1ll << 20)) imm -= (1ll << 21);
+            if ((((va - back * 4) & ~0xfffull) + (uint64_t)(imm << 12)) == (str & ~0xfffull)) {
+                ref = va; break;
+            }
+        }
+        if (ref) break;
+    }
+    if (!ref) { *why = "no adrp+add of the string"; return 0; }
+
+    // 3. the guard: a b.ls landing just before the reference, and the cmp before it.
+    uint64_t cmp_va = 0; unsigned unit = 32;
+    for (uint64_t va = ref; va >= 4 && ref - va < 4096; va -= 4) {
+        uint32_t *pw = at(ctx, va);
+        if (!pw) break;
+        uint32_t w = *pw;
+        if ((w & 0xFF000010u) != 0x54000000u || (w & 0xf) != 0x9) continue;   // b.ls
+        int64_t off = (int64_t)((w >> 5) & 0x7FFFF);
+        if (off & (1ll << 18)) off -= (1ll << 19);
+        uint64_t tgt = va + (uint64_t)(off * 4);
+        if (tgt > ref || ref - tgt > 64) continue;
+        uint32_t *pc = at(ctx, va - 4);
+        if (!pc || (*pc & 0xFFE0FC1Fu) != 0x6B00001Fu) continue;         // cmp wN, wM
+        cmp_va = va - 4; unit = (*pc >> 16) & 31;
+        break;
+    }
+    if (!cmp_va) { *why = "no cmp/b.ls guard into the reject"; return 0; }
+
+    // 4. where the unit register was set. Nothing between there and the cmp
+    //    may name it as a destination (low five bits) — conservative, so a
+    //    store through it refuses too, which is the safe direction.
+    for (uint64_t va = cmp_va - 4; cmp_va - va <= 64 * 4; va -= 4) {
+        uint32_t *pw = at(ctx, va);
+        if (!pw) break;
+        uint32_t w = *pw;
+        if (w == 0xd65f03c0u) break;                                       // ret: left the function
+        if ((w & 0xFFE0FFE0u) == 0x2A0003E0u && (w & 31) == unit) {      // mov wU, wM
+            unsigned src = (w >> 16) & 31;
+            if (src > 7) { *why = "the unit is not moved from an argument"; return 0; }
+            *def_va = va; *mov_word = w;
+            *and_word = 0x12001000u | (src << 5) | unit;                  // and wU, wM, #31
+            return 1;
+        }
+        if ((w & 0xFFFFFC00u) == 0x12001000u && (w & 31) == unit) {      // and wU, wM, #31
+            unsigned src = (w >> 5) & 31;
+            *def_va = va; *and_word = w;
+            *mov_word = 0x2A0003E0u | (src << 16) | unit;
+            return 2;
+        }
+        if ((w & 31) == unit) { *why = "the unit register is written between its "
+                                       "definition and the cap check"; return 0; }
+        if (va < 4) break;
+    }
+    *why = "no `mov wU, w<arg>` before the cap check";
+    return 0;
+}
+
+int kl_gp_texunit_state(kl_gp_at at, void *ctx) {
+    uint64_t def; uint32_t mov, and_; const char *why = NULL;
+    return texunit_find(at, ctx, &def, &mov, &and_, &why);
+}
+
+static unsigned texunit_apply(const char *base, kl_gp_at at, void *ctx) {
+    if (turned_off("unity-texunit-mask")) {
+        fprintf(stderr, "  [patch] unity-texunit-mask: OFF (KL_GUEST_PATCH_OFF)\n");
+        return 0;
+    }
+    uint64_t def = 0; uint32_t mov = 0, and_ = 0; const char *why = "?";
+    int st = texunit_find(at, ctx, &def, &mov, &and_, &why);
+    if (st == 0) {
+        fprintf(stderr, "  [patch] unity-texunit-mask: SKIPPED — %s in %s; the image "
+                        "is untouched\n", why, base);
+        return 0;
+    }
+    if (st == 2) return 0;                         // a second pass over one image
+    *at(ctx, def) = and_;
+    fprintf(stderr, "  [patch] unity-texunit-mask: applied to %s — texture units are "
+                    "taken & 31 at the bind (0x%llx: 0x%08x -> 0x%08x)\n",
+            base, (unsigned long long)def, mov, and_);
+    return 1;
+}
+
 unsigned kl_guest_patch_apply(const char *path, kl_gp_at at, void *ctx) {
     if (!kl_env_on("KL_GUEST_PATCH", 1)) return 0;
     const char *base = basename_of(path);
     unsigned applied = 0;
+    if (strcmp(base, "libunity.so") == 0) applied += texunit_apply(base, at, ctx);
 
     for (size_t i = 0; i < KL_GP_N; i++) {
         const kl_gp_patch *p = &k_patches[i];
