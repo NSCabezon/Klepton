@@ -570,6 +570,16 @@ static int klovrp_GetSystemRecommendedMSAALevel(void) {
     return (int)kl_env_int("KL_OVRP_MSAA", 4);
 }
 
+// ovrp_GetSystemHeadphonesPresent: OVRP_1_1_0, no arguments, the ovrpBool
+// DIRECTLY. On a Quest it says whether something is in the 3.5 mm jack; a
+// Vision Pro has none, and its audio pods are the built-in speakers a Quest's
+// answer of false describes. Battle Sister (x3231001163584154) asks during
+// startup and aborted here on the unimplemented entry point.
+static int klovrp_GetSystemHeadphonesPresent(void) {
+    ovrp_hit("ovrp_GetSystemHeadphonesPresent");
+    return 0;
+}
+
 static uint64_t klovrp_GetSystemRecommendedMSAALevel2(int *out) {
     ovrp_hit("ovrp_GetSystemRecommendedMSAALevel2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
@@ -8383,6 +8393,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetAppShouldRecreateDistortionWindow2",
      (void *)klovrp_GetAppShouldRecreateDistortionWindow2},
     {"ovrp_GetSystemRecommendedMSAALevel", (void *)klovrp_GetSystemRecommendedMSAALevel},
+    {"ovrp_GetSystemHeadphonesPresent", (void *)klovrp_GetSystemHeadphonesPresent},
     {"ovrp_GetSystemRecommendedMSAALevel2", (void *)klovrp_GetSystemRecommendedMSAALevel2},
     {"ovrp_GetGPUFrameTime",   (void *)klovrp_GetGPUFrameTime},
     {"ovrp_InitializeMixedReality", (void *)klovrp_InitializeMixedReality},

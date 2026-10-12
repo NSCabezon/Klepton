@@ -2172,6 +2172,9 @@ static const char *const g_plat_request[] = {
     "ovr_User_GetOrgScopedID",
     "ovr_User_LaunchFriendRequestFlow",
     "ovr_User_GetLoggedInUserManagedInfo",
+    // Pending room invites for that user — the same social graph. Battle
+    // Sister asks at its title screen (2026-10-12).
+    "ovr_Notification_GetRoomInvites",
 };
 
 // Whole families where EVERY entry point is request-returning, so the same
