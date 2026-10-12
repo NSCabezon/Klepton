@@ -48,7 +48,7 @@
 #                                       #   ASC_KEY_ID / ASC_ISSUER_ID + the app record)
 #                                       #   Version: KLEPTON_APP_VERSION (0.1.0);
 #                                       #   build: KLEPTON_APP_BUILD (YYYYMMDD.HHMM)
-#   ./build_run_vpro.sh hub             # the HUB: one app (com.example.MyAeroClub)
+#   ./build_run_vpro.sh hub             # the HUB: one app (com.example.avpgamehub)
 #                                       #   with every game in targets.py's hub list
 #                                       #   and an in-app library; KL_HUB_GAME=alyx
 #                                       #   boots that game instead of the library

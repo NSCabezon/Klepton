@@ -1184,7 +1184,7 @@ TARGETS = {
             # ownership is the real account's through the Steam bridge.
             "metro",
         ],
-        "bundle_id": "com.example.MyAeroClub",
+        "bundle_id": "com.example.avpgamehub",
         "product": "KleptonHub",
         # The Home View name and what Siri calls the app in its phrases
         # ("Activa el visor de FPS en AVP Game Hub", KleptonIntents.swift). Siri also

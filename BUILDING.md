@@ -186,13 +186,13 @@ makes the folders):
 
 ```bash
 xcrun devicectl device copy to --device <udid> \
-  --domain-type appDataContainer --domain-identifier com.example.MyAeroClub \
+  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
   --source alyx.foz --destination Documents/games/alyx/klfz/alyx.foz
 # optional, only for the very first launch: the Mac's record of the game's device.
 # The headset writes its own there on every launch with the setting on, and the
 # prewarm needs one; without it that launch replays on the game's own device.
 xcrun devicectl device copy to --device <udid> \
-  --domain-type appDataContainer --domain-identifier com.example.MyAeroClub \
+  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
   --source device-info.json --destination Documents/games/alyx/klfz/device-info.json
 ```
 
