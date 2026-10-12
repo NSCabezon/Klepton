@@ -1482,17 +1482,18 @@ def resolve(name):
         t.setdefault(k, "")
     t["data_panel"] = "obb_file" in TARGETS[name]
     if t["kind"] == "hub":
-        # Space-separated for the shells (`targets.py hub games`); the generator
-        # reads hub_games() for the list itself.
-        t["games"] = " ".join(t["games"])
+        # Space-separated for the shells (`targets.py hub games`): the games THIS
+        # build carries (hub_games: the KLEPTON_HUB_GAMES subset, minus any whose
+        # inputs are missing). The generator reads hub_games() for the list itself.
+        t["games"] = " ".join(hub_games(name))
         return t
     if t["libs"] is None:
         t["libs"] = glibc_libs_for(name) if t["kind"] == "glibc" else libs_for(t["srcdir"])
     return t
 
 
-def hub_games(name):
-    """The games a hub row carries, each validated as a real guest row."""
+def hub_games_all(name):
+    """Every game a hub row lists, in library order, each validated as a real guest row."""
     games = list(TARGETS[name].get("games", []))
     for g in games:
         if g not in TARGETS or TARGETS[g]["kind"] == "hub":
@@ -1502,6 +1503,109 @@ def hub_games(name):
         print(f"!! hub {name!r} lists no games", file=sys.stderr)
         sys.exit(1)
     return games
+
+
+# What a hub build needs ON THIS MAC per game, and how to get it when it is not
+# there. The game DATA is never needed here (the headset downloads it); the
+# game's CODE is, because its libraries are translated at build time:
+#
+#  - an APK game: its decoded tree, <tree>/lib/arm64-v8a/*.so (apktool d);
+#  - a glibc game (alyx): the --gap manifest build/<name>_images.txt and every
+#    library it names (the depot's bin/ and the Steam Linux Runtime sysroot).
+#
+# A game whose inputs are missing is LEFT OUT of the build rather than stopping
+# it: the hub still lists it, as "not in this build" (the manifest's `bundled:`
+# flag), so a build with only some games — or none — still installs and runs.
+HUB_INPUT_HINTS = {
+    "alyx": "download Half-Life: Alyx's Linux arm64 depot (546564) into local/game/bin and the "
+            "Steam Linux Runtime 4 arm64 into local/game/steamrt4-arm64, then run "
+            "`./build_run_host.sh alyx --gap` (docs/GUIDE.md, \"Getting each game's files\")",
+}
+_HUB_APK_HINT = ("get its APK ({apk}) and decode it: `apktool d -f -o {tree} {apk}` in klepton/ "
+                 "(docs/GUIDE.md, \"Getting each game's files\")")
+
+
+def hub_game_missing(g):
+    """What game `g` lacks for a hub build on this Mac ("" = nothing: it can be built in)."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    t = TARGETS[g]
+    if t["kind"] == "glibc":
+        path = glibc_manifest(g)
+        try:
+            with open(path) as f:
+                rows = [l.rstrip("\n").split("\t") for l in f if l.strip()]
+        except OSError:
+            rows = []
+        if not rows:
+            return f"no {os.path.relpath(path, root)} (the --gap image list)"
+        gone = [r[1] for r in rows if len(r) < 2 or not os.path.isfile(r[1])]
+        if gone:
+            return (f"{len(gone)} of the {len(rows)} libraries build/{g}_images.txt names are "
+                    f"not on this Mac (first: {gone[0]})")
+        return ""
+    libdir = os.path.join(root, t["srcdir"])
+    try:
+        has_so = any(n.endswith(".so") for n in os.listdir(libdir))
+    except OSError:
+        return f"no {t['srcdir']}/ (the decoded APK)"
+    return "" if has_so else f"no .so files in {t['srcdir']}/"
+
+
+def hub_game_hint(g):
+    t = TARGETS[g]
+    return HUB_INPUT_HINTS.get(g) or _HUB_APK_HINT.format(apk=t["apk"], tree=t["tree"])
+
+
+def hub_games(name, quiet=False):
+    """The games THIS build of hub `name` carries: KLEPTON_HUB_GAMES (comma- or
+    space-separated; "none" = no game, a library-only hub) narrows the row's list,
+    then every game whose inputs are missing on this Mac is dropped, with a
+    warning saying what is missing and how to get it. May be empty."""
+    import os, re
+    games = hub_games_all(name)
+    want = os.environ.get("KLEPTON_HUB_GAMES", "").strip()
+    if want:
+        pick = [w for w in re.split(r"[,\s]+", want) if w and w != "none"]
+        unknown = [w for w in pick if w not in games]
+        if unknown:
+            print(f"!! KLEPTON_HUB_GAMES: {', '.join(unknown)} not in hub {name!r} "
+                  f"(one of: {', '.join(games)}, or none)", file=sys.stderr)
+            sys.exit(1)
+        games = [g for g in games if g in pick]
+    out, left = [], []
+    for g in games:
+        why = hub_game_missing(g)
+        if why:
+            left.append((g, why))
+        else:
+            out.append(g)
+    if left and not quiet and not os.environ.get("KL_HUB_QUIET"):
+        print(f"!! hub: {len(left)} game(s) left out of this build — their files are not on this "
+              f"Mac (the library still lists them as not in this build):", file=sys.stderr)
+        for g, why in left:
+            print(f"!!   {g} ({TARGETS[g]['display']}): {why}", file=sys.stderr)
+            print(f"!!     to add it: {hub_game_hint(g)}", file=sys.stderr)
+        print(f"!! building with: {', '.join(out) if out else 'no games (library only)'}",
+              file=sys.stderr)
+    return out
+
+
+def hub_check(name):
+    """`targets.py --hub-check [hub]`: one line per listed game, for the Mac app's
+    Status: <game>\t<display>\tok|skip|missing\t<what is missing>\t<how to get it>
+    (skip = excluded by KLEPTON_HUB_GAMES)."""
+    import os, re
+    want = os.environ.get("KLEPTON_HUB_GAMES", "").strip()
+    pick = set(w for w in re.split(r"[,\s]+", want) if w) if want else None
+    for g in hub_games_all(name):
+        t = TARGETS[g]
+        if pick is not None and g not in pick:
+            print(f"{g}\t{t['display']}\tskip\tKLEPTON_HUB_GAMES\t")
+            continue
+        why = hub_game_missing(g)
+        print(f"{g}\t{t['display']}\t{'missing' if why else 'ok'}\t{why}\t{hub_game_hint(g) if why else ''}")
+    return 0
 
 
 # The runtime's copy of the table, as an X-macro list. Only the fields C needs
@@ -1547,6 +1651,8 @@ def main(argv):
         for k in sorted(TARGETS):
             print(k)
         return 0
+    if len(argv) > 1 and argv[1] == "--hub-check":
+        return hub_check(argv[2] if len(argv) > 2 else "hub")
     if len(argv) > 1 and argv[1] == "--c-table":
         print(c_table())
         return 0

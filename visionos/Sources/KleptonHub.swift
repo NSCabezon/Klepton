@@ -35,7 +35,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     let display: String
     let kind: String
     let entry: String
-    /// False in a UI-only build (KLEPTON_HUB_NO_GUESTS): no frameworks, cannot boot.
+    /// False when this build carries no frameworks for the game, so it cannot boot:
+    /// its files were not on the Mac that built it (targets.py hub_games), or a UI-only
+    /// build (KLEPTON_HUB_NO_GUESTS, klHubNoGuests).
     let bundled: Bool
     /// targets.py's tree and apk: where the runtime looks, relative to the game's
     /// container root, for <tree>/assets, the metadata beside it, and the APK.
@@ -577,7 +579,7 @@ final class HubLibraryModel: ObservableObject {
         case notInBuild, notDownloaded, partial, working(String, Double?), verifyScheduled, updateAvailable, ready, manual, notInLibrary
         var label: String {
             switch self {
-            case .notInBuild: return klL("Not in this build", "No está en esta versión")
+            case .notInBuild: return klL("Not included in this build", "No incluido en esta compilación")
             case .notDownloaded: return klL("Not downloaded", "Sin descargar")
             case .partial: return klL("Incomplete — not verified", "Incompleto — sin verificar")
             case .working(let what, let f): return f.map { "\(what) \(Int(($0 * 100).rounded()))%" } ?? what
@@ -605,6 +607,10 @@ final class HubLibraryModel: ObservableObject {
     }
 
     func status(_ g: KLHubGameRow) -> Status {
+        // Left out of this build (its files were not on the Mac that built it): nothing
+        // to download or play here until a build carries it. A UI-only build
+        // (klHubNoGuests) still shows the stores' state.
+        if !g.bundled && !klHubNoGuests { return .notInBuild }
         if KLCatalog.entry(g.target) != nil {
             switch activeStore(g) {
             case .meta?:
@@ -2117,9 +2123,12 @@ struct HubLibraryView: View {
             }
             #endif
             if !g.bundled {
-                Text(klL("This build carries no game code (library-only build).",
-                         "Esta versión no incluye el código del juego (solo biblioteca)."))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(klHubNoGuests
+                     ? klL("This build carries no game code (library-only build).",
+                           "Esta versión no incluye el código del juego (solo biblioteca).")
+                     : klL("Add its files on the Mac and build again to play it.",
+                           "Añade sus archivos en el Mac y vuelve a compilar para jugarlo."))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
         }
     }
