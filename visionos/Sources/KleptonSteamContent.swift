@@ -272,6 +272,11 @@ final class SteamContentModel: ObservableObject {
         switch stage { case .connecting, .qr, .working, .guardCode, .approve: return true; default: return false }
     }
 
+    /// A start() is in flight, from the moment it is called (isBusy follows the stage, which
+    /// the run sets a moment later) until its task has ended. The hub's "Download all" queue
+    /// waits on this.
+    var isRunning: Bool { task != nil }
+
     func refreshLocal() {
         local = game.status()
         let root = game.root
