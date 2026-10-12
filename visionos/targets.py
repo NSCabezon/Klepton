@@ -126,6 +126,9 @@ TARGETS = {
         "hand_matting": False,
     },
     "superhot": {
+        # Foveation is the OpenGL guests' rate map (kl_glfb); a Vulkan guest's
+        # passes are MoltenVK's, so the hub shows the setting as unavailable.
+        "gl_foveation": False,
         # SUPERHOT VR — Unity + IL2CPP + the Oculus Mobile SDK, i.e. the same
         # shape as Beat Saber and the reason it is the third target: it shares
         # the entire Unity path and exercises it against an APK nothing here was
@@ -259,6 +262,9 @@ TARGETS = {
         "hand_matting": False,
     },
     "batman": {
+        # Foveation is the OpenGL guests' rate map (kl_glfb); a Vulkan guest's
+        # passes are MoltenVK's, so the hub shows the setting as unavailable.
+        "gl_foveation": False,
         # Batman: Arkham Shadow 1.4.1 (com.camouflaj.manta, versionCode 350961).
         # Unity 2022 + IL2CPP + Burst, the Oculus XR plugin, Wwise for audio,
         # and Vulkan REQUIRED by its manifest — so the same shape as bonelab
@@ -574,6 +580,9 @@ TARGETS = {
         "display": "Vampire: The Masquerade - Justice",
     },
     "metro": {
+        # Foveation is the OpenGL guests' rate map (kl_glfb); a Vulkan guest's
+        # passes are MoltenVK's, so the hub shows the setting as unavailable.
+        "gl_foveation": False,
         # Metro Awakening (Vertigo Games), package com.vertigogames.
         # ImpactDevelopment (project "Impact") — the STEAM FRAME build (Steam app
         # 2669410, Android depot 2669412), and the first UE5 title here that is

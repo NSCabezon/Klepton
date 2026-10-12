@@ -384,6 +384,15 @@ enum KLRenderPrefs {
         return KleptonRendering.targetFoveation
     }
 
+    /// False for a Vulkan guest (targets.py "gl_foveation"): the GL rate map
+    /// does not reach it, so the setting is shown as unavailable.
+    static func glFoveation(for t: String) -> Bool {
+        #if KL_HUB
+        if let row = klHubGameRows.first(where: { $0.target == t }) { return row.glFoveation }
+        #endif
+        return true
+    }
+
     static func defaultRenderScale(for t: String) -> Double {
         #if KL_HUB
         if let row = klHubGameRows.first(where: { $0.target == t }), scaleRange.contains(row.renderScale) {
