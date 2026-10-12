@@ -215,11 +215,13 @@ TARGETS = {
         # The game draws its own gloved hands where the user's are, so the
         # system's matte of the real arms would be a second pair (beatsaber128).
         "hand_matting": False,
-        # Unmeasured default for an M2: a light Unity 2019 GLES title through
-        # ANGLE/Metal, multi-pass stereo. 0.8 is ~two thirds of the pixels; the
-        # in-app "Render resolution" slider starts here and goes back up if the
-        # headset's fps allow.
-        "render_scale": 0.8,
+        # Default for an M2, not yet measured on the headset: Unity 2019 GLES
+        # through ANGLE/Metal with multi-pass stereo (each eye drawn twice
+        # over). On the Mac host (M1 Max, 1832x1920 per eye, with PNG capture
+        # on) the office ran ~55-60 fps but the first level (the car) ~28.
+        # 0.7 is half the pixels, Batman's value; the in-app "Render
+        # resolution" slider starts here and can go up if the headset allows.
+        "render_scale": 0.7,
     },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
