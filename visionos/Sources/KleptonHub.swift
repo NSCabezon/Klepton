@@ -2070,7 +2070,6 @@ struct HubLibraryView: View {
     @State private var addonsFor: SheetTarget?
     /// Why a card's Download did not start (no Meta sign-in, not enough space).
     @State private var cardAlert: CardAlert?
-    @Environment(\.scenePhase) private var scenePhase
     struct SheetTarget: Identifiable { let id: String }
     struct CardAlert: Identifiable {
         let id = UUID()
