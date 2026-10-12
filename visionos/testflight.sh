@@ -43,6 +43,9 @@ OUT="${KL_TF_OUT:-build/testflight}/$KLT_NAME-$VERSION-$BUILD"
 ARCHIVE="$OUT/$PRODUCT.xcarchive"
 EXPORT="$OUT/export"
 DD="build/dd-archive-$KLT_NAME"
+# A re-run of the same version + build writes over the same paths; start them
+# empty so nothing a previous layout embedded can ride along into this archive.
+rm -rf "$ARCHIVE" "$EXPORT"
 mkdir -p "$OUT"
 LOG="$OUT/xcodebuild.log"
 

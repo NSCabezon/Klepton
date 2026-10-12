@@ -2,9 +2,9 @@
 //
 // Built only for the "hub" row of visionos/targets.py (compilation condition
 // KL_HUB). The games it carries are generated into klHubGameRows
-// (build/hub/KleptonHubManifest.swift) from that row's "games" list, and each
-// game's translated frameworks sit in their own Frameworks/<game>/ (kl_app.c
-// picks the selected one).
+// (build/hub/KleptonHubManifest.swift) from that row's "games" list, and every
+// game's translated frameworks sit flat in Frameworks/ as <game>__<lib>.framework
+// (kl_app.c hands the runtime the selected game's prefix).
 //
 // How a game runs: Play sets KL_TARGET to the game's target name — the same
 // override kl_app_configure and kl_app_target_name_or_default() already honour —
