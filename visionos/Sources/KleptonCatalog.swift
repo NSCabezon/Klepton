@@ -56,6 +56,9 @@ enum KLCatalog {
         // Meta only (the Steam build is PC VR): the Quest build 1.2.174682 — a single APK, no OBB;
         //        byte-identical to the APK this port is translated from.
         KLCatalogEntry(target: "ieytd", display: "I Expect You To Die", steamApp: nil, metaRecipe: "ieytd"),
+        // Meta only (the Steam build is PC VR): the Quest build 1.10.15 (versionCode 87) — a single
+        //        150 MB APK, no OBB; byte-identical to the APK this port is translated from.
+        KLCatalogEntry(target: "ktane", display: "Keep Talking and Nobody Explodes", steamApp: nil, metaRecipe: "ktane"),
         // Steam only: the Steam Frame build (depot 2669412 = Impact-Android-Shipping-arm64.apk,
         //        com.vertigogames.ImpactDevelopment 944116, + 14 OBBs, 19.2 GB). The Quest build on
         //        Meta's store is a different APK and is not what this port is translated from.
