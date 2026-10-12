@@ -87,7 +87,11 @@
         if (nf < KL_MAX_SYNC) tab##_free[nf] = idx;                              \
     }
 
-SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
+// Rwlocks are not on this table: see the rwl_entry map below. Refusing to
+// recycle at init covers a re-init over a relocated block, but not storage
+// that is reused WITHOUT any init (90 of 101 lock sites in Pinball FX's
+// libUnreal never call pthread_rwlock_init) where the stale slot index is
+// simply believed. Address keying covers both.
 
 // ---------- mutexes: address-keyed map ----------
 // The slot-in-guest-storage design (shared SYNC_TABLE above) aliases two
@@ -100,18 +104,34 @@ SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 // deadlock (2026-08-06 capture hang). So mutexes are keyed by guest
 // *address* instead: a copied or recycled address is the same mutex, a
 // different address is a different mutex, and guest storage is never read.
-// Keyed by guest ADDRESS, and slots are only reclaimed on an explicit
-// pthread_mutex_destroy — which many guests never call (freeing the containing
-// object is legal on Linux, where a pthread_mutex_t needs no destroy). So the
-// table fills monotonically with the working set of distinct mutex addresses.
-// TWD2's UE4 load creates ~32k mutexes without destroying any and overflowed the
-// old 32768 table: mtx_entry_for's unbounded probe then spun FOREVER on the first
-// insert into a full table (the "abort past it" below was never implemented), which
-// looked like a hang with FAsyncLoading pinned 99% in mtx_entry_for. 8x the size so
-// a large UE4 load fits, and mtx_entry_for now bounds its probe (see there).
-#define MTX_MAP_SIZE 262144         // power of two; mtx_entry_for degrades (not hangs) if full
+// Power of two. TWD2's UE4 load creates ~32k mutexes without destroying any,
+// which overflowed a 32768-entry table; 2^18 leaves a large UE4 load room, and
+// with tombstones (below) occupancy tracks LIVE mutexes rather than every
+// address ever used as one. If it does fill, mtx_entry_for degrades to a shared
+// fallback mutex rather than hanging.
+#define MTX_MAP_BITS 18
+#define MTX_MAP_SIZE (1u << MTX_MAP_BITS)
+// Key sentinels. A guest mutex address is a real pointer — page-aligned storage
+// at minimum, never 0, 1 or 2 — so three low values are free to mean something.
+//
+// **Why the tombstone.** This is an open-addressed table with LINEAR PROBING,
+// and `destroy` used to
+// write 0 — a true empty — into the middle of a live probe chain. Every entry
+// behind that hole became unreachable: the next lookup of such a key stopped at
+// the hole, inserted a DUPLICATE there, and orphaned the original for the life
+// of the process. Orphans only accumulate, so the table filled monotonically
+// under mutex churn until the probe found no empty slot at all. Worse, a
+// duplicate is a LOST LOCK: the thread holding the original host mutex and the
+// thread that resolved the duplicate do not exclude each other. On a build
+// whose probe was unbounded this was Pinball FX's table-load stall: the lobby
+// ran 2.5 minutes, the table load churned enough mutexes to top the table off,
+// and the render thread never returned from `pthread_mutex_init` — no crash,
+// no log, one core at 100%.
+#define MTX_EMPTY  ((uintptr_t)0)   // never used; probing stops here
+#define MTX_TOMB   ((uintptr_t)1)   // destroyed; probing CONTINUES through it
+#define MTX_CLAIM  ((uintptr_t)2)   // reserved, contents not yet published
 typedef struct {
-    _Atomic(uintptr_t)   key;       // guest address; 0 = empty
+    _Atomic(uintptr_t)   key;       // guest address, or one of the sentinels
     // Atomic, and published AFTER the key with release ordering — see
     // mtx_entry_for. A plain pointer here was a publication race and it was
     // reached: the claiming thread stored the key, and any other thread that
@@ -129,8 +149,12 @@ typedef struct {
 } mtx_entry;
 static mtx_entry g_mtx_map[MTX_MAP_SIZE];
 
+// Fibonacci hashing: the top MTX_MAP_BITS of the multiply, not a fixed 15. The
+// shift was hard-coded at 49 when the table was 2^15, and the table grew
+// without it: every key folded into the first 32768 slots, and the probe
+// chains were eight times longer than the table needs.
 static unsigned mtx_hash(uintptr_t a) {
-    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> 49);
+    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> (64 - MTX_MAP_BITS));
 }
 
 static pthread_mutex_t *mtx_make(void) {
@@ -200,7 +224,14 @@ static pthread_cond_t *cnd_make(void) {
 static cnd_entry *cnd_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_cond_t *fresh = NULL;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+    // BOUNDED, for the mutex map's reason. This map never tombstones —
+    // cond_destroy is deliberately a no-op, because a host cond the guest might
+    // still signal is worse to free than to leak — so it only ever grows, and
+    // an unbounded probe over a full table is an infinite 100%-CPU spin with no
+    // crash and no log. If this ever fires, the answer is a bigger table, and
+    // the abort is what makes that visible instead of a frozen headset.
+    for (unsigned n = 0; n < MTX_MAP_SIZE; n++) {
+        unsigned i = (mtx_hash(want) + n) & (MTX_MAP_SIZE - 1);
         uintptr_t k = atomic_load(&g_cnd_map[i].key);
         if (k == want) {
             if (fresh) { pthread_cond_destroy(fresh); free(fresh); }
@@ -210,10 +241,18 @@ static cnd_entry *cnd_entry_for(void *g) {
         if (!fresh) fresh = cnd_make();
         uintptr_t expect = 0;
         if (!atomic_compare_exchange_strong(&g_cnd_map[i].key, &expect, want))
-            { i--; continue; }
+            { n--; continue; }
         atomic_store(&g_cnd_map[i].c, fresh);
         return &g_cnd_map[i];
     }
+    if (fresh) { pthread_cond_destroy(fresh); free(fresh); }
+    fprintf(stderr,
+            "  [klb] FATAL: the condvar map is full — %u slots, all taken, "
+            "probing for guest %p. Condvars are never reclaimed by design; "
+            "this guest made more than the table holds.\n",
+            (unsigned)MTX_MAP_SIZE, (void *)want);
+    kl_pthread_report(stderr);
+    abort();
 }
 
 // The host cond behind an entry, with the mutex map's publication wait: the key
@@ -248,11 +287,24 @@ static pthread_mutex_t *mtx_host(mtx_entry *e) {
 // Several threads first-locking one brand-new mutex at once is exactly what a
 // thread pool coming up does, which is why it was intermittent and why it
 // picked the guest with the most thread pools.
+// How many slots are not MTX_EMPTY. Tombstones are reusable, so this is the
+// high-water mark of the PROBE, not of live mutexes — it is what says how close
+// the table is to the state that used to hang, and it is the only number worth
+// printing about this map.
+static _Atomic(unsigned) g_mtx_used;
+
+// Exposed for `t_mtx`, and only for it. The gate's subject is whether destroyed
+// slots come BACK, and "the process did not hang" is far too weak a way to ask:
+// with destroy writing an empty, 500,000 churn cycles through 64 addresses
+// consumed 98,304 of 131,072 slots and still finished. Occupancy is the number
+// that tells the two behaviours apart at a glance.
+unsigned kl_pthread_mtx_used(void) { return atomic_load(&g_mtx_used); }
+
 // A single shared fallback used only when the whole table is full — better a few
 // guest mutexes serialising on one recursive host mutex than an infinite probe
-// spin. With MTX_MAP_SIZE at 262144 this should never be reached in practice; it
-// exists so a pathological guest degrades instead of hanging (which is exactly
-// what TWD2 did at the old 32768).
+// spin. With tombstones reclaiming destroyed slots this needs more LIVE mutexes
+// than the table holds; it exists so a pathological guest degrades instead of
+// hanging (which is what TWD2 did at the old 32768).
 static mtx_entry g_mtx_overflow;
 static mtx_entry *mtx_overflow(void) {
     if (!atomic_load(&g_mtx_overflow.m)) {
@@ -265,50 +317,264 @@ static mtx_entry *mtx_overflow(void) {
     static _Atomic int said;
     if (atomic_fetch_add(&said, 1) == 0)
         fprintf(stderr, "  [klb] mutex table FULL (%d slots) — sharing one fallback "
-                        "mutex; sync correctness degraded (raise MTX_MAP_SIZE)\n",
+                        "mutex; sync correctness degraded (raise MTX_MAP_BITS)\n",
                 MTX_MAP_SIZE);
     return &g_mtx_overflow;
 }
+
 static mtx_entry *mtx_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_mutex_t *fresh = NULL;
-    unsigned probes = 0;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
-        uintptr_t k = atomic_load(&g_mtx_map[i].key);
-        if (k == want) {
-            if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
-            return &g_mtx_map[i];
-        }
-        if (k) {
-            // Bound the probe: a full table (every slot occupied by a DIFFERENT
-            // key) would otherwise loop forever. One full sweep proves it full.
-            if (++probes >= MTX_MAP_SIZE) {
+    for (;;) {
+        unsigned start = mtx_hash(want) & (MTX_MAP_SIZE - 1);
+        long tomb = -1;                 // first reusable slot seen on this pass
+        unsigned n = 0;
+        for (; n < MTX_MAP_SIZE; n++) {
+            unsigned i = (start + n) & (MTX_MAP_SIZE - 1);
+            uintptr_t k = atomic_load(&g_mtx_map[i].key);
+            if (k == want) {
                 if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
-                return mtx_overflow();
+                return &g_mtx_map[i];
             }
-            continue;
+            // A tombstone is a candidate to reuse, but the scan does NOT stop
+            // here: `want` may still be live further along a chain that ran
+            // through this slot before it was destroyed. Stopping early is how
+            // duplicates are made.
+            if (k == MTX_TOMB) { if (tomb < 0) tomb = (long)i; continue; }
+            // A slot mid-claim must be WAITED ON, never stepped over. The
+            // claim may be for `want` itself, and a prober that walks past it
+            // finds the next empty and inserts a DUPLICATE — two entries, two
+            // host mutexes, one guest address. That is not a slow path, it is
+            // a lost lock: the thread that took host mutex A resolves the same
+            // address to host mutex B on the way out and unlocks the wrong one,
+            // leaving A held forever. (Measured, not theorised — it deadlocked
+            // t_mtx's first-touch race on the first run.)
+            //
+            // The wait cannot cycle: a thread holding a claim never waits on
+            // another one — its own duplicate re-scan below skips claims rather
+            // than blocking on them — so every claim resolves in a bounded
+            // number of instructions.
+            if (k == MTX_CLAIM) { sched_yield(); n--; continue; }   // re-read
+            // Live, and not ours — unless this is the last slot of a full lap
+            // and a tombstone was passed: a table with no empty left but
+            // reclaimed slots in it still has room, in the tombstone.
+            if (k != MTX_EMPTY && !(n == MTX_MAP_SIZE - 1 && tomb >= 0)) continue;
+            // A true empty ends the chain: `want` is definitively absent, so
+            // this is the insert. Prefer the first tombstone — that is what
+            // keeps occupancy bounded by LIVE mutexes rather than by every
+            // address ever used as one.
+            if (!fresh) fresh = mtx_make();
+            unsigned at = (tomb >= 0) ? (unsigned)tomb : i;
+            uintptr_t expect = (tomb >= 0) ? MTX_TOMB : MTX_EMPTY;
+            // Reserve before publishing. The old code stored the key first and
+            // the mutex after, and any thread probing in that window got the
+            // entry with m == NULL; MTX_CLAIM is that window made explicit, and
+            // it is skipped by every other prober because it is not MTX_EMPTY.
+            if (!atomic_compare_exchange_strong(&g_mtx_map[at].key, &expect,
+                                                MTX_CLAIM))
+                break;                  // lost the slot; rescan from the top
+            mtx_entry *e = &g_mtx_map[at];
+            // Re-scan for a live `want` before committing. Only reachable on
+            // the insert path, and it closes the one window the tombstone
+            // reuse opens: another thread may have inserted `want` between our
+            // sighting of this tombstone and our arrival at the empty.
+            mtx_entry *dup = NULL;
+            for (unsigned j = 0; j < MTX_MAP_SIZE; j++) {
+                unsigned p = (start + j) & (MTX_MAP_SIZE - 1);
+                if (p == at) continue;
+                uintptr_t kk = atomic_load(&g_mtx_map[p].key);
+                if (kk == want) { dup = &g_mtx_map[p]; break; }
+                if (kk == MTX_EMPTY) break;
+            }
+            if (dup) {                  // someone beat us; give the slot back
+                atomic_store(&e->key, expect);
+                if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
+                return dup;
+            }
+            if (expect == MTX_EMPTY) {
+                unsigned used = atomic_fetch_add(&g_mtx_used, 1) + 1;
+                // Say so ONCE, well before it fills. A guest that legitimately
+                // needs three quarters of the table is a guest whose next
+                // version needs all of it, and this is the only warning that
+                // can be given while the run is still healthy.
+                if (used == (MTX_MAP_SIZE / 4) * 3)
+                    fprintf(stderr,
+                            "  [klb] the mutex map is %u of %u slots deep — "
+                            "not fatal, but the table was sized for far less; "
+                            "raise MTX_MAP_BITS before it fills.\n",
+                            used, (unsigned)MTX_MAP_SIZE);
+            }
+            // A recycled slot still points at its previous life's host mutex.
+            // That object is deliberately leaked rather than freed — destroy
+            // cannot know whether the guest still holds it — but it must not be
+            // INHERITED by a different guest address, and the stale
+            // owner/depth must not be either.
+            atomic_store(&e->m, fresh);
+            atomic_store(&e->owner, NULL);
+            atomic_store(&e->locksite, NULL);
+            atomic_store(&e->depth, 0);
+            atomic_store(&e->key, want);        // publish last
+            return e;
         }
-        // empty: build the mutex first, so claiming the key publishes a
-        // complete entry. Kept across a lost race rather than rebuilt.
-        if (!fresh) fresh = mtx_make();
-        uintptr_t expect = 0;
-        if (!atomic_compare_exchange_strong(&g_mtx_map[i].key, &expect, want))
-            { i--; continue; }          // lost the race; re-read this slot
-        atomic_store(&g_mtx_map[i].m, fresh);
-        return &g_mtx_map[i];
+        if (n == MTX_MAP_SIZE) {
+            // Neither a match, nor an empty, nor a tombstone in a full lap.
+            if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
+            return mtx_overflow();
+        }
     }
 }
 
 static mtx_entry *mtx_find(void *g) {
     uintptr_t want = (uintptr_t)g;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+    for (unsigned n = 0; n < MTX_MAP_SIZE; n++) {
+        unsigned i = (mtx_hash(want) + n) & (MTX_MAP_SIZE - 1);
         uintptr_t k = atomic_load(&g_mtx_map[i].key);
         if (k == want) return &g_mtx_map[i];
+        if (k == MTX_EMPTY) return NULL;    // tombstones do NOT end the chain
+    }
+    return NULL;
+}
+
+// ---------- rwlocks: address-keyed, for the mutex map's reason ----------
+//
+// Rwlocks were the last sync type still on the slot-in-guest-storage SYNC_TABLE
+// after mutexes and condvars were moved off it, and they failed for exactly the
+// reason the mutex map's comment predicts: a slot index living in guest storage
+// aliases two logical objects onto one host object whenever that storage is
+// stale or copied.
+//
+// It was measured on Pinball FX's table load. The guest's array
+// entries are 0x50 bytes with a `pthread_rwlock_t` at +8, walked by a linear
+// scan — a TArray, which UE reallocates and **memcpy**s wholesale when it
+// grows. A moved entry carries its slot index into the new storage, and the
+// freed storage is handed back out for a new entry that has never called
+// `pthread_rwlock_init` — bionic's static initialiser is all-zero, and 90 of
+// this guest's 101 lock sites never init at all, so the stale index is simply
+// believed. Two unrelated guest rwlocks, one host rwlock.
+//
+// The stall dump caught the consequence exactly: ONE guest thread blocked in
+// `pthread_rwlock_wrlock`, and no other thread anywhere in the process inside a
+// lock call — every other guest thread idle in a cond wait or a usleep. Nobody
+// was holding it legitimately, because the thread blocking on it was the thread
+// holding it: it took a READ lock on entry A at one call site and a WRITE lock
+// on entry B four instructions later, and A and B were the same host object. On
+// Android they are two, and the guest runs.
+//
+// So: keyed on the guest ADDRESS, guest storage never read or written. A copied
+// or recycled address is the same rwlock; a different address is a different
+// rwlock. Same shape as the cond map — create-on-demand, destroy leaks (a host
+// rwlock is 200 bytes, and freeing one the guest might still lock is worse than
+// keeping it), bounded probe with an abort rather than an unbounded spin.
+typedef struct {
+    _Atomic(uintptr_t)          key;
+    _Atomic(pthread_rwlock_t *) l;
+    // Who holds it, so a stall dump can NAME the holder instead of leaving a
+    // blocked thread with nothing on the other end of the wait. Without it the
+    // dump above could say only "blocked in wrlock"; the whole diagnosis had
+    // to come from what was NOT in the dump.
+    _Atomic(void *)             writer;   // tid holding it for write, or NULL
+    _Atomic(void *)             wsite;    // where that write lock was taken
+    _Atomic(int)                readers;  // read holders, across all threads
+} rwl_entry;
+static rwl_entry g_rwl_map[MTX_MAP_SIZE];
+
+static struct { _Atomic(void *) tid, guest, ra; _Atomic(int) write; }
+    g_rwl_waiters[64];
+
+static pthread_rwlock_t *rwl_make(void) {
+    pthread_rwlock_t *fresh = malloc(sizeof *fresh);
+    if (fresh) pthread_rwlock_init(fresh, NULL);
+    return fresh;
+}
+
+static rwl_entry *rwl_entry_for(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    pthread_rwlock_t *fresh = NULL;
+    for (unsigned n = 0; n < MTX_MAP_SIZE; n++) {
+        unsigned i = (mtx_hash(want) + n) & (MTX_MAP_SIZE - 1);
+        uintptr_t k = atomic_load(&g_rwl_map[i].key);
+        if (k == want) {
+            if (fresh) { pthread_rwlock_destroy(fresh); free(fresh); }
+            return &g_rwl_map[i];
+        }
+        if (k) continue;
+        if (!fresh) fresh = rwl_make();
+        uintptr_t expect = 0;
+        if (!atomic_compare_exchange_strong(&g_rwl_map[i].key, &expect, want))
+            { n--; continue; }
+        atomic_store(&g_rwl_map[i].l, fresh);
+        return &g_rwl_map[i];
+    }
+    if (fresh) { pthread_rwlock_destroy(fresh); free(fresh); }
+    fprintf(stderr,
+            "  [klb] FATAL: the rwlock map is full — %u slots, all taken, "
+            "probing for guest %p. Rwlocks are never reclaimed by design; "
+            "this guest made more than the table holds.\n",
+            (unsigned)MTX_MAP_SIZE, (void *)want);
+    kl_pthread_report(stderr);
+    abort();
+}
+
+// The key is published before the lock is stored, so a reader that arrives in
+// that window waits rather than dereferencing NULL — the mutex map's rule.
+static pthread_rwlock_t *rwl_host(rwl_entry *e) {
+    pthread_rwlock_t *l = atomic_load(&e->l);
+    while (!l) { sched_yield(); l = atomic_load(&e->l); }
+    return l;
+}
+// (There is deliberately no one-shot `rwl(g)` helper any more: every entry
+// point below needs the ENTRY, not just the host lock, because ownership is
+// recorded on it — and a helper that returned only the lock is how the previous
+// design made the holder unnameable in a stall dump.)
+
+// Lookup that never creates and never aborts — the report's form. This map has
+// no tombstones (destroy is a no-op), so an empty slot really does end a chain.
+static rwl_entry *rwl_find(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    for (unsigned n = 0; n < MTX_MAP_SIZE; n++) {
+        unsigned i = (mtx_hash(want) + n) & (MTX_MAP_SIZE - 1);
+        uintptr_t k = atomic_load(&g_rwl_map[i].key);
+        if (k == want) return &g_rwl_map[i];
         if (!k) return NULL;
+    }
+    return NULL;
+}
+
+static void rwl_wait_enter(void *guest, void *ra, int write) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(&g_rwl_waiters[i].tid, &expect, self)) {
+            atomic_store(&g_rwl_waiters[i].guest, guest);
+            atomic_store(&g_rwl_waiters[i].ra, ra);
+            atomic_store(&g_rwl_waiters[i].write, write);
+            return;
+        }
+    }
+}
+static void rwl_wait_leave(void) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = self;
+        if (atomic_compare_exchange_strong(&g_rwl_waiters[i].tid, &expect, NULL))
+            return;
     }
 }
 
-static pthread_rwlock_t *rwl(void *g) { return g_rwl_get(g); }
+// A thread that already holds this rwlock for WRITE and asks for it again is
+// about to block forever against itself. With the aliasing gone that can only
+// be the guest's own lock order, so say so before the process goes quiet.
+static void rwl_self_check(void *g, void *ra, void *wsite) {
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) >= 4) return;
+    size_t off = 0;
+    const char *img = kl_addr_image(ra, &off);
+    fprintf(stderr, "  [klb] pthread_rwlock_wrlock on guest %p by the thread "
+                    "that already WRITE-holds it (taken at %p) — this will "
+                    "block forever; from ", g, wsite);
+    if (img) fprintf(stderr, "%s+0x%zx\n", img, off); else fprintf(stderr, "%p\n", ra);
+}
+
 
 // KL_TRACE_MUTEX=1: lifecycle of translated mutexes — init, destroy, and
 // lazy creation — so aliasing (two guest addresses, one host object) can be
@@ -633,7 +899,12 @@ int klb_pthread_mutex_trylock(void *m) {
 int klb_pthread_mutex_destroy(void *p) {
     mtx_log("destroy", p, 0);
     mtx_entry *e = mtx_find(p);
-    if (e) atomic_store(&e->key, 0);    // host leaks; it may be held
+    // TOMBSTONE, not empty. Writing 0 here is what broke every probe chain
+    // running through this slot and, over a long session, filled the table and
+    // hung the guest — see the sentinel comment at the top of the file. The
+    // host mutex is still leaked rather than freed (the guest may hold it); it
+    // is released when the slot is next claimed.
+    if (e) atomic_store(&e->key, MTX_TOMB);
     return 0;
 }
 
@@ -705,6 +976,56 @@ void kl_pthread_report(FILE *out) {
         shown++;
     }
     if (!shown) fprintf(out, "  (no tracked holders)\n");
+    // Rwlocks, on the same terms. Pinball FX's stall was a thread blocked in
+    // pthread_rwlock_wrlock with NOTHING on the other end of the report — the
+    // holder had to be inferred from the absence of any other blocked thread.
+    // Holder and waiter together are what say a run is STUCK rather than busy,
+    // and a WRITE-holder that is also the waiter names the bug outright.
+    unsigned rwl_shown = 0;
+    for (uint32_t i = 0; i < MTX_MAP_SIZE; i++) {
+        void *w = atomic_load(&g_rwl_map[i].writer);
+        int rd = atomic_load(&g_rwl_map[i].readers);
+        if (!w && rd <= 0) continue;
+        void *key = (void *)atomic_load(&g_rwl_map[i].key);
+        if (w) {
+            const char *nm = thread_name_of(w);
+            fprintf(out, "  guest rwlock %p: WRITE-held by tid %p%s%s%s%s "
+                         "(locked from %p), %d reader(s) counted\n",
+                    key, w, nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
+                    thread_is_alive(w) ? "" : "  ** EXITED **",
+                    atomic_load(&g_rwl_map[i].wsite), rd);
+            dump_thread_stack(out, w);
+        } else {
+            fprintf(out, "  guest rwlock %p: %d reader(s) counted, no writer\n",
+                    key, rd);
+        }
+        rwl_shown++;
+        if (rwl_shown >= 64) { fprintf(out, "  ...(more rwlocks held)\n"); break; }
+    }
+    for (int i = 0; i < 64; i++) {
+        void *tid = atomic_load(&g_rwl_waiters[i].tid);
+        if (!tid) continue;
+        const char *nm = thread_name_of(tid);
+        void *guest = atomic_load(&g_rwl_waiters[i].guest);
+        void *ra = atomic_load(&g_rwl_waiters[i].ra);
+        int write = atomic_load(&g_rwl_waiters[i].write);
+        // find, never create: this report is also what the map-full abort
+        // prints, and a creating lookup there would recurse into that abort.
+        rwl_entry *e = rwl_find(guest);
+        void *holder = e ? atomic_load(&e->writer) : NULL;
+        size_t off = 0;
+        const char *img = kl_addr_image(ra, &off);
+        fprintf(out, "  waiter tid %p%s%s%s wants guest rwlock %p for %s (from ",
+                tid, nm ? " [" : "", nm ? nm : "", nm ? "]" : "", guest,
+                write ? "WRITE" : "read");
+        if (img) fprintf(out, "%s+0x%zx)", img, off); else fprintf(out, "%p)", ra);
+        if (holder == tid)
+            fprintf(out, "  ** AND ALREADY WRITE-HOLDS IT — self-deadlock **");
+        else if (holder)
+            fprintf(out, "  [write-held by tid %p]", holder);
+        fprintf(out, "\n");
+        dump_thread_stack(out, tid);
+    }
     for (int i = 0; i < 64; i++) {
         void *tid = atomic_load(&g_mtx_waiters[i].tid);
         if (!tid) continue;
@@ -905,16 +1226,99 @@ int klb_pthread_condattr_destroy(long *a)              { (void)a; return 0; }
 int klb_pthread_condattr_setclock(long *a, int clk)    { (void)a; (void)clk; return 0; }
 
 // ---------- rwlock ----------
-int klb_pthread_rwlock_init(void *l, const void *a) { (void)a; g_rwl_recycle(l); rwl(l); return 0; }
-int klb_pthread_rwlock_destroy(void *p) { g_rwl_recycle(p); return 0; }
-int klb_pthread_rwlock_rdlock(void *l) { return px(pthread_rwlock_rdlock(rwl(l))); }
-int klb_pthread_rwlock_wrlock(void *l) { return px(pthread_rwlock_wrlock(rwl(l))); }
-int klb_pthread_rwlock_unlock(void *l) { return px(pthread_rwlock_unlock(rwl(l))); }
-// SDL3 reaches for the try- forms; Beat Saber never did. Same side-table
-// indirection as the blocking pair — a bionic rwlock is 56 bytes of 4-byte
-// aligned int32, so what lives in it is an index, not a handle.
-int klb_pthread_rwlock_tryrdlock(void *l) { return px(pthread_rwlock_tryrdlock(rwl(l))); }
-int klb_pthread_rwlock_trywrlock(void *l) { return px(pthread_rwlock_trywrlock(rwl(l))); }
+// Address-keyed; see the rwl_entry map above for why guest storage is never
+// read. `l == NULL` would match the map's empty-slot sentinel, so it is refused
+// the way a NULL mutex is rather than handed back an entry with no lock in it.
+static int rwl_null(const char *what) {
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) < 4)
+        fprintf(stderr, "  [klb] pthread_rwlock_%s(NULL) from the guest — "
+                        "refusing with EINVAL (its own bug)\n", what);
+    return kl_errno_to_linux(EINVAL);
+}
+
+// Re-init KEEPS the host rwlock, for the reason klb_pthread_mutex_init spells
+// out: a recycled address is the same lock, and swapping the host object under
+// a guest that still holds or waits on it is the manufactured deadlock this map
+// exists to prevent.
+// kl_pthread_rwl_stale_inits (counted for t_mtx): under address keying a
+// "stale init" is an init at an address that already has an entry — a re-init
+// without destroy, or a reused block. It keeps its host rwlock (see above).
+static _Atomic unsigned g_rwl_stale_inits;
+unsigned kl_pthread_rwl_stale_inits(void) { return atomic_load(&g_rwl_stale_inits); }
+int klb_pthread_rwlock_init(void *l, const void *a) {
+    (void)a;
+    if (!l) return rwl_null("init");
+    if (rwl_find(l)) atomic_fetch_add(&g_rwl_stale_inits, 1);
+    rwl_entry *e = rwl_entry_for(l);
+    rwl_host(e);
+    atomic_store(&e->writer, NULL);
+    atomic_store(&e->wsite, NULL);
+    atomic_store(&e->readers, 0);
+    return 0;
+}
+// Deliberately a no-op, exactly like klb_pthread_cond_destroy: the entry is
+// keyed on an address the guest may hand straight back to a new object, and a
+// host rwlock is far cheaper to leak than to free under a guest that still
+// locks it.
+int klb_pthread_rwlock_destroy(void *p) { (void)p; return 0; }
+
+int klb_pthread_rwlock_rdlock(void *l) {
+    if (!l) return rwl_null("rdlock");
+    rwl_entry *e = rwl_entry_for(l);
+    rwl_wait_enter(l, __builtin_return_address(0), 0);
+    int r = pthread_rwlock_rdlock(rwl_host(e));
+    rwl_wait_leave();
+    if (!r) atomic_fetch_add(&e->readers, 1);
+    return px(r);
+}
+int klb_pthread_rwlock_wrlock(void *l) {
+    if (!l) return rwl_null("wrlock");
+    rwl_entry *e = rwl_entry_for(l);
+    void *self = (void *)pthread_self();
+    void *held = atomic_load(&e->writer);
+    if (held == self)
+        rwl_self_check(l, __builtin_return_address(0), atomic_load(&e->wsite));
+    rwl_wait_enter(l, __builtin_return_address(0), 1);
+    int r = pthread_rwlock_wrlock(rwl_host(e));
+    rwl_wait_leave();
+    if (!r) {
+        atomic_store(&e->writer, self);
+        atomic_store(&e->wsite, __builtin_return_address(0));
+    }
+    return px(r);
+}
+int klb_pthread_rwlock_unlock(void *l) {
+    if (!l) return rwl_null("unlock");
+    rwl_entry *e = rwl_entry_for(l);
+    void *self = (void *)pthread_self();
+    void *expect = self;
+    // Clear the ownership BEFORE the host unlock: a reader that wakes the
+    // instant the lock drops must not find this entry still naming a writer.
+    if (atomic_compare_exchange_strong(&e->writer, &expect, NULL))
+        atomic_store(&e->wsite, NULL);
+    else if (atomic_load(&e->readers) > 0)
+        atomic_fetch_sub(&e->readers, 1);
+    return px(pthread_rwlock_unlock(rwl_host(e)));
+}
+// SDL3 reaches for the try- forms; Beat Saber never did.
+int klb_pthread_rwlock_tryrdlock(void *l) {
+    if (!l) return rwl_null("tryrdlock");
+    rwl_entry *e = rwl_entry_for(l);
+    int r = pthread_rwlock_tryrdlock(rwl_host(e));
+    if (!r) atomic_fetch_add(&e->readers, 1);
+    return px(r);
+}
+int klb_pthread_rwlock_trywrlock(void *l) {
+    if (!l) return rwl_null("trywrlock");
+    rwl_entry *e = rwl_entry_for(l);
+    int r = pthread_rwlock_trywrlock(rwl_host(e));
+    if (!r) {
+        atomic_store(&e->writer, (void *)pthread_self());
+        atomic_store(&e->wsite, __builtin_return_address(0));
+    }
+    return px(r);
+}
 
 // ---------- attributes ----------
 // bionic pthread_attr_t: { uint32 flags; void* stack_base; size_t stack_size;
