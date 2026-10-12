@@ -167,7 +167,8 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 # there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
 # mkangle.sh below stops and names the bootstrap command instead.
 if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
-# The hub carries several games: translate each into its own Frameworks/<game>/.
+# The hub carries several games: translate each into its own visionos/Frameworks/<game>/
+# (source side; in the .app they all land flat, as <game>__<lib>.framework).
 # KL_SKIP_GUEST=1 reuses the frameworks already there (a glibc guest is ~90
 # translations; the hub's own Swift is what usually changed).
 if [ -n "${KL_SKIP_GUEST:-}" ]; then
@@ -200,17 +201,30 @@ else
   # A device build needs a signing team; the generator stops with the fix when none is found.
   KL_REQUIRE_TEAM="$([ "$MODE" != sim ] && echo 1 || true)" python3 gen_xcodeproj.py | head -1
 fi
-# An incremental build never deletes what an earlier one embedded: a hub game this build no
-# longer carries (KLEPTON_HUB_GAMES, or its files gone) would ride along, dead weight, in the
-# old .app's Frameworks/<game>/. Drop those folders (games only: frameworks are *.framework).
-if [ "$KLT_KIND" = hub ]; then
-  for D in build/dd-*-"$KLT_NAME"*/Build/Products/*/"$PRODUCT".app/Frameworks/*/; do
-    [ -d "$D" ] || continue
-    G="$(basename "$D")"
-    case "$G" in *.*) continue ;; esac
-    case " $KLT_GAMES " in *" $G "*) ;; *) rm -rf "$D" ;; esac
-  done
-fi
+# An incremental build never deletes what an earlier one embedded, and every game's frameworks
+# share the .app's one Frameworks/. So drop, from the previous build's .app:
+#  - any SUBFOLDER of Frameworks/ (the per-game layout before the flat one — App Store rejects
+#    it, ITMS-90432, and nothing reads it any more);
+#  - a game's <game>__*.framework when this build no longer carries that game (hub:
+#    KLEPTON_HUB_GAMES, or its files gone; single target: another target's leftovers);
+#  - an UNPREFIXED guest framework (a pre-flat single-target build), recognised by the
+#    dev.klepton.guest. bundle id mkguest.sh gives every translation.
+# Anything else (ANGLE, MoltenVK, Swift's dylibs) is Xcode's to manage and left alone.
+if [ "$KLT_KIND" = hub ]; then CARRIED="$KLT_GAMES"; else CARRIED="$KLT_NAME"; fi
+for E in build/dd-*-"$KLT_NAME"*/Build/Products/*/"$PRODUCT".app/Frameworks/*; do
+  [ -d "$E" ] || continue
+  N="$(basename "$E")"
+  case "$N" in
+    *__*.framework)
+      G="${N%%__*}"
+      case " $CARRIED " in *" $G "*) continue ;; esac ;;
+    *.framework)
+      /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$E/Info.plist" 2>/dev/null \
+        | grep -q '^dev\.klepton\.guest\.' || continue ;;
+    *.*) continue ;;
+  esac
+  rm -rf "$E"
+done
 
 # The App Store build: archive + export from the project just generated, with
 # nothing installed or launched. testflight.sh reads PRODUCT / BUNDLE_ID / KLT_*.
@@ -569,8 +583,7 @@ APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.
 # nothing and reports the entry as unmappable. Ad-hoc signing (no identity, no
 # team) is all the simulator asks for; frameworks first, then the app around
 # them.
-# (the hub's games sit one level down, in Frameworks/<game>/)
-for F in "$APP"/Frameworks/*.framework "$APP"/Frameworks/*/*.framework; do
+for F in "$APP"/Frameworks/*.framework; do
   [ -d "$F" ] && codesign -f -s - "$F" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $F"
 done
 codesign -f -s - "$APP" >/dev/null 2>&1 || echo "  !! could not ad-hoc sign $APP"

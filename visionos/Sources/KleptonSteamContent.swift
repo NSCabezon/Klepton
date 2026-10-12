@@ -349,14 +349,21 @@ final class SteamContentModel: ObservableObject {
     /// Token hand-off from the Mac: `steamdepot` on the Mac writes ~/.steamdepot/token.json;
     /// copying it to <Documents>/steamdepot-token.json (devicectl) imports it into the Keychain.
     private func importHandoffToken() {
+        if let name = Self.importHandoff() { account = name }
+    }
+
+    /// Imports a token the Mac app copied in ("Send to headset") and returns its account name.
+    /// Called when the library opens as well as before a download, so the hub shows the Steam
+    /// session (and "Download all" includes Steam games) without a sign-in first.
+    @discardableResult
+    static func importHandoff() -> String? {
         let handoff = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("steamdepot-token.json")
-        if let imported = try? FileCredentialStore(url: handoff).load() {
-            try? store.save(imported)
-            try? FileManager.default.removeItem(at: handoff)
-            account = imported.accountName
-            log("imported Steam token for '\(KLAccountPrivacy.mask(imported.accountName))' from Documents/steamdepot-token.json")
-        }
+        guard let imported = try? FileCredentialStore(url: handoff).load() else { return nil }
+        guard (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").save(imported)) != nil else { return nil }
+        try? FileManager.default.removeItem(at: handoff)
+        NSLog("[steam] imported Steam token for '\(KLAccountPrivacy.mask(imported.accountName))' from Documents/steamdepot-token.json")
+        return imported.accountName
     }
 
     private func run(_ method: Method) async {
