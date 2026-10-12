@@ -859,6 +859,29 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   probe tick; needs `KL_PROBE_INPUT=1`. Found IEYTD sitting in
   `GameManager:_instance._fsm._currentState = CalibrationState` behind a black
   frame, and its calibration panel 1.7 m below the camera.
+  More forms, all built while scripting IEYTD's office tutorial:
+  - `@<scene path>=<Class>:<chain>` starts from a live component found with
+    `GameObject.Find` + `GetComponent` instead of a static, e.g.
+    `@VRRig/TrackingSpace/HMD=Transform:get_localRotation()`.
+  - `name[i]` takes element i of an array-of-references field, `[i]` indexes
+    the array the chain is on, `#` is its length:
+    `..._conditionEntities[0].[0]`, `..._conditionEntities.#`.
+  - A class name without a namespace is searched for in every namespace (the
+    match is printed once), so a title's own types need no prefix.
+  - A `UnityEngine.Object` at the end also prints its `name`.
+  Beware zsh when building the variable: `"$X:r..."` is a history modifier;
+  write `"${X}:r..."`.
+- `KL_PROBE_TREE=<filter,...>` — walk the live scene hierarchy (every root
+  Transform, inactive ones included) and print each node whose NAME contains a
+  filter, with its full path, `activeSelf`/`activeInHierarchy`, world position
+  and forward, and its components' class names. A filter starting with `/`
+  matches the path (a whole subtree), one starting with `#` matches a component
+  class name on an active object (`#ButtonEntity`, `#PickUpEntity`), `*` is
+  everything. `KL_PROBE_TREE_FROM=<frame>` (the probe's own default),
+  `KL_PROBE_TREE_MAX` (2 prints), `KL_PROBE_TREE_DEPTH` (12). Needs
+  `KL_PROBE_INPUT=1`. This is how a script finds what to touch: IEYTD's "Done"
+  is `P_LanguageSettingsMenu_DoneButton_01`, its office Start is
+  `Office_Projector_01/Button_Play`.
 
 **One caveat, recorded so it is not trusted.** The probe also prints
 `eventsystem: overUI=...`, which stays `no` even when the pointer works:
