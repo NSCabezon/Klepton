@@ -590,6 +590,10 @@ bcast: build/t_bcast
 
 # The glibc personality's in-process SysV semaphores and fault-signal masks,
 # through the same kl_glibc_lookup entry points a glibc guest binds.
+build/t_dylibpath: tests/t_dylibpath.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_dylibpath.c $(RUNTIME) $(LDLIBS)
+
 build/t_glibc_ipc: tests/t_glibc_ipc.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_glibc_ipc.c $(RUNTIME) $(LDLIBS)
@@ -677,8 +681,10 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_x18_casp build/t_bcast build/t_glibc_ipc build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_x18_casp build/t_bcast build/t_glibc_ipc build/t_fault build/t_glcaps build/t_dylibpath
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_dylibpath > build/dylibpath.log 2>&1 || { cat build/dylibpath.log; exit 1; }
+	@head -1 build/dylibpath.log && tail -1 build/dylibpath.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
