@@ -37,7 +37,7 @@
 static klj_val klj_Class_getClassLoader(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *loader;
-    if (!loader) loader = kl_jni_new_object("java/lang/ClassLoader");
+    if (!loader) { loader = kl_jni_new_object("java/lang/ClassLoader"); kl_jni_pin_object(loader); }
     return (klj_val){.l = loader};
 }
 

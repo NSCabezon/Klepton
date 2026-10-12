@@ -109,6 +109,11 @@ static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val
     static void *ids;
     if (!ids) {
         ids = klj_new_array('I', NULL, 2);
+        // Pinned: cached for the run and handed out on every call. Unpinned, a
+        // guest PopLocalFrame retired it and the next caller got a dead pointer —
+        // End Space's C# reached it through reflection inside a local frame and
+        // aborted on "GetObjectClass on an untagged pointer" (2026-10-12).
+        kl_jni_pin_object(ids);
         int32_t *v = klj_arr(ids)->data;
         v[0] = KLJ_INPUT_DEV_LTOUCH;
         v[1] = KLJ_INPUT_DEV_RTOUCH;

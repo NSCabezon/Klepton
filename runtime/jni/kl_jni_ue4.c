@@ -434,6 +434,7 @@ static klj_val klj_GA_getSupportedRefreshRates(void *env, void *self, const klj_
     static void *arr;
     if (!arr) {
         arr = klj_new_array('I', NULL, 1);
+        kl_jni_pin_object(arr);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
         int32_t *v = klj_arr(arr)->data;
         v[0] = 90;
     }
