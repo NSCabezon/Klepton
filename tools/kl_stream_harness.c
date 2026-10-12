@@ -15,10 +15,17 @@
 //     the kl_stream_yuv_msl render pass for native YUV), timed;
 //   * PNGs of a few published frames (both eyes side by side) for eyeballing.
 //
+//   * the session's state as the hub's HUD would show it, logged on every
+//     change ("harness: +12.3 s state waiting -> streaming"); "no-signal"
+//     before the first picture while the host is alive (booting) fails.
+//
 // Usage: kl_stream_harness <host> [port] [--seconds N] [--out DIR] [--yaw DPS]
 //                          [--expect-loss] [--png-every N] [--eye WxH]
+//                          [--expect-end bye|lost]
 // (--eye: the recommended per-eye size HELLO carries; the device sends its
-// panel size, 3072x2465 on the Vision Pro.)
+// panel size, 3072x2465 on the Vision Pro. --expect-end: run until the session
+// ENDS — at most --seconds — and require that reason: the host's BYE, or its
+// silence after video, as when it dies without one.)
 // Exit 0 when it decoded frames and every frame matched its ring pose.
 
 #include "kl_stream_client.h"
@@ -43,7 +50,7 @@ int main(int argc, char **argv) {
     // (KL_STREAM_AUDIO_PLAY=1 to listen).
     setenv("KL_STREAM_AUDIO_PLAY", "0", 0);
     const char *host = "127.0.0.1";
-    int port = 0, png_every = 90, expect_loss = 0, eye_w = 1888, eye_h = 1792;
+    int port = 0, png_every = 90, expect_loss = 0, eye_w = 1888, eye_h = 1792, expect_end = 0;
     double seconds = 6, yaw_dps = 20;
     const char *out = "build/stream";
     int positional = 0;
@@ -53,6 +60,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--yaw") && i + 1 < argc) yaw_dps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--png-every") && i + 1 < argc) png_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--expect-loss")) expect_loss = 1;
+        else if (!strcmp(argv[i], "--expect-end") && i + 1 < argc) {
+            i++;
+            expect_end = !strcmp(argv[i], "bye") ? KL_STREAM_END_BYE
+                       : !strcmp(argv[i], "lost") ? KL_STREAM_END_LOST : -1;
+            if (expect_end < 0) { fprintf(stderr, "harness: --expect-end bye|lost\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--eye") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &eye_w, &eye_h);
         else if (positional == 0) { host = argv[i]; positional++; }
         else if (positional == 1) { port = atoi(argv[i]); positional++; }
@@ -80,8 +93,37 @@ int main(int argc, char **argv) {
     double pub_gpu = 0, pub_wall = 0;
     uint32_t last_frame = 0;
     float yaw = 0;
+    int last_state = -1, nosignal_booting = 0, saw_booting = 0;
+    double t_last_state = -1, t_first_pic = -1, t_ended = -1;
     while (kl_stream_now() - t0 < seconds) {
         double now = kl_stream_now();
+        // The state the HUD reads, every 50 ms.
+        if (now - t_last_state >= 0.05) {
+            t_last_state = now;
+            kl_stream_client_status ss;
+            kl_stream_client_get_status(c, &ss);
+            if (ss.host_state == KL_STREAM_HOST_BOOTING) saw_booting = 1;
+            if (ss.state != last_state) {
+                printf("harness: +%.1f s state %s -> %s (host %s %.1f s, %u guest frames, "
+                       "since rx %.1f s, audio %u pkts, %u frames decoded%s)\n", now - t0,
+                       last_state < 0 ? "-" : kl_stream_client_state_name(last_state),
+                       kl_stream_client_state_name(ss.state),
+                       ss.host_state == KL_STREAM_HOST_BOOTING ? "booting"
+                       : ss.host_state == KL_STREAM_HOST_RUNNING ? "running" : "?",
+                       (double)ss.host_seconds, ss.host_guest_frames, ss.since_rx_s,
+                       ss.audio_packets, ss.frames_decoded,
+                       ss.state == KL_STREAM_CLIENT_ENDED
+                           ? (ss.end_reason == KL_STREAM_END_BYE ? ", ended: BYE" : ", ended: host silent")
+                           : "");
+                last_state = ss.state;
+            }
+            if (ss.state == KL_STREAM_CLIENT_NO_SIGNAL && ss.frames_decoded == 0 &&
+                ss.host_state == KL_STREAM_HOST_BOOTING) nosignal_booting++;
+            if (ss.state == KL_STREAM_CLIENT_ENDED) {
+                t_ended = now;
+                if (expect_end) break;
+            }
+        }
         if (next > now) { usleep((useconds_t)((next - now) * 1e6)); continue; }
         next += period;
         double t_present = now + 0.030;     // a typical prediction horizon
@@ -94,6 +136,10 @@ int main(int argc, char **argv) {
         kl_stream_frame_info info;
         CVPixelBufferRef pb = kl_stream_client_pull_frame(c, &info);
         if (!pb) continue;
+        if (t_first_pic < 0) {
+            t_first_pic = now;
+            printf("harness: +%.1f s first picture\n", now - t0);
+        }
         frames++;
         if (!info.have_pose) { if (info.pose_id != 0) missing++; }
         else {
@@ -140,6 +186,13 @@ int main(int argc, char **argv) {
     int ok = frames > 0 && mismatched == 0 && missing == 0 && st.decode_errors == 0 && pub_fail == 0;
     // Loss must have been SEEN and survived: recovered by parity, or by IDR.
     if (expect_loss) ok = ok && (st.fec_fixed > 0 || (st.frames_lost > 0 && st.idr_requests > 0));
+    if (saw_booting || expect_end)
+        printf("harness: first picture at %+.1f s; host BOOTING seen %s; no-signal while booting: %d polls; "
+               "ended %s (%s)\n", t_first_pic >= 0 ? t_first_pic - t0 : -1.0, saw_booting ? "yes" : "no",
+               nosignal_booting, t_ended >= 0 ? "yes" : "no",
+               st.end_reason == KL_STREAM_END_BYE ? "BYE" : st.end_reason == KL_STREAM_END_LOST ? "host silent" : "-");
+    ok = ok && nosignal_booting == 0;
+    if (expect_end) ok = ok && st.state == KL_STREAM_CLIENT_ENDED && st.end_reason == expect_end;
     printf("harness: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
