@@ -136,7 +136,9 @@ final class MetaContentModel: ObservableObject {
 
     var account: MetaAccountModel { MetaAccountModel.shared }
     var isBusy: Bool { task != nil }
-    var requiredBytes: Int64 { recipe.files.filter(\.required).reduce(0) { $0 + ($1.size ?? 0) } }
+    /// The voice-language packs fetched with the game (KLCatalog.metaVoiceLocales).
+    var voiceLocales: Set<String> { KLCatalog.metaVoiceLocales(target, recipe) }
+    var requiredBytes: Int64 { recipe.files(locales: voiceLocales).reduce(0) { $0 + ($1.size ?? 0) } }
 
     /// Fraction for the library card while working.
     var activeFraction: Double? {
@@ -145,7 +147,7 @@ final class MetaContentModel: ObservableObject {
     }
 
     func refreshLocal() {
-        complete = store.isComplete(recipe)
+        complete = store.isComplete(recipe, locales: voiceLocales)
         hasAnything = store.hasAnything(recipe)
         try? FileManager.default.createDirectory(at: store.root, withIntermediateDirectories: true)
         if let v = try? store.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -202,7 +204,9 @@ final class MetaContentModel: ObservableObject {
                 }
             }
             let record = store.loadRecord()
-            let selection = FetchSelection(ownedSKUs: skus, withheld: Set(record?.withheld ?? []))
+            let locales = voiceLocales
+            if !locales.isEmpty { log("voice-language packs: \(locales.sorted().joined(separator: ", "))") }
+            let selection = FetchSelection(ownedSKUs: skus, withheld: Set(record?.withheld ?? []), locales: locales)
             let plan = FetchPlan.plan(recipe: recipe, selection: selection, record: record, state: store.state(of:))
             let missing = plan.reduce(Int64(0)) { sum, p in
                 switch p.action {
@@ -268,7 +272,8 @@ struct MetaContentView: View {
                 if account.signedIn { Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary) }
             }
             Text(klL("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))",
-                     "Versión de Quest \(model.recipe.versionName) de la tienda de Meta · \(gb(model.requiredBytes))"))
+                     "Versión de Quest \(model.recipe.versionName) de la tienda de Meta · \(gb(model.requiredBytes))")
+                 + voicePacksLabel)
                 .foregroundStyle(.secondary)
             content
             Spacer(minLength: 0)
@@ -290,6 +295,12 @@ struct MetaContentView: View {
                 if case .failed = model.stage { model.start() }
             }
         }
+    }
+
+    /// " · voices es-ES, en-US" for a game with voice-language packs.
+    private var voicePacksLabel: String {
+        let l = model.voiceLocales.sorted()
+        return l.isEmpty ? "" : klL(" · voices ", " · voces ") + l.joined(separator: ", ")
     }
 
     @ViewBuilder private var content: some View {

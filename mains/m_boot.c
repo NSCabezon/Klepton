@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -121,6 +122,88 @@ static int drm_call(const char *name) {
     }
 }
 
+// batman's language-pack downloads, against the packs on disk. A pack on disk:
+// a non-error DownloadById completion naming its path, then a "completed"
+// update notification (request 0) at its real size. A manifest pack that is
+// not there: an ERROR completion. An id that is no pack of the game: abort.
+static uint64_t langpack_id(const char *file) {
+    uint64_t h = 0;
+    for (const char *p = file; *p; p++) h = h * 131 + (unsigned char)*p;
+    return h ? h : 1;
+}
+static int check_langpack_download(void) {
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "batman") != 0) return 0;
+    char mf[1200];
+    snprintf(mf, sizeof mf, "%s/obb/localized-asset-manifest.txt", kl_jni_files_dir());
+    FILE *f = fopen(mf, "r");
+    if (!f) { printf("  (no language-pack manifest at %s: pack downloads not checked)\n", mf); return 0; }
+    char have[256] = "", miss[256] = "", line[512];
+    unsigned long long have_size = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *c1 = strchr(line, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c2) continue;
+        *c2 = 0;
+        unsigned long long want = strtoull(c2 + 1, NULL, 10);
+        char path[1500];
+        snprintf(path, sizeof path, "%s/obb/%s", kl_jni_files_dir(), c1 + 1);
+        struct stat st;
+        int there = stat(path, &st) == 0 && (unsigned long long)st.st_size == want;
+        if (there && !have[0]) { snprintf(have, sizeof have, "%s", c1 + 1); have_size = want; }
+        if (!there && !miss[0]) snprintf(miss, sizeof miss, "%s", c1 + 1);
+    }
+    fclose(f);
+    typedef uint64_t (*u64_fn)(void *);
+    void *pop = kl_ovrplat_sym("ovr_PopMessage");
+    uint64_t (*dl)(uint64_t) = (uint64_t (*)(uint64_t))kl_ovrplat_sym("ovr_AssetFile_DownloadById");
+    u64_fn rid  = (u64_fn)kl_ovrplat_sym("ovr_Message_GetRequestID");
+    u64_fn err  = (u64_fn)kl_ovrplat_sym("ovr_Message_IsError");
+    u64_fn type = (u64_fn)kl_ovrplat_sym("ovr_Message_GetType");
+    u64_fn res  = (u64_fn)kl_ovrplat_sym("ovr_Message_GetAssetFileDownloadResult");
+    u64_fn upd  = (u64_fn)kl_ovrplat_sym("ovr_Message_GetAssetFileDownloadUpdate");
+    const char *(*rpath)(void *) = (const char *(*)(void *))kl_ovrplat_sym("ovr_AssetFileDownloadResult_GetFilepath");
+    u64_fn done  = (u64_fn)kl_ovrplat_sym("ovr_AssetFileDownloadUpdate_GetCompleted");
+    u64_fn bytes = (u64_fn)kl_ovrplat_sym("ovr_AssetFileDownloadUpdate_GetBytesTransferred");
+    const char *(*emsg)(void *) = (const char *(*)(void *))kl_ovrplat_sym("ovr_Error_GetMessage");
+    if (!pop || !dl || !rid || !err || !type || !res || !upd || !rpath || !done || !bytes || !emsg)
+        return fail("language-pack download: a symbol resolved to nothing");
+    void *(*popm)(void) = (void *(*)(void))pop;
+    while (popm()) { }
+    if (have[0]) {
+        uint64_t req = dl(langpack_id(have));
+        void *m = popm(), *n = popm();
+        if (!m || rid(m) != req || err(m) || type(m) != 0x2D008992u)
+            return fail("language-pack download: a pack on disk did not complete");
+        const char *p = rpath((void *)(uintptr_t)res(m));
+        if (!p || !strstr(p, have)) return fail("language-pack download: wrong path in the result");
+        if (!n || rid(n) != 0 || type(n) != 0x2FDD0CCDu)
+            return fail("language-pack download: no completed-update notification");
+        void *u = (void *)(uintptr_t)upd(n);
+        if (!done(u) || bytes(u) != have_size)
+            return fail("language-pack download: the update is not complete at the pack's size");
+        printf("  language pack %s on disk: its download completes from the disk (nothing fetched)\n", have);
+    }
+    if (miss[0]) {
+        uint64_t req = dl(langpack_id(miss));
+        void *m = popm();
+        if (!m || rid(m) != req || !err(m) || !strstr(emsg(m), "Game Hub"))
+            return fail("language-pack download: a missing pack did not get an error completion");
+        printf("  language pack %s not on disk: its download gets an error completion\n", miss);
+    }
+    fflush(NULL);
+    pid_t p = fork();
+    if (p == 0) {
+        freopen("/dev/null", "w", stderr);
+        dl(12345);                       // no pack of this game has this id
+        _exit(3);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT))
+        return fail("language-pack download: an id outside the manifest did NOT abort");
+    return 0;
+}
+
 // The line this asserts, in both directions. It moved once, deliberately, and
 // the move is the reason the value is now checked rather than just the refusal:
 //
@@ -200,6 +283,11 @@ static int check_drm_guard(void) {
     if (r == KLDRM_ABORTED)
         return fail("ovr_AssetFile_GetList aborted — enumerating DLC we do not have "
                     "is a fact about this host, not a licence decision");
+
+    // 4. batman's language packs: a download of one is answered from the disk
+    //    (kl_ovrplat.c, klplat_langpack_Download). Checked only where the game's
+    //    own manifest is present, against whatever packs are on disk right now.
+    if (check_langpack_download()) return 1;
 
     printf("  the app's own entitlement answers yes AND completes, DLC delivery\n"
            "  refuses and aborts (guard verified); course enumeration is answered\n"

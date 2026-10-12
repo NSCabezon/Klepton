@@ -834,7 +834,7 @@ final class HubLibraryModel: ObservableObject {
         case .meta:
             #if canImport(MetaStore)
             guard let m = meta[target] else { return nil }
-            let p = m.store.requiredProgress(m.recipe)
+            let p = m.store.requiredProgress(m.recipe, locales: m.voiceLocales)
             return UInt64(max(0, p.total - p.have))
             #else
             return nil
