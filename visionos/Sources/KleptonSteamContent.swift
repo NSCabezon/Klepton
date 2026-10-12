@@ -576,35 +576,8 @@ struct SteamContentView: View {
     @ViewBuilder private var content: some View {
         switch model.stage {
         case .idle: idle
-        case .connecting(let s):
-            HStack(spacing: 12) { ProgressView(); Text(s) }
-        case .signIn(let message):
-            SteamSignInForm(model: model, message: message)
-        case .guardCode(let type, let canApprove, let error):
-            SteamGuardCodeForm(model: model, type: type, canApprove: canApprove, error: error)
-        case .approve(let text):
-            VStack(alignment: .leading, spacing: 14) {
-                Text(klL("Confirm the sign-in", "Confirma el inicio de sesión")).font(.title2.bold())
-                HStack(spacing: 12) { ProgressView(); Text(text) }
-                Button(klL("Cancel", "Cancelar")) { model.cancelSignIn() }
-            }
-        case .qr(let url):
-            HStack(alignment: .top, spacing: 28) {
-                if let img = qrImage(url) {
-                    Image(uiImage: img).interpolation(.none).resizable().frame(width: 300, height: 300)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                }
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(klL("Sign in with a QR code", "Inicia sesión con un código QR")).font(.title2.bold())
-                    Text(klL("Scan it with the Steam app on a phone (Steam Guard shield → “Scan a QR code”). "
-                         + "A headset's own display can't be seen by a phone camera, so this mostly helps when "
-                         + "mirroring the view; the same link is written to the device log as “[steam] QR url:”.",
-                         "Escanéalo con la app de Steam en un móvil (escudo de Steam Guard → “Escanear un código QR”). "
-                         + "La cámara de un móvil no puede ver la pantalla del visor, así que sirve sobre todo "
-                         + "al duplicar la vista; el mismo enlace se escribe en el registro del dispositivo como “[steam] QR url:”."))
-                    Button(klL("Back", "Atrás")) { model.cancelSignIn() }
-                }
-            }
+        case .connecting, .signIn, .guardCode, .approve, .qr:
+            SteamSignInStages(model: model)
         case .working: working
         case .paused:
             VStack(alignment: .leading, spacing: 12) {
@@ -691,6 +664,49 @@ struct SteamContentView: View {
         if p.depotBytes > 0 {
             Text(klL("\(gbD(Double(p.depotBytes - p.bytesToDownload + p.bytesDownloaded))) of \(gb(p.depotBytes))", "\(gbD(Double(p.depotBytes - p.bytesToDownload + p.bytesDownloaded))) de \(gb(p.depotBytes))"))
                 .monospacedDigit().foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The sign-in steps of a Steam run (and its "connecting" lines): the game's page shows them
+/// inline, the hub's card in a sheet (HubSteamSignInSheet). Signing in carries straight on into
+/// the download — the same run.
+struct SteamSignInStages: View {
+    @ObservedObject var model: SteamContentModel
+
+    var body: some View {
+        switch model.stage {
+        case .connecting(let s):
+            HStack(spacing: 12) { ProgressView(); Text(s) }
+        case .signIn(let message):
+            SteamSignInForm(model: model, message: message)
+        case .guardCode(let type, let canApprove, let error):
+            SteamGuardCodeForm(model: model, type: type, canApprove: canApprove, error: error)
+        case .approve(let text):
+            VStack(alignment: .leading, spacing: 14) {
+                Text(klL("Confirm the sign-in", "Confirma el inicio de sesión")).font(.title2.bold())
+                HStack(spacing: 12) { ProgressView(); Text(text) }
+                Button(klL("Cancel", "Cancelar")) { model.cancelSignIn() }
+            }
+        case .qr(let url):
+            HStack(alignment: .top, spacing: 28) {
+                if let img = qrImage(url) {
+                    Image(uiImage: img).interpolation(.none).resizable().frame(width: 300, height: 300)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(klL("Sign in with a QR code", "Inicia sesión con un código QR")).font(.title2.bold())
+                    Text(klL("Scan it with the Steam app on a phone (Steam Guard shield → “Scan a QR code”). "
+                         + "A headset's own display can't be seen by a phone camera, so this mostly helps when "
+                         + "mirroring the view; the same link is written to the device log as “[steam] QR url:”.",
+                         "Escanéalo con la app de Steam en un móvil (escudo de Steam Guard → “Escanear un código QR”). "
+                         + "La cámara de un móvil no puede ver la pantalla del visor, así que sirve sobre todo "
+                         + "al duplicar la vista; el mismo enlace se escribe en el registro del dispositivo como “[steam] QR url:”."))
+                    Button(klL("Back", "Atrás")) { model.cancelSignIn() }
+                }
+            }
+        default:
+            EmptyView()
         }
     }
 }
