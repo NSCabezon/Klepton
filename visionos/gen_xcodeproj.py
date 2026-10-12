@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import targets as targets_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Quiet about hub games left out for missing files: run.sh already said which, and why.
+os.environ.setdefault("KL_HUB_QUIET", "1")
 KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAULT)
 # The PRODUCT name, which is also the .xcodeproj's, the .app's and the scheme's.
 # The Swift sources are still Klepton*.swift whatever the product is called —
