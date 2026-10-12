@@ -649,10 +649,13 @@ struct SteamContentView: View {
                 }
                 Text(model.game.title).font(.largeTitle.bold())
                 Spacer()
+                #if !KL_HUB
+                // The hub signs out from its Settings (Steam account), not from a game's page.
                 if model.account != nil {
                     Text(KLAccountPrivacy.steamLabel).font(.footnote).foregroundStyle(.secondary)
                     Button(klL("Sign out", "Cerrar sesión")) { model.signOut() }.font(.footnote).disabled(model.isBusy)
                 }
+                #endif
             }
             content
             #if KL_HUB

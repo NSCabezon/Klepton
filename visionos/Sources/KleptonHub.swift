@@ -1108,6 +1108,34 @@ final class HubLibraryModel: ObservableObject {
         }
     }
 
+    /// The card's "Check for updates / Verify files": the active store's run, re-checking every file
+    /// against the store (Steam: a forced verify; Meta: its start(), which checks and resumes).
+    func verifyCardDownload(_ g: KLHubGameRow) -> CardStart {
+        guard let store = activeStore(g), !HubStorage.isBusy(self, g.target) else { return .nothing }
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let m = content[g.target] else { return .nothing }
+            NSLog("[hub] \(g.target): verify from its card (Steam)")
+            m.start(forceVerify: true)
+            return .started
+            #else
+            return .nothing
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            guard let m = meta[g.target] else { return .nothing }
+            metaAccount.importHandoff()
+            guard metaAccount.token() != nil else { return .metaSignIn }
+            NSLog("[hub] \(g.target): verify from its card (Meta)")
+            m.start()
+            return .started
+            #else
+            return .nothing
+            #endif
+        }
+    }
+
     /// The card's Pause: as the page's (the run stops, what is on disk stays, Resume goes on).
     func pauseCardDownload(_ g: KLHubGameRow) {
         #if canImport(SteamDepot)
@@ -2321,8 +2349,13 @@ struct HubLibraryView: View {
     #endif
 
     /// The card's Download / Resume / Retry / Update / Verify.
-    private func startDownload(_ g: KLHubGameRow) {
-        switch model.startCardDownload(g) {
+    private func startDownload(_ g: KLHubGameRow) { handleStart(g, model.startCardDownload(g)) }
+
+    private func verifyDownload(_ g: KLHubGameRow) { handleStart(g, model.verifyCardDownload(g)) }
+
+    /// A card run started (Steam may stop at its sign-in, shown in a sheet) or why it did not.
+    private func handleStart(_ g: KLHubGameRow, _ result: HubLibraryModel.CardStart) {
+        switch result {
         case .started:
             if model.activeStore(g) == .steam { signInFor = g.target; signInShown = false }
         case .metaSignIn:
@@ -2593,9 +2626,9 @@ struct HubLibraryView: View {
         }
     }
 
-    /// A card is as tall as what it has to say: art at 460:215, title + store pills, the status
-    /// with the actions beside it (under it when they don't fit), then only the rows that have
-    /// something — a message, download progress, "Play from Mac" / "Add-ons", the last session.
+    /// A card is as tall as what it has to say: art at 460:215 with the status (bottom left) and
+    /// the store pills (bottom right) on it, the title, every action on one row, then only the rows
+    /// that have something — a message, download progress, the last session.
     /// A row of cards still lines up: each card stretches to the tallest one in its row.
     /// `dimmed`: a game the account does not own or this build does not carry — greyed, no Play
     /// or Download (its settings stay under "…").
@@ -2612,53 +2645,51 @@ struct HubLibraryView: View {
             Text(statusText).font(.callout).foregroundStyle(statusColor)
                 .monospacedDigit().lineLimit(1).truncationMode(.tail)
         }
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(.regularMaterial, in: Capsule())
         .help(statusText)
         let streamable = Self.streamable(g)
         let addons = hasAddons(g, active)
         let lastSession = model.lastSession[g.target].map(HubSessionText.card)
-        return VStack(alignment: .leading, spacing: 8) {
-            cover(g).saturation(dimmed ? 0.15 : 1)
-            HStack(spacing: 8) {
-                Text(g.display).font(.title3.bold()).lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: 4)
-                // One pill per store this game can come from: owned = highlighted, otherwise dimmed.
-                ForEach(KLCatalog.stores(g.target)) { store in
-                    storeBadge(store, owns: model.ownership(g, store), state: model.sourceState(g, store), active: store == active)
-                }
-            }
-            // Status and actions on one row when they fit; else the actions go under the status.
-            // Play and the download in place (the download page is under "…"), then the menu.
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 10) {
-                    status.fixedSize()
-                    Spacer(minLength: 8)
-                    if !dimmed { mainButtons(g, st, dl, active: active) }
-                    cardMenu(g, st, active: active)
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    status
-                    HStack(spacing: 10) {
-                        if !dimmed { mainButtons(g, st, dl, active: active) }
-                        Spacer(minLength: 0)
-                        cardMenu(g, st, active: active)
+        // Every action on one row: Play / the download in place, "Play from Mac", "Add-ons", then
+        // the menu. When that does not fit, the Mac's name goes, then the secondary labels.
+        func actions(macCaption: Bool, iconOnly: Bool) -> some View {
+            HStack(spacing: 10) {
+                if !dimmed { mainButtons(g, st, dl, active: active) }
+                if streamable && !dimmed { playFromMacButton(g, caption: macCaption, iconOnly: iconOnly) }
+                if addons {
+                    Button { addonsFor = SheetTarget(id: g.target) } label: {
+                        Label("Add-ons", systemImage: "puzzlepiece.extension")
+                            .labelStyle(AnyKLLabelStyle(iconOnly: iconOnly))
                     }
+                    .help(klL("Optional content: voice languages", "Contenido opcional: idiomas de voz"))
                 }
+                Spacer(minLength: 0)
+                cardMenu(g, st, active: active)
+            }
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            // The art carries the status (bottom left) and the store pills (bottom right).
+            cover(g).saturation(dimmed ? 0.15 : 1)
+                .overlay(alignment: .bottomLeading) { status.padding(8) }
+                .overlay(alignment: .bottomTrailing) {
+                    // One pill per store this game can come from: owned = highlighted, otherwise dimmed.
+                    HStack(spacing: 6) {
+                        ForEach(KLCatalog.stores(g.target)) { store in
+                            storeBadge(store, owns: model.ownership(g, store), state: model.sourceState(g, store), active: store == active)
+                        }
+                    }
+                    .padding(8)
+                }
+            Text(g.display).font(.title3.bold()).lineLimit(1).truncationMode(.tail)
+            ViewThatFits(in: .horizontal) {
+                actions(macCaption: true, iconOnly: false)
+                actions(macCaption: false, iconOnly: false)
+                actions(macCaption: false, iconOnly: true)
             }
             messageSlot(g, st, dl, unavailable: unavailable)
-            // "Play from Mac" for a game the Mac can host, "Add-ons" for a game with optional
-            // content — only on the cards that have one.
-            if streamable || addons {
-                HStack(spacing: 12) {
-                    if streamable { playFromMacButton(g) }
-                    Spacer(minLength: 0)
-                    if addons {
-                        Button { addonsFor = SheetTarget(id: g.target) } label: {
-                            Label("Add-ons", systemImage: "puzzlepiece.extension")
-                        }
-                        .help(klL("Optional content: voice languages", "Contenido opcional: idiomas de voz"))
-                    }
-                }
-            }
+            // The settings line and the last session sit at the card's foot, level across a row.
+            Spacer(minLength: 0)
             VStack(alignment: .leading, spacing: 2) {
                 Text(HubGameSettingsView.summary(g.target)).lineLimit(1)
                 if let lastSession { Text(lastSession).lineLimit(1).monospacedDigit() }
@@ -2800,7 +2831,7 @@ struct HubLibraryView: View {
     /// needs no game data on the headset, so it ignores the card's download
     /// state; it needs a Mac, so it is disabled until one is found. With
     /// several, a menu picks one.
-    @ViewBuilder private func playFromMacButton(_ g: KLHubGameRow) -> some View {
+    @ViewBuilder private func playFromMacButton(_ g: KLHubGameRow, caption: Bool = true, iconOnly: Bool = false) -> some View {
         // Only the Macs hosting THIS game (the host's Bonjour TXT "guest"; a Mac
         // that does not say is offered everywhere, as before).
         let found = macs.macs.filter { $0.serves(g.target) }
@@ -2812,17 +2843,19 @@ struct HubLibraryView: View {
                     ForEach(found) { m in
                         Button(m.name) { onPlayFromMac(g.target, m) }
                     }
-                } label: { Label(title, systemImage: "desktopcomputer") }
+                } label: { Label(title, systemImage: "desktopcomputer").labelStyle(AnyKLLabelStyle(iconOnly: iconOnly)) }
                 .disabled(busy)
             } else {
                 Button {
                     if let m = found.first { onPlayFromMac(g.target, m) }
-                } label: { Label(title, systemImage: "desktopcomputer") }
+                } label: { Label(title, systemImage: "desktopcomputer").labelStyle(AnyKLLabelStyle(iconOnly: iconOnly)) }
                 .disabled(found.isEmpty || busy)
             }
-            Text(found.isEmpty ? klL("Looking for your Mac…", "Buscando tu Mac…")
-                 : found.count == 1 ? found[0].name : klL("\(found.count) Macs", "\(found.count) Macs"))
-                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            if caption {
+                Text(found.isEmpty ? klL("Looking for your Mac…", "Buscando tu Mac…")
+                     : found.count == 1 ? found[0].name : klL("\(found.count) Macs", "\(found.count) Macs"))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
         }
         .help(klL("The game runs on your Mac and streams to the headset; no download needed here.",
                   "El juego corre en tu Mac y se ve en el visor; no hace falta descargarlo aquí."))
@@ -2895,21 +2928,22 @@ struct HubLibraryView: View {
                       "Detiene la descarga; lo que ya está en el visor se conserva"))
     }
 
-    /// "…": the game's settings and its download page (verify, delete, cloud saves, update).
+    /// "…": the game's settings and a check of its files (updates, damaged or missing files).
     private func cardMenu(_ g: KLHubGameRow, _ st: HubLibraryModel.Status, active: KLStore?) -> some View {
         Menu {
             Button { settingsFor = g } label: {
                 Label(klL("Game settings", "Ajustes del juego"), systemImage: "gearshape")
             }
-            if let a = active, hasDownloadPage(g.target, a), st != .notInLibrary {
-                Button { detailStore = a; detail = g.target } label: {
-                    Label(klL("Manage download…", "Gestionar descarga…"), systemImage: "externaldrive")
+            if let a = active, hasDownloadPage(g.target, a), st.canPlay, model.cardDownload(g) == .none {
+                Button { verifyDownload(g) } label: {
+                    Label(klL("Check for updates / Verify files", "Buscar actualizaciones / Verificar archivos"),
+                          systemImage: "checkmark.shield")
                 }
             }
         } label: {
             Label(klL("More", "Más"), systemImage: "ellipsis.circle").labelStyle(.iconOnly)
         }
-        .help(klL("Settings, manage the download", "Ajustes, gestionar la descarga"))
+        .help(klL("Settings, verify the game's files", "Ajustes, verificar los archivos del juego"))
     }
 
     /// The game has optional content to add (today: a Meta recipe's voice-language packs).
@@ -2996,5 +3030,12 @@ struct HubLibraryView: View {
         }
     }
     #endif
+}
+/// A label that is its icon only when room is short (the full title stays in its accessibility label).
+struct AnyKLLabelStyle: LabelStyle {
+    let iconOnly: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        if iconOnly { Label(configuration).labelStyle(.iconOnly) } else { Label(configuration).labelStyle(.titleAndIcon) }
+    }
 }
 #endif
