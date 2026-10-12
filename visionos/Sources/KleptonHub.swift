@@ -44,6 +44,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// targets.py's "render_scale" for this game: what the "Render resolution"
     /// setting means until the player moves it (KleptonRendering.apply).
     let renderScale: Double
+    /// targets.py's "foveation" for this game: what "Foveated rendering" means
+    /// until the player changes it (KLRenderPrefs).
+    let foveation: Bool
     /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
     /// for a guest that has none). Written beside <tree>/assets by HubPrep.
     let meta: [String: String]
@@ -1188,6 +1191,10 @@ struct HubGameSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var s = KLGameSettings()
     @State private var sessions: [KLSessionRecord] = []
+    /// Foveation / render resolution as chosen for this game (nil = the game's
+    /// default), KLRenderPrefs; read at boot by KleptonRendering.apply.
+    @State private var fovChoice: Bool?
+    @State private var scaleChoice: Double?
 
     private var base: KLTune { KleptonTuning.shared.baseline }
 
@@ -1299,30 +1306,11 @@ struct HubGameSettingsView: View {
                     }
                 }
 
+                if game.bundled { graphicsSection }
+
                 #if canImport(SteamDepot)
                 KLCloudSaveSection(target: game.target)
                 #endif
-
-                if KLGameSettingsStore.hasPrecompile(game.target) {
-                    Section {
-                        Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
-                            get: { s.precompileGraphics ?? false },
-                            set: { s.precompileGraphics = $0 ? true : nil; save() }))
-                        let have = FileManager.default.fileExists(
-                            atPath: KLGameSettingsStore.fozURL(game.target).path)
-                        Text(have ? klL("Pipeline list found.", "Lista de pipelines encontrada.")
-                                  : klL("No pipeline list on the headset yet.",
-                                        "Aún no hay lista de pipelines en el visor."))
-                            .font(.footnote).foregroundStyle(.secondary)
-                    } header: { Text(klL("Graphics", "Gráficos")) } footer: {
-                        Text(klL("Before the game starts, compiles the shaders it will need, so walking "
-                                 + "into a new area does not freeze the picture. Takes a while each "
-                                 + "launch; the progress shows in the game's window.",
-                                 "Antes de arrancar el juego compila los shaders que va a usar, para "
-                                 + "que la imagen no se congele al entrar en una zona nueva. Tarda un "
-                                 + "rato en cada arranque; el progreso sale en la ventana del juego."))
-                    }
-                }
 
                 Section {
                     Toggle(klL("Performance overlay", "Visor de rendimiento"), isOn: Binding(
@@ -1344,6 +1332,9 @@ struct HubGameSettingsView: View {
                 Section {
                     Button(klL("Reset all settings for this game", "Restablecer todos los ajustes de este juego"), role: .destructive) {
                         s = KLGameSettings(); save()
+                        fovChoice = nil; scaleChoice = nil
+                        KLRenderPrefs.setFoveation(nil, for: game.target)
+                        KLRenderPrefs.setRenderScale(nil, for: game.target)
                     }
                 }
             }
@@ -1356,7 +1347,88 @@ struct HubGameSettingsView: View {
         .onAppear {
             s = KLGameSettingsStore.load(game.target)
             sessions = Array(KLSessionHistory.load(game.target).suffix(6).reversed())
+            fovChoice = KLRenderPrefs.storedFoveation(for: game.target)
+            scaleChoice = KLRenderPrefs.storedRenderScale(for: game.target)
         }
+    }
+
+    /// "Graphics": foveated rendering and render resolution for THIS game
+    /// (KLRenderPrefs, applied at the next launch), each with its default and a
+    /// reset, plus (where offered) shader precompilation. Every bundled game.
+    @ViewBuilder private var graphicsSection: some View {
+        let t = game.target
+        let dFov = KLRenderPrefs.defaultFoveation(for: t)
+        let dScale = KLRenderPrefs.defaultRenderScale(for: t)
+        let scale = scaleChoice ?? dScale
+        let onOff = { (b: Bool) in b ? klL("on", "activado") : klL("off", "desactivado") }
+        let pct = { (v: Double) in "\(Int((v * 100).rounded())) %" }
+        Section {
+            // Alyx foveates through MoltenVK (KL_FOVEATE, "Foveated rendering" under
+            // Performance above); this one is the OpenGL guests' rate map (KL_VRR).
+            if !KLGameSettingsStore.hasPerformance(t) {
+                HStack {
+                    Toggle(klL("Foveated rendering", "Renderizado foveado"), isOn: Binding(
+                        get: { fovChoice ?? dFov },
+                        set: { fovChoice = $0; KLRenderPrefs.setFoveation($0, for: t) }))
+                    resetButton(disabled: fovChoice == nil) {
+                        fovChoice = nil; KLRenderPrefs.setFoveation(nil, for: t)
+                    }
+                }
+                Text(klL("Default: \(onOff(dFov))", "Por defecto: \(onOff(dFov))"))
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            HStack {
+                Text(klL("Render resolution", "Resolución de render")).frame(width: 160, alignment: .leading)
+                Slider(value: Binding(get: { scale },
+                                      set: { v in
+                                          let r = (v * 20).rounded() / 20
+                                          scaleChoice = r; KLRenderPrefs.setRenderScale(r, for: t)
+                                      }),
+                       in: KLRenderPrefs.scaleRange, step: 0.05)
+                Text(pct(scale)).font(.system(.body, design: .monospaced)).frame(width: 64, alignment: .trailing)
+                resetButton(disabled: scaleChoice == nil) {
+                    scaleChoice = nil; KLRenderPrefs.setRenderScale(nil, for: t)
+                }
+            }
+            Text(klL("Default: \(pct(dScale))", "Por defecto: \(pct(dScale))"))
+                .font(.footnote).foregroundStyle(.secondary)
+            if KLGameSettingsStore.hasPrecompile(t) {
+                Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
+                    get: { s.precompileGraphics ?? false },
+                    set: { s.precompileGraphics = $0 ? true : nil; save() }))
+                let have = FileManager.default.fileExists(atPath: KLGameSettingsStore.fozURL(t).path)
+                Text(have ? klL("Pipeline list found.", "Lista de pipelines encontrada.")
+                          : klL("No pipeline list on the headset yet.",
+                                "Aún no hay lista de pipelines en el visor."))
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        } header: { Text(klL("Graphics", "Gráficos")) } footer: {
+            Text(klL("Applies the next time the game starts. Foveated rendering keeps the centre sharp "
+                     + "and renders the edges at a lower rate (fixed, not eye-tracked); off renders every "
+                     + "pixel at full rate. Render resolution is the size of the picture the game renders, "
+                     + "per axis: lower it if looking around stutters.",
+                     "Se aplica la próxima vez que arranque el juego. El renderizado foveado mantiene "
+                     + "nítido el centro y dibuja los bordes a menor resolución (fijo, no sigue la mirada); "
+                     + "desactivado, todo se dibuja a resolución completa. La resolución de render es el "
+                     + "tamaño de la imagen que dibuja el juego, por eje: bájala si al mirar alrededor "
+                     + "va a tirones.")
+                 + (KLGameSettingsStore.hasPrecompile(t)
+                    ? klL("\n\nPrecompile graphics: before the game starts, compiles the shaders it will need, "
+                          + "so walking into a new area does not freeze the picture. Takes a while each "
+                          + "launch; the progress shows in the game's window.",
+                          "\n\nPrecompilar gráficos: antes de arrancar el juego compila los shaders que va a "
+                          + "usar, para que la imagen no se congele al entrar en una zona nueva. Tarda un "
+                          + "rato en cada arranque; el progreso sale en la ventana del juego.")
+                    : ""))
+        }
+    }
+
+    private func resetButton(disabled: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: "arrow.uturn.backward") }
+            .buttonStyle(.borderless)
+            .disabled(disabled)
+            .accessibilityLabel(klL("Reset to default", "Restablecer valor por defecto"))
+            .help(klL("Reset to default", "Restablecer valor por defecto"))
     }
 
     /// The last session in detail, then the five before it, and a way to forget them.
