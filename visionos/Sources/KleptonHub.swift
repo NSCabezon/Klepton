@@ -1566,6 +1566,8 @@ struct HubGameSettingsView: View {
     let game: KLHubGameRow
     /// Store availability in full (technical: versions, packages), when the card shows a short reason.
     var details: String? = nil
+    /// "Check for updates / Verify files" for an installed game with nothing running (nil = not offered).
+    var onVerify: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var s = KLGameSettings()
     @State private var sessions: [KLSessionRecord] = []
@@ -1689,6 +1691,23 @@ struct HubGameSettingsView: View {
                 #if canImport(SteamDepot)
                 KLCloudSaveSection(target: game.target)
                 #endif
+
+                if let onVerify {
+                    Section {
+                        Button {
+                            dismiss()
+                            onVerify()
+                        } label: {
+                            Label(klL("Check for updates / Verify files", "Buscar actualizaciones / Verificar archivos"),
+                                  systemImage: "checkmark.shield")
+                        }
+                    } header: { Text(klL("Game files", "Archivos del juego")) } footer: {
+                        Text(klL("Checks every file against the store and downloads what is new, missing or damaged. "
+                                 + "Progress shows on the game's card.",
+                                 "Comprueba cada archivo con la tienda y descarga lo nuevo, lo que falta o lo dañado. "
+                                 + "El progreso se ve en la tarjeta del juego."))
+                    }
+                }
 
                 Section {
                     Toggle(klL("Performance overlay", "Visor de rendimiento"), isOn: Binding(
@@ -2304,7 +2323,8 @@ struct HubLibraryView: View {
         }
         .onDisappear { macs.stop() }
         .sheet(item: $settingsFor, onDismiss: { model.reloadSessions() }) { g in
-            HubGameSettingsView(game: g, details: model.status(g) == .notInLibrary ? model.notInLibraryReason(g) : nil)
+            HubGameSettingsView(game: g, details: model.status(g) == .notInLibrary ? model.notInLibraryReason(g) : nil,
+                                onVerify: canVerify(g) ? { verifyDownload(g) } : nil)
         }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
         .sheet(item: $downloadAll) { offer in
@@ -2665,7 +2685,7 @@ struct HubLibraryView: View {
                     .help(klL("Optional content: voice languages", "Contenido opcional: idiomas de voz"))
                 }
                 Spacer(minLength: 0)
-                cardMenu(g, st, active: active)
+                settingsButton(g)
             }
         }
         return VStack(alignment: .leading, spacing: 8) {
@@ -2928,22 +2948,18 @@ struct HubLibraryView: View {
                       "Detiene la descarga; lo que ya está en el visor se conserva"))
     }
 
-    /// "…": the game's settings and a check of its files (updates, damaged or missing files).
-    private func cardMenu(_ g: KLHubGameRow, _ st: HubLibraryModel.Status, active: KLStore?) -> some View {
-        Menu {
-            Button { settingsFor = g } label: {
-                Label(klL("Game settings", "Ajustes del juego"), systemImage: "gearshape")
-            }
-            if let a = active, hasDownloadPage(g.target, a), st.canPlay, model.cardDownload(g) == .none {
-                Button { verifyDownload(g) } label: {
-                    Label(klL("Check for updates / Verify files", "Buscar actualizaciones / Verificar archivos"),
-                          systemImage: "checkmark.shield")
-                }
-            }
-        } label: {
-            Label(klL("More", "Más"), systemImage: "ellipsis.circle").labelStyle(.iconOnly)
+    /// The game's settings (the check of its files is there too).
+    private func settingsButton(_ g: KLHubGameRow) -> some View {
+        Button { settingsFor = g } label: {
+            Label(klL("Game settings", "Ajustes del juego"), systemImage: "gearshape").labelStyle(.iconOnly)
         }
-        .help(klL("Settings, verify the game's files", "Ajustes, verificar los archivos del juego"))
+        .help(klL("Game settings", "Ajustes del juego"))
+    }
+
+    /// The game can re-check its files: installed, from a store with a download model, nothing running.
+    private func canVerify(_ g: KLHubGameRow) -> Bool {
+        guard let a = model.activeStore(g) else { return false }
+        return hasDownloadPage(g.target, a) && model.status(g).canPlay && model.cardDownload(g) == .none
     }
 
     /// The game has optional content to add (today: a Meta recipe's voice-language packs).
