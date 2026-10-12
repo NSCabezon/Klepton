@@ -2061,6 +2061,71 @@ int klb_alphasort(const bionic_dirent **a, const bionic_dirent **b) {
     return strcoll((*a)->d_name, (*b)->d_name);
 }
 
+// ---------- signal NUMBERS ----------
+// Linux and Darwin agree on 1-6, 8, 9, 11, 13-15 and disagree on most of the
+// rest, and this runtime has always passed guest signal numbers through
+// UNtranslated. That has held because it is self-consistent: a guest that
+// installs a handler for N and later sends N gets it, whatever N means to
+// Darwin — Unity's Boehm GC signals by Linux SIGPWR (30) and SIGXCPU (24),
+// which land on Darwin 30 and 24 and work as private signals.
+//
+// It breaks where the Darwin number is FATAL, because sigaction below refuses
+// a guest handler for a fatal signal. Linux SIGUSR2 is 12, and Darwin 12 is
+// SIGSYS: the guest's SIGUSR2 handler was refused as a "fatal-signal handler",
+// the guest then pthread_kill'ed 12, and Darwin delivered SIGSYS with no
+// handler — the process died (the Half-Life: Alyx launcher's SysV-semaphore
+// self-test interrupts a waiter with SIGUSR2 exactly this way).
+//
+// So ONE pair is swapped: Linux 12 (SIGUSR2) <-> Darwin 31 (SIGUSR2), and Linux
+// 31 (SIGSYS) <-> Darwin 12 (SIGSYS). A swap is a bijection, so every other
+// number keeps its old self-consistent pass-through, and both members now mean
+// what they say. Masks carry the same swap on bits 11 and 30. Linux SIGUSR1
+// (10, Darwin SIGBUS) is NOT remapped: its Darwin twin (30) is Boehm's SIGPWR.
+// Entry points that apply it: sigaction, signal, kill, raise, pthread_kill,
+// pthread_sigmask/sigprocmask, sigsuspend/sigwait/sigpending (below).
+int kl_sig_to_darwin(int sig) {
+    return sig == 12 ? 31 : sig == 31 ? 12 : sig;
+}
+uint64_t kl_sigmask_to_darwin(uint64_t m) {
+    uint64_t b11 = (m >> 11) & 1, b30 = (m >> 30) & 1;
+    m &= ~((1ull << 11) | (1ull << 30));
+    return (m | (b11 << 30) | (b30 << 11)) & 0xFFFFFFFFu;
+}
+int  klb_kill(pid_t pid, int sig) { return kill(pid, kl_sig_to_darwin(sig)); }
+
+// The three that take a whole mask. A guest builds its mask in LINUX numbering
+// (sigaddset(&m, SIGUSR2) sets bit 11), while the signal arrives as Darwin 31:
+// forwarded raw, a sigwait on Linux SIGUSR2 waits for Darwin SIGSYS and never
+// wakes for the signal it asked for. The mask goes over with the swap, and what
+// comes back — sigwait's signal number, sigpending's mask — comes back through
+// it too (the swap is its own inverse). bionic's sigset_t is 8 bytes and
+// Darwin's 4: only the low word carries signals Darwin has, and the guest's
+// high word (Linux 33..64, realtime) is written as zero.
+int klb_sigwait(const uint64_t *set, int *sig) {
+    if (!set || !sig) return EINVAL;
+    sigset_t d = (sigset_t)kl_sigmask_to_darwin(*set);
+    int got = 0;
+    int r = sigwait(&d, &got);
+    if (!r) *sig = kl_sig_to_darwin(got);
+    return r;
+}
+int klb_sigsuspend(const uint64_t *set) {
+    if (!set) { errno = EFAULT; return -1; }
+    sigset_t d = (sigset_t)kl_sigmask_to_darwin(*set);
+    return sigsuspend(&d);
+}
+int klb_sigpending(uint64_t *set) {
+    if (!set) { errno = EFAULT; return -1; }
+    sigset_t d;
+    int r = sigpending(&d);
+    if (!r) *set = kl_sigmask_to_darwin((uint64_t)d);
+    return r;
+}
+int  klb_raise(int sig)           { return raise(kl_sig_to_darwin(sig)); }
+void *klb_signal(int sig, void *handler) {
+    return (void *)signal(kl_sig_to_darwin(sig), (void (*)(int))handler);
+}
+
 // ---------- sigaction ----------
 // bionic/LP64 puts sa_flags FIRST, ahead of the handler union. That is specific
 // to __LP64__; the 32-bit layout leads with the handler instead. Getting it
@@ -2172,8 +2237,9 @@ static void kl_sig_x18_tramp(int sig, siginfo_t *info, void *uctx) {
     }
 }
 
-int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
+int klb_sigaction(int linux_sig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
+    int sig = kl_sig_to_darwin(linux_sig);
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] sigaction(%d, handler=%p)\n", sig,
                 in ? in->handler : NULL);
@@ -2182,7 +2248,7 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     if (in && in->handler && in->handler != (void *)SIG_DFL &&
         in->handler != (void *)SIG_IGN && klb_fatal_signal(sig) && !allow_guest) {
         fprintf(stderr, "[sig] refusing the guest's handler for signal %d "
-                        "(Linux ucontext; set KL_GUEST_SIGNALS=1 to install it)\n", sig);
+                        "(Linux ucontext; set KL_GUEST_SIGNALS=1 to install it)\n", linux_sig);
         if (old) { memset(old, 0, sizeof *old); }
         return 0;                    // the guest believes it is installed
     }
@@ -2196,11 +2262,11 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
             g_guest_sig[sig].siginfo = (in->flags & KL_SA_SIGINFO) ? 1 : 0;
             d.sa_sigaction = kl_sig_x18_tramp;
             d.sa_flags     = kl_sa_flags((uint32_t)in->flags) | SA_SIGINFO;
-            d.sa_mask      = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask      = (sigset_t)kl_sigmask_to_darwin(in->mask);
         } else {
             d.sa_handler = (void (*)(int))in->handler;
             d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
-            d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask    = (sigset_t)kl_sigmask_to_darwin(in->mask);
         }
     }
     int r = sigaction(sig, in ? &d : NULL, old ? &o : NULL);
@@ -2211,7 +2277,7 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
             oh = g_guest_sig[sig].handler;      // unwrap our trampoline
         old->handler = oh;
         old->flags   = (int32_t)kl_sa_flags_back(o.sa_flags);
-        old->mask    = o.sa_mask;
+        old->mask    = kl_sigmask_to_darwin(o.sa_mask);
     }
     return r;
 }

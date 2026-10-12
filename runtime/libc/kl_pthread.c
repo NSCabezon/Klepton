@@ -1839,7 +1839,7 @@ void  klb_pthread_exit(void *r)                { thread_unregister(pthread_self(
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
 int   klb_pthread_kill(pthread_t t, int sig)   {
-    int r = px(pthread_kill(t, sig));
+    int r = px(pthread_kill(t, kl_sig_to_darwin(sig)));
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] pthread_kill(%p, %d) -> %d%s\n", (void *)t, sig, r,
                 r ? " FAILED" : "");
@@ -1870,9 +1870,9 @@ static int kl_sigmask_how(int linux_how) {
 
 int klb_pthread_sigmask(int how, const uint64_t *s, uint64_t *o) {
     sigset_t din, dout;
-    if (s) din = (sigset_t)(*s & 0xFFFFFFFFu);
+    if (s) din = (sigset_t)kl_sigmask_to_darwin(*s);
     int r = pthread_sigmask(kl_sigmask_how(how), s ? &din : NULL, o ? &dout : NULL);
-    if (!r && o) *o = dout;
+    if (!r && o) *o = kl_sigmask_to_darwin(dout);   // the swap is its own inverse
     return r;
 }
 
