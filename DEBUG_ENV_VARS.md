@@ -983,10 +983,15 @@ puts the camera on the ground with its hands underneath it.
   Frontends publish the head in a floor frame; a guest that never selects
   FloorLevel (OVRPlugin's default is EyeLevel — I Expect You To Die) reads its
   node poses relative to an anchor instead: `KL_OVRP_EYE_HEIGHT` straight up
-  until the guest calls `ovrp_RecenterTrackingOrigin`, then the head position at
-  that recenter (position only, not yaw). Read side only: the compositor's
-  pose records stay in the floor frame. Off = the old answer, where IEYTD's
-  calibration panel sat 1.7 m below the view and the frame looked black.
+  until the guest calls `ovrp_RecenterTrackingOrigin`, then the head position
+  and HEADING at that recenter (the head's yaw becomes forward; pitch and roll
+  stay gravity's). With no frontend the default head already sits at the
+  origin, so nothing is subtracted (subtracting 1.6 m put headless captures
+  under the floor). Read side only: the compositor's pose records stay in the
+  floor frame. Off = the old answer, where IEYTD's calibration panel sat 1.7 m
+  below the view and the frame looked black.
+- `KL_OVRP_RECENTER_YAW=0` — recenter re-anchors position only (the behaviour
+  before yaw was taken out). Only EyeLevel guests are affected either way.
 - `KL_OVRP_HANDS_IN_VIEW=1` — park both hands at a fixed spot inside the
   *current head's* frustum (head-relative, 15 cm out, 12 cm down, 55 cm
   forward), overriding whatever the frontend last wrote. Read side, so it

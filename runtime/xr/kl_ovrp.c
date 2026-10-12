@@ -384,9 +384,9 @@ static uint64_t klovrp_RecenterTrackingOrigin2(int flags) {
 // So for an EyeLevel guest the node poses it READS (and only those — the
 // compositor's records stay in the frontend's frame, so reprojection deltas are
 // untouched) are taken relative to an anchor: the standing eye height until the
-// guest recenters, then the head position at that recenter. Yaw is NOT
-// recentred; only the position is. KL_OVRP_EYELEVEL=0 restores the old,
-// floor-frame answer.
+// guest recenters, then the head position and heading at that recenter
+// (klovrp_eyelevel_apply; KL_OVRP_RECENTER_YAW=0 keeps the heading out of it).
+// KL_OVRP_EYELEVEL=0 restores the old, floor-frame answer.
 static int   g_recenter_count;
 static int   g_anchor_set;           // a recenter has captured the head
 static float g_anchor[3];
@@ -2272,18 +2272,71 @@ static void klovrp_eyelevel_anchor(float out[3]) {
     out[0] = out[1] = out[2] = 0.0f;
     if (!klovrp_eyelevel_on()) return;
     if (g_anchor_set) { memcpy(out, g_anchor, sizeof g_anchor); return; }
+    // Only a PUBLISHED head is in the floor frame. With no frontend the default
+    // head already sits at the EyeLevel origin (klovrp_eye_height answers 0
+    // there), and subtracting a standing eye height from it put a headless
+    // run's camera 1.6 m under the floor — every KL_GLFB_OUT capture black.
+    if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) return;
     static float h = -1.0f;   // read once: this runs ~20 times a guest frame
     if (h < 0.0f) h = kl_env_float("KL_OVRP_EYE_HEIGHT", 1.6f);
     out[1] = h;
 }
 
+// The yaw a recenter takes out, as the half-angle sine/cosine of a rotation
+// about +Y. Identity until the first recenter. A recenter on a Quest makes the
+// head's CURRENT heading the new forward (pitch and roll are gravity's and stay),
+// so a seated title that recenters — IEYTD does, from its calibration and from
+// the pause menu — expects its scene to swing round to wherever the player
+// faces. Position alone left the scene behind the player if they had turned.
+// KL_OVRP_RECENTER_YAW=0 restores position-only.
+static float g_anchor_yaw_s, g_anchor_yaw_c = 1.0f;
+
+// Carry a pose read in the frontend's frame into the recentred EyeLevel frame:
+// subtract the anchor, then undo the anchor's yaw on position, orientation and
+// both velocities. A no-op (beyond the subtraction) until a recenter.
+static void klovrp_eyelevel_apply(float *f /* ovrpPoseStatef */) {
+    float anc[3];
+    klovrp_eyelevel_anchor(anc);     // zero unless an EyeLevel guest
+    f[4] -= anc[0]; f[5] -= anc[1]; f[6] -= anc[2];
+    if (!klovrp_eyelevel_on() || !g_anchor_set) return;
+    float s = g_anchor_yaw_s, c = g_anchor_yaw_c;
+    if (s == 0.0f) return;
+    // Rotation by -yaw about +Y: v' = (x cos - z sin... ) with the full angle,
+    // so form cos/sin of the full angle from the half-angle pair.
+    float C = c * c - s * s, S = 2.0f * s * c;     // cos(yaw), sin(yaw)
+    for (int v = 4; v <= 13; v += 3) {           // pos +0x10, vel +0x1c, (acc), angvel +0x34
+        if (v == 10) continue;                     // acceleration: left zero
+        float x = f[v], z = f[v + 2];
+        f[v]     = C * x - S * z;
+        f[v + 2] = S * x + C * z;
+    }
+    // q' = conj(qyaw) * q, qyaw = (0, s, 0, c).
+    float qx = f[0], qy = f[1], qz = f[2], qw = f[3];
+    f[0] = c * qx - s * qz;
+    f[1] = c * qy - s * qw;
+    f[2] = c * qz + s * qx;
+    f[3] = c * qw + s * qy;
+}
+
 static void klovrp_eyelevel_recenter(void) {
     klovrp_pose h = klovrp_head_published();
     g_anchor[0] = h.px; g_anchor[1] = h.py; g_anchor[2] = h.pz;
+    // The heading: where the head's -Z points, flattened onto the floor.
+    float yaw = 0.0f;
+    static int want_yaw = -1;
+    if (want_yaw < 0) want_yaw = kl_env_on("KL_OVRP_RECENTER_YAW", 1);
+    if (want_yaw) {
+        float fx = -2.0f * (h.qx * h.qz + h.qw * h.qy);
+        float fz = -(1.0f - 2.0f * (h.qx * h.qx + h.qy * h.qy));
+        if (fx * fx + fz * fz > 1e-6f) yaw = atan2f(-fx, -fz);
+    }
+    g_anchor_yaw_s = sinf(0.5f * yaw);
+    g_anchor_yaw_c = cosf(0.5f * yaw);
     g_anchor_set = 1;
     g_recenter_count++;
     fprintf(stderr, "  [ovrp] recenter #%d: EyeLevel origin now at head "
-                    "(%.3f, %.3f, %.3f)%s\n", g_recenter_count, h.px, h.py, h.pz,
+                    "(%.3f, %.3f, %.3f), yaw %.1f deg%s\n", g_recenter_count, h.px, h.py, h.pz,
+            (double)(yaw * 57.29578f),
             klovrp_eyelevel_on() ? "" : " (not applied: FloorLevel or KL_OVRP_EYELEVEL=0)");
 }
 
@@ -4355,10 +4408,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     float *f = out;
     f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
     f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c
-    float anc[3];
-    klovrp_eyelevel_anchor(anc);     // zero unless an EyeLevel guest (see above)
-    f[4] = p->px - anc[0]; f[5] = p->py - anc[1];   // position at +0x10
-    f[6] = p->pz - anc[2];
+    f[4] = p->px; f[5] = p->py; f[6] = p->pz;       // position at +0x10
         // Velocity at +0x1c and angular velocity at +0x34, both of which were left
     // zero until now. libunity copies all four vectors straight into its XR
     // node state, so a zero here is not "unknown", it is "not moving" — and
@@ -4368,6 +4418,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     // estimate off a 90 Hz pose stream is noise wearing a physical name.
     f[7]  = p->vx;  f[8]  = p->vy;  f[9]  = p->vz;
     f[13] = p->avx; f[14] = p->avy; f[15] = p->avz;
+    klovrp_eyelevel_apply(f);        // EyeLevel guests only (see above)
     if (klovrp_pose_time()) {
         int ix = klovrp_step_ix(step);
         double t = __atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE)
