@@ -223,6 +223,29 @@ TARGETS = {
         # resolution" slider starts here and can go up if the headset allows.
         "render_scale": 0.7,
     },
+    "ktane": {
+        # Keep Talking and Nobody Explodes (Steel Crate Games), Quest build
+        # 1.10.15 (com.steelcrategames.keeptalkingandnobodyexplodes, versionCode
+        # 87), Meta app 2010043642376517. Unity 2022.3.62f3 + IL2CPP on the XR
+        # SDK path (boot.config `xrsdk-pre-init-library=OculusXRPlugin`):
+        # Beat Saber 1.40's / Walkabout's shape — libOVRPlugin + libOculusXRPlugin
+        # for the display, libovrplatformloader for the Meta platform (kl_ovrp /
+        # kl_ovrplat). libopenxr_loader ships beside them but is OVRPlugin's own
+        # backend, never the title's. Not a split binary: no OBB, everything is
+        # in the 150 MB APK. A two-player game: the second player reads the
+        # manual (bombmanual.com), nothing to ship.
+        "libs":    None,
+        "srcdir":  "ktane/lib/arm64-v8a",
+        "tree":    "ktane",
+        "apk":     "ktane.apk",
+        "assets":  "ktane/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonKTANE",
+        "display": "Keep Talking and Nobody Explodes",
+    },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
         # com.MightyCoconut.WalkaboutMiniGolf — Unity + IL2CPP through the stock
