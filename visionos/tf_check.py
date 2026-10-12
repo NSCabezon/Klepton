@@ -21,15 +21,19 @@ What the checks are, and the App Store error each one stands in for:
   PrivacyInfo       an app-level privacy manifest at the bundle root (ITMS-91053).
   stray files       .so / .py / __pycache__ / .DS_Store / headers / .debug.dylib
                     / __preview.dylib / loose dylibs (ITMS-90171, 90206...).
+  Frameworks/ dir   nothing directly in it but *.framework bundles and *.dylib
+                    files — no subfolders, no loose files (ITMS-90432) — and no
+                    framework anywhere but directly in it (90205).
   frameworks        a complete Info.plist each, unique and well-formed
-                    CFBundleIdentifiers (90046, 90685), an executable that exists
-                    and is named legally (90121), a MinimumOSVersion not above
-                    the app's (90208), no framework nested in a framework (90205).
+                    CFBundleIdentifiers (90046, 90685), an executable that exists,
+                    is named legally (90121) and is named like the framework, a
+                    MinimumOSVersion not above the app's (90208), no framework
+                    nested in a framework (90205).
   Mach-O            every binary arm64-only, built for the visionOS DEVICE
                     platform (not the simulator), minos <= the app's, __TEXT
                     under the 500 MB per-binary limit.
   signature         codesign --verify --deep --strict on the app and on every
-                    framework one by one (so a failure names the framework).
+                    entry of Frameworks/ one by one (so a failure names it).
   size              the uncompressed app against the 4 GB limit.
 """
 import argparse
@@ -211,6 +215,28 @@ def check_app(app, bundle_id, team, distribution):
     else:
         rec("PASS", "no stray files", ".so/.py/__pycache__/.DS_Store/headers/.debug.dylib/__preview.dylib")
 
+    # ---- Frameworks/ itself
+    # ITMS-90432: "the Swift runtime libraries are the only files permitted in that
+    # directory" besides frameworks — so every entry directly in Frameworks/ is a
+    # *.framework bundle or a *.dylib, never a subfolder (the hub's old per-game
+    # Frameworks/<game>/ layout, rejected at processing) or a loose file.
+    print("-- Frameworks/ directory")
+    fwdir = os.path.join(app, "Frameworks")
+    fw_entries = sorted(os.listdir(fwdir)) if os.path.isdir(fwdir) else []
+    odd = []
+    for n in fw_entries:
+        p = os.path.join(fwdir, n)
+        if n.endswith(".framework") and os.path.isdir(p) and not os.path.islink(p):
+            continue
+        if n.endswith(".dylib") and os.path.isfile(p) and not os.path.islink(p):
+            continue
+        odd.append(n + ("/" if os.path.isdir(p) else ""))
+    for n in odd:
+        rec("FAIL", f"Frameworks/{n}", "not a .framework or .dylib — App Store allows nothing else "
+            "directly in Frameworks/ (ITMS-90432)")
+    if not odd:
+        rec("PASS", f"Frameworks/: {len(fw_entries)} entries", "every one a .framework or a .dylib, no subfolders")
+
     # ---- frameworks
     print("-- frameworks")
     fws = []
@@ -226,6 +252,8 @@ def check_app(app, bundle_id, team, distribution):
         probs = []
         if ".framework/" in rel[:-len(".framework")] and rel.count(".framework") > 1:
             probs.append("nested inside another framework (ITMS-90205)")
+        elif os.path.dirname(rel) != "Frameworks":
+            probs.append("not directly in Frameworks/ (ITMS-90432 / 90205)")
         ip = os.path.join(fw, "Info.plist")
         if not os.path.isfile(ip):
             rec("FAIL", rel, "no Info.plist")
@@ -239,6 +267,8 @@ def check_app(app, bundle_id, team, distribution):
             probs.append(f"CFBundleExecutable {exe!r} has a character App Store rejects (90121)")
         else:
             framework_exes.add(os.path.realpath(os.path.join(fw, exe)))
+            if exe != os.path.basename(fw)[:-len(".framework")]:
+                probs.append(f"CFBundleExecutable {exe!r} is not named like the framework")
         fid = d.get("CFBundleIdentifier", "")
         if not ID_RE.match(fid):
             probs.append(f"CFBundleIdentifier {fid!r} invalid")
@@ -265,11 +295,6 @@ def check_app(app, bundle_id, team, distribution):
         rec("FAIL", "duplicate framework CFBundleIdentifier", f"{k}: {', '.join(v)}")
     if not bad:
         rec("PASS", f"{len(fws)} frameworks", "complete Info.plists, unique ids, legal names, minos <= app")
-    nested_dirs = sorted({os.path.relpath(os.path.dirname(f), app) for f in fws} - {"Frameworks"})
-    if nested_dirs:
-        rec("WARN", "frameworks in Frameworks/ SUBFOLDERS",
-            f"{', '.join(nested_dirs)} — the hub's per-game layout; only an upload "
-            "(or altool --validate-app) can confirm App Store accepts it")
 
     # ---- Mach-O
     print("-- Mach-O slices")
@@ -315,14 +340,16 @@ def check_app(app, bundle_id, team, distribution):
     rc, out, err = run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
     rec("PASS" if rc == 0 else "FAIL", "codesign --verify --deep --strict (app)",
         (err.strip().splitlines() or [""])[-1][:200])
+    # Every framework wherever it is, plus every entry of Frameworks/ (the .dylibs too).
+    signed = sorted(set(fws) | {os.path.join(fwdir, n) for n in fw_entries})
     sbad = 0
-    for fw in sorted(fws):
+    for fw in signed:
         rc, _, err = run(["codesign", "--verify", "--strict", fw])
         if rc != 0:
             sbad += 1
             rec("FAIL", f"signature {os.path.relpath(fw, app)}", err.strip()[:200])
     if not sbad:
-        rec("PASS", f"signature of each of the {len(fws)} frameworks")
+        rec("PASS", f"signature of each of the {len(signed)} frameworks / Frameworks/ entries")
     rc, out, _ = run(["codesign", "-d", "--entitlements", ":-", app])
     ent = {}
     try:

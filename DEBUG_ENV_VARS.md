@@ -43,7 +43,15 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 - `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
   (klepton-ld output) over the ELF when loading each guest library — how
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
-  maps the `.so` directly.
+  maps the `.so` directly. `<dir>/<name>.framework/<name>` (the app bundle's
+  layout) is accepted too.
+- `KL_DYLIB_PREFIX=<p>` — (`runtime/kl_image.c`) the prefix every translated
+  library's FILE name carries in `KL_DYLIB_DIR`: the guest's `libunity.so`
+  resolves to `<dir>/<p>libunity.framework/<p>libunity`, and nothing unprefixed
+  is considered. Set by the app (`kl_app.c`) to `<target>__`, because every
+  game's translations sit flat in one `Frameworks/` (App Store rejects
+  subfolders there, ITMS-90432) and several games ship the same library names.
+  The guest never sees it. Unset on the host (`make dylibs` writes bare names).
 
 ## GL / null driver (`runtime/gfx/kl_egl.c`)
 
@@ -3428,7 +3436,8 @@ Read by the scripts themselves, never forwarded to the app.
   `visionos/targets.py`. It decides the guest libraries, the APK and asset tree
   that get staged, the bundle id, the display name and the **product name** —
   and with that the `.xcodeproj`, the `.app`, the derived-data directory and the
-  `Frameworks/<target>/` the translations are staged into, so two apps built
+  `visionos/Frameworks/<target>/` the translations are staged into (inside the
+  `.app` they are flat, `Frameworks/<target>__<lib>.framework`), so two apps built
   from this tree never write to the same place. Default `beatsaber`.
   `./build_run_vpro.sh <target>` sets it from its first bare argument, which is
   the shortest way to say which guest a device run is for — and the same table
