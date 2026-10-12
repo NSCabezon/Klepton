@@ -855,7 +855,8 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   runtime class, a value its first word as int/float plus three floats (a
   Vector3). A step written `name()` calls that zero-argument method instead —
   static at the first step — so engine properties work too:
-  `UnityEngine.Camera:get_main().get_transform().get_position()`. Printed each
+  `UnityEngine.Camera:get_main().get_transform().get_position()`. A string at
+  the end prints its value. Printed each
   probe tick; needs `KL_PROBE_INPUT=1`. Found IEYTD sitting in
   `GameManager:_instance._fsm._currentState = CalibrationState` behind a black
   frame, and its calibration panel 1.7 m below the camera.
