@@ -129,13 +129,60 @@ int kl_errno_from_linux(int e) {
 
 // bionic spells it __errno(), and it returns the *location* rather than the
 // value — so the translation has to be staged through a per-thread slot that is
-// refreshed on every call. Reads are what matter and they are always fresh; a
-// guest that writes here (errno = 0 before a call) sets the slot, and the next
-// read re-derives from Darwin's real errno anyway.
-static _Thread_local int g_guest_errno;
+// refreshed on every call.
+//
+// A GUEST WRITE HAS TO SURVIVE THE NEXT CALL. The slot used to be re-derived
+// from Darwin's errno unconditionally, which threw away every value the guest
+// stored itself the moment it asked for the location again — and the common
+// save/restore idiom does exactly that:
+//
+//     *__errno() = EEXIST;          // a guest's own libc-like code failing
+//     int saved = *__errno();       // ...save it across an unlock
+//     pthread_mutex_unlock(&m);
+//     *__errno() = saved;
+//
+// read back Darwin's stale errno instead of EEXIST (the Half-Life: Alyx launcher's
+// SysV-semaphore self-test failed on precisely this and refused to start the
+// game). So the refresh now asks WHO wrote last. If
+// Darwin's errno moved since the slot was filled, a host call failed in
+// between and its value wins (translated); if it did not and the slot no
+// longer holds what was filled, the guest wrote it, and that value is kept —
+// and pushed down to Darwin's errno, so a host function that reads errno (the
+// strtol family's callers, perror) sees the same thing the guest does.
+//
+// One case stays ambiguous and is resolved for the host: a guest write
+// followed by a host call that fails with exactly the errno the slot was last
+// filled from, with no __errno() call in between, reads as "Darwin did not
+// move" and keeps the guest's value. That needs the same code twice in a row
+// around a guest write, and it is no worse than the old rule, which lost every
+// guest write.
+static _Thread_local int g_guest_errno, g_errno_filled, g_errno_darwin;
 int *klb_errno(void) {
-    g_guest_errno = kl_errno_to_linux(*__error());
+    int d = *__error();
+    if (d == g_errno_darwin && g_guest_errno != g_errno_filled) {
+        *__error() = kl_errno_from_linux(g_guest_errno);        // the guest wrote
+        g_errno_darwin = *__error();
+        g_errno_filled = g_guest_errno;
+        return &g_guest_errno;
+    }
+    g_errno_darwin = d;
+    g_guest_errno = g_errno_filled = kl_errno_to_linux(d);
     return &g_guest_errno;
+}
+
+// Set errno for the guest from inside a shim, in BOTH places it can be read:
+// Darwin's errno (what the next __errno() call re-derives from) and the slot
+// __errno() last handed out. The second is not redundant. bionic declares
+// __errno() __attribute_const__, so a compiler may call it ONCE and keep the
+// pointer across later calls — the Half-Life: Alyx launcher's affinity self-test does exactly
+// that (x19 = __errno() at entry, then syscall(...), then `ldr w8, [x19]`), and
+// a shim that set only Darwin's errno left it reading its own earlier write.
+// Direct forwards cannot do this (Darwin's libc sets its own errno and nothing
+// here runs afterwards); every hand-written shim that fails on purpose can.
+void kl_errno_set(int darwin_errno) {
+    *__error() = darwin_errno;
+    g_errno_darwin = darwin_errno;
+    g_guest_errno = g_errno_filled = kl_errno_to_linux(darwin_errno);
 }
 
 extern char **environ;
@@ -1616,12 +1663,22 @@ static int kl_fs_trace_mode(void) {
     }
     return mode;
 }
+// Every path shim reports here right after its call, so this is also where a
+// FAILURE is published to the guest's errno slot (kl_errno_set) — not only to
+// Darwin's errno. A guest that cached the __errno() pointer and cleared or
+// wrote it before the call otherwise reads its own stale value whenever the
+// failure repeats the errno the slot was last filled from (klb_errno's one
+// ambiguous case): Valve's tier0 Plat_CreateDirectory, run four threads wide
+// by the Half-Life: Alyx launcher's directory self-test, saw 5 such misses in 1,024 calls.
 static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed) {
+    int saved = errno;
+    if (failed) kl_errno_set(saved);
     if (!extra) extra = "";
     int mode = kl_fs_trace_mode();
     if (!mode || (mode == 1 && !failed)) return;
-    if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(errno));
+    if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(saved));
     else        fprintf(stderr, "[fs] %s(\"%s\", \"%s\") ok\n", op, path, extra);
+    errno = saved;
 }
 
 void kl_file_note(void *f, const char *path);
@@ -2587,7 +2644,7 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     if (n == KL_SYS_gettid) return klb_gettid();
 
     syscall_warn_once(n, __builtin_return_address(0));
-    errno = ENOSYS;
+    kl_errno_set(ENOSYS);
     return -1;
 }
 int    klb_swprintf(wchar_t *s, size_t n, const wchar_t *f, ...) {
