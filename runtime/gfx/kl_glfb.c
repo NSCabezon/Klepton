@@ -4564,6 +4564,11 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &s_vao);
     a_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &s_vbo);
     a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &s_at);
+    // TEXTURE_BINDING_2D is per UNIT, and the restore below puts it back on
+    // unit 0 — so unit 0 is where it has to be READ. Saving the binding of
+    // whichever unit the guest had selected and restoring it onto unit 0
+    // overwrites unit 0 with another unit's texture, once per eye per frame.
+    r_ActiveTexture(0x84C0 /* TEXTURE0 */);
     a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &s_tex2d);
     a_glGetIntegerv(0x0BA2 /* VIEWPORT */, s_vp);
     a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &s_draw_fb);
@@ -4580,6 +4585,7 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
     if (r_CheckFbStatus && r_CheckFbStatus(0x8CA9) != 0x8CD5) {
         r_BindFramebuffer2(0x8CA9, (uint32_t)s_draw_fb);
+        if (s_at != 0x84C0) r_ActiveTexture((uint32_t)s_at);  // switched above
         return 1;   // let the caller blit instead
     }
 
