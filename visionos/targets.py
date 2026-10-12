@@ -185,10 +185,22 @@ TARGETS = {
         #     the language-select room. Spanish because the host locale is
         #     es_ES. Unity 2019.4's texture-unit cap of 32 rejected ~100 binds
         #     a frame there (black slabs, blank labels); this build's offsets
-        #     are measured and the raise to 64 is on (kl_guestpoke.c). Still
-        #     wrong: 16 shaders Unity reports as
-        #     "GLSL compilation failed, no infolog" (likely compute kernels, beside "Kernel at index (11) is invalid", on an
-        #     ES 3.0 ANGLE), and no controller/hand models seen yet.
+        #     are measured and the raise to 64 is on (kl_guestpoke.c).
+        # Measured on the Mac host (2026-10-12):
+        #  - The 16 "GLSL compilation failed, no infolog" were Unity's compute
+        #     SKINNING kernels (we described ES 3.2; ANGLE/Metal is ES 3.0 and
+        #     has no compute), and every SkinnedMeshRenderer — the gloved hands
+        #     — went undrawn. ieytd is now told ES 3.0 (kl_egl.c), the kernels
+        #     are never built and the hands draw.
+        #  - Recenter now also takes out the head's yaw for this EyeLevel guest.
+        #  - A headless run plays through: calibration, language room ("Done"),
+        #     intro, the office tutorial (18 steps: leaning, radio button,
+        #     note + lighter, telekinesis, freezing three targets, the spy
+        #     gun, the drawer, the mission disc) and Start, into the first
+        #     mission (GameManager LevelState, the Car scene) — driven by
+        #     KL_OVRP_POKE + KL_OVRP_HAND_SCRIPT + KL_PROBE_* (DEBUG_ENV_VARS.md);
+        #     the script itself is AlyxAVP/local/ieytd/scripts/tutorial.sh, not in
+        #     this repo. Headless M1 Max: ~57 fps in the office, ~28 in the car.
         "libs":    None,
         "srcdir":  "ieytd/lib/arm64-v8a",
         "tree":    "ieytd",
