@@ -827,6 +827,12 @@ const klj_binding klj_bind_window[] = {
     {"android/hardware/input/InputManager", "registerInputDeviceListener",
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},
+    // ...and as Unity's reflection spells it when C# passes a null Handler:
+    // dotted class names, and Object for the argument it could not type. End
+    // Space (x2434361173248640) registers its controller watcher this way.
+    {"android/hardware/input/InputManager", "registerInputDeviceListener",
+     "(Landroid.hardware.input.InputManager$InputDeviceListener;Ljava/lang/Object;)V",
+     klj_InputManager_registerListener},
     {"android/hardware/input/InputManager", "getInputDeviceIds", "()[I",
      klj_InputManager_getInputDeviceIds},
     {"android/hardware/input/InputManager", "getInputDevice",
