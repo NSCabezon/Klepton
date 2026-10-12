@@ -1109,11 +1109,11 @@ TARGETS = {
     # ---- THE HUB: one app, several games ----
     #
     # Not a guest: a BUILD that embeds several of the rows above and lets the
-    # player pick one from an in-app library (Sources/KleptonHub.swift). Each
-    # game's translated frameworks land in their own Frameworks/<game>/ inside
-    # the .app (gen_xcodeproj.py), so same-named libraries from two games
-    # (libunity, libUE4, libc++_shared) never meet; kl_app.c picks the selected
-    # game's folder. The selection is KL_TARGET, set by the library before the
+    # player pick one from an in-app library (Sources/KleptonHub.swift). Every
+    # game's translated frameworks land flat in the .app's Frameworks/ as
+    # <game>__<lib>.framework (mkguest.sh; App Store allows no subfolders there),
+    # so same-named libraries from two games (libunity, libUE4, libc++_shared)
+    # never meet; kl_app.c hands the runtime the selected game's prefix. The selection is KL_TARGET, set by the library before the
     # runtime is configured, so everything downstream is the single-game path.
     # One game per process: when it ends, the app ends.
     #
