@@ -579,6 +579,28 @@ static const kl_gp_word k_metro_noswappy[] = {
     { 0x4cc7780, 0x2a1f03e4, 0x2a1f03e4, "mov w4, wzr (flags; unchanged)" },
 };
 
+// Metro Awakening — the same survived-fatal corruption as metro-swappy-off,
+// from whatever fatal fires next. Headset crash 2026-10-12 11:03 (in play, ~1.5
+// min after launch): the GC's purge loop (0x4bac9f0..) called
+// UObject::ConditionalBeginDestroy (0x4bf29e8: flags |= RF_BeginDestroyed,
+// then vtable+0xb8) on an object whose memory RealityKit had since reused —
+// its "vtable" was CoreRE text, so the indirect call landed on two instruction
+// words (pc 0xf90033e8ca080128, "Invalid Page"). That is a slot left pointing
+// at freed memory, which is exactly what ~UObjectBase does once GIsCriticalError
+// (0x8982dbc) is set: it skips GUObjectArray.FreeUObjectIndex. A shipping UE
+// sets the flag on its fatal path and, here, carries on running.
+//
+// The skip exists so a CRASHING engine does not touch the object array; this
+// process does not crash, so the slot is freed as it would be on any normal
+// run. One word: the `cbnz w8` on *GIsCriticalError becomes a nop; the
+// UObjectInitialized and ClassPrivate checks either side are unchanged.
+// kl_ue4.c also watches the flag and names the moment it is set.
+static const kl_gp_word k_metro_uobject_free[] = {
+    { 0x4c81f60, 0x39400108, 0x39400108, "ldrb w8, [x8] (*GIsCriticalError; unchanged)" },
+    { 0x4c81f64, 0x350005c8, 0xd503201f, "cbnz w8, skip-free -> nop (free the slot anyway)" },
+    { 0x4c81f68, 0xb001d955, 0xb001d955, "adrp x21, GUObjectArray (unchanged)" },
+};
+
 static const kl_gp_patch k_patches[] = {
     { "alyx-lua-arena-anywhere", "libvscript.so",
       "the Lua VM arena may live above 2 GB (ARM64 LuaJIT is GC64)",
@@ -617,6 +639,9 @@ static const kl_gp_patch k_patches[] = {
     { "metro-swappy-off", "libUnreal.so",
       "a.UseSwappyForFramePacing defaults to 0 (Swappy cannot init here; its present error was a fatal that set GIsCriticalError)",
       k_metro_noswappy, sizeof k_metro_noswappy / sizeof *k_metro_noswappy },
+    { "metro-uobject-free-on-critical", "libUnreal.so",
+      "~UObjectBase frees its GUObjectArray slot even after a survived fatal (GIsCriticalError)",
+      k_metro_uobject_free, sizeof k_metro_uobject_free / sizeof *k_metro_uobject_free },
 
     { "wrath2-force-vulkan-available", "libUE4.so",
       "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
