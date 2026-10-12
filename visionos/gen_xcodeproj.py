@@ -392,6 +392,12 @@ SHORTCUTS_FILEREF = "".join(f'\t\t{f} = {{isa = PBXFileReference; lastKnownFileT
 SHORTCUTS_CHILD = "".join(f"\t\t\t\t{f},\n" for n, f, b in _CATALOGS)
 SHORTCUTS_RES = "".join(f"\t\t\t\t{b},\n" for n, f, b in _CATALOGS)
 
+# The privacy manifest (PrivacyInfo.xcprivacy: the required-reason APIs the app
+# calls, and that it tracks and collects nothing). App Store Connect reads it from
+# the bundle root and refuses an upload that uses those APIs without one; every
+# target carries it, since the runtime that makes most of the calls is shared.
+F_PRIV, B_PRIV = _fixed("PRIVINFOF"), _fixed("PRIVINFOB")
+
 # The two files apktool leaves beside assets/ — apktool.yml (versionCode /
 # versionName) and the decoded AndroidManifest.xml (package, <meta-data>,
 # permissions) — which the runtime reads through <assets>/../ (kl_jni_services.c).
@@ -699,6 +705,7 @@ PBX = f"""// !$*UTF8*$!
 {swift_buildfiles}
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
+		{B_PRIV} /* PrivacyInfo.xcprivacy in Resources */ = {{isa = PBXBuildFile; fileRef = {F_PRIV}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
 {PKG_BUILDFILE}{SHORTCUTS_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
@@ -710,6 +717,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_H} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kl_app.h; sourceTree = "<group>"; }};
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
+		{F_PRIV} = {{isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
 {SHORTCUTS_FILEREF}{filerefs}
 /* End PBXFileReference section */
@@ -747,6 +755,7 @@ PBX = f"""// !$*UTF8*$!
 				{G_FW},
 				{G_PROD},
 				{F_ASSETS},
+				{F_PRIV},
 			);
 			sourceTree = "<group>";
 		}};
@@ -831,6 +840,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_ASSETS},
+				{B_PRIV},
 {SHORTCUTS_RES}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
