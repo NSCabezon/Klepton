@@ -40,7 +40,9 @@ KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAUL
 # they are the app layer, shared by every target, and renaming them per build
 # would be five file copies to say one thing.
 NAME = KLT["product"]
-BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
+# `or`, not a default: a config file may set KLEPTON_BUNDLE_ID to "" (an empty
+# PRODUCT_BUNDLE_IDENTIFIER makes the pbxproj unreadable), like the shells' ${…:-…}.
+BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID") or KLT["bundle"]
 
 # Klepton.entitlements — the two memory capabilities (see that file for what
 # they buy and why this app wants them). **On by default: they fixed the
@@ -667,7 +669,7 @@ COMMON = f"""
 				// -lc++: Fossilize (kl_fossilize.cpp) rides in the runtime archive
 				// when vendored (make fossilize); harmless when it does not.
 				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
-				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
+				PRODUCT_BUNDLE_IDENTIFIER = "{BUNDLE_ID}";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
