@@ -8399,6 +8399,20 @@ static int glfb_state_pname(uint32_t p) {
     case 0x8A28:                // UNIFORM_BUFFER_BINDING
     case 0x88ED: case 0x88EF:   // PIXEL_PACK / PIXEL_UNPACK_BUFFER_BINDING
     case 0x8F36: case 0x8F37:   // COPY_READ / COPY_WRITE_BUFFER_BINDING
+    // The rest of the save/restore set a guest brackets a pass with. A zero
+    // here is not a missing answer but a WRONG one, and it does its damage on
+    // the restore: GL_ZERO is a valid blend factor, so a guest that saves
+    // BLEND_SRC/DST_RGB around a quad and puts them back gets
+    // glBlendFunc(GL_ZERO, GL_ZERO), and everything it draws afterwards blends
+    // to black (the Simpsons Hit & Run VR port's HUD minimap). The equations
+    // and the depth/cull enums are the same family. All are ES 3.0 state that
+    // ANGLE's context accepts.
+    case 0x80C8: case 0x80C9:   // BLEND_DST_RGB, BLEND_SRC_RGB
+    case 0x80CA: case 0x80CB:   // BLEND_DST_ALPHA, BLEND_SRC_ALPHA
+    case 0x0BE0: case 0x0BE1:   // BLEND_DST, BLEND_SRC (ES 1.x names, same state)
+    case 0x8009: case 0x883D:   // BLEND_EQUATION_RGB, BLEND_EQUATION_ALPHA
+    case 0x0B74: case 0x0B45:   // DEPTH_FUNC, CULL_FACE_MODE
+    case 0x0B71: case 0x0BE2:   // DEPTH_TEST, BLEND (as integers)
         return 1;
     }
     return 0;
@@ -8412,7 +8426,16 @@ static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
     if (kl_gl_cap_integerv(pname, params)) return;
     // Same contract as the null driver: named, not guessed — and crucially
     // no GL error set, which forwarding to the ES 3.0 context would do.
-    fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours)\n", pname);
+    //
+    // Said ONCE per pname: a guest that asks every draw asks a hundred thousand
+    // times a session, and an unthrottled line here buries the rest of the log.
+    static uint32_t said[64]; static int said_n;
+    int seen = 0;
+    for (int i = 0; i < said_n; i++) if (said[i] == pname) { seen = 1; break; }
+    if (!seen) {
+        { int n = said_n; if (n < (int)(sizeof said / sizeof said[0])) { said[n] = pname; said_n = n + 1; } }
+        fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours; said once)\n", pname);
+    }
     if (params) params[0] = 0;
 }
 static void klfb_GetFloatv(uint32_t pname, float *data) {
