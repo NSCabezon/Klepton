@@ -1819,7 +1819,35 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 // ---------- semaphores ----------
 // bionic sem_t is 4 bytes -- too small for a pointer, so it holds a table index.
 // Darwin's POSIX sem_init is deprecated/unimplemented, so back them with GCD.
-#define KL_MAX_SEMS 1024
+//
+// **This table used to be a one-way bump allocator, and it was a fuse.** Every
+// other kind in this file recycles its slots (SYNC_TABLE, above); semaphores
+// alone counted up and never came back down, because sem_destroy only zeroed
+// the guest's handle. Unity churns roughly a dozen semaphores a second in
+// gameplay — job-system fences, async file reads, the audio mixer — so a
+// 1024-slot table burned through in about eighty seconds of play, EVERY run,
+// and then the cascade (a SUPERHOT VR session log):
+//
+//     "Failed to open a semaphore (No space left on device)"  x132
+//   -> init returned -1 without writing *s, so the guest kept handle 0
+//   -> every post/wait on it EINVAL'd silently
+//   -> the async asset read never ran, and Unity parsed the buffer anyway
+//   -> "The file sharedassets5.assets is corrupted!"          (a lie)
+//   -> "GLSL link error: No compiled shaders."                (also a lie)
+//   -> SIGTRAP FatalError, ~80 s in, blamed on the level that happened to load
+//
+// So: slots come back on destroy, the bound is checked before the bump, and a
+// failed init writes a poison handle rather than leaving the guest's storage
+// untouched — "this semaphore does not exist" must not be spelled the same way
+// as "this semaphore was never created".
+#define KL_MAX_SEMS       16384         // must fit KL_SEM_SLOT_BITS
+#define KL_SEM_SLOT_BITS  14
+#define KL_SEM_SLOT_MASK  ((1u << KL_SEM_SLOT_BITS) - 1)
+#define KL_SEM_GEN_MASK   (0xFFFFFFFFu >> KL_SEM_SLOT_BITS)
+// Slot 0 is never allocated, so a handle naming it can never resolve. That
+// makes it the poison value: distinguishable from a pristine 0 handle, and
+// EINVAL either way.
+#define KL_SEM_POISON     (KL_SEM_GEN_MASK << KL_SEM_SLOT_BITS)
 
 // The count is tracked alongside the dispatch semaphore rather than left to GCD.
 // It has to be: GCD gives no way to read the count, and IL2CPP POLLS it, so a
@@ -1829,113 +1857,187 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 // main thread apparently just asleep — a silent zero read as an answer rather
 // than as "unknown".
 typedef struct {
-    dispatch_semaphore_t d;
+    dispatch_semaphore_t d;          // NULL when the slot is free
     _Atomic int          count;
-    int                  initial;   // what it was created with, for the release
-                                    // rule in klb_sem_destroy
+    int                  initial;    // what it was created with; see sem_retire
+    unsigned             gen;        // bumped by destroy; the handle carries a copy
+    unsigned             waiters;    // threads currently inside dispatch_semaphore_wait
+    unsigned             retired;    // destroyed while waiters remained
 } kl_sem;
-static kl_sem g_sems[KL_MAX_SEMS];
-static _Atomic int g_nsems = 1;                 // index 0 means "uninitialised"
-
-// The free list. An atomic_fetch_add-only g_nsems against KL_MAX_SEMS makes the
-// table a ONE-WAY budget for the life of the process: after 1024 sem_init calls
-// every later one answers ENOSPC forever, whatever was destroyed in between —
-// SUPERHOT's slot leak ~80 s into play, which lands at about the same point in a
-// run as the OOM and is a different bug.
-//
-// A dead slot must keep `d` NULL, because sem_of() uses a live `d` as its
-// validity test: a recycled slot holding a stale dispatch_semaphore_t would
-// answer for a semaphore the guest destroyed.
-static int      g_sem_free[KL_MAX_SEMS];
-static int      g_sem_nfree;
+static kl_sem   g_sems[KL_MAX_SEMS];
+static uint32_t g_sem_free[KL_MAX_SEMS];
+static unsigned g_sem_nfree;
+static unsigned g_sem_high = 1;                 // bump pointer; slot 0 is reserved
+// One lock for the whole table. It is never held across a blocking wait, and
+// semaphore create/destroy runs at guest speed (tens per second), so the
+// contention is noise next to being able to reason about the teardown at all.
 static pthread_mutex_t g_sem_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Caller holds g_sem_lock. A handle resolves only if its slot is live AND its
+// generation still matches — which is what makes use-after-destroy fail at the
+// call that is wrong rather than at some innocent later one that inherited the
+// slot.
+static kl_sem *sem_locked(uint32_t h) {
+    unsigned slot = h & KL_SEM_SLOT_MASK;
+    if (!slot || slot >= KL_MAX_SEMS) return NULL;
+    kl_sem *k = &g_sems[slot];
+    if (!k->d || k->gen != (h >> KL_SEM_SLOT_BITS)) return NULL;
+    return k;
+}
+
+static void sem_complain(uint32_t h) {
+    static _Atomic int logged;
+    if (atomic_fetch_add(&logged, 1) >= 8) return;
+    unsigned slot = h & KL_SEM_SLOT_MASK;
+    const char *why =
+        h == 0                    ? "it never initialised here" :
+        h == KL_SEM_POISON        ? "whose creation failed (table was full)" :
+        (slot && slot < KL_MAX_SEMS && g_sems[slot].d)
+                                  ? "it already destroyed (stale generation)" :
+                                    "that does not exist";
+    fprintf(stderr, "  [klepton] sem: handle %#x (slot %u) — the guest is using "
+                    "a semaphore %s\n", h, slot, why);
+}
+
+// Caller holds g_sem_lock, and k has no waiters left. libdispatch traps on a
+// dispatch_semaphore_t released while its value sits below the value it was
+// created with ("Semaphore object deallocated while in use"), so pay the count
+// back first. With no waits in flight our mirror IS GCD's internal value.
+static void sem_retire(kl_sem *k) {
+    for (int have = atomic_load(&k->count); have < k->initial; have++)
+        dispatch_semaphore_signal(k->d);
+    dispatch_release(k->d);
+    k->d = NULL;
+    k->retired = 0;
+    if (g_sem_nfree < KL_MAX_SEMS) g_sem_free[g_sem_nfree++] = (uint32_t)(k - g_sems);
+}
 
 int klb_sem_init(int *s, int pshared, unsigned value) {
     (void)pshared;
-    int i = 0;
     pthread_mutex_lock(&g_sem_lock);
-    if (g_sem_nfree) i = g_sem_free[--g_sem_nfree];
+    unsigned slot = 0;
+    if (g_sem_nfree)                 slot = g_sem_free[--g_sem_nfree];
+    // Bound-checked BEFORE the bump. The old code fetch_add'd first and checked
+    // after, so a full table kept counting up forever — past the cap, past the
+    // point where any later free could have helped.
+    else if (g_sem_high < KL_MAX_SEMS) slot = g_sem_high++;
+    if (!slot) {
+        pthread_mutex_unlock(&g_sem_lock);
+        *s = (int)KL_SEM_POISON;
+        errno = ENOSPC;
+        return -1;
+    }
+    kl_sem *k = &g_sems[slot];
+    // Fill the slot BEFORE publishing the index. The pre-lock version bumped the
+    // counter first, which made the range check pass while the slot was still
+    // empty — a waiter on another thread then got EINVAL from a semaphore that
+    // had, as far as its owner was concerned, been initialised.
+    atomic_store(&k->count, (int)value);
+    k->initial = (int)value;
+    k->waiters = 0;
+    k->retired = 0;
+    k->d = dispatch_semaphore_create((long)value);
+    uint32_t h = (k->gen << KL_SEM_SLOT_BITS) | slot;
+    // Occupancy is worth one line in the log: this table failing is not a
+    // semaphore bug when it happens, it is a leak somewhere upstream, and the
+    // last run gave no warning at all before the wall.
+    static int warned;
+    unsigned live = (g_sem_high - 1) - g_sem_nfree;
+    if (!warned && live > (unsigned)(KL_MAX_SEMS / 4) * 3) {
+        warned = 1;
+        fprintf(stderr, "  [klepton] sem: %u of %d slots live — the table is 75%% "
+                        "full; something is creating semaphores it never destroys\n",
+                live, KL_MAX_SEMS);
+    }
     pthread_mutex_unlock(&g_sem_lock);
-    if (!i) i = atomic_fetch_add(&g_nsems, 1);
-    if (i >= KL_MAX_SEMS) { errno = ENOSPC; return -1; }
-    // Fill the slot BEFORE publishing the index. The old order bumped g_nsems
-    // first, which made the range check pass while the slot was still empty — a
-    // waiter on another thread then got EINVAL from a semaphore that had, as far
-    // as its owner was concerned, been initialised.
-    atomic_store(&g_sems[i].count, (int)value);
-    g_sems[i].initial = (int)value;
-    g_sems[i].d = dispatch_semaphore_create(value);
-    atomic_thread_fence(memory_order_release);
-    *s = i;
+    *s = (int)h;
     return 0;
 }
 
+// Resolve for the non-blocking operations, which run entirely under the lock so
+// that the dispatch object cannot be released out from under them.
 static kl_sem *sem_of(int *s) {
-    int i = *s;
-    if (i > 0 && i < KL_MAX_SEMS && g_sems[i].d) return &g_sems[i];
-    static _Atomic int logged;
-    if (atomic_fetch_add(&logged, 1) < 8)
-        fprintf(stderr, "  [klepton] sem: no semaphore for slot %d — the guest is "
-                        "waiting on one it never initialised here\n", i);
-    return NULL;
+    kl_sem *k = sem_locked((uint32_t)*s);
+    if (!k) sem_complain((uint32_t)*s);
+    return k;
 }
 
 int klb_sem_destroy(int *s) {
-    int i = *s;
-    *s = 0;
-    if (i <= 0 || i >= KL_MAX_SEMS) return 0;
-    // Clear `d` before the slot is offered back, and offer it back only once —
-    // a double sem_destroy is guest UB, but it must not put the same index on
-    // the free list twice and hand two live semaphores one slot.
+    uint32_t h = (uint32_t)*s;
     pthread_mutex_lock(&g_sem_lock);
-    dispatch_semaphore_t d = g_sems[i].d;
-    int releasable = d && atomic_load(&g_sems[i].count) >= g_sems[i].initial;
-    if (d) {
-        g_sems[i].d = NULL;
-        atomic_store(&g_sems[i].count, 0);
-        g_sems[i].initial = 0;
-        if (g_sem_nfree < KL_MAX_SEMS) g_sem_free[g_sem_nfree++] = i;
+    kl_sem *k = sem_locked(h);
+    if (k) {
+        k->gen = (k->gen + 1) & KL_SEM_GEN_MASK;   // the old handle stops resolving here
+        if (k->waiters) {
+            // Releasing with threads parked inside dispatch_semaphore_wait is
+            // the one thing libdispatch will kill the process over. Wake them
+            // (as posts, so the count mirror stays faithful) and let the last
+            // one out do the teardown.
+            k->retired = 1;
+            for (unsigned i = 0; i < k->waiters; i++) {
+                atomic_fetch_add(&k->count, 1);
+                dispatch_semaphore_signal(k->d);
+            }
+        } else {
+            sem_retire(k);
+        }
     }
     pthread_mutex_unlock(&g_sem_lock);
-    // GCD *aborts* if a dispatch semaphore is deallocated below the value it
-    // was created with — "Semaphore object deallocated while in use" — which is
-    // the guest destroying one that still has waiters, i.e. its bug, and not
-    // one worth turning into a crash of ours. So it is released only when the
-    // count is back where it started, and otherwise deliberately dropped: one
-    // small object leaked against a crash inside a destructor.
-    if (releasable) dispatch_release(d);
+    *s = 0;
     return 0;
 }
 
 int klb_sem_post(int *s) {
+    pthread_mutex_lock(&g_sem_lock);
     kl_sem *k = sem_of(s);
-    if (!k) { errno = EINVAL; return -1; }
+    if (!k) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
     if (kl_env_on("KL_TRACE_SIG", 0)) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 12)
-            fprintf(stderr, "  [sig] sem_post slot %d (count now %d)\n",
-                    *s, atomic_load(&k->count) + 1);
+            fprintf(stderr, "  [sig] sem_post handle %#x (count now %d)\n",
+                    (unsigned)*s, atomic_load(&k->count) + 1);
     }
     atomic_fetch_add(&k->count, 1);
     dispatch_semaphore_signal(k->d);
+    pthread_mutex_unlock(&g_sem_lock);
     return 0;
 }
 
-int klb_sem_wait(int *s) {
+// The blocking pair: registered as a waiter under the lock, block outside it,
+// then settle up. The waiter count is what keeps a concurrent destroy from
+// releasing the object while we are standing on it.
+static int sem_block(int *s, dispatch_time_t when, int timeout_errno) {
+    pthread_mutex_lock(&g_sem_lock);
     kl_sem *k = sem_of(s);
-    if (!k) { errno = EINVAL; return -1; }
+    if (!k) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
+    k->waiters++;
+    pthread_mutex_unlock(&g_sem_lock);
+
     sem_wait_enter(s, __builtin_return_address(0));
-    dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
+    long timed_out = dispatch_semaphore_wait(k->d, when);
     sem_wait_leave();
-    atomic_fetch_sub(&k->count, 1);
+
+    pthread_mutex_lock(&g_sem_lock);
+    if (!timed_out) atomic_fetch_sub(&k->count, 1);
+    if (--k->waiters == 0 && k->retired) sem_retire(k);
+    pthread_mutex_unlock(&g_sem_lock);
+    if (timed_out) { errno = timeout_errno; return -1; }
     return 0;
 }
+
+int klb_sem_wait(int *s) { return sem_block(s, DISPATCH_TIME_FOREVER, EINVAL); }
 
 int klb_sem_trywait(int *s) {
+    pthread_mutex_lock(&g_sem_lock);
     kl_sem *k = sem_of(s);
-    if (!k) { errno = EINVAL; return -1; }
-    if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) { errno = EAGAIN; return -1; }
+    if (!k) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
+    if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) {
+        pthread_mutex_unlock(&g_sem_lock);
+        errno = EAGAIN;
+        return -1;
+    }
     atomic_fetch_sub(&k->count, 1);
+    pthread_mutex_unlock(&g_sem_lock);
     return 0;
 }
 
@@ -1983,21 +2085,18 @@ int klb_pthread_setschedparam(void *t, int policy, const void *param) {
 }
 
 int klb_sem_timedwait(int *s, const struct timespec *ts) {
-    kl_sem *k = sem_of(s);
-    if (!k) { errno = EINVAL; return -1; }
-    dispatch_time_t when = dispatch_walltime(ts, 0);
-    if (dispatch_semaphore_wait(k->d, when) != 0) { errno = ETIMEDOUT; return -1; }
-    atomic_fetch_sub(&k->count, 1);
-    return 0;
+    return sem_block(s, dispatch_walltime(ts, 0), ETIMEDOUT);
 }
 
 // POSIX lets an implementation report 0 rather than a negative count when there
 // are waiters, which is what Linux does — so clamp rather than exposing our
 // internal debt.
 int klb_sem_getvalue(int *s, int *out) {
+    pthread_mutex_lock(&g_sem_lock);
     kl_sem *k = sem_of(s);
-    if (!k) { errno = EINVAL; return -1; }
+    if (!k) { pthread_mutex_unlock(&g_sem_lock); errno = EINVAL; return -1; }
     int v = atomic_load(&k->count);
+    pthread_mutex_unlock(&g_sem_lock);
     *out = v > 0 ? v : 0;
     return 0;
 }
