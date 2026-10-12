@@ -2725,7 +2725,7 @@ struct HubLibraryView: View {
     /// for Alyx only (the OpenVR guest); Metro (OpenXR) has the pacing hook in
     /// the stream host but no verified session yet, so it is not offered. The
     /// card shows nothing new for the rest.
-    static func streamable(_ g: KLHubGameRow) -> Bool { g.target == "alyx" }
+    static func streamable(_ g: KLHubGameRow) -> Bool { ["alyx", "metro"].contains(g.target) }   // metro: experimental (user asked to try it)
 
     /// The second way to play: the game runs on the Mac and streams here. It
     /// needs no game data on the headset, so it ignores the card's download
