@@ -989,6 +989,15 @@ xros-sim: build/xrsim/libklepton.dylib
 	@printf '  xrsim      '; xcrun vtool -show-build $< | grep -E 'platform' | tr -d '\n'
 	@printf '  %s\n' "$$(ls -l $< | awk '{print $$5" bytes"}')"
 
+# The hub as an App Store Connect build for INTERNAL TestFlight: Release archive,
+# App Store signed .ipa exported to visionos/build/testflight/, and the local
+# pre-flight checks (visionos/tf_check.py). Uploads nothing unless UPLOAD=1.
+# Needs KLEPTON_TEAM and KLEPTON_BUNDLE_ID (your App Store Connect app's id).
+#   KLEPTON_TEAM=... KLEPTON_BUNDLE_ID=... make testflight [UPLOAD=1]
+.PHONY: testflight
+testflight:
+	./build_run_vpro.sh hub --archive $(if $(filter 1,$(UPLOAD)),--upload)
+
 # The two archives as one XCFramework, so the app target links the right slice
 # without a per-platform search path. Xcode resolves the slice from the
 # destination; getting that wrong otherwise fails as a confusing arch mismatch.
