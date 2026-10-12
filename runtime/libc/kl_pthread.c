@@ -1699,28 +1699,8 @@ typedef struct { void *(*fn)(void *); void *arg; } tramp;
 static void *thread_tramp(void *p) {
     tramp t = *(tramp *)p; free(p);
     kl_thread_init();
-    // KL_GUEST_QOS=1: every guest thread at USER_INITIATED instead of default.
-    // On visionOS a default-QoS thread is scheduled behind the compositor's
-    // work, and for Steam Link that thread set includes the UDP receive and
-    // AV-decode pipeline - a scheduling gap there queues packets, Steam reads
-    // the queueing as network jitter, and the bitrate controller backs off. A
-    // stream that stutters on a clean link is often this, not the link.
-    // Default OFF: it changes scheduling for every guest, so it is opt-in.
-#ifdef __APPLE__
-    {
-        static int q = -1;
-        if (q < 0) {
-            q = kl_env_on("KL_GUEST_QOS", 0);
-            // Named ONCE either way: this knob's whole use is as an A/B, and a
-            // scheduling change leaves no other trace in a log — the first QoS
-            // run came back unverifiable because nothing said whether the knob
-            // was in force.
-            fprintf(stderr, "  [thr] guest threads at %s QoS (KL_GUEST_QOS=%d)\n",
-                    q ? "USER_INITIATED" : "default", q);
-        }
-        if (q) pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
-    }
-#endif
+    // QoS is set on the attr at creation now (guest_thread_qos, below), so the
+    // thread starts in its class rather than switching into it here.
     thread_register(pthread_self());
     // KL_TRACE_THREADS: log this guest thread's tid ON the thread (klb_pthread_create
     // logs the entry pointer at creation but cannot know the tid yet). The x18
@@ -1748,6 +1728,57 @@ static void *thread_tramp(void *p) {
     thread_unregister(pthread_self());
     return r;
 }
+// The QoS class every guest thread is created with.
+//
+// **A plain pthread_attr gets QOS_CLASS_UNSPECIFIED**, which on Apple silicon
+// is the legacy tier: the scheduler is free to put such a thread on an
+// efficiency core, and a thread pool full of them is a load that takes minutes
+// where the hardware could do it in less. kl_app.c already makes this argument
+// for the guest's own frame thread and gives it USER_INTERACTIVE; every OTHER
+// guest thread — UE4's render thread, its RHI thread, its task-graph workers,
+// its streaming and audio threads — came through here and got nothing.
+//
+// USER_INITIATED rather than USER_INTERACTIVE, deliberately. Interactive is the
+// frame producer's tier and the compositor's; a task-graph worker that shares
+// it can preempt the thread whose deadline actually matters. Initiated is "the
+// user is waiting for this", which is exactly what a loading screen is, and it
+// still keeps the pool off the E-cores.
+//
+// This used to be the opt-in KL_GUEST_QOS=1 (a self-set at thread start, for
+// Steam Link's UDP receive and decode threads, which a default-QoS schedule
+// queued behind the compositor). It is the default now, set on the attr so the
+// thread starts in its class. KL_GUEST_QOS names the class: `off` restores the
+// unspecified behaviour, `1`/`on` keep meaning USER_INITIATED, and the class
+// names select one. Applies to every target built from this runtime, which is
+// why the off switch exists.
+static qos_class_t guest_thread_qos(void) {
+    static int resolved;
+    static qos_class_t qos = QOS_CLASS_USER_INITIATED;
+    if (resolved) return qos;
+    resolved = 1;
+    const char *s = kl_env_str("KL_GUEST_QOS", NULL);
+    if (s) {
+        if      (!strcmp(s, "off") || !strcmp(s, "0")) qos = QOS_CLASS_UNSPECIFIED;
+        else if (!strcmp(s, "background"))  qos = QOS_CLASS_BACKGROUND;
+        else if (!strcmp(s, "utility"))     qos = QOS_CLASS_UTILITY;
+        else if (!strcmp(s, "default"))     qos = QOS_CLASS_DEFAULT;
+        else if (!strcmp(s, "initiated") || !strcmp(s, "1") || !strcmp(s, "on"))
+                                            qos = QOS_CLASS_USER_INITIATED;
+        else if (!strcmp(s, "interactive")) qos = QOS_CLASS_USER_INTERACTIVE;
+        else fprintf(stderr, "  [thr] KL_GUEST_QOS=%s is not a class name "
+                             "(off/background/utility/default/initiated/"
+                             "interactive) — using initiated\n", s);
+    }
+    fprintf(stderr, "  [thr] guest threads are created at QoS %s\n",
+            qos == QOS_CLASS_UNSPECIFIED     ? "unspecified (KL_GUEST_QOS=off)" :
+            qos == QOS_CLASS_BACKGROUND      ? "background" :
+            qos == QOS_CLASS_UTILITY         ? "utility" :
+            qos == QOS_CLASS_DEFAULT         ? "default" :
+            qos == QOS_CLASS_USER_INTERACTIVE ? "user-interactive" :
+                                                "user-initiated");
+    return qos;
+}
+
 int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
                        void *(*fn)(void *), void *arg) {
     // A NULL start routine becomes a jump to 0x0 the instant the thread runs,
@@ -1763,6 +1794,9 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
     }
     pthread_attr_t da;
     pthread_attr_init(&da);
+    qos_class_t qos = guest_thread_qos();
+    if (qos != QOS_CLASS_UNSPECIFIED)
+        pthread_attr_set_qos_class_np(&da, qos, 0);
     if (ga) {
         if (ga->stack_size) pthread_attr_setstacksize(&da, ga->stack_size);
         if (ga->flags & BIONIC_ATTR_DETACHED)
@@ -1779,12 +1813,24 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
     // reads identically to a thread that exited. The entry pointer is printed
     // because it symbolises against the chain's load addresses each door
     // prints at load, and so names WHICH pool or subsystem it was.
+    //
+    // The QoS the thread was actually created at is on the line as well. The
+    // one-shot "guest threads are created at QoS ..." banner
+    // above says what the DEFAULT is; it cannot say that a particular thread
+    // got it, and "the loader is starved" is a claim about a particular thread.
     static int trace = -1;
     if (trace < 0) trace = kl_env_on("KL_TRACE_THREADS", 0);
     if (trace)
-        fprintf(stderr, "  [thr] pthread_create entry=%p arg=%p stack=%zu%s -> %d\n",
+        fprintf(stderr, "  [thr] pthread_create entry=%p arg=%p stack=%zu%s"
+                        " qos=%s -> %d\n",
                 (void *)fn, arg, ga ? ga->stack_size : 0,
-                (ga && (ga->flags & BIONIC_ATTR_DETACHED)) ? " detached" : "", rc);
+                (ga && (ga->flags & BIONIC_ATTR_DETACHED)) ? " detached" : "",
+                qos == QOS_CLASS_UNSPECIFIED      ? "unspecified" :
+                qos == QOS_CLASS_BACKGROUND       ? "background"  :
+                qos == QOS_CLASS_UTILITY          ? "utility"     :
+                qos == QOS_CLASS_DEFAULT          ? "default"     :
+                qos == QOS_CLASS_USER_INTERACTIVE ? "interactive" :
+                                                    "initiated", rc);
     return rc;
 }
 int   klb_pthread_join(pthread_t t, void **r)  { return px(pthread_join(t, r)); }
