@@ -2546,33 +2546,16 @@ struct HubLibraryView: View {
                        : klL("\(text): not signed in — sign in from Settings", "\(text): sin sesión — inicia sesión en Ajustes"))
     }
 
-    /// "Download all" in the header: the button (when some owned game can be downloaded), or the
-    /// queue's progress and its Cancel while it runs.
+    /// "Download all" in the header, when some owned game can be downloaded. While the queue runs
+    /// the header shows nothing: its progress and Cancel are in the report under it.
     @ViewBuilder private var bulkControl: some View {
         let bulk = model.bulk
-        if bulk.running {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.mini)
-                Text(bulkProgressText).monospacedDigit().lineLimit(1)
-                Button(klL("Cancel", "Cancelar"), role: .destructive) { bulk.cancel(model: model) }
-            }
-            .font(.footnote)
-            .fixedSize()
-        } else if !model.bulkCandidates(measure: false).isEmpty {
+        if !bulk.running, !model.bulkCandidates(measure: false).isEmpty {
             Button {
                 downloadAll = DownloadAllOffer(candidates: model.bulkCandidates(), free: HubLibraryModel.freeBytes())
             } label: { Label(klL("Download all", "Descargar todos"), systemImage: "arrow.down.circle") }
                 .font(.footnote).fixedSize()
         }
-    }
-
-    /// "Descargando 2 de 4 · Metro Awakening 34 %".
-    private var bulkProgressText: String {
-        let bulk = model.bulk
-        guard let i = bulk.current, let job = bulk.currentJob else { return klL("Downloading…", "Descargando…") }
-        let n = bulk.jobs.count
-        let pct = model.activeFraction(job.id).map { " \(Int(($0 * 100).rounded())) %" } ?? ""
-        return klL("Downloading \(i + 1) of \(n) · \(job.item.display)", "Descargando \(i + 1) de \(n) · \(job.item.display)") + pct
     }
 
     /// Under the header while "Download all" runs and after it ends: each game and how it went
@@ -2583,7 +2566,9 @@ struct HubLibraryView: View {
             HStack {
                 Text(klL("Download all", "Descargar todos")).font(.headline)
                 Spacer()
-                if !bulk.running {
+                if bulk.running {
+                    Button(klL("Cancel", "Cancelar"), role: .destructive) { bulk.cancel(model: model) }.font(.footnote)
+                } else {
                     Button(klL("Close", "Cerrar")) { bulk.clear() }.font(.footnote)
                 }
             }
