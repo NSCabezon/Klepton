@@ -2490,21 +2490,18 @@ struct HubLibraryView: View {
         Text(title).font(.title3.bold()).foregroundStyle(.secondary).padding(.top, 8)
     }
 
-    // Two rows: the title with Settings, then status, accounts and actions. On one row the
-    // actions ran out of width while "Checking library…" showed and "Download all" was cut.
+    // The title, then on the right: the library check's state, each store's session, "Check for
+    // updates" and Settings. "Download all" (button or the queue's progress) gets a row of its own
+    // when there is one: on the top row it ran out of width.
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 16) {
+            HStack(alignment: .center, spacing: 12) {
                 HStack(alignment: .firstTextBaseline, spacing: 12) {
                     Text("AVP Game Hub").font(.extraLargeTitle2.bold())
                     Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
-                    .font(.footnote).fixedSize()
-            }
-            // Status first, then the accounts, then the actions.
-            HStack(alignment: .center, spacing: 12) {
+                .layoutPriority(1)
+                Spacer(minLength: 8)
                 if model.checking || model.metaChecking {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.mini)
@@ -2517,37 +2514,36 @@ struct HubLibraryView: View {
                         Label(klL("Couldn't check · Retry", "No se pudo comprobar · Reintentar"),
                               systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                     }
-                    .font(.footnote).tint(.orange)
+                    .font(.footnote).tint(.orange).fixedSize()
                     .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
                 }
-                if model.account != nil {
-                    signedInChip("Steam")
-                }
+                storeChip("Steam", signedIn: model.account != nil)
                 #if canImport(MetaStore)
-                if model.metaAccount.signedIn {
-                    signedInChip("Meta")
-                }
+                storeChip("Meta", signedIn: model.metaAccount.signedIn)
                 #endif
                 if !(model.checking || model.metaChecking), model.checkError == nil, !model.metaCheckFailed,
                    model.account != nil {
                     Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }
                         .font(.footnote).fixedSize()
                 }
-                bulkControl
-                Spacer(minLength: 0)
+                Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
+                    .font(.footnote).fixedSize()
             }
+            HStack { bulkControl; Spacer(minLength: 0) }
         }
     }
 
-    /// A store the hub has a session for: its name, then a green dot (same mark for both stores).
-    private func signedInChip(_ text: String) -> some View {
+    /// A store's session: its name, then a dot — green signed in, grey not (sign in from Settings).
+    private func storeChip(_ text: String, signedIn: Bool) -> some View {
         HStack(spacing: 6) {
             Text(text).lineLimit(1)
-            Circle().fill(.green).frame(width: 8, height: 8)
-                .accessibilityLabel(klL("signed in", "sesión iniciada"))
+            Circle().fill(signedIn ? Color.green : Color.gray.opacity(0.6)).frame(width: 8, height: 8)
+                .accessibilityLabel(signedIn ? klL("signed in", "sesión iniciada") : klL("not signed in", "sin sesión"))
         }
         .font(.footnote).foregroundStyle(.secondary)
         .fixedSize()
+        .help(signedIn ? klL("\(text): signed in", "\(text): sesión iniciada")
+                       : klL("\(text): not signed in — sign in from Settings", "\(text): sin sesión — inicia sesión en Ajustes"))
     }
 
     /// "Download all" in the header: the button (when some owned game can be downloaded), or the
