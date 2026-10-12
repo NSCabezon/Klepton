@@ -1400,12 +1400,16 @@ struct HubGameSettingsView: View {
                 .font(.footnote).foregroundStyle(.secondary)
             if KLGameSettingsStore.hasPrecompile(t) {
                 Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
-                    get: { s.precompileGraphics ?? false },
-                    set: { s.precompileGraphics = $0 ? true : nil; save() }))
+                    get: { s.precompileGraphics ?? KLGameSettingsStore.defaultPrecompile(t) },
+                    set: { s.precompileGraphics = $0 == KLGameSettingsStore.defaultPrecompile(t) ? nil : $0
+                           save() }))
                 let have = FileManager.default.fileExists(atPath: KLGameSettingsStore.fozURL(t).path)
+                let recorded = KLGameSettingsStore.hasRecordedPipelines(t)
                 Text(have ? klL("Pipeline list found.", "Lista de pipelines encontrada.")
-                          : klL("No pipeline list on the headset yet.",
-                                "Aún no hay lista de pipelines en el visor."))
+                          : recorded ? klL("Pipelines recorded in earlier sessions found.",
+                                           "Hay pipelines grabados en sesiones anteriores.")
+                          : klL("No pipeline list on the headset yet; this session records one.",
+                                "Aún no hay lista de pipelines en el visor; esta sesión la graba."))
                     .font(.footnote).foregroundStyle(.secondary)
             }
         } header: { Text(klL("Graphics", "Gráficos")) } footer: {
