@@ -1223,9 +1223,72 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     return 1;
 }
 
+// ESSL's default INT precision is per-STAGE, and a uniform declared in both
+// stages without one is therefore two different types.
+//
+// The spec: a vertex shader defaults `int` to highp, a fragment shader defaults
+// it to mediump. A uniform (or a struct member) that states no precision picks
+// up its stage's default, and a strict linker then refuses the program because
+// the two declarations disagree. ANGLE is strict; Quest drivers are not, which
+// is why a Quest title can ship shaders that do not link here. The Simpsons
+// Hit & Run VR port is the case that found it — six lit programs failed with
+//
+//   Precisions of uniform 'lights' member 'lights.enabled' differ between
+//   VERTEX and FRAGMENT shaders.
+//
+// against `struct LightParams { int enabled; vec4 position; ... }`, and the
+// engine then dereferenced the null program it got back for one of them on the
+// first level load.
+//
+// The repair states the vertex stage's default OUT LOUD in both stages, which
+// is a no-op in the vertex shader (it already defaults to highp int) and a
+// PROMOTION in the fragment shader (mediump -> highp). Nothing is narrowed, so
+// no value that fitted before stops fitting; pinning both to mediump instead
+// would demote vertex-stage loop counters and index arithmetic.
+//
+// Placement is directly after the source's FIRST precision statement, which is
+// guaranteed to follow #version and #extension. A source that states an int
+// precision already has no mismatch to fix, and a source with no precision
+// statement at all is left alone. KL_GLFB_NO_INT_PRECISION=1 disables it.
+static int klfb_rewrite_int_precision(char *buf, size_t cap) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_NO_INT_PRECISION", 0);
+    if (off) return 0;
+
+    static const char *const q[] = { "precision highp int;", "precision mediump int;",
+                                     "precision lowp int;" };
+    for (unsigned i = 0; i < sizeof q / sizeof q[0]; i++)
+        if (strstr(buf, q[i])) return 0;
+
+    char *p = strstr(buf, "precision ");
+    if (!p) return 0;
+    char *semi = strchr(p, ';');
+    if (!semi) return 0;
+    char *at = semi + 1;                       // insert directly after it
+
+    static const char ins[] = "\nprecision highp int;";
+    size_t n = sizeof ins - 1;
+    if (strlen(buf) + n + 1 > cap) return 0;   // no slack: leave the text alone
+    memmove(at + n, at, strlen(at) + 1);
+    memcpy(at, ins, n);
+    return 1;
+}
+
 static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     int changed = 0;
     klfb_pin_reset(shader);
+    // First, because it inserts a line and the rules below either shrink or
+    // preserve length.
+    if (klfb_rewrite_int_precision(buf, cap)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] `precision highp int;` stated in shaders that "
+                            "left it to the stage default — ESSL defaults int to "
+                            "highp in a vertex shader and mediump in a fragment "
+                            "one, so a uniform declared in both is two types and "
+                            "the link fails (KL_GLFB_NO_INT_PRECISION=1 disables)\n");
+        changed = 1;
+    }
     if (strncmp(buf, "#version 3", 10) == 0 &&
         buf[10] >= '0' && buf[10] <= '9' && buf[11] >= '0' && buf[11] <= '9' &&
         (buf[10] > '0' || buf[11] > '0') && strncmp(buf + 12, " es", 3) == 0) {
