@@ -9,9 +9,12 @@
 //    nsurlsessiond runs while a game plays, while the hub sits in the background, and
 //    after the process has exited. They land in a staging directory beside the depot
 //    (<root>/.steamdepot/staging-<depot>/<chunk id>); the in-app downloader (SteamDepot)
-//    takes them from there on its next run in the foreground — decrypt, decompress, Adler
-//    and size check, exactly as a chunk from the network — and fetches only what is not
-//    staged. The depot key never leaves the process and is never written anywhere.
+//    takes them from there whenever it runs in the foreground — staged chunks FIRST, picked
+//    up every couple of seconds as they land, then its own fetch from the start of the plan;
+//    decrypt, decompress, Adler and size check, exactly as a chunk from the network. Each
+//    staged chunk it assembles is deleted, which frees room under the staging cap, so in the
+//    foreground both lanes run at once and staging never fills up and stalls the system's
+//    share. The depot key never leaves the process and is never written anywhere.
 //    A server that asks for a CDN auth token makes the lane stop (`needsToken`): such a
 //    token is not handed to the system; the in-app download fetches those chunks itself.
 //
@@ -165,6 +168,14 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
     private var inFlight: [String: [String: URLSessionDownloadTask]] = [:]
     private var attempts: [String: Int] = [:]
     private var reconnected = false
+    /// When each lane's staging directory was last listed (the in-app run deletes what it uses).
+    private var lastScan: [String: Date] = [:]
+    /// Lane key -> staging directory, readable WITHOUT `q`: the session's delegate moves a
+    /// finished chunk with it. The delegate must never wait for `q` — `q` calls into the session
+    /// (task creation, resume, suspend) while the session may be waiting for its delegate, and
+    /// a `q.sync` there deadlocked the lanes on the headset (no progress noted, nothing topped up).
+    private let dirLock = NSLock()
+    private var stagingDirs: [String: URL] = [:]
     private var gameRunning = false
     private var events: (() -> Void)?
     private var notifyPending = false
@@ -263,7 +274,8 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
     /// The in-app run's plan for one depot: hand its chunks (from the end) to the system.
     /// Replaces an earlier lane of the same depot; staged chunks and tasks in flight are kept.
     func setLane(target: String, depot: UInt32, appID: UInt32, manifest: UInt64, servers: [String],
-                 staging: URL, chunks list: [(id: String, comp: UInt32, uncomp: UInt32)], workers: Int, needsToken: Bool) {
+                 staging: URL, chunks list: [(id: String, comp: UInt32, uncomp: UInt32)], workers: Int, needsToken: Bool,
+                 depotBytes: UInt64 = 0, presentBytes: UInt64 = 0) {
         // The depot's files are sparse until written: free space must still hold everything the
         // plan writes, plus a margin, before any of it goes to staging.
         let need = list.reduce(Int64(0)) { $0 + Int64($1.uncomp) } + 2_000_000_000
@@ -281,10 +293,13 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
                             stagingPath: rel, front: min(list.count, workers), nextTail: list.count - 1,
                             count: list.count, paused: false, needsToken: needsToken)
             lane.maxStaged = spare.map { min(self.stagingCap, $0) }
-            lane.depotBytes = old?.depotBytes ?? 0
-            lane.doneBytes = old?.doneBytes ?? 0
+            // What the depot weighs and what of it is on disk, from the plan itself: the card has a
+            // figure before (and without) the in-app run's first progress report.
+            lane.depotBytes = depotBytes > 0 ? depotBytes : old?.depotBytes ?? 0
+            lane.doneBytes = depotBytes > 0 ? presentBytes : old?.doneBytes ?? 0
             if lane.servers.isEmpty { lane.needsToken = true }
             self.lanes[key] = lane
+            self.setStagingDir(key, self.stagingURL(lane))
             self.chunks[key] = list
             self.uncompressedByID[key] = Dictionary(list.map { ($0.id, $0.uncomp) }, uniquingKeysWith: { a, _ in a })
             try? FileManager.default.createDirectory(at: self.stagingURL(lane), withIntermediateDirectories: true)
@@ -306,6 +321,10 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
     }
 
     /// The in-app run's position: chunks below `front` are its own; `done` of `depot` bytes are written.
+    /// `chunksDone` counts only what it fetched itself in plan order — the staged chunks it took
+    /// (from the lane's end) say nothing about how far its own cursor got.
+    /// The staging directory is listed again now and then: every staged chunk the run assembled
+    /// is gone from it, and that room goes back to the lane (top-up).
     func noteProgress(target: String, depot: UInt32, chunksDone: Int, workers: Int, doneBytes: UInt64, depotBytes: UInt64) {
         q.async {
             let key = "\(target)/\(depot)"
@@ -315,6 +334,10 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
             lane.depotBytes = depotBytes
             self.lanes[key] = lane
             self.persist(key, now: false)
+            if Date().timeIntervalSince(self.lastScan[key] ?? .distantPast) >= 3 {
+                self.scanStaging(key)
+                self.topUp(key)
+            }
             self.notify()
         }
     }
@@ -335,7 +358,8 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
         for t in (inFlight[key] ?? [:]).values { t.cancel() }
         inFlight[key] = nil
         if let lane = lanes[key] { try? FileManager.default.removeItem(at: stagingURL(lane)) }
-        lanes[key] = nil; chunks[key] = nil; uncompressedByID[key] = nil
+        lanes[key] = nil; chunks[key] = nil; uncompressedByID[key] = nil; lastScan[key] = nil
+        setStagingDir(key, nil)
         staged[key] = nil; stagedBytes[key] = nil; stagedUncompressed[key] = nil
         try? FileManager.default.removeItem(at: laneURL(key))
         try? FileManager.default.removeItem(at: listURL(key))
@@ -436,27 +460,26 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
         guard let (key, id) = Self.parse(downloadTask.taskDescription) else { return }
         var moved: URL?
         var size: Int64 = 0
-        if status == 200 {
-            q.sync {
-                guard let lane = lanes[key] else { return }
-                let dir = stagingURL(lane)
-                let dst = dir.appendingPathComponent(id)
-                let fm = FileManager.default
-                try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-                try? fm.removeItem(at: dst)
-                if (try? fm.moveItem(at: location, to: dst)) != nil {
-                    moved = dst
-                    size = (try? fm.attributesOfItem(atPath: dst.path)[.size] as? NSNumber)?.int64Value ?? 0
-                }
+        // Here, on the delegate queue, without `q` (see `stagingDirs`).
+        if status == 200, let dir = stagingDir(key) {
+            let dst = dir.appendingPathComponent(id)
+            let fm = FileManager.default
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: dst)
+            if (try? fm.moveItem(at: location, to: dst)) != nil {
+                moved = dst
+                size = (try? fm.attributesOfItem(atPath: dst.path)[.size] as? NSNumber)?.int64Value ?? 0
             }
         }
         q.async {
             self.inFlight[key]?[id] = nil
             guard self.lanes[key] != nil else { return }
             if moved != nil {
-                self.staged[key, default: []].insert(id)
-                self.stagedBytes[key, default: 0] += size
-                self.stagedUncompressed[key, default: 0] += UInt64(self.uncompressedByID[key]?[id] ?? 0)
+                // A rescan may have counted it already.
+                if self.staged[key, default: []].insert(id).inserted {
+                    self.stagedBytes[key, default: 0] += size
+                    self.stagedUncompressed[key, default: 0] += UInt64(self.uncompressedByID[key]?[id] ?? 0)
+                }
             } else if status == 401 || status == 403 {
                 // The server wants a CDN auth token: not something to hand to the system.
                 self.lanes[key]?.needsToken = true
@@ -561,11 +584,15 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
                 return (String(p[0]), c, u)
             }
             lanes[key] = lane
+            setStagingDir(key, stagingURL(lane))
             chunks[key] = list
             uncompressedByID[key] = Dictionary(list.map { ($0.id, $0.uncomp) }, uniquingKeysWith: { a, _ in a })
             scanStaging(key)
         }
     }
+
+    private func setStagingDir(_ key: String, _ url: URL?) { dirLock.withLock { stagingDirs[key] = url } }
+    private func stagingDir(_ key: String) -> URL? { dirLock.withLock { stagingDirs[key] } }
 
     private func scanStaging(_ key: String) {
         guard let lane = lanes[key] else { return }
@@ -582,6 +609,7 @@ final class KLBackgroundDownloads: NSObject, URLSessionDownloadDelegate, @unchec
         staged[key] = ids
         stagedBytes[key] = bytes
         stagedUncompressed[key] = unc
+        lastScan[key] = Date()
     }
 
     // MARK: Helpers
