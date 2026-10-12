@@ -1294,10 +1294,10 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
 // instead of relying on the cond's configured clock. olar (UE5) calls it and it
 // was unresolved -> fatal. Delegate to klb_pthread_cond_timedwait: its abstime
 // rebase already keys off the magnitude (monotonic abstimes are small, realtime
-// ones ~1.7e9), which classifies both clocks correctly, so the clockid is
-// redundant here. Reuses all the timedwait handling (rebase, cap, owner table).
+// ones ~1.7e9), which classifies both clocks correctly. Any other clock is
+// EINVAL, as bionic answers (Linux numbering: REALTIME 0, MONOTONIC 1).
 int klb_pthread_cond_clockwait(void *c, void *m, int clk, const struct timespec *ts) {
-    (void)clk;
+    if (clk != 0 && clk != 1) return kl_errno_to_linux(EINVAL);
     return klb_pthread_cond_timedwait(c, m, ts);
 }
 int klb_pthread_condattr_init(long *a)                 { *a = 0; return 0; }
@@ -1416,6 +1416,17 @@ int klb_pthread_attr_destroy(bionic_attr *a) { (void)a; return 0; }
 int klb_pthread_attr_setstacksize(bionic_attr *a, size_t n) { a->stack_size = n; return 0; }
 int klb_pthread_attr_setdetachstate(bionic_attr *a, int st) {
     if (st) a->flags |= BIONIC_ATTR_DETACHED; else a->flags &= ~BIONIC_ATTR_DETACHED;
+    return 0;
+}
+// No such call on Darwin. klb_pthread_create maps only the stack and detach
+// state out of this attr — the scheduling policy is never honoured either way
+// (Darwin gives an unprivileged process nothing worth promising a game
+// thread) — so there is nothing for the flag to change. Validate the argument
+// the way bionic does (0 = PTHREAD_INHERIT_SCHED, 1 = PTHREAD_EXPLICIT_SCHED)
+// and otherwise accept: the usual attr-setter answer.
+int klb_pthread_attr_setinheritsched(bionic_attr *a, int inherit) {
+    (void)a;
+    if (inherit < 0 || inherit > 1) return EINVAL;
     return 0;
 }
 int klb_pthread_attr_getstack(const bionic_attr *a, void **base, size_t *size) {
