@@ -2879,6 +2879,102 @@ static void klfb_FramebufferTextureLayer(uint32_t target, uint32_t attachment,
 #define GL_TEXTURE_SWIZZLE_R 0x8E42
 #define GL_TEXTURE_SWIZZLE_A 0x8E45
 
+// ---- depth textures sampled with LINEAR, which ES leaves UNDEFINED ---------
+//
+// A depth texture is not filterable unless the driver says so. ES 3.0 §3.8.13:
+// a texture whose internal format is DEPTH_COMPONENT* is incomplete for
+// sampling if its minification or magnification filter is anything but NEAREST
+// **and** its compare mode is NONE — and an incomplete texture samples as
+// (0,0,0,1). Hardware PCF (compare mode COMPARE_REF_TO_TEXTURE) is the one case
+// where LINEAR is legal, because the filtering then happens on the comparison
+// rather than on the depth value.
+//
+// Quest drivers sample it anyway; Metal does not. The failure is silent — no GL
+// error, no incomplete-framebuffer status, no link error: the shadow lookup
+// returns 0.0, every `depth > shadowSample` test passes, and the whole world is
+// in shadow. The Simpsons Hit & Run VR port is the case that found it: its
+// cascades are depth-only targets sampled with "manual bilinear PCF" (four
+// texels, lerped in the shader), which needs NEAREST; the LINEAR filter left on
+// the texture is a leftover, not a filtering choice, and the level rendered
+// black.
+//
+// So: for a texture this runtime knows to be depth-formatted, a LINEAR filter
+// written while the compare mode is NONE is rewritten to NEAREST, and the swap
+// is UNDONE if the guest later turns compare mode on (the order of the two
+// writes is the guest's business, and a hardware-PCF texture is entitled to its
+// LINEAR). Reported once per texture either way.
+//
+// KL_GLFB_DEPTH_LINEAR=1 leaves the guest's write alone.
+#define KLFB_MAX_DEPTHTEX 32
+static struct {
+    uint32_t name;
+    int      cmp;                  // compare mode is COMPARE_REF_TO_TEXTURE
+    int      want_min, want_mag;   // what the guest asked for
+    int      forced;               // we rewrote at least one filter for it
+    int      said;
+} g_dtex[KLFB_MAX_DEPTHTEX];
+static unsigned g_ndtex;
+
+static int klfb_fmt_is_depth(uint32_t f) {
+    return f == 0x81A5 /* DEPTH_COMPONENT16 */ || f == 0x81A6 /* DEPTH_COMPONENT24 */ ||
+           f == 0x81A7 /* DEPTH_COMPONENT32 */ || f == 0x8CAC /* DEPTH_COMPONENT32F */ ||
+           f == 0x88F0 /* DEPTH24_STENCIL8 */  || f == 0x8CAD /* DEPTH32F_STENCIL8 */ ||
+           f == 0x1902 /* DEPTH_COMPONENT */;
+}
+
+static unsigned klfb_dtex_slot(uint32_t name) {
+    for (unsigned i = 0; i < g_ndtex; i++) if (g_dtex[i].name == name) return i;
+    if (g_ndtex >= KLFB_MAX_DEPTHTEX) return (unsigned)-1;
+    g_dtex[g_ndtex].name = name;
+    g_dtex[g_ndtex].want_min = g_dtex[g_ndtex].want_mag = 0x2600 /* NEAREST */;
+    return g_ndtex++;
+}
+
+// Returns the parameter to actually pass. `name` is the bound texture.
+static int32_t klfb_depth_filter_fix(uint32_t name, uint32_t pname, int32_t param) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_DEPTH_LINEAR", 0);
+    if (off || !name) return param;
+    if (pname != 0x884C /* TEXTURE_COMPARE_MODE */ &&
+        pname != 0x2801 /* MIN_FILTER */ && pname != 0x2800 /* MAG_FILTER */)
+        return param;
+    uint32_t fmt = 0;
+    if (!klfb_tex_info(name, &fmt, NULL, NULL) || !klfb_fmt_is_depth(fmt)) return param;
+    unsigned i = klfb_dtex_slot(name);
+    if (i == (unsigned)-1) return param;
+
+    if (pname == 0x884C /* TEXTURE_COMPARE_MODE */) {
+        int now_cmp = (param == 0x884E /* COMPARE_REF_TO_TEXTURE */);
+        if (now_cmp && !g_dtex[i].cmp && g_dtex[i].forced) {
+            // The guest wants hardware PCF after all: give the filters back.
+            if (g_real_TexParameteri) {
+                g_real_TexParameteri(0x0DE1, 0x2801 /* MIN_FILTER */, g_dtex[i].want_min);
+                g_real_TexParameteri(0x0DE1, 0x2800 /* MAG_FILTER */, g_dtex[i].want_mag);
+            }
+            fprintf(stderr, "  [glfb] depth tex %u went into COMPARE_REF_TO_TEXTURE — "
+                            "its LINEAR filters are legal now and have been restored\n",
+                    name);
+            g_dtex[i].forced = 0;
+        }
+        g_dtex[i].cmp = now_cmp;
+        return param;
+    }
+    if (pname == 0x2801) g_dtex[i].want_min = param; else g_dtex[i].want_mag = param;
+    // NEAREST and NEAREST_MIPMAP_NEAREST are the two complete choices; anything
+    // else filters, and filtering a depth texture with compare mode NONE is the
+    // undefined case.
+    if (g_dtex[i].cmp) return param;
+    if (param == 0x2600 /* NEAREST */ || param == 0x2700 /* NEAREST_MIPMAP_NEAREST */)
+        return param;
+    if (!g_dtex[i].said++)
+        fprintf(stderr, "  [glfb] depth tex %u (fmt 0x%x) asked for filter 0x%x with "
+                        "compare mode NONE — ES leaves that sample UNDEFINED and Metal "
+                        "returns 0. Forced to NEAREST (KL_GLFB_DEPTH_LINEAR=1 restores "
+                        "the guest's write)\n", name, fmt, param);
+    g_dtex[i].forced = 1;
+    return 0x2600 /* NEAREST */;
+}
+
 static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     if (klfb_trace_tex())
         fprintf(stderr, "  [glfb] #%u glTexParameteri target=0x%04x pname=0x%04x "
@@ -2897,6 +2993,14 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
     // those calls have to land on the same object the bind did.
     if (target == 0x8D65 /* TEXTURE_EXTERNAL_OES */) target = 0x0DE1;
+    // The depth-texture completeness rule, which needs to know WHICH texture
+    // is bound rather than only what was asked for.
+    if (target == 0x0DE1 /* TEXTURE_2D */ && a_glGetIntegerv &&
+        (pname == 0x2801 || pname == 0x2800 || pname == 0x884C)) {
+        int32_t bound = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        if (bound > 0) param = klfb_depth_filter_fix((uint32_t)bound, pname, param);
+    }
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
     if (kl_env_on("KL_GLFB_ERRPROBE", 0) && a_glGetError) {
         uint32_t e = a_glGetError();
