@@ -2263,11 +2263,11 @@ struct HubLibraryView: View {
                     .help(model.checkError ?? klL("Meta did not answer", "Meta no respondió"))
                 }
                 if model.account != nil {
-                    Text(model.steamLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                    signedInChip("Steam")
                 }
                 #if canImport(MetaStore)
                 if model.metaAccount.signedIn {
-                    Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                    signedInChip("Meta")
                 }
                 #endif
                 if !(model.checking || model.metaChecking), model.checkError == nil, !model.metaCheckFailed,
@@ -2279,6 +2279,17 @@ struct HubLibraryView: View {
                 Spacer(minLength: 0)
             }
         }
+    }
+
+    /// A store the hub has a session for: its name, then a green dot (same mark for both stores).
+    private func signedInChip(_ text: String) -> some View {
+        HStack(spacing: 6) {
+            Text(text).lineLimit(1)
+            Circle().fill(.green).frame(width: 8, height: 8)
+                .accessibilityLabel(klL("signed in", "sesión iniciada"))
+        }
+        .font(.footnote).foregroundStyle(.secondary)
+        .fixedSize()
     }
 
     /// "Download all" in the header: the button (when some owned game can be downloaded), or the
