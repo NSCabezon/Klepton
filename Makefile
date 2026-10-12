@@ -342,8 +342,11 @@ hevc: build/t_hevc
 #
 # `make streamtest` runs one against the other on loopback, clean, then with
 # 1% packet loss twice: with the default FEC (losses rebuilt from parity) and
-# with KL_STREAM_FEC=0 (recovered by IDR requests). Not in `make
-# check`: it needs the hardware HEVC encoder and a free UDP port.
+# with KL_STREAM_FEC=0 (recovered by IDR requests); then the session's ends:
+# a host that "boots" for 6 s before its first picture (STATUS BOOTING: the
+# client must not say "no signal") and quits with a BYE, and a host that
+# vanishes without one (the client must end the session by itself). Not in
+# `make check`: it needs the hardware HEVC encoder and a free UDP port.
 .PHONY: testhost streamtest
 build/kl_stream_testhost: tools/kl_stream_testhost.m runtime/net/kl_stream_proto.h \
                           runtime/net/kl_stream_tx.c runtime/net/kl_stream_tx.h
@@ -377,6 +380,17 @@ streamtest: build/kl_stream_testhost build/kl_stream_harness
 	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 6 --expect-loss \
 	    --out build/stream/lossy-nofec > build/stream/lossy-nofec/client.log 2>&1; rc=$$?; \
 	  grep -E 'harness: [0-9]|PASS|FAIL' build/stream/lossy-nofec/client.log; wait; exit $$rc
+	@mkdir -p build/stream/boot-bye build/stream/vanish
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=10 \
+	  KL_TESTHOST_BOOT_S=6 ./build/kl_stream_testhost > build/stream/boot-bye/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 15 --expect-end bye \
+	    --out build/stream/boot-bye > build/stream/boot-bye/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: \+|first picture at|PASS|FAIL' build/stream/boot-bye/client.log; wait; exit $$rc
+	@KL_TESTHOST_PORT=$(STREAMTEST_PORT) KL_TESTHOST_NAME="klepton streamtest" KL_TESTHOST_SECONDS=4 \
+	  KL_TESTHOST_VANISH=1 ./build/kl_stream_testhost > build/stream/vanish/host.log 2>&1 & \
+	  sleep 0.5; ./build/kl_stream_harness 127.0.0.1 $(STREAMTEST_PORT) --seconds 15 --expect-end lost \
+	    --out build/stream/vanish > build/stream/vanish/client.log 2>&1; rc=$$?; \
+	  grep -E 'harness: \+|first picture at|PASS|FAIL' build/stream/vanish/client.log; wait; exit $$rc
 
 # The video TEXTURE gate: a natively-decoded biplanar frame through
 # CVMetalTextureCache + EGL_METAL_TEXTURE_ANGLE to sampled pixels, compared
