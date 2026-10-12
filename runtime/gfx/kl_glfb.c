@@ -1725,6 +1725,78 @@ static void klfb_CompileShader(uint32_t shader) {
     }
     pthread_mutex_unlock(&g_compile_lock);
 }
+// ----------------------------------------------------- the OTHER way to link
+//
+// glLinkProgram reports a failed link (below); glProgramBinary was passed
+// straight through, so a program loaded from a cached binary that FAILS to link
+// left no line anywhere. The guest then uses it, every glUseProgram answers
+// GL_INVALID_OPERATION ("program has not been successfully linked" — the same
+// error as "not a program object", so it reads like a name bug), and UE4 turns
+// its RHI's Fatal into a ForceQuit storm and, eventually, a crash.
+//
+// That is exactly what a stale ProgramBinaryCache does on the first launch
+// after an OS update; kl_app.c's shader_cache_guard is the cure, and this is
+// the alarm that names it in one line.
+//
+// KL_GLFB_PROGRAM_BINARY=0 refuses the binary path outright: the program is
+// left unlinked, which is precisely what the spec says a rejected binary looks
+// like, so a guest that checks GL_LINK_STATUS falls back to its shader source.
+static void (*g_real_ProgramBinary)(uint32_t, uint32_t, const void *, int32_t);
+static _Atomic unsigned g_pb_loads, g_pb_failed, g_pb_refused;
+static void klfb_ProgramBinary(uint32_t program, uint32_t format,
+                               const void *binary, int32_t length) {
+    static int allow = -1;
+    if (allow < 0) allow = kl_env_on("KL_GLFB_PROGRAM_BINARY", 1);
+    g_pb_loads++;
+    if (!allow) {
+        if (g_pb_refused++ == 0)
+            fprintf(stderr, "  [glfb] glProgramBinary REFUSED "
+                            "(KL_GLFB_PROGRAM_BINARY=0) — every cached program "
+                            "is left unlinked so the guest recompiles from "
+                            "source\n");
+        return;
+    }
+    if (!g_real_ProgramBinary) return;
+    g_real_ProgramBinary(program, format, binary, length);
+
+    static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_GetProgramInfoLog)(uint32_t, int32_t, int32_t *, char *);
+    if (!r_GetProgramiv) r_GetProgramiv = asym("glGetProgramiv");
+    if (!r_GetProgramiv) return;
+    int32_t ok = 1;
+    r_GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &ok);
+    if (ok) return;
+
+    unsigned nth = ++g_pb_failed;
+    if (nth <= 4)
+        fprintf(stderr, "  [glfb] glProgramBinary(%u) REJECTED — format 0x%x, "
+                        "%d bytes, program left UNLINKED (failure #%u). A "
+                        "compiled-program cache does not survive a driver "
+                        "change; see kl_app.c shader_cache_guard.\n",
+                program, format, length, nth);
+    else if (nth == 5)
+        fprintf(stderr, "  [glfb] glProgramBinary: further rejections counted, "
+                        "not printed\n");
+    // The info log is the driver's own reason and is usually empty for a
+    // format mismatch, but it costs nothing to ask on the first one.
+    if (nth == 1) {
+        if (!r_GetProgramInfoLog) r_GetProgramInfoLog = asym("glGetProgramInfoLog");
+        char log[1024]; log[0] = 0;
+        if (r_GetProgramInfoLog) r_GetProgramInfoLog(program, sizeof log, NULL, log);
+        if (log[0]) fprintf(stderr, "  [glfb]   info log: %s\n", log);
+    }
+}
+
+void kl_glfb_program_binary_census(FILE *f) {
+    unsigned n = g_pb_loads, bad = g_pb_failed, ref = g_pb_refused;
+    if (!n) return;
+    fprintf(f, "  [glfb] glProgramBinary: %u load(s), %u REJECTED, %u refused "
+               "by KL_GLFB_PROGRAM_BINARY=0\n", n, bad, ref);
+    if (bad)
+        fprintf(f, "  [glfb]   a rejected binary is an UNLINKED program — every "
+                   "glUseProgram on it is GL_INVALID_OPERATION\n");
+}
+
 static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
@@ -8307,6 +8379,8 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glShaderSource", (void *)klfb_ShaderSource, (void **)&g_real_ShaderSource},
     {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
+    // the other way a program gets linked, and the only one that was silent
+    {"glProgramBinary", (void *)klfb_ProgramBinary, (void **)&g_real_ProgramBinary},
     // the texture storage census — which format the AGX abort follows
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
