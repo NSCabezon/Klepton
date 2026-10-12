@@ -2,9 +2,9 @@
 //
 // Built only for the "hub" row of visionos/targets.py (compilation condition
 // KL_HUB). The games it carries are generated into klHubGameRows
-// (build/hub/KleptonHubManifest.swift) from that row's "games" list, and each
-// game's translated frameworks sit in their own Frameworks/<game>/ (kl_app.c
-// picks the selected one).
+// (build/hub/KleptonHubManifest.swift) from that row's "games" list, and every
+// game's translated frameworks sit flat in Frameworks/ as <game>__<lib>.framework
+// (kl_app.c hands the runtime the selected game's prefix).
 //
 // How a game runs: Play sets KL_TARGET to the game's target name — the same
 // override kl_app_configure and kl_app_target_name_or_default() already honour —
@@ -353,6 +353,7 @@ final class HubLibraryModel: ObservableObject {
                 .throttle(for: .milliseconds(500), scheduler: RunLoop.main, latest: true)
                 .sink { [weak self] _ in self?.objectWillChange.send() })
         }
+        SteamContentModel.importHandoff()
         account = (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load())?.accountName
         #endif
         #if canImport(MetaStore)
@@ -556,6 +557,22 @@ final class HubLibraryModel: ObservableObject {
     }
 
     /// Header "Retry": both stores' library checks again.
+    /// Imports tokens the Mac app copied in since the last look, and re-checks the store
+    /// whose session just appeared.
+    func reimportTokens() {
+        #if canImport(SteamDepot)
+        if let name = SteamContentModel.importHandoff() {
+            account = name
+            checkUpdates()
+        }
+        #endif
+        #if canImport(MetaStore)
+        let wasSignedIn = metaAccount.signedIn
+        metaAccount.importHandoff()
+        if metaAccount.signedIn && !wasSignedIn { metaAccount.refresh(force: true) }
+        #endif
+    }
+
     func retryChecks() {
         checkUpdates()
         #if canImport(MetaStore)
@@ -1064,6 +1081,7 @@ final class HubLibraryModel: ObservableObject {
     /// Steam's latest, and fetch the account's library for the info section.
     func checkUpdates() {
         #if canImport(SteamDepot)
+        SteamContentModel.importHandoff()
         let store = KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam")
         guard !checking, let creds = try? store.load() else { return }
         account = creds.accountName
@@ -2028,6 +2046,7 @@ struct HubLibraryView: View {
     /// "Jugar desde el Mac" (KleptonStreamClient.swift): the game, and the Mac.
     var onPlayFromMac: (String, KLStreamTarget) -> Void = { _, _ in }
     @StateObject private var model = HubLibraryModel()
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var art = HubMetaArt.shared
     #if canImport(SteamDepot)
     @ObservedObject private var cloud = KLCloudSaveModel.shared
@@ -2071,6 +2090,11 @@ struct HubLibraryView: View {
             } else {
                 library
             }
+        }
+        // A token the Mac sent ("Send to headset") while the hub was open: pick it up
+        // when the hub comes back to the front, not only at launch.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { model.reimportTokens() }
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.

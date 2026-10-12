@@ -38,10 +38,12 @@ its saves into another's directory.
 
 **A bundle id separates the installed apps and nothing else about a build**, so
 the target also carries the PRODUCT name, and with it the `.xcodeproj`, the
-`.app`, the derived-data directory and the `Frameworks/<target>/` the
+`.app`, the derived-data directory and the `visionos/Frameworks/<target>/` the
 translations are staged into. ANGLE is deliberately not per-target: it is the
 same renderer for every guest and `mkangle.sh` writes it once, into
-`Frameworks/` itself.
+`visionos/Frameworks/` itself. Inside the `.app` everything is flat in
+`Frameworks/`, the translations named `<target>__<lib>.framework/<target>__<lib>`
+(see the hub below).
 
 The id itself is **derived, not stored**: `$USER.dev.klepton.target.<target>`.
 Two halves, for two different collisions. The `<target>` half separates the apps
@@ -75,17 +77,21 @@ misbehaving.
 `runtime/kl_target_table.h`). It embeds every game in its `games` list and opens
 on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
 
-- **Frameworks, per game.** Each game's translations go to
-  `KleptonHub.app/Frameworks/<game>/` (one Embed phase per game, `dstPath` =
-  the game), so same-named libraries from two games cannot collide. They are
-  referenced as the platform slice's `.framework`, not the `.xcframework`:
-  Xcode flattens every xcframework into one products directory first, and two
-  games' `libphonon` then fail the build ("Multiple commands produce"). Guest
-  framework bundle ids carry the target (`dev.klepton.guest.<target>.<lib>`). `kl_app.c`
-  sets `KL_DYLIB_DIR` to `Frameworks/<target>/` when that folder holds the
-  target's entry library, else to `Frameworks/` (every single-target build).
-  ANGLE and MoltenVK stay in `Frameworks/` for all games (`KL_ANGLE_DIR`,
-  `KL_MVK_DIR`).
+- **Frameworks, flat and prefixed.** App Store validation allows nothing but
+  `.framework` bundles and `.dylib`s directly in `Frameworks/` — a per-game
+  subfolder is rejected at processing (ITMS-90432), and `tf_check.py` fails on
+  one. So every game's translations sit flat in `KleptonHub.app/Frameworks/`,
+  each named `<game>__<lib>.framework/<game>__<lib>` by `mkguest.sh` (the same
+  name for a single-target app, a Debug run and an archive), so the games'
+  same-named libraries (`libunity`, `libil2cpp`, `libmain`, `libc++_shared`)
+  cannot collide. Guest framework bundle ids carry the target too
+  (`dev.klepton.guest.<target>.<lib>`). They are referenced as the platform
+  slice's `.framework`, not the `.xcframework`, and embedded by the one Embed
+  phase. `kl_app.c` sets `KL_DYLIB_DIR` to `Frameworks/` and
+  `KL_DYLIB_PREFIX=<target>__`; the runtime (`dylib_candidate`, and the glibc
+  door's translation index) puts the prefix on the file name only — the guest
+  still asks for `libunity.so`. ANGLE and MoltenVK sit unprefixed in the same
+  `Frameworks/` for all games (`KL_ANGLE_DIR`, `KL_MVK_DIR`).
 - **Selection.** Play sets `KL_TARGET=<game>` (the existing runtime override)
   and only then creates the boot window, so `kl_app_target_name_or_default()`,
   `kl_app_configure` and everything after them are the single-game path. The
@@ -175,7 +181,7 @@ KLEPTON_TEAM=<team> KLEPTON_BUNDLE_ID=<your.app.id> ./build_run_vpro.sh hub --ar
 |  | where | why |
 |---|---|---|
 | C runtime | `build/Klepton.xcframework`, linked **statically** | `make xros` builds both slices; `run.sh` passes `XROS_PLATFORMS=xros` or `=xrsim` so a run builds only the one it will install, which halves it. Static, so it is inside the app binary — no load-time cost, and nothing for dyld to resolve. |
-| guest libraries | `Frameworks/<name>.xcframework`, **embedded, not linked** | klepton-ld output. Embedded so Xcode code-signs them; a loose Mach-O elsewhere in the bundle is only *sealed* by the outer signature, which is not the same thing and is not what AMFI accepted in P3. Not *linked*, because nothing references their symbols — the runtime `dlopen`s them by path, and linking would make dyld want an exports trie klepton-ld deliberately does not emit. |
+| guest libraries | `Frameworks/<target>/<name>.xcframework` → `.app/Frameworks/<target>__<name>.framework`, **embedded, not linked** | klepton-ld output. Embedded so Xcode code-signs them; a loose Mach-O elsewhere in the bundle is only *sealed* by the outer signature, which is not the same thing and is not what AMFI accepted in P3. Not *linked*, because nothing references their symbols — the runtime `dlopen`s them by path, and linking would make dyld want an exports trie klepton-ld deliberately does not emit. |
 | APK assets (2.2 GB) | the app's **Documents container**, staged once | They change only when the APK does; the code changes every few minutes. Bundling them would put a multi-minute upload in front of every build. |
 
 The asymmetry is deliberate: **code in the bundle, data in the container.** P3
