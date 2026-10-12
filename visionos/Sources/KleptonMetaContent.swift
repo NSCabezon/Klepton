@@ -122,23 +122,103 @@ final class MetaContentModel: ObservableObject {
     @Published var freeBytes: UInt64?
     @Published private(set) var complete = false
     @Published private(set) var hasAnything = false
+    /// The base game's required files are all verified (voice packs aside).
+    @Published private(set) var baseComplete = false
+    /// The voice-language packs this game is installed with (KLCatalog.metaVoiceLocales): fetched
+    /// with the game, part of "installed". Changed on the game's page ("Voice languages").
+    @Published private(set) var voiceLocales: Set<String> = []
+    /// The voice packs on disk, verified at their exact size.
+    @Published private(set) var installedVoiceLocales: Set<String> = []
+    /// A pack the game asked the platform for during a session and did not get (the runtime's
+    /// note in android-files/, see klplat_langpack_note_request), until it is installed.
+    @Published private(set) var requestedVoiceLocale: String?
     private var samples: [(t: Date, b: Int64)] = []
     private var task: Task<Void, Never>?
+    /// Bytes of the running plan before each of its files (by file name): one file's own progress.
+    private var planBase: [String: Int64] = [:]
+    /// A pack was added while a download ran (its plan was made without it): go again after.
+    private var rerun = false
     var interruptedByBackground = false
 
     init(target: String, recipe: Recipe) {
         self.target = target
         self.recipe = recipe
         self.store = KLCatalog.metaStore(target)
+        self.voiceLocales = KLCatalog.metaVoiceLocales(target, recipe)
         refreshLocal()
         if complete { stage = .complete }
     }
 
     var account: MetaAccountModel { MetaAccountModel.shared }
     var isBusy: Bool { task != nil }
-    /// The voice-language packs fetched with the game (KLCatalog.metaVoiceLocales).
-    var voiceLocales: Set<String> { KLCatalog.metaVoiceLocales(target, recipe) }
     var requiredBytes: Int64 { recipe.files(locales: voiceLocales).reduce(0) { $0 + ($1.size ?? 0) } }
+
+    // MARK: Voice-language packs
+
+    /// The recipe's optional voice packs, in the recipe's order. Empty for most games.
+    var voicePacks: [RecipeFile] { recipe.files.filter { $0.locale != nil } }
+
+    /// The pack for the player's language (game setting, else headset).
+    var recommendedVoiceLocale: String? { KLCatalog.metaRecommendedVoiceLocale(target, recipe) }
+
+    /// The pack's own progress while the running download is on it (0...1), else nil.
+    func voicePackFraction(_ f: RecipeFile) -> Double? {
+        guard isBusy, let p = progress, p.fileName == f.name, !p.verifying,
+              let base = planBase[f.name], let size = f.size, size > 0 else { return nil }
+        return min(1, max(0, Double(p.bytesDone - base) / Double(size)))
+    }
+
+    /// The pack is being checksummed after its download.
+    func voicePackVerifying(_ f: RecipeFile) -> Bool {
+        isBusy && progress?.fileName == f.name && progress?.verifying == true
+    }
+
+    /// Add a pack to the game. Base game installed and nothing running: downloaded now (the
+    /// same path as the game's own download: ownership asked fresh, one request at a time through
+    /// the account's gate, checksum verified). A download running: fetched right after it. Base
+    /// game not downloaded yet: fetched with it.
+    func addVoicePack(_ locale: String) {
+        guard recipe.voiceLocales.contains(locale) else { return }
+        voiceLocales.insert(locale)
+        KLCatalog.setMetaVoiceLocales(voiceLocales, for: target)
+        log("voice pack \(locale) added (now \(voiceLocales.sorted().joined(separator: ", ")))")
+        refreshLocal()
+        if isBusy { rerun = true }
+        else if baseComplete { start() }
+    }
+
+    /// Take a pack off the game: no longer part of "installed", and its file (finished or
+    /// partial) deleted. Not while a download runs (its plan may be writing it).
+    func removeVoicePack(_ locale: String) {
+        guard !isBusy, let f = voicePacks.first(where: { $0.locale == locale }) else { return }
+        voiceLocales.remove(locale)
+        KLCatalog.setMetaVoiceLocales(voiceLocales, for: target)
+        let fm = FileManager.default
+        try? fm.removeItem(at: store.url(for: f))
+        try? fm.removeItem(at: store.partialURL(for: f))
+        if var r = store.loadRecord(), r.files.removeValue(forKey: f.relativePath) != nil {
+            r.updated = Date()
+            try? store.save(r)
+        }
+        log("voice pack \(locale) removed (now \(voiceLocales.sorted().joined(separator: ", ")))")
+        refreshLocal()
+        if !isBusy, complete { stage = .complete }
+    }
+
+    /// The runtime's note: the tag on the first line, the file name on the second.
+    private var requestNoteURL: URL { store.root.appendingPathComponent("android-files/klepton-voicepack-request.txt") }
+
+    private func readVoicePackRequest() -> String? {
+        guard !voicePacks.isEmpty, let text = try? String(contentsOf: requestNoteURL, encoding: .utf8) else { return nil }
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        let pack = voicePacks.first { f in lines.contains { $0 == f.locale || $0 == f.name || $0 == f.localFileName } }
+        guard let locale = pack?.locale else { return nil }
+        if installedVoiceLocales.contains(locale) {
+            try? FileManager.default.removeItem(at: requestNoteURL)    // answered: the pack is there now
+            return nil
+        }
+        return locale
+    }
 
     /// Fraction for the library card while working.
     var activeFraction: Double? {
@@ -148,7 +228,17 @@ final class MetaContentModel: ObservableObject {
 
     func refreshLocal() {
         complete = store.isComplete(recipe, locales: voiceLocales)
+        baseComplete = store.isComplete(recipe)
         hasAnything = store.hasAnything(recipe)
+        if !voicePacks.isEmpty {
+            let verified = store.loadRecord().flatMap { $0.versionCode == recipe.versionCode ? $0.files : nil } ?? [:]
+            installedVoiceLocales = Set(voicePacks.compactMap { f in
+                guard let l = f.locale, let size = f.size, verified[f.relativePath]?.size == size,
+                      GameStore.fileSize(store.url(for: f)) == size else { return nil }
+                return l
+            })
+            requestedVoiceLocale = readVoicePackRequest()
+        }
         try? FileManager.default.createDirectory(at: store.root, withIntermediateDirectories: true)
         if let v = try? store.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage { freeBytes = UInt64(v) }
@@ -162,9 +252,17 @@ final class MetaContentModel: ObservableObject {
         task = Task { [weak self] in
             await self?.run()
             await MainActor.run {
-                self?.task = nil
+                guard let self else { return }
+                self.task = nil
+                self.planBase = [:]
                 UIApplication.shared.isIdleTimerDisabled = false
-                self?.refreshLocal()
+                self.refreshLocal()
+                // A pack added while it ran: its turn now (same MainActor turn, so "Download
+                // all" never sees this game idle in between).
+                if self.rerun {
+                    self.rerun = false
+                    if case .idle = self.stage { self.start() }
+                }
             }
         }
     }
@@ -205,7 +303,12 @@ final class MetaContentModel: ObservableObject {
             }
             let record = store.loadRecord()
             let locales = voiceLocales
-            if !locales.isEmpty { log("voice-language packs: \(locales.sorted().joined(separator: ", "))") }
+            if !locales.isEmpty {
+                // What this download is made with stays the game's packs from now on (a later
+                // change of the game's or the headset's language does not silently add one).
+                if !KLCatalog.hasStoredMetaVoiceLocales(target) { KLCatalog.setMetaVoiceLocales(locales, for: target) }
+                log("voice-language packs: \(locales.sorted().joined(separator: ", "))")
+            }
             let selection = FetchSelection(ownedSKUs: skus, withheld: Set(record?.withheld ?? []), locales: locales)
             let plan = FetchPlan.plan(recipe: recipe, selection: selection, record: record, state: store.state(of:))
             let missing = plan.reduce(Int64(0)) { sum, p in
@@ -215,6 +318,9 @@ final class MetaContentModel: ObservableObject {
                 case .download: return sum + (p.file.size ?? 0)
                 }
             }
+            var base: Int64 = 0
+            planBase = [:]
+            for p in plan { planBase[p.file.name] = base; base += p.file.size ?? 0 }
             refreshLocal()
             if let free = freeBytes, UInt64(max(0, missing)) + 1_000_000_000 > free {
                 stage = .failed(klL("Not enough space: \(gb(missing)) to download, \(gb(Int64(free))) free.",
@@ -229,8 +335,12 @@ final class MetaContentModel: ObservableObject {
                 }, log: { [target] s in NSLog("[meta] \(target): \(s)") })
             log("done: \(summary.downloaded) downloaded, \(summary.kept) kept, \(summary.withheld.count) withheld")
             refreshLocal()
-            stage = complete ? .complete : .failed(klL("Download finished but the files are not complete.",
-                                                       "La descarga terminó pero faltan archivos."))
+            if complete { stage = .complete }
+            else if voiceLocales != locales, rerun { stage = .idle }   // a pack added meanwhile: start() goes again
+            else {
+                stage = .failed(klL("Download finished but the files are not complete.",
+                                    "La descarga terminó pero faltan archivos."))
+            }
         } catch is CancellationError {
             stage = .paused
         } catch {
@@ -264,29 +374,9 @@ struct MetaContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .firstTextBaseline) {
-                Button { onBack() } label: { Label(klL("Library", "Biblioteca"), systemImage: "chevron.left") }
-                Text(model.recipe.title).font(.largeTitle.bold())
-                Spacer()
-                if account.signedIn { Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary) }
-            }
-            Text(klL("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))",
-                     "Versión de Quest \(model.recipe.versionName) de la tienda de Meta · \(gb(model.requiredBytes))")
-                 + voicePacksLabel)
-                .foregroundStyle(.secondary)
-            content
-            Spacer(minLength: 0)
-            if model.isBusy {
-                Label(klL("Keep this window open and the headset on: visionOS pauses apps in the background, "
-                          + "and the download stops with it. It resumes where it left off.",
-                          "Deja esta ventana abierta y el visor puesto: visionOS pausa las apps en segundo plano "
-                          + "y la descarga se para con ellas. Sigue donde se quedó."),
-                      systemImage: "exclamationmark.triangle")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
+        ScrollView {
+            page.padding(32)
         }
-        .padding(32)
         .onAppear { model.refreshLocal() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background, model.isBusy { model.interruptedByBackground = true }
@@ -297,10 +387,29 @@ struct MetaContentView: View {
         }
     }
 
-    /// " · voices es-ES, en-US" for a game with voice-language packs.
-    private var voicePacksLabel: String {
-        let l = model.voiceLocales.sorted()
-        return l.isEmpty ? "" : klL(" · voices ", " · voces ") + l.joined(separator: ", ")
+    private var page: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .firstTextBaseline) {
+                Button { onBack() } label: { Label(klL("Library", "Biblioteca"), systemImage: "chevron.left") }
+                Text(model.recipe.title).font(.largeTitle.bold())
+                Spacer()
+                if account.signedIn { Text(KLAccountPrivacy.metaLabel).font(.footnote).foregroundStyle(.secondary) }
+            }
+            Text(klL("Quest build \(model.recipe.versionName) from Meta's store · \(gb(model.requiredBytes))",
+                     "Versión de Quest \(model.recipe.versionName) de la tienda de Meta · \(gb(model.requiredBytes))"))
+                .foregroundStyle(.secondary)
+            content
+            if !model.voicePacks.isEmpty { MetaVoicePacksSection(model: model) }
+            if model.isBusy {
+                Label(klL("Keep this window open and the headset on: visionOS pauses apps in the background, "
+                          + "and the download stops with it. It resumes where it left off.",
+                          "Deja esta ventana abierta y el visor puesto: visionOS pausa las apps en segundo plano "
+                          + "y la descarga se para con ellas. Sigue donde se quedó."),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder private var content: some View {
@@ -364,6 +473,136 @@ struct MetaContentView: View {
                 }
             }
         }
+    }
+}
+
+/// "Voice languages" on a Meta game's page, for a recipe with optional voice-language packs
+/// (Batman): one row per pack with its size, whether it is on the headset, and Download / Delete.
+/// The game's own download fetches the packs chosen here (by default the player's language plus
+/// en-US); a pack added here later goes through that same download.
+struct MetaVoicePacksSection: View {
+    @ObservedObject var model: MetaContentModel
+    @State private var confirmDelete: RecipeFile?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(klL("Voice languages", "Idiomas de voz")).font(.title3.bold())
+            Text(klL("The game's spoken dialogue comes in one pack per language. The game plays the pack for its "
+                     + "language setting and falls back to English; it cannot download one itself.",
+                     "Los diálogos hablados del juego vienen en un paquete por idioma. El juego usa el del idioma "
+                     + "que tenga configurado y, si falta, el inglés; no puede descargarlo él mismo."))
+                .font(.footnote).foregroundStyle(.secondary)
+            if let req = model.requestedVoiceLocale {
+                Label(klL("The game asked for the \(KLCatalog.voicePackName(req)) voice pack — download it here.",
+                          "El juego pidió el paquete de voz \(KLCatalog.voicePackName(req)) — descárgalo aquí."),
+                      systemImage: "exclamationmark.bubble.fill")
+                    .foregroundStyle(.orange)
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(model.voicePacks.enumerated()), id: \.element.id) { i, f in
+                    if i > 0 { Divider() }
+                    row(f).padding(.horizontal, 16).padding(.vertical, 10)
+                }
+            }
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        }
+        .padding(.top, 8)
+        .confirmationDialog(confirmTitle, isPresented: Binding(get: { confirmDelete != nil },
+                                                               set: { if !$0 { confirmDelete = nil } }),
+                            titleVisibility: .visible, presenting: confirmDelete) { f in
+            Button(klL("Delete", "Borrar"), role: .destructive) {
+                if let l = f.locale { model.removeVoicePack(l) }
+            }
+        } message: { f in Text(confirmMessage(f)) }
+    }
+
+    @ViewBuilder private func row(_ f: RecipeFile) -> some View {
+        let locale = f.locale ?? ""
+        let installed = model.installedVoiceLocales.contains(locale)
+        let chosen = model.voiceLocales.contains(locale)
+        let fraction = model.voicePackFraction(f)
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(KLCatalog.voicePackName(locale)).font(.body.bold())
+                    Text(locale).font(.caption).foregroundStyle(.secondary)
+                    ForEach(badges(locale), id: \.self) { b in
+                        Text(b).font(.caption.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.25), in: Capsule())
+                    }
+                }
+                Text("\(gb(f.size ?? 0)) · " + stateText(f, installed: installed, chosen: chosen, fraction: fraction))
+                    .font(.callout).monospacedDigit()
+                    .foregroundStyle(installed ? Color.green : fraction != nil ? Color.blue : Color.secondary)
+                if let fraction { ProgressView(value: fraction) }
+            }
+            Spacer(minLength: 8)
+            button(f, locale: locale, installed: installed, chosen: chosen)
+        }
+    }
+
+    private func badges(_ locale: String) -> [String] {
+        var out: [String] = []
+        if locale == model.recommendedVoiceLocale {
+            out.append(KLGameSettingsStore.language(for: model.target).locale != nil
+                       ? klL("Recommended: the game's language", "Recomendado: idioma del juego")
+                       : klL("Recommended: the headset's language", "Recomendado: idioma del visor"))
+        }
+        if locale == "en-US", locale != model.recommendedVoiceLocale {
+            out.append(klL("Recommended: the game's fallback", "Recomendado: idioma base del juego"))
+        }
+        return out
+    }
+
+    private func stateText(_ f: RecipeFile, installed: Bool, chosen: Bool, fraction: Double?) -> String {
+        if let fraction { return klL("Downloading \(Int((fraction * 100).rounded())) %", "Descargando \(Int((fraction * 100).rounded())) %") }
+        if model.voicePackVerifying(f) { return klL("Verifying…", "Verificando…") }
+        if installed { return klL("Installed", "Instalado") }
+        if chosen && model.isBusy { return klL("Queued", "En cola") }
+        if chosen && !model.baseComplete { return klL("Not installed · downloads with the game", "No instalado · se descarga con el juego") }
+        return klL("Not installed", "No instalado")
+    }
+
+    @ViewBuilder private func button(_ f: RecipeFile, locale: String, installed: Bool, chosen: Bool) -> some View {
+        if installed {
+            Button(klL("Delete", "Borrar"), role: .destructive) { confirmDelete = f }
+                .disabled(model.isBusy)
+        } else if chosen && (model.isBusy || !model.baseComplete) {
+            // Queued (with the running download, or with the game's own): can be taken off while
+            // nothing runs.
+            Button(klL("Remove", "Quitar")) { model.removeVoicePack(locale) }
+                .disabled(model.isBusy)
+        } else if chosen {
+            // Chosen but not there (a failed or paused download): fetch it now.
+            Button(klL("Download", "Descargar")) { model.start() }.buttonStyle(.borderedProminent)
+        } else {
+            Button(klL("Download", "Descargar")) { model.addVoicePack(locale) }.buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var confirmTitle: String {
+        guard let l = confirmDelete?.locale else { return "" }
+        return klL("Delete the \(KLCatalog.voicePackName(l)) voices?", "¿Borrar las voces en \(KLCatalog.voicePackName(l))?")
+    }
+
+    /// Frees the pack's size; and says so plainly when the game would be left without the voices
+    /// it plays (the pack for its language, or the last pack on the headset).
+    private func confirmMessage(_ f: RecipeFile) -> String {
+        let l = f.locale ?? ""
+        var m = klL("Frees \(gb(f.size ?? 0)). You can download it again here at any time.",
+                    "Libera \(gb(f.size ?? 0)). Puedes volver a descargarlo aquí cuando quieras.")
+        let others = model.installedVoiceLocales.subtracting([l])
+        if others.isEmpty {
+            m += klL("\n\nWarning: this is the last voice pack on the headset — the game will have no spoken dialogue.",
+                     "\n\nAtención: es el último paquete de voz del visor — el juego se quedará sin diálogos hablados.")
+        } else if l == model.recommendedVoiceLocale {
+            m += klL("\n\nWarning: the game is set to this language. Without it the game asks to download it "
+                     + "(which it cannot do itself) and plays another language.",
+                     "\n\nAtención: el juego está en este idioma. Sin él, el juego pedirá descargarlo "
+                     + "(no puede hacerlo él mismo) y usará otro idioma.")
+        }
+        return m
     }
 }
 
