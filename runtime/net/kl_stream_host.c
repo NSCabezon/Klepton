@@ -118,6 +118,7 @@ static struct {
     struct sockaddr_storage addr;
     socklen_t addr_len;
     double   last_heard;           // host time of the last POSE/HELLO from it
+    int      timed_out;            // went silent (not BYE): its POSEs resume it
     // what the encoder is asked for
     int      frame_w, frame_h, kbps;
     float    fps;
@@ -504,6 +505,7 @@ static void on_hello(const kl_stream_hello *m, size_t n,
         C.fps = kl_env_float("KL_STREAM_FPS", lock_fps() > 0 ? lock_fps() : 60.0f);
         C.addr = *from; C.addr_len = fl;
         C.active = 1;
+        C.timed_out = 0;
         tx_fd_connect_locked();
         g_abr_kbps = kbps;
         g_abr_clean = 0;
@@ -533,9 +535,23 @@ static void on_pose(const kl_stream_pose *m, size_t n,
                     const struct sockaddr_storage *from, socklen_t fl) {
     if (n < sizeof *m) return;
     pthread_mutex_lock(&g_mu);
+    // A client that went silent past KL_STREAM_TIMEOUT_MS and then speaks
+    // again from the same socket was stalled, not gone: resume it with a
+    // keyframe. Its client never saw an end (PING/PONG kept flowing — only the
+    // POSEs stopped: on a Mac harness, a GPU stall in its frame loop while the
+    // game loaded a level) and would otherwise wait forever on a host that
+    // ignores its POSEs. A BYE or a new HELLO clears this.
+    int resumed = 0;
+    if (!C.active && C.timed_out && addr_eq(&C.addr, C.addr_len, from, fl)) {
+        C.active = 1;
+        C.timed_out = 0;
+        g_idr = 1;
+        resumed = 1;
+    }
     int ok = C.active && addr_eq(&C.addr, C.addr_len, from, fl);
     if (ok) C.last_heard = kl_stream_host_now();
     pthread_mutex_unlock(&g_mu);
+    if (resumed) fprintf(stderr, SH "client is back (POSE after a timeout): streaming resumed\n");
     if (!ok) return;
     uint64_t ns = mono_ns();
     g_pose_ring[m->pose_id % POSE_RING].id = m->pose_id;
@@ -617,6 +633,7 @@ static void on_packet(const uint8_t *buf, size_t n, const struct sockaddr_storag
         pthread_mutex_lock(&g_mu);
         int was = C.active && addr_eq(&C.addr, C.addr_len, from, fl);
         if (was) C.active = 0;
+        if (was || addr_eq(&C.addr, C.addr_len, from, fl)) C.timed_out = 0;
         pthread_mutex_unlock(&g_mu);
         if (was) fprintf(stderr, SH "client said BYE — streaming stopped, the guest keeps running\n");
         break;
@@ -767,12 +784,12 @@ static void *net_thread(void *arg) {
         double now = kl_stream_host_now();
         pthread_mutex_lock(&g_mu);
         int gone = C.active && now - C.last_heard > timeout;
-        if (gone) C.active = 0;
+        if (gone) { C.active = 0; C.timed_out = 1; }
         int on = C.active;
         pthread_mutex_unlock(&g_mu);
         if (gone)
             fprintf(stderr, SH "client timed out (no POSE for %.1f s) — streaming stopped, the "
-                            "guest keeps running\n", timeout);
+                            "guest keeps running (a POSE from it resumes)\n", timeout);
         // STATUS: once a second, at once for a new client or a state change.
         int st = g_t_first_frame > 0 ? KL_STREAM_HOST_RUNNING : KL_STREAM_HOST_BOOTING;
         if (on && (!keep_on || st != keep_state || now - t_keep >= 1.0)) {
