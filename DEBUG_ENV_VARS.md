@@ -1316,10 +1316,33 @@ puts the camera on the ground with its hands underneath it.
   - `KL_ANGLE_VRR_TRACE=1` alongside it shows the ANGLE half: which render
     passes found the map, and whether each eye resolve took the
     physical-passthrough path (`passthrough=1`) rather than warping twice.
+  - **Zone seams are the trade-off.** A Metal rate map holds one constant rate
+    per zone, so a guest whose screen-space post-processing samples across zone
+    boundaries shows each rate step as a line — Beat Saber's menu, looking down:
+    one or two horizontal lines across the view. `KL_VRR=0` removes them at the
+    full fragment cost; `KL_VRR_FLOOR` does not. They appear only where the
+    guest renders straight into the eye textures (the OVRPlugin path): on the
+    copy path (an OpenXR array swapchain) `kl_glfb` already drops the guest's
+    rate map.
 - `KL_VRR_EDGE=<0..1>` — the rate at the edge of the eye, default 0.35 (the
   fovea is always 1.0, falling off linearly). Lower is cheaper and blurrier in
   the periphery; 1.0 is a map that does nothing. Ignored on device when the
   drawable's own curve was sampled.
+- `KL_VRR_FLOOR=<0.01..1>` — **the smallest per-zone rate the guest's map may
+  carry**, default **0.50**, applied on device after the display's curve is
+  sampled (and to the synthetic curve alike). A fragment shader under a rate map
+  runs in physical space, so `dFdx`/`dFdy` and every texture LOD derived from
+  them measure physical pixels: a zone at rate `r` samples `log2(1/r)` mip
+  levels higher than it would unfoveated. The display's own periphery
+  (≈0.12 x, ≈0.10 y) is +3.1/+3.3 levels, a soft, screen-fixed over-blur.
+  The floor bounds it at `log2(1/floor)` levels — 0.50 is +1 — at a fragment
+  cost of 28.6% -> 48.8% of the unfoveated eye on the measured curve. One
+  `[cp] foveation LOD:` line states the worst bias on both axes before and
+  after, and the fragment fraction. `KL_VRR_FLOOR=0.01` restores the raw
+  display curve.
+  - **It does not remove zone seams.** The horizontal lines in Beat Saber's
+    menu (looking down) are the rate map's own zone boundaries, and they stay
+    with the floor engaged; see `KL_VRR` above — `KL_VRR=0` is the only cure.
 - `KL_VRR_ZONES=<n>` — how many equal screen-space zones each axis of that
   synthetic curve is divided into, default 16, capped at 64. Also the unwarp
   grid's cell count, which is what makes the unwarp exact rather than a sampling
