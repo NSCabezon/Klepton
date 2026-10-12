@@ -34,6 +34,8 @@
 # a SYMLINK to the main checkout's unpacked tree in worktrees, hence the bare form
 /ieytd
 /ieytd/
+/ktane
+/ktane/
 /intotheradius/*
 /intotheradius/
 /cs1/*
