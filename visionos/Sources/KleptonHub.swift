@@ -326,6 +326,8 @@ final class HubLibraryModel: ObservableObject {
     @Published var checkError: String?
     /// Each game's most recent session (KleptonSessionStats.swift), for its card.
     @Published var lastSession: [String: KLSessionRecord] = [:]
+    /// "Download all": the queue of games downloading one after another.
+    let bulk = HubBulkDownload()
     private var relay: [AnyCancellable] = []
 
     init() {
@@ -358,6 +360,7 @@ final class HubLibraryModel: ObservableObject {
         }
         relay.append(metaAccount.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() })
         #endif
+        relay.append(bulk.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() })
         reloadSessions()
     }
 
@@ -773,6 +776,83 @@ final class HubLibraryModel: ObservableObject {
         objectWillChange.send()
     }
 
+    // MARK: Download all
+
+    /// The games "Download all" offers: not (fully) downloaded or with an update, from the store
+    /// the card would use, and only when that store confirms the account owns a build this port
+    /// runs (never "not in your library", never a store that has not answered).
+    /// `measure` = also work out each one's size (a stat of its files: for the sheet, not every redraw).
+    func bulkCandidates(measure: Bool = true) -> [HubBulkCandidate] {
+        games.compactMap { g -> HubBulkCandidate? in
+            guard KLCatalog.entry(g.target) != nil, !HubStorage.isBusy(self, g.target) else { return nil }
+            let st = status(g)
+            guard st == .notDownloaded || st == .partial || st == .updateAvailable else { return nil }
+            guard let store = activeStore(g), sourceState(g, store) == .owned, ownership(g, store) == true,
+                  hasContentModel(g.target, store) else { return nil }
+            return HubBulkCandidate(target: g.target, display: g.display, store: store,
+                                    update: st == .updateAvailable, bytes: measure ? bulkBytes(g.target, store, st) : nil)
+        }
+    }
+
+    private func hasContentModel(_ target: String, _ store: KLStore) -> Bool {
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            return content[target] != nil
+            #else
+            return false
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            return meta[target] != nil
+            #else
+            return false
+            #endif
+        }
+    }
+
+    /// Roughly what is still to download (offline, stat only); nil for an update, whose size
+    /// Steam only tells once it starts.
+    private func bulkBytes(_ target: String, _ store: KLStore, _ st: Status) -> UInt64? {
+        if st == .updateAvailable { return nil }
+        switch store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let m = content[target] else { return nil }
+            let l = m.local
+            if l.totalBytes > 0 { return l.totalBytes > l.presentBytes ? l.totalBytes - l.presentBytes : 0 }
+            return m.game.approxBytes
+            #else
+            return nil
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            guard let m = meta[target] else { return nil }
+            let p = m.store.requiredProgress(m.recipe)
+            return UInt64(max(0, p.total - p.have))
+            #else
+            return nil
+            #endif
+        }
+    }
+
+    /// The download/verify fraction of the game's running download (the card's figure).
+    func activeFraction(_ target: String) -> Double? {
+        #if canImport(MetaStore)
+        if let m = meta[target], m.isBusy { return m.activeFraction }
+        #endif
+        #if canImport(SteamDepot)
+        if let m = content[target], m.isBusy { return m.activeFraction }
+        #endif
+        return nil
+    }
+
+    /// Free space on the headset, as the system counts it for a download the user asked for.
+    static func freeBytes() -> UInt64? {
+        (try? Paths.documents.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage.map { UInt64(max(0, $0)) }
+    }
+
     /// With a saved Steam sign-in: compare each game's installed manifests with
     /// Steam's latest, and fetch the account's library for the info section.
     func checkUpdates() {
@@ -836,6 +916,262 @@ final class HubLibraryModel: ObservableObject {
     static let checkTimeout: Double = 45
     private var checkGen = 0
     private var checkTask: Task<Void, Never>?
+}
+
+// MARK: - Download all
+
+/// One game "Download all" can fetch, as the confirmation sheet lists it.
+struct HubBulkCandidate: Identifiable, Equatable {
+    let target: String
+    let display: String
+    /// The store the card uses (HubLibraryModel.activeStore), confirmed as owning it.
+    let store: KLStore
+    let update: Bool
+    /// Roughly what is still to download; nil = an update (size known only once it starts).
+    let bytes: UInt64?
+    var id: String { target }
+
+    var sizeText: String {
+        if update { return klL("update · size shown once it starts", "actualización · tamaño al empezar") }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes ?? 0), countStyle: .file)
+    }
+}
+
+/// "Download all": the chosen games, ONE AT A TIME (smallest first, so the quick ones become
+/// playable early). Each goes through exactly what its card's Download page runs — the game's
+/// own SteamContentModel / MetaContentModel and its start() — and the queue only waits for that
+/// run to end and reads how it ended. A game that needs a sign-in is skipped with the reason; a
+/// failure is marked and the queue goes on. Cancel pauses the running download as the card's
+/// Pause does and drops the rest. Every Meta request already waits its turn at the one shared
+/// RequestGate (5 s apart); consecutive Meta games also leave 5 s between them.
+@MainActor
+final class HubBulkDownload: ObservableObject {
+    enum JobState: Equatable {
+        case pending, running, done
+        case skipped(String)
+        case failed(String)
+        case cancelled
+    }
+    struct Job: Identifiable, Equatable {
+        let item: HubBulkCandidate
+        var state: JobState
+        var id: String { item.target }
+    }
+
+    @Published private(set) var jobs: [Job] = []
+    /// Index in `jobs` of the game downloading now.
+    @Published private(set) var current: Int?
+    @Published private(set) var running = false
+    private var loop: Task<Void, Never>?
+    /// Gap between two Meta games (the gate spaces every request already; this is extra).
+    static let metaGap: Duration = .seconds(5)
+
+    var currentJob: Job? { current.flatMap { jobs.indices.contains($0) ? jobs[$0] : nil } }
+    /// Something to show under the header: a queue running, or how the last one ended.
+    var hasReport: Bool { !jobs.isEmpty }
+
+    func start(_ items: [HubBulkCandidate], model: HubLibraryModel) {
+        guard !running, !items.isEmpty else { return }
+        jobs = items.sorted { ($0.bytes ?? 0) < ($1.bytes ?? 0) }.map { Job(item: $0, state: .pending) }
+        running = true
+        NSLog("[hub] download all: \(jobs.map { "\($0.item.target) (\($0.item.store.rawValue))" }.joined(separator: ", "))")
+        loop = Task { [weak self, weak model] in
+            var lastStore: KLStore?
+            for i in 0 ..< (self?.jobs.count ?? 0) {
+                guard let self, let model, !Task.isCancelled else { break }
+                let item = self.jobs[i].item
+                self.current = i
+                if item.store == .meta, lastStore == .meta {
+                    try? await Task.sleep(for: Self.metaGap)
+                    if Task.isCancelled { break }
+                }
+                self.jobs[i].state = .running
+                let result = await self.run(item, model)
+                if result != .cancelled { lastStore = item.store }
+                self.jobs[i].state = result
+                NSLog("[hub] download all: \(item.target) -> \(Self.logText(result))")
+            }
+            guard let self else { return }
+            for i in self.jobs.indices where self.jobs[i].state == .pending || self.jobs[i].state == .running {
+                self.jobs[i].state = .cancelled
+            }
+            self.current = nil
+            self.running = false
+            self.loop = nil
+            NSLog("[hub] download all: finished")
+        }
+    }
+
+    /// Stop the queue: the running download pauses exactly as its card's Pause does.
+    func cancel(model: HubLibraryModel) {
+        guard running else { return }
+        NSLog("[hub] download all: cancelled")
+        loop?.cancel()
+        if let job = currentJob, job.state == .running { Self.pause(job.item, model) }
+    }
+
+    /// Forget the last queue's report.
+    func clear() { if !running { jobs = []; current = nil } }
+
+    private static func pause(_ item: HubBulkCandidate, _ model: HubLibraryModel) {
+        switch item.store {
+        case .steam:
+            #if canImport(SteamDepot)
+            model.content[item.target]?.pause()
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            model.meta[item.target]?.pause()
+            #endif
+        }
+    }
+
+    private static func logText(_ s: JobState) -> String {
+        switch s {
+        case .pending: return "pending"
+        case .running: return "running"
+        case .done: return "done"
+        case .skipped(let w): return "skipped (\(w))"
+        case .failed: return "failed (its own log line says why)"
+        case .cancelled: return "cancelled"
+        }
+    }
+
+    /// Waits while `busy` holds; false if the queue was cancelled meanwhile.
+    private func wait(while busy: () -> Bool) async -> Bool {
+        while busy() {
+            if Task.isCancelled { return false }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return !Task.isCancelled
+    }
+
+    /// One game, through its card's own download model.
+    private func run(_ item: HubBulkCandidate, _ model: HubLibraryModel) async -> JobState {
+        guard let g = model.games.first(where: { $0.target == item.target }) else { return .failed("?") }
+        // What changed while it waited its turn.
+        if HubStorage.isBusy(model, item.target) {
+            return .skipped(klL("Already downloading from its card", "Ya se estaba descargando desde su tarjeta"))
+        }
+        let st = model.status(g)
+        if st == .ready || st == .manual { return .done }
+        guard model.activeStore(g) == item.store, model.sourceState(g, item.store) == .owned else {
+            return .skipped(klL("\(item.store.label) no longer confirms you own it", "\(item.store.label) ya no confirma que lo tienes"))
+        }
+        switch item.store {
+        case .steam:
+            #if canImport(SteamDepot)
+            guard let m = model.content[item.target] else { return .failed("?") }
+            // Read only: whether a saved Steam sign-in exists (the run would otherwise ask for one).
+            guard (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load()) != nil else {
+                return .skipped(klL("Sign in to Steam first (Download on its card)", "Inicia sesión en Steam primero (Descargar en su tarjeta)"))
+            }
+            m.start()
+            guard await wait(while: { m.isRunning }) else { return .cancelled }
+            switch m.stage {
+            case .complete: return .done
+            case .signIn: return .skipped(klL("Steam asks you to sign in again (Download on its card)",
+                                              "Steam pide iniciar sesión de nuevo (Descargar en su tarjeta)"))
+            case .paused: return .failed(klL("Paused from its card", "Pausado desde su tarjeta"))
+            case .failed(let why): return .failed(why)
+            default: return .failed(klL("Stopped before finishing", "Se detuvo antes de terminar"))
+            }
+            #else
+            return .failed("?")
+            #endif
+        case .meta:
+            #if canImport(MetaStore)
+            guard let m = model.meta[item.target] else { return .failed("?") }
+            guard model.metaAccount.token() != nil else { return .skipped(HubLibraryModel.metaSignInHint) }
+            m.start()
+            guard await wait(while: { m.isBusy }) else { return .cancelled }
+            switch m.stage {
+            case .complete: return .done
+            case .paused: return .failed(klL("Paused from its card", "Pausado desde su tarjeta"))
+            case .failed(let why): return .failed(why)
+            default: return .failed(klL("Stopped before finishing", "Se detuvo antes de terminar"))
+            }
+            #else
+            return .failed("?")
+            #endif
+        }
+    }
+}
+
+/// The confirmation sheet: the games, their sizes, the total against the headset's free space,
+/// and a toggle per game; Confirm stays off while the selection does not fit.
+struct HubDownloadAllSheet: View {
+    let candidates: [HubBulkCandidate]
+    let free: UInt64?
+    let onConfirm: ([HubBulkCandidate]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: Set<String>
+
+    /// Left free on top of the downloads (Meta's own download refuses to start with less).
+    static let margin: UInt64 = 1_000_000_000
+
+    init(candidates: [HubBulkCandidate], free: UInt64?, onConfirm: @escaping ([HubBulkCandidate]) -> Void) {
+        self.candidates = candidates
+        self.free = free
+        self.onConfirm = onConfirm
+        _selected = State(initialValue: Set(candidates.map(\.target)))
+    }
+
+    private var chosen: [HubBulkCandidate] { candidates.filter { selected.contains($0.target) } }
+    private var total: UInt64 { chosen.reduce(0) { $0 + ($1.bytes ?? 0) } }
+    private var fits: Bool { free.map { total + Self.margin <= $0 } ?? true }
+    private func size(_ b: UInt64) -> String { ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    ForEach(candidates) { c in
+                        Toggle(isOn: Binding(get: { selected.contains(c.target) },
+                                             set: { if $0 { selected.insert(c.target) } else { selected.remove(c.target) } })) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(c.display)
+                                Text("\(c.store.label) · \(c.sizeText)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                            }
+                        }
+                    }
+                } footer: {
+                    Text(klL("One game at a time, smallest first, each exactly as its own Download button does it. "
+                             + "Keep the headset on and this window open: visionOS pauses downloads in the background.",
+                             "Un juego cada vez, del más pequeño al más grande, cada uno igual que con su propio botón Descargar. "
+                             + "Deja el visor puesto y esta ventana abierta: visionOS pausa las descargas en segundo plano."))
+                }
+                Section {
+                    LabeledContent(klL("To download", "Por descargar"), value: size(total)).monospacedDigit()
+                    LabeledContent(klL("Free on this headset", "Libre en este visor"),
+                                   value: free.map(size) ?? klL("unknown", "desconocido")).monospacedDigit()
+                    if !fits {
+                        Label(klL("Not enough space for all of them (1 GB is kept free). Untick a game.",
+                                  "No caben todos (se dejan libres 1 GB). Desmarca algún juego."),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                    if chosen.contains(where: \.update) {
+                        Text(klL("Updates are not counted: they replace files already on the headset.",
+                                 "Las actualizaciones no se cuentan: sustituyen archivos que ya están en el visor."))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle(klL("Download all", "Descargar todos"))
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button(klL("Cancel", "Cancelar")) { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(klL("Download \(chosen.count)", "Descargar \(chosen.count)")) {
+                        onConfirm(chosen)
+                        dismiss()
+                    }
+                    .disabled(chosen.isEmpty || !fits)
+                }
+            }
+        }
+        .frame(minWidth: 520, minHeight: 420)
+    }
 }
 
 // MARK: - Per-game settings
@@ -1364,6 +1700,13 @@ struct HubLibraryView: View {
     /// The game whose settings sheet is open.
     @State private var settingsFor: KLHubGameRow?
     @State private var showAppSettings = false
+    /// The "Download all" confirmation sheet, with what it offers.
+    @State private var downloadAll: DownloadAllOffer?
+    struct DownloadAllOffer: Identifiable {
+        let id = UUID()
+        let candidates: [HubBulkCandidate]
+        let free: UInt64?
+    }
 
     var body: some View {
         Group {
@@ -1393,6 +1736,9 @@ struct HubLibraryView: View {
             HubGameSettingsView(game: g, details: model.status(g) == .notInLibrary ? model.notInLibraryReason(g) : nil)
         }
         .sheet(isPresented: $showAppSettings) { HubAppSettingsView(model: model) }
+        .sheet(item: $downloadAll) { offer in
+            HubDownloadAllSheet(candidates: offer.candidates, free: offer.free) { model.bulk.start($0, model: model) }
+        }
     }
 
     /// The download page of the store the card opened.
@@ -1427,6 +1773,7 @@ struct HubLibraryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+                if model.bulk.hasReport { bulkReport }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 24, alignment: .top)],
                           alignment: .leading, spacing: 24) {
                     ForEach(model.games) { g in card(g) }
@@ -1480,9 +1827,99 @@ struct HubLibraryView: View {
                    model.account != nil {
                     Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
                 }
+                bulkControl
                 Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
                     .font(.footnote)
             }
+        }
+    }
+
+    /// "Download all" in the header: the button (when some owned game can be downloaded), or the
+    /// queue's progress and its Cancel while it runs.
+    @ViewBuilder private var bulkControl: some View {
+        let bulk = model.bulk
+        if bulk.running {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.mini)
+                Text(bulkProgressText).monospacedDigit().lineLimit(1)
+                Button(klL("Cancel", "Cancelar"), role: .destructive) { bulk.cancel(model: model) }
+            }
+            .font(.footnote)
+            .fixedSize()
+        } else if !model.bulkCandidates(measure: false).isEmpty {
+            Button {
+                downloadAll = DownloadAllOffer(candidates: model.bulkCandidates(), free: HubLibraryModel.freeBytes())
+            } label: { Label(klL("Download all", "Descargar todos"), systemImage: "arrow.down.circle") }
+                .font(.footnote)
+        }
+    }
+
+    /// "Descargando 2 de 4 · Metro Awakening 34 %".
+    private var bulkProgressText: String {
+        let bulk = model.bulk
+        guard let i = bulk.current, let job = bulk.currentJob else { return klL("Downloading…", "Descargando…") }
+        let n = bulk.jobs.count
+        let pct = model.activeFraction(job.id).map { " \(Int(($0 * 100).rounded())) %" } ?? ""
+        return klL("Downloading \(i + 1) of \(n) · \(job.item.display)", "Descargando \(i + 1) de \(n) · \(job.item.display)") + pct
+    }
+
+    /// Under the header while "Download all" runs and after it ends: each game and how it went
+    /// (a skipped or failed game says why).
+    private var bulkReport: some View {
+        let bulk = model.bulk
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(klL("Download all", "Descargar todos")).font(.headline)
+                Spacer()
+                if !bulk.running {
+                    Button(klL("Close", "Cerrar")) { bulk.clear() }.font(.footnote)
+                }
+            }
+            ForEach(bulk.jobs) { job in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: Self.bulkIcon(job.state)).foregroundStyle(Self.bulkColor(job.state))
+                    Text(job.item.display).lineLimit(1)
+                    Text("\(job.item.store.label) · \(job.item.sizeText)").foregroundStyle(.secondary).lineLimit(1)
+                    Text(bulkStateText(job)).foregroundStyle(Self.bulkColor(job.state)).lineLimit(2)
+                        .help(bulkStateText(job))
+                }
+                .font(.callout).monospacedDigit()
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func bulkStateText(_ job: HubBulkDownload.Job) -> String {
+        switch job.state {
+        case .pending: return klL("Waiting", "En espera")
+        case .running: return model.activeFraction(job.id).map { klL("Downloading", "Descargando") + " \(Int(($0 * 100).rounded())) %" }
+            ?? klL("Starting…", "Empezando…")
+        case .done: return klL("Done", "Listo")
+        case .skipped(let why): return klL("Skipped: ", "Omitido: ") + why
+        case .failed(let why): return klL("Failed: ", "Falló: ") + why
+        case .cancelled: return klL("Cancelled", "Cancelado")
+        }
+    }
+
+    private static func bulkIcon(_ s: HubBulkDownload.JobState) -> String {
+        switch s {
+        case .pending: return "clock"
+        case .running: return "arrow.down.circle"
+        case .done: return "checkmark.circle.fill"
+        case .skipped: return "forward.circle"
+        case .failed: return "xmark.octagon.fill"
+        case .cancelled: return "stop.circle"
+        }
+    }
+
+    private static func bulkColor(_ s: HubBulkDownload.JobState) -> Color {
+        switch s {
+        case .pending, .cancelled: return .secondary
+        case .running: return .blue
+        case .done: return .green
+        case .skipped: return .orange
+        case .failed: return .red
         }
     }
 
