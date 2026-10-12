@@ -285,16 +285,48 @@ final class SteamContentModel: ObservableObject {
     #endif
 
     /// Fraction of the game's bytes on disk while downloading/verifying, for the
-    /// library's "Downloading x%" — nil when nothing is running.
+    /// library's "Downloading x%" — nil when nothing is running. Downloading counts the raw
+    /// chunks the system already fetched (staged, not yet assembled) too: they are downloaded,
+    /// only not yet written into the game's files.
     var activeFraction: Double? {
         guard isBusy else { return nil }
         let p = progress
         switch p.phase {
         case .verifying: return p.verifyBytesTotal > 0 ? Double(p.verifyBytesDone) / Double(p.verifyBytesTotal) : 0
-        case .downloading, .finished:
-            return p.depotBytes > 0 ? Double(p.depotBytes - p.bytesToDownload + p.bytesDownloaded) / Double(p.depotBytes) : 0
+        case .downloading, .finished: return downloadBytes?.fraction ?? 0
         case .preparing: return 0
         }
+    }
+
+    /// The card's figures: written into the game's files, fetched by the system and waiting to be
+    /// assembled (bytes and pieces), and the whole depot.
+    struct DownloadBytes: Equatable {
+        var assembled: UInt64
+        var staged: UInt64
+        var stagedPieces: Int
+        var total: UInt64
+        var fraction: Double? { total > 0 ? min(1, Double(assembled + staged) / Double(total)) : nil }
+    }
+
+    /// The in-app run's own count while it downloads; otherwise the background lane's (set when
+    /// the run planned, then from its reports), else what is on disk. nil = nothing known yet.
+    var downloadBytes: DownloadBytes? {
+        let p = progress
+        var staged: UInt64 = 0, pieces = 0
+        var laneDone: UInt64 = 0, laneTotal: UInt64 = 0
+        #if KL_HUB
+        let bg = background
+        if bg.lanes > 0 { staged = bg.stagedBytes; pieces = bg.staged; laneDone = bg.doneBytes; laneTotal = bg.depotBytes }
+        #endif
+        if isBusy, p.phase == .downloading || p.phase == .finished, p.depotBytes > 0 {
+            let done = p.depotBytes - min(p.depotBytes, p.bytesToDownload) + p.bytesDownloaded
+            return DownloadBytes(assembled: done, staged: staged, stagedPieces: pieces, total: p.depotBytes)
+        }
+        if laneTotal > 0 { return DownloadBytes(assembled: laneDone, staged: staged, stagedPieces: pieces, total: laneTotal) }
+        if local.totalBytes > 0 {
+            return DownloadBytes(assembled: local.presentBytes, staged: staged, stagedPieces: pieces, total: local.totalBytes)
+        }
+        return nil
     }
 
     var isBusy: Bool {
@@ -508,7 +540,8 @@ final class SteamContentModel: ObservableObject {
                         bg.setLane(target: target, depot: plan.depotID, appID: plan.appID, manifest: plan.manifestID,
                                    servers: plan.servers, staging: staging,
                                    chunks: plan.chunks.map { ($0.id, $0.compressedLength, $0.uncompressedLength) },
-                                   workers: plan.workers, needsToken: plan.needsCDNToken)
+                                   workers: plan.workers, needsToken: plan.needsCDNToken,
+                                   depotBytes: plan.depotBytes, presentBytes: plan.presentBytes)
                     }
                 }
                 #endif
@@ -544,7 +577,8 @@ final class SteamContentModel: ObservableObject {
         progress = p
         #if KL_HUB
         if let depot = currentDepot, p.phase == .downloading || p.phase == .finished {
-            KLBackgroundDownloads.shared.noteProgress(target: game.target, depot: depot, chunksDone: p.chunksDone,
+            KLBackgroundDownloads.shared.noteProgress(target: game.target, depot: depot,
+                                                      chunksDone: max(0, p.chunksDone - p.chunksFromStaging),
                                                       workers: game.maxConcurrentDownloads,
                                                       doneBytes: p.depotBytes - p.bytesToDownload + p.bytesDownloaded,
                                                       depotBytes: p.depotBytes)

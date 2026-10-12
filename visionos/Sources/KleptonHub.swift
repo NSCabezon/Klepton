@@ -662,7 +662,7 @@ final class HubLibraryModel: ObservableObject {
         // next time the in-app download runs).
         let bg = m.background
         if bg.active, !local.isComplete {
-            return .working(klL("In the background", "En segundo plano"), bg.fraction)
+            return .working(klL("In the background", "En segundo plano"), m.downloadBytes?.fraction ?? bg.fraction)
         }
         if local.isComplete {
             if UserDefaults.standard.bool(forKey: m.game.verifyNextLaunchKey) { return .verifyScheduled }
@@ -864,7 +864,12 @@ final class HubLibraryModel: ObservableObject {
             #if canImport(SteamDepot)
             guard let m = content[target] else { return nil }
             let l = m.local
-            if l.totalBytes > 0 { return l.totalBytes > l.presentBytes ? l.totalBytes - l.presentBytes : 0 }
+            // presentBytes = what is written (a planned file is pre-sized but sparse); the raw
+            // chunks the system already fetched are not to be fetched again either.
+            if l.totalBytes > 0 {
+                let have = l.presentBytes + m.background.stagedBytes
+                return l.totalBytes > have ? l.totalBytes - have : 0
+            }
             return m.game.approxBytes
             #else
             return nil
@@ -899,6 +904,54 @@ final class HubLibraryModel: ObservableObject {
         return nil
     }
 
+    /// The card's line under a Steam download's bar: "1,0 GB de 72 GB · 1.056 piezas en espera
+    /// de montar" — downloaded (written + staged) of the whole, and the raw chunks the system
+    /// fetched that the in-app run has not written into the game's files yet.
+    func downloadDetail(_ g: KLHubGameRow) -> String? {
+        #if canImport(SteamDepot)
+        guard activeStore(g) == .steam, let m = content[g.target], let b = m.downloadBytes, b.total > 0 else { return nil }
+        if m.isBusy, m.progress.phase == .verifying || m.progress.phase == .preparing { return nil }
+        let f = { (n: UInt64) in ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file) }
+        let got = min(b.total, b.assembled + b.staged)
+        var line = klL("\(f(got)) of \(f(b.total))", "\(f(got)) de \(f(b.total))")
+        if b.stagedPieces > 0 {
+            let n = b.stagedPieces.formatted()
+            line += " · " + klL("\(n) pieces waiting to be assembled", "\(n) piezas en espera de montar")
+        }
+        return line
+        #else
+        return nil
+        #endif
+    }
+
+    /// Set once resumeWantedDownloads has had its go (it starts the runs it wants itself).
+    private var resumePassDone = false
+
+    /// In the foreground, a Steam game the system is fetching for (a background lane, not paused)
+    /// always has its in-app run going: that run assembles what the system staged (first) and
+    /// fetches the rest itself from the plan's start, while the system goes on from the end. Without
+    /// it the card would read "downloading" while nothing gets written and staging fills up to its
+    /// cap. A run the player paused, one that failed or wants a sign-in, and any game session, are
+    /// left alone; so is everything while "Download all" runs (it starts its games itself).
+    func assembleInForeground(_ why: String) {
+        #if canImport(SteamDepot)
+        guard resumePassDone, Lifecycle.keepAlive, !bulk.running,
+              UIApplication.shared.applicationState == .active else { return }
+        for (target, m) in content {
+            let b = m.background
+            guard b.lanes > 0, !b.paused, !m.isRunning, !m.local.isComplete else { continue }
+            switch m.stage {
+            case .idle, .complete: break
+            default: continue
+            }
+            guard !HubStorage.isBusy(self, target),
+                  (try? KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam").load()) != nil else { continue }
+            NSLog("[hub] \(target): the system is fetching its chunks and nothing assembles them — in-app run started (\(why))")
+            m.start()
+        }
+        #endif
+    }
+
     private var resumedWanted = false
     /// Background downloads on: the games the player started downloading and that did not finish
     /// (the hub was closed, or a game was played meanwhile) continue by themselves when the library
@@ -906,12 +959,13 @@ final class HubLibraryModel: ObservableObject {
     /// button does it (ownership asked fresh, Meta's request gate, checksums). Steam's run also
     /// assembles the chunks the system fetched meanwhile. Waits for the stores' answers first.
     func resumeWantedDownloads() {
-        guard KLDownloadSettings.background, !resumedWanted else { return }
+        guard !resumedWanted else { return }
         resumedWanted = true
         let wanted = KLDownloadIntent.all()
-        guard !wanted.isEmpty else { return }
+        guard KLDownloadSettings.background, !wanted.isEmpty else { resumePassDone = true; assembleInForeground("library opened"); return }
         NSLog("[hub] downloads to resume: \(wanted.sorted().joined(separator: ", "))")
         Task { [weak self] in
+            defer { if let self { self.resumePassDone = true; self.assembleInForeground("library opened") } }
             for _ in 0 ..< 120 {
                 guard let self else { return }
                 var busy = self.checking
@@ -1286,6 +1340,7 @@ final class HubBulkDownload: ObservableObject {
             self.running = false
             self.loop = nil
             NSLog("[hub] download all: finished")
+            model?.assembleInForeground("download all finished")
         }
     }
 
@@ -2340,7 +2395,11 @@ struct HubLibraryView: View {
         // Downloads started from the cards: what each game's page does for itself.
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.noteBackground() }
-            if phase == .active { model.resumeAfterForeground() }
+            if phase == .active { model.resumeAfterForeground(); model.assembleInForeground("back in the foreground") }
+        }
+        // The system staged chunks (or a lane appeared): whatever it fetches gets assembled here.
+        .onReceive(NotificationCenter.default.publisher(for: KLBackgroundDownloads.didChange)) { _ in
+            model.assembleInForeground("background lane")
         }
     }
 
@@ -2493,7 +2552,11 @@ struct HubLibraryView: View {
 
     private func bulkStateText(_ job: HubBulkDownload.Job) -> String {
         if job.state != .done, model.activeFraction(job.id) == nil, let b = model.backgroundStatus(job.id), b.active {
-            return klL("In the background", "En segundo plano") + (b.fraction.map { " \(Int(($0 * 100).rounded())) %" } ?? "")
+            var f = b.fraction
+            #if canImport(SteamDepot)
+            if let d = model.content[job.id]?.downloadBytes?.fraction { f = d }
+            #endif
+            return klL("In the background", "En segundo plano") + (f.map { " \(Int(($0 * 100).rounded())) %" } ?? "")
         }
         switch job.state {
         case .pending: return klL("Waiting", "En espera")
@@ -2623,6 +2686,9 @@ struct HubLibraryView: View {
                 if let d = u.detail { Text(d).font(.callout).foregroundStyle(.secondary).lineLimit(2).help(d) }
             } else if case .working(_, let f?) = st {
                 ProgressView(value: f)
+                if let d = model.downloadDetail(g) {
+                    Text(d).font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1).help(d)
+                }
             } else if case .failed(let why) = dl {
                 Label(why, systemImage: "xmark.octagon.fill").font(.callout).foregroundStyle(.red)
                     .lineLimit(2).help(why)
