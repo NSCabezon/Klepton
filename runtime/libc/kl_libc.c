@@ -399,8 +399,24 @@ void klb_sysprop_read(const void *p, char *n, char *v) {
     if (v) klb_sysprop_get(prop, v);
 }
 int  klb_prctl(int op, ...)                  { (void)op; return 0; }
+// Every CPU the guest is told it has (kl_cpu_count — the same number
+// sysconf(_SC_NPROCESSORS_*) and /proc/cpuinfo give), and NO others. It used to
+// set every bit of the caller's buffer, which describes 8*sz CPUs — a machine
+// that does not exist, and one a caller that checks the mask against the count
+// catches: the Half-Life: Alyx launcher's affinity self-test requires the bits past
+// the last CPU to be zero ("zero-tail=1"). bionic's wrapper zeroes the tail
+// past what the kernel wrote in the same way.
+long kl_cpu_count(void);             // below, with sysconf
+static void kl_affinity_mask(void *m, size_t sz) {
+    memset(m, 0, sz);
+    long n = kl_cpu_count();
+    for (long i = 0; i < n && (size_t)(i / 8) < sz; i++)
+        ((unsigned char *)m)[i / 8] |= (unsigned char)(1u << (i % 8));
+}
 int  klb_sched_getaffinity(int p, size_t sz, void *m) {
-    (void)p; if (m && sz) memset(m, 0xFF, sz);       // pretend every CPU is available
+    (void)p;
+    if (!m || !sz) { errno = EINVAL; return -1; }
+    kl_affinity_mask(m, sz);
     return 0;
 }
 int  klb_sched_setaffinity(int p, size_t sz, const void *m) { (void)p;(void)sz;(void)m; return 0; }
@@ -2303,6 +2319,11 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 #define KL_SYS_futex 98                 // aarch64 Linux
 #define KL_SYS_getrandom 278            // ...and the other one a guest depends on
 #define KL_SYS_gettid 178               // ...and the third, via libc++'s guards
+#define KL_SYS_sched_getaffinity 123    // Half-Life: Alyx's affinity self-test
+#define KL_SYS_process_vm_readv 270     // Half-Life: Alyx's code guards read itself
+#define KL_SYS_process_vm_writev 271
+#define KL_SYS_tkill 130               // thread liveness probes: tkill(tid, 0) /
+#define KL_SYS_tgkill 131              //   tgkill(getpid(), tid, 0) — see kl_tid_alive
 
 enum {
     KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAKE_OP = 5,
@@ -2595,6 +2616,30 @@ static void syscall_warn_once(long n, void *ra) {
             n, img ? img : "", img ? "+" : "pc ", img ? off : (size_t)(uintptr_t)ra);
 }
 
+// Is `tid` (an id klb_gettid handed out) a live thread of this process? The
+// kernel's answer to tgkill(pid, tid, 0): the null signal is a pure existence
+// probe. Answered from the task's own thread list — thread_identifier_info's
+// thread_id is the same number pthread_threadid_np gives klb_gettid, truncated
+// the same way, so the two doors agree about identity.
+static int kl_tid_alive(int tid) {
+    thread_act_array_t th = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return -1;
+    int found = 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        if (!found) {
+            thread_identifier_info_data_t id;
+            mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &cnt) == KERN_SUCCESS
+                && (int)id.thread_id == tid)
+                found = 1;
+        }
+        mach_port_deallocate(mach_task_self(), th[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(*th));
+    return found;
+}
+
 long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // futex is the only syscall here that reads past the fourth argument, so a5
     // and a6 must be carried through: without them FUTEX_WAKE_OP cannot be
@@ -2642,6 +2687,107 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // different hat: the guard would then compare an id from one door against an
     // id from the other and call every acquisition recursive.
     if (n == KL_SYS_gettid) return klb_gettid();
+    // sched_getaffinity, raw: the KERNEL's contract, which differs from libc's
+    // in its return — the number of bytes of cpumask the kernel wrote (8 for
+    // up to 64 CPUs on arm64), EINVAL if the buffer is smaller than that — and
+    // in writing nothing past those bytes. The mask is the libc door's, so the
+    // two agree about which CPUs exist.
+    if (n == KL_SYS_sched_getaffinity) {
+        size_t len = (size_t)a2;
+        void *mask = (void *)(uintptr_t)a3;
+        if (len < 8) { kl_errno_set(EINVAL); return -1; }
+        if (!mask) { kl_errno_set(EFAULT); return -1; }
+        kl_affinity_mask(mask, 8);
+        return 8;
+    }
+
+    // process_vm_readv/writev on THIS process: a fault-safe memcpy (the
+    // reason a guest uses it on itself — the Half-Life: Alyx launcher's native-general guard
+    // reads Valve's instruction words and a flag byte this way, and a refused
+    // call is its fatal `guest-local-read fatal=native-general-guard`). Another
+    // pid is refused. vm_read_overwrite/vm_write fail cleanly on
+    // unmapped memory instead of faulting, which is the contract.
+    if (n == KL_SYS_process_vm_readv || n == KL_SYS_process_vm_writev) {
+        struct kiov { void *base; size_t len; };
+        const struct kiov *loc = (const struct kiov *)(uintptr_t)a2, *rem = (const struct kiov *)(uintptr_t)a4;
+        unsigned long nl = (unsigned long)a3, nr = (unsigned long)a5;
+        if ((pid_t)a1 != getpid()) {
+            syscall_warn_once(n, __builtin_return_address(0));
+            kl_errno_set(EPERM);
+            return -1;
+        }
+        if ((nl && !loc) || (nr && !rem)) { kl_errno_set(EFAULT); return -1; }
+        long total = 0;
+        unsigned long li = 0, ri = 0;
+        size_t lo = 0, ro = 0;
+        while (li < nl && ri < nr) {
+            size_t k = loc[li].len - lo, rk = rem[ri].len - ro;
+            if (k > rk) k = rk;
+            if (k) {
+                uint8_t *l = (uint8_t *)loc[li].base + lo, *r = (uint8_t *)rem[ri].base + ro;
+                kern_return_t kr;
+                // vm_* (not mach_vm_*): the only spelling every SDK carries
+                // (visionOS has no mach_vm.h); addresses are 64-bit on arm64.
+                if (n == KL_SYS_process_vm_readv) {
+                    vm_size_t got = 0;
+                    kr = vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)r, k,
+                                           (vm_address_t)(uintptr_t)l, &got);
+                } else {
+                    kr = vm_write(mach_task_self(), (vm_address_t)(uintptr_t)r,
+                                  (vm_offset_t)(uintptr_t)l, (mach_msg_type_number_t)k);
+                }
+                if (kr != KERN_SUCCESS) {
+                    if (total) return total;
+                    kl_errno_set(EFAULT);
+                    return -1;
+                }
+                total += (long)k;
+            }
+            lo += k; ro += k;
+            if (lo == loc[li].len) { li++; lo = 0; }
+            if (ri < nr && ro == rem[ri].len) { ri++; ro = 0; }
+        }
+        return total;
+    }
+
+    // tgkill / tkill with the NULL signal — "is that thread still alive?" —
+    // and refusing it is a WRONG ANSWER, not a missing feature: -1 reads as
+    // "no such thread". Half-Life: Alyx's libvideo keeps a 2048-slot per-thread
+    // registry (libvideo.so+0x11a0f8) that, when a thread registers, probes each
+    // occupied slot with tgkill(getpid(), tid, 0) (+0x114ee0) and RECLAIMS the
+    // first slot whose owner looks dead — destroying that thread's 0x220-byte
+    // state (+0x11a030 zeroes its +0x18 object) while the owner still runs.
+    // With every probe refused, the second VideoPlayer Decoder thread to
+    // register tore down the first one's state, and the first faulted on the
+    // NULL at libvideo.so+0x1180b0 (`ldr w1, [x0, #0x48]`) as the level
+    // finished loading a save that plays a video.
+    //
+    // Only the null signal is answered. Delivering a real signal would run a
+    // Darwin default action (guest handlers are refused by default — see
+    // [sig]), so those keep falling through to the logged refusal below.
+    if ((n == KL_SYS_tgkill && a3 == 0) || (n == KL_SYS_tkill && a2 == 0)) {
+        long tid = n == KL_SYS_tgkill ? a2 : a1;
+        if (n == KL_SYS_tgkill && (pid_t)a1 != getpid()) { kl_errno_set(ESRCH); return -1; }
+        if (tid <= 0) { kl_errno_set(EINVAL); return -1; }
+        int alive = kl_tid_alive((int)tid);
+        static _Atomic int told;
+        if (!atomic_exchange(&told, 1)) {
+            size_t off = 0;
+            void *ra = __builtin_return_address(0);
+            const char *img = kl_addr_image(ra, &off);
+            fprintf(stderr, "  [klepton] %s(tid %ld, 0) liveness probe from %s%s0x%zx answered from "
+                            "the task's thread list -> %s (logged once)\n",
+                    n == KL_SYS_tgkill ? "tgkill" : "tkill", tid, img ? img : "", img ? "+" : "pc ",
+                    img ? off : (size_t)(uintptr_t)ra,
+                    alive > 0 ? "alive" : alive == 0 ? "ESRCH" : "thread list unreadable, alive");
+        }
+        // The thread list itself failing is the one case with no honest
+        // answer; "alive" is the safe one — a live thread's state is never
+        // reclaimed, and a dead one's only leaks a slot.
+        if (alive != 0) return 0;
+        kl_errno_set(ESRCH);
+        return -1;
+    }
 
     syscall_warn_once(n, __builtin_return_address(0));
     kl_errno_set(ENOSYS);
