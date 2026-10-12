@@ -19,8 +19,8 @@
 #   ./stage_alyx.sh --list-excluded      # every file left behind, and why
 #
 # Options: --device <id> (else KLEPTON_DEVICE, else the first paired physical
-# Vision Pro), --src <dir> (else KL_ALYX_CONTENT, else ../../game/content/game
-# beside this repo), --include-extras (keep the editor/workshop-sample
+# Vision Pro), --src <dir> (else KL_ALYX_CONTENT, else ../local/game/content/game
+# in this checkout), --include-extras (keep the editor/workshop-sample
 # exclusions below off), --free-gb <n> (the device's free space when it cannot
 # be read — Settings > General > Storage), --skip-space-check, --reset (forget
 # the manifest for this device), --settle <s> (default 600; see below).
@@ -57,15 +57,17 @@
 # The app must be installed first (it owns the container): ./build_run_vpro.sh alyx
 set -euo pipefail
 cd "$(dirname "$0")"
+. ./local_config.sh   # <repo>/local/config.env
 ROOT=".."
 eval "$(python3 targets.py alyx | grep -v '^KLT_LIBS=')"
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+kl_require_bundle_id "$BUNDLE_ID"
 DEST_REL="Documents/android-files/${KLT_STAGE_FILES:-alyx}/game"
 
 DRY=0; VERIFY=0; LIST_EXCL=0; EXTRAS=0; RESET=0; SKIP_SPACE=0
 FREE_GB=""; ONLY=""; SKIP=""; SETTLE="${KL_STAGE_SETTLE:-600}"; JOBS="${KL_STAGE_JOBS:-1}"
 DEVID="${KLEPTON_DEVICE:-}"
-SRC="${KL_ALYX_CONTENT:-$ROOT/../../game/content/game}"
+SRC="${KL_ALYX_CONTENT:-$ROOT/../local/game/content/game}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run|-n)       DRY=1; shift ;;

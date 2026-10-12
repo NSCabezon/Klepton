@@ -2,7 +2,7 @@
 //
 // ONE table (KLCatalog.entries), one row per Klepton target: display name, its
 // Steam source (a SteamGames descriptor, KleptonSteamContent.swift) and/or its
-// Meta source (a MetaStore recipe id — ../../../AlyxAVP/MetaStore). A store is a
+// Meta source (a MetaStore recipe id — ../../packages/MetaStore). A store is a
 // source only if it ships a build this port can run (an ARM64 Android/Quest APK
 // or Linux arm64): Beat Saber on Steam is Windows-only, so it has no Steam source.
 // Adding a game is one row here (+ the target in targets.py's hub list).

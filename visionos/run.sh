@@ -21,6 +21,7 @@
 # targets.py, so two apps built from this tree never write to the same place.
 set -euo pipefail
 cd "$(dirname "$0")"
+. ./local_config.sh   # <repo>/local/config.env
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
 export KLEPTON_TARGET="$KLT_NAME"
 
@@ -49,6 +50,7 @@ fi
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 PRODUCT="$KLT_PRODUCT"
 MODE="${1:-sim}"
+if [ "$MODE" = device ]; then kl_require_bundle_id "$BUNDLE_ID"; fi
 
 # Give the custom-launcher build its OWN derived data. Xcode's incremental Swift
 # build does not reliably invalidate on a SWIFT_ACTIVE_COMPILATION_CONDITIONS change,

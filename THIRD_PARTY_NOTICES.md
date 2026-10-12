@@ -46,7 +46,7 @@ runtime fixes across `runtime/` (OVRPlugin, Meta platform, OpenXR, Vulkan, GL,
 JNI, libc, media, x18), `tools/`, `visionos/` and `tests/t_casp.c`. Each adapted
 block says so in a comment of the form
 `Adapted from avp-play (MIT, github.com/myMartek/avp-play) <their path>`.
-The inventory of what was taken and why is in the AlyxAVP repository,
+The inventory of what was taken and why is in the AVP Game Hub repository,
 `docs/2026-10-11-avp-play-klepton-diff.md`.
 
 ```

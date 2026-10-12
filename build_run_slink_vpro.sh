@@ -80,6 +80,7 @@
 #
 set -euo pipefail
 cd "$(dirname "$0")"
+. visionos/local_config.sh   # <repo>/local/config.env
 
 # Pinned, not defaulted: the whole point of the wrapper is this target's
 # questions, and a bare-word target argument would quietly turn it back into

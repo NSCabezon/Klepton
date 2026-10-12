@@ -48,7 +48,7 @@
 #                                       #   ASC_KEY_ID / ASC_ISSUER_ID + the app record)
 #                                       #   Version: KLEPTON_APP_VERSION (0.1.0);
 #                                       #   build: KLEPTON_APP_BUILD (YYYYMMDD.HHMM)
-#   ./build_run_vpro.sh hub             # the HUB: one app (com.example.avpgamehub)
+#   ./build_run_vpro.sh hub             # the HUB: one app ($KLEPTON_BUNDLE_ID)
 #                                       #   with every game in targets.py's hub list
 #                                       #   and an in-app library; KL_HUB_GAME=alyx
 #                                       #   boots that game instead of the library
@@ -60,6 +60,7 @@
 #
 set -euo pipefail
 cd "$(dirname "$0")"
+. visionos/local_config.sh   # <repo>/local/config.env
 
 # The app's own defaults are now "immersive, with ANGLE, booting on its own"
 # (KleptonApp.swift / kl_app_configure), so this script does not have to turn any
@@ -113,6 +114,7 @@ KLT_VARS=$(KL_HUB_QUIET=1 python3 visionos/targets.py "$KLEPTON_TARGET") || exit
 eval "$KLT_VARS"
 export KLEPTON_TARGET="$KLT_NAME"
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+kl_require_bundle_id "$BUNDLE_ID"
 
 # ...and the log lands under the target's own name, for the same reason: two
 # targets writing to one path means the second run's summary describes the

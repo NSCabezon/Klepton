@@ -170,9 +170,9 @@ no shader code):
 # github.com/glovebox-vr/glovebox — for Steam build 25487405
 # (manifests 546561=1436897171613240821, 546564=9198205754520568813)
 python3 tools/alyx_pipelines.py check alyx.recipe
-python3 tools/alyx_pipelines.py build alyx.recipe ../../game/content/game alyx.foz
+python3 tools/alyx_pipelines.py build alyx.recipe ../local/game/content/game alyx.foz
 # your own recordings (KL_FOZ_RECORD) -> a recipe you may share
-python3 tools/alyx_pipelines.py make mine.recipe ../../game/content/game recorded.foz
+python3 tools/alyx_pipelines.py make mine.recipe ../local/game/content/game recorded.foz
 ```
 
 `make xros` compiles the same files into each visionOS slice of the runtime
@@ -186,13 +186,13 @@ makes the folders):
 
 ```bash
 xcrun devicectl device copy to --device <udid> \
-  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
+  --domain-type appDataContainer --domain-identifier "$KLEPTON_BUNDLE_ID" \
   --source alyx.foz --destination Documents/games/alyx/klfz/alyx.foz
 # optional, only for the very first launch: the Mac's record of the game's device.
 # The headset writes its own there on every launch with the setting on, and the
 # prewarm needs one; without it that launch replays on the game's own device.
 xcrun devicectl device copy to --device <udid> \
-  --domain-type appDataContainer --domain-identifier com.example.avpgamehub \
+  --domain-type appDataContainer --domain-identifier "$KLEPTON_BUNDLE_ID" \
   --source device-info.json --destination Documents/games/alyx/klfz/device-info.json
 ```
 

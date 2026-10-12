@@ -297,7 +297,7 @@ func klL(_ en: String, _ es: String) -> String {
     (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? es : en
 }
 
-/// What the hub may show of a store account: Steam's public persona name ("Steam: NSCabezon"),
+/// What the hub may show of a store account: Steam's public persona name ("Steam: Gordon"),
 /// never the login name used to sign in nor the SteamID; Meta only as signed in. Logs mask login
 /// names and ids the same way, since logs end up in bug reports.
 enum KLAccountPrivacy {

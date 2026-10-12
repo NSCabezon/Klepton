@@ -1,6 +1,6 @@
 // Game content from Meta's store, on the headset (the hub's Meta source).
 //
-// The MetaStore package (../../../AlyxAVP/MetaStore) downloads a game's exact
+// The MetaStore package (../../packages/MetaStore) downloads a game's exact
 // Quest build — the files a recipe names by store id, size and sha256 — with the
 // player's own Meta account: Meta only hands a file to an account that owns it.
 //

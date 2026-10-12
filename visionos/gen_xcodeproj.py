@@ -92,7 +92,7 @@ ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 # files that have to agree is exactly how they stop agreeing. The authored file
 # is the union; the knob FILTERS a generated copy.
 #
-#   com.apple.developer.low-latency-streaming (KLEPTON_LOW_LATENCY=0 drops it)
+#   com.apple.developer.low-latency-streaming (off unless KLEPTON_LOW_LATENCY=1)
 #       Added at the user's request while chasing a streaming regression. Note
 #       honestly what is and is not known about it: this key does not appear in
 #       the XROS SDK or in Xcode's Library tree — but neither do the two memory
@@ -108,10 +108,10 @@ OPTIONAL_ENTITLEMENTS = {
     "com.apple.developer.low-latency-streaming": "KLEPTON_LOW_LATENCY",
 }
 ENTITLEMENTS_FILE = "Klepton.entitlements"
-# What an unset knob means. On here (this checkout's builds have always carried
-# the key); the public AVP Game Hub tree ships "0" — a new team's signing may
-# refuse a key it was never granted — and its builders opt in with =1.
-OPTIONAL_ENTITLEMENTS_DEFAULT = "1"
+# What an unset knob means: OFF in AVP Game Hub. The key is unverified and not
+# self-service, and a team that was never granted it fails signing outright (taking
+# the memory keys with it). KLEPTON_LOW_LATENCY=1 (local/config.env) attaches it.
+OPTIONAL_ENTITLEMENTS_DEFAULT = "0"
 _dropped = [k for k, env in OPTIONAL_ENTITLEMENTS.items()
             if (os.environ.get(env) or OPTIONAL_ENTITLEMENTS_DEFAULT) == "0"]
 if ENTITLEMENTS and _dropped:
@@ -329,13 +329,13 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 # The alyx build downloads its own game content from Steam (Sources/KleptonSteamContent.swift)
-# through the SteamDepot Swift package, which lives in the AlyxAVP checkout beside this repo
-# (vendor/Klepton/visionos -> ../../../SteamDepot), like the alyx srcdir does. Local package
+# through the SteamDepot Swift package, which lives in the AVP Game Hub checkout beside this
+# tree (klepton/visionos -> ../../packages/SteamDepot), like the alyx srcdir does. Local package
 # reference, alyx only; KL_STEAMDEPOT_PKG overrides the path (relative to visionos/). Fixed
 # object ids rather than oid(): the counter would renumber every later object, and a kept,
 # hand-edited project is diffed against this output.
 def _fixed(tag): return ("KLEPT0N" + tag).upper().ljust(24, "0")[:24]
-STEAMDEPOT_PKG = os.environ.get("KL_STEAMDEPOT_PKG", "../../../SteamDepot")
+STEAMDEPOT_PKG = os.environ.get("KL_STEAMDEPOT_PKG", "../../packages/SteamDepot")
 STEAMDEPOT = KLT["name"] == "alyx" or IS_HUB
 if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package.swift")):
     print(f"!! alyx: no SteamDepot package at {os.path.join(HERE, STEAMDEPOT_PKG)} "
@@ -343,9 +343,9 @@ if STEAMDEPOT and not os.path.isfile(os.path.join(HERE, STEAMDEPOT_PKG, "Package
     STEAMDEPOT = False
 PKG_REF, PKG_PROD, B_PKG = _fixed("SDPKGREF"), _fixed("SDPKGPROD"), _fixed("SDPKGBLD")
 # The hub's Meta store source (Sources/KleptonMetaContent.swift): the MetaStore Swift package,
-# a sibling of SteamDepot in the AlyxAVP checkout. Hub only; KL_METASTORE_PKG overrides the path
+# a sibling of SteamDepot in the AVP Game Hub checkout (packages/). Hub only; KL_METASTORE_PKG overrides the path
 # (relative to visionos/). Without it the hub has no Meta source (Steam and the catalog still work).
-METASTORE_PKG = os.environ.get("KL_METASTORE_PKG", "../../../MetaStore")
+METASTORE_PKG = os.environ.get("KL_METASTORE_PKG", "../../packages/MetaStore")
 METASTORE = IS_HUB
 if METASTORE and not os.path.isfile(os.path.join(HERE, METASTORE_PKG, "Package.swift")):
     print(f"!! hub: no MetaStore package at {os.path.join(HERE, METASTORE_PKG)} "

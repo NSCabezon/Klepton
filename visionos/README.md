@@ -123,7 +123,7 @@ on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
   into the generated manifest from the Mac's apktool tree (metadata, not game
   data). Stamped with the APK's size and mtime, so it reruns only after an
   update. Nothing is staged from the Mac.
-- **Bundle id** `com.example.avpgamehub` (the container with Alyx's 72 GB);
+- **Bundle id** `KLEPTON_BUNDLE_ID` from `local/config.env` (the container with Alyx's 72 GB);
   product `KleptonHub`, display name "Klepton".
 
 Adding a game: build its frameworks (`KLEPTON_TARGET=<game> ./mkguest.sh`, which

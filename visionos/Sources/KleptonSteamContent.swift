@@ -4,7 +4,7 @@
 // headset with devicectl (stage_alyx.sh). This gate lets the app fetch a game's
 // data itself, from the player's own Steam account (ownership is proved by Steam:
 // no depot key without a licence), through the SteamDepot package
-// (../../../SteamDepot).
+// (../../packages/SteamDepot).
 //
 // What a game needs is a DESCRIPTOR (SteamGameDescriptor, registry in
 // SteamGames below): the Steam app id, the depots (or an OS filter to discover

@@ -34,6 +34,34 @@ every guest and `mkangle.sh` writes it once, into Frameworks/ itself.
 import sys
 import shlex
 
+
+# AVP Game Hub: <repo>/local/config.env (gitignored; see local/config.env.example) fills the
+# environment for every KEY=VALUE not already set, so gen_xcodeproj.py, the scripts that read
+# this table and the Mac app agree on KLEPTON_TEAM / KLEPTON_DEVICE / KLEPTON_BUNDLE_ID.
+# KL_LOCAL_CONFIG names another file. The environment always wins.
+def _load_local_config():
+    import os
+    path = os.environ.get("KL_LOCAL_CONFIG") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "local", "config.env")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key.replace("_", "").isalnum() and not os.environ.get(key):
+            os.environ[key] = val
+
+
+_load_local_config()
+
 TARGETS = {
     "beatsaber": {
         # Unity + IL2CPP + Oculus Mobile SDK. The chain is staged: libmain
@@ -1084,14 +1112,14 @@ TARGETS = {
     "alyx": {
         # Half-Life: Alyx, the linuxsteamrtarm64 build (Source 2, glibc). NOT an
         # APK: the srcdir is the depot's own bin directory, which sits OUTSIDE
-        # this repo (../../game is the AlyxAVP checkout's download area — see
-        # its PLAN.md), and the entry is the `hlvr` executable rather than a
+        # this repo (../local/game is the AVP Game Hub checkout's gitignored
+        # download area — see its README), and the entry is the `hlvr` executable rather than a
         # library. kl_glibc.c derives the other two search directories from it
         # (hlvr/bin/linuxsteamrtarm64 for client/server/host, and the SteamRT4
         # arm64 sysroot for libstdc++ & co.); KL_GLIBC_MODDIRS / _SYSROOT
         # override both. tree/apk/assets are placeholders nothing reads yet.
         "libs":    None,
-        "srcdir":  "../../game/bin/game/bin/linuxsteamrtarm64",
+        "srcdir":  "../local/game/bin/game/bin/linuxsteamrtarm64",
         "tree":    "alyx",
         "apk":     "alyx.apk",
         "assets":  "alyx/assets",
@@ -1124,9 +1152,10 @@ TARGETS = {
     # One game per process: when it ends, the app ends.
     #
     # The bundle id is FIXED rather than derived: it is the container that
-    # already holds Half-Life: Alyx's 72 GB (the id the alyx device runs used
-    # through KLEPTON_BUNDLE_ID), so the hub adopts that data in place.
-    # KLEPTON_BUNDLE_ID still overrides it.
+    # holds Half-Life: Alyx's 72 GB, so it must never change under an install.
+    # It is YOURS: set KLEPTON_BUNDLE_ID in local/config.env (an App ID your team
+    # can register). The placeholder below only builds for the Simulator; a
+    # device build with it stops with an error (visionos/local_config.sh).
     #
     # Never in the runtime's C table (c_table skips kind "hub"): the runtime only
     # ever sees the game that was picked.
@@ -1184,7 +1213,7 @@ TARGETS = {
             # ownership is the real account's through the Steam bridge.
             "metro",
         ],
-        "bundle_id": "com.example.avpgamehub",
+        "bundle_id": "com.example.avpgamehub",   # placeholder: KLEPTON_BUNDLE_ID (local/config.env)
         "product": "KleptonHub",
         # The Home View name and what Siri calls the app in its phrases
         # ("Activa el visor de FPS en AVP Game Hub", KleptonIntents.swift). Siri also
@@ -1444,7 +1473,7 @@ def bundle_for(name):
     # holds data that cannot be re-staged cheaply) states it outright.
     fixed = TARGETS.get(name, {}).get("bundle_id")
     if fixed:
-        return fixed
+        return os.environ.get("KLEPTON_BUNDLE_ID") or fixed
     scope = os.environ.get("KLEPTON_BUNDLE_SCOPE", os.environ.get("USER", ""))
     scope = re.sub(r"[^A-Za-z0-9-]", "-", scope).strip("-").lower()
     ident = re.sub(r"[^A-Za-z0-9.-]", "-", f"{BUNDLE_PREFIX}.{name}")
