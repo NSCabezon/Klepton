@@ -78,9 +78,11 @@ answers GL and kl_glfb never initializes.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
 - `KL_EGL_EXTENSIONS=<space-separated list>` — override what
-  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
+  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the four we
   actually implement (`EGL_KHR_image_base`,
-  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`);
+  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`,
+  and `EGL_KHR_create_context`, without which SDL2 refuses to request a GLES 3
+  context at all);
   set it EMPTY to restore the pre-VRChat behaviour. Worth having as an A/B
   because a guest may branch on a name here — and because an empty list, though
   legal, is what no Android driver actually ships: AVPro Video walks this string
@@ -160,6 +162,27 @@ answers GL and kl_glfb never initializes.
   sRGB).
 - `KL_GLFB_NOSWIZZLE=1` — drop the four `GL_TEXTURE_SWIZZLE_*` parameters.
   Single-channel textures then sample as red; a probe only.
+- `KL_GL_NO_BACKEND_EXT=1` — adopt nothing from ANGLE's own extension string.
+  By default the GL description repeats a short candidate list
+  (`GL_EXT_texture_format_BGRA8888`, the DXT/BC family, and
+  `GL_EXT_texture_filter_anisotropic`) when, and only when, ANGLE names them;
+  `[glfb] backend extensions adopted:` lists what was taken. Once anything is
+  adopted, `MAX_TEXTURE_MAX_ANISOTROPY` and the compressed-format pair are
+  answered by ANGLE instead of the table.
+- `KL_GLFB_DEPTH_LINEAR=1` — leave a LINEAR filter on a depth texture whose
+  compare mode is NONE. By default it is rewritten to NEAREST (ES leaves that
+  sample undefined and Metal returns 0, which reads as "everything is in
+  shadow"), and restored if the guest later turns compare mode on.
+- `KL_GLFB_NO_INT_PRECISION=1` — do not insert `precision highp int;` into
+  shaders that leave int precision to the stage default (which differs between
+  vertex and fragment, so a uniform declared in both fails to link).
+- `KL_GLFB_NOMIP=1` — demote every mipmapped min filter to its level-0 form,
+  on textures and sampler objects. Default off; a per-title workaround for a
+  guest that samples a mip level it should not (Tetris Effect's backdrop).
+- `KL_GLFB_PROGRAM_BINARY=0` — refuse `glProgramBinary` outright, leaving the
+  program unlinked so the guest recompiles from source. By default the binary
+  is forwarded and a rejected one (LINK_STATUS 0) is named in the log and
+  counted in the exit report.
 - `KL_GLFB_ERRPROBE=1` — bracket draws and blits with `glGetError` and print
   the first 20 with the state around them (draw FBO, program, viewport;
   `glCheckFramebufferStatus` on 0x506). Consumes the pending error. Also
@@ -3181,6 +3204,14 @@ these are the gate's own knobs.
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
 except its own control vars (next section).
+
+- `KL_SHADER_CACHE_GUARD=0` — keep a guest's compiled-program caches across a
+  driver change. By default `kl_app.c` stamps `kern.osversion`, `hw.model` and
+  `KL_GLFB_REWRITE_GEN` into `<files>/.klepton-gl-driver` and, when the stamp
+  moves (an OS update, a rewrite-rule change), deletes every
+  `ProgramBinaryCache` / `ShaderCache` / `UnityShaderCache` / `il2cpp_cache` /
+  `GPUCache` directory beneath it, once. A stale cache reloads into programs
+  that never link, which UE4 titles turn into a crash on the first level load.
 
 - `KL_TARGET=<name>` — which guest the app boots: `beatsaber`, `superhot` or
   `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
