@@ -98,6 +98,7 @@ enum HubLaunch {
         KleptonChroma.shared.loadGame(target)
         KleptonTuning.shared.loadGame(target)
         KLSessionStats.shared.prepareStream(target: target)
+        KLBackgroundDownloads.shared.noteGameWillStart()
         Lifecycle.keepAlive = false
         NSLog("[hub] \(target): Jugar desde el Mac")
     }
@@ -118,6 +119,9 @@ enum HubLaunch {
         #if canImport(SteamDepot)
         KleptonSteamBridge.register()
         #endif
+        // Downloads: the system's background session goes on (or is suspended, per the hub's
+        // setting); in-app work that would compete with the game stops (KleptonBackgroundDownloads.swift).
+        KLBackgroundDownloads.shared.noteGameWillStart()
         // A game is about to boot: from here on, backgrounding ends the process
         // as in a single-game build.
         Lifecycle.keepAlive = false
@@ -195,6 +199,7 @@ enum HubStorage {
 
     /// Remove dataURLs(row). nil on success, else the first error.
     static func deleteData(_ row: KLHubGameRow) -> String? {
+        KLBackgroundDownloads.shared.clearLanes(target: row.target)
         var firstError: String?
         for u in dataURLs(row) where FileManager.default.fileExists(atPath: u.path) {
             do { try FileManager.default.removeItem(at: u) } catch {
@@ -653,6 +658,12 @@ final class HubLibraryModel: ObservableObject {
             }
         }
         let local = m.local
+        // Not running in the app, but the system is fetching its chunks (they are assembled the
+        // next time the in-app download runs).
+        let bg = m.background
+        if bg.active, !local.isComplete {
+            return .working(klL("In the background", "En segundo plano"), bg.fraction)
+        }
         if local.isComplete {
             if UserDefaults.standard.bool(forKey: m.game.verifyNextLaunchKey) { return .verifyScheduled }
             if let newest = latest[g.target], newest.contains(where: { id, gid in local.markers[id] != gid }) {
@@ -846,7 +857,7 @@ final class HubLibraryModel: ObservableObject {
 
     /// Roughly what is still to download (offline, stat only); nil for an update, whose size
     /// Steam only tells once it starts.
-    private func bulkBytes(_ target: String, _ store: KLStore, _ st: Status) -> UInt64? {
+    func bulkBytes(_ target: String, _ store: KLStore, _ st: Status) -> UInt64? {
         if st == .updateAvailable { return nil }
         switch store {
         case .steam:
@@ -880,6 +891,52 @@ final class HubLibraryModel: ObservableObject {
         return nil
     }
 
+    /// What the system's background session is doing for a game (Steam only; nil without one).
+    func backgroundStatus(_ target: String) -> KLBackgroundDownloads.Status? {
+        #if canImport(SteamDepot)
+        if let m = content[target] { let b = m.background; return b.lanes > 0 ? b : nil }
+        #endif
+        return nil
+    }
+
+    private var resumedWanted = false
+    /// Background downloads on: the games the player started downloading and that did not finish
+    /// (the hub was closed, or a game was played meanwhile) continue by themselves when the library
+    /// opens — through the "Download all" queue, one at a time, each exactly as its own Download
+    /// button does it (ownership asked fresh, Meta's request gate, checksums). Steam's run also
+    /// assembles the chunks the system fetched meanwhile. Waits for the stores' answers first.
+    func resumeWantedDownloads() {
+        guard KLDownloadSettings.background, !resumedWanted else { return }
+        resumedWanted = true
+        let wanted = KLDownloadIntent.all()
+        guard !wanted.isEmpty else { return }
+        NSLog("[hub] downloads to resume: \(wanted.sorted().joined(separator: ", "))")
+        Task { [weak self] in
+            for _ in 0 ..< 120 {
+                guard let self else { return }
+                var busy = self.checking
+                #if canImport(MetaStore)
+                busy = busy || self.metaAccount.checking
+                #endif
+                if !busy { break }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            try? await Task.sleep(for: .seconds(1))
+            guard let self, !self.bulk.running else { return }
+            let items = self.games.compactMap { g -> HubBulkCandidate? in
+                guard let store = self.activeStore(g), wanted.contains("\(store.rawValue):\(g.target)"),
+                      !HubStorage.isBusy(self, g.target) else { return nil }
+                let st = self.status(g)
+                if st == .ready || st == .manual || st == .notInBuild { KLDownloadIntent.set(store.rawValue, g.target, false); return nil }
+                return HubBulkCandidate(target: g.target, display: g.display, store: store,
+                                        update: st == .updateAvailable, bytes: self.bulkBytes(g.target, store, st))
+            }
+            guard !items.isEmpty else { return }
+            NSLog("[hub] resuming \(items.count) download(s) left unfinished")
+            self.bulk.start(items, model: self)
+        }
+    }
+
     // MARK: The card's own download
 
     /// Where the card's download stands (the active store's model), for its buttons and message.
@@ -903,7 +960,9 @@ final class HubLibraryModel: ObservableObject {
             case .connecting, .working: return .running
             case .paused: return .paused
             case .failed(let why): return .failed(why)
-            case .idle, .complete: return m.isRunning ? .running : .none
+            // The system still fetching its chunks (KleptonBackgroundDownloads) counts as running:
+            // the card offers Pause, which holds the system's share too.
+            case .idle, .complete: return m.isRunning || m.background.active ? .running : .none
             }
             #else
             return .none
@@ -995,7 +1054,7 @@ final class HubLibraryModel: ObservableObject {
     /// The card's Pause: as the page's (the run stops, what is on disk stays, Resume goes on).
     func pauseCardDownload(_ g: KLHubGameRow) {
         #if canImport(SteamDepot)
-        if let m = content[g.target], m.isRunning || m.isBusy { m.pause() }
+        if let m = content[g.target], m.isRunning || m.isBusy || m.background.active { m.pause() }
         #endif
         #if canImport(MetaStore)
         if let m = meta[g.target], m.isBusy { m.pause() }
@@ -1199,6 +1258,9 @@ final class HubBulkDownload: ObservableObject {
         guard !running, !items.isEmpty else { return }
         jobs = items.sorted { ($0.bytes ?? 0) < ($1.bytes ?? 0) }.map { Job(item: $0, state: .pending) }
         running = true
+        // Background setting on: the whole queue is remembered, so what the hub could not get to
+        // before it closed continues the next time it opens (HubLibraryModel.resumeWantedDownloads).
+        if KLDownloadSettings.background { for j in jobs { KLDownloadIntent.set(j.item.store.rawValue, j.item.target, true) } }
         NSLog("[hub] download all: \(jobs.map { "\($0.item.target) (\($0.item.store.rawValue))" }.joined(separator: ", "))")
         loop = Task { [weak self, weak model] in
             var lastStore: KLStore?
@@ -1232,6 +1294,7 @@ final class HubBulkDownload: ObservableObject {
         guard running else { return }
         NSLog("[hub] download all: cancelled")
         loop?.cancel()
+        for j in jobs where j.state == .pending { KLDownloadIntent.set(j.item.store.rawValue, j.item.target, false) }
         if let job = currentJob, job.state == .running { Self.pause(job.item, model) }
     }
 
@@ -1361,10 +1424,17 @@ struct HubDownloadAllSheet: View {
                         }
                     }
                 } footer: {
-                    Text(klL("One game at a time, smallest first, each exactly as its own Download button does it. "
-                             + "Keep the headset on and this window open: visionOS pauses downloads in the background.",
-                             "Un juego cada vez, del más pequeño al más grande, cada uno igual que con su propio botón Descargar. "
-                             + "Deja el visor puesto y esta ventana abierta: visionOS pausa las descargas en segundo plano."))
+                    Text(KLDownloadSettings.background
+                         ? klL("One game at a time, smallest first, each exactly as its own Download button does it. "
+                               + "Steam games keep downloading in the background (while you play, or with the hub closed); "
+                               + "Meta games only while the hub is running. Whatever is left continues when you open the hub again.",
+                               "Un juego cada vez, del más pequeño al más grande, cada uno igual que con su propio botón Descargar. "
+                               + "Los juegos de Steam siguen descargándose en segundo plano (mientras juegas o con el hub cerrado); "
+                               + "los de Meta, solo con el hub en marcha. Lo que falte continúa al volver a abrir el hub.")
+                         : klL("One game at a time, smallest first, each exactly as its own Download button does it. "
+                               + "Keep the headset on and this window open: visionOS pauses downloads in the background.",
+                               "Un juego cada vez, del más pequeño al más grande, cada uno igual que con su propio botón Descargar. "
+                               + "Deja el visor puesto y esta ventana abierta: visionOS pausa las descargas en segundo plano."))
                 }
                 Section {
                     LabeledContent(klL("To download", "Por descargar"), value: size(total)).monospacedDigit()
@@ -1824,6 +1894,8 @@ struct HubAppSettingsView: View {
                 MetaAccountSection()
                 #endif
 
+                HubDownloadSettingsSection()
+
                 Section {
                     ForEach(model.games) { g in
                         HStack {
@@ -1895,6 +1967,39 @@ struct HubAppSettingsView: View {
             if let err { error = klL("Could not delete all of \(g.display): \(err)", "No se pudo borrar todo \(g.display): \(err)") }
             model.refreshAfterDelete(g.target)
             await measure()
+        }
+    }
+}
+
+/// "Descargas": background downloads (on by default) and pausing them while a game runs.
+struct HubDownloadSettingsSection: View {
+    @State private var background = KLDownloadSettings.background
+    @State private var pauseWhilePlaying = KLDownloadSettings.pauseWhilePlaying
+
+    var body: some View {
+        Section {
+            Toggle(klL("Background downloads", "Descargas en segundo plano"), isOn: $background)
+                .onChange(of: background) { _, v in
+                    KLDownloadSettings.background = v
+                    NSLog("[hub] background downloads \(v ? "on" : "off")")
+                }
+            Toggle(klL("Pause downloads while playing", "Pausar descargas mientras juegas"), isOn: $pauseWhilePlaying)
+                .disabled(!background)
+                .onChange(of: pauseWhilePlaying) { _, v in
+                    KLDownloadSettings.pauseWhilePlaying = v
+                    NSLog("[hub] pause downloads while playing \(v ? "on" : "off")")
+                }
+        } header: { Text(klL("Downloads", "Descargas")) } footer: {
+            Text(klL("Keeps downloading while you play or with the hub closed: Steam games through visionOS's background "
+                     + "downloads (their files are checked and put in place when you open the hub again), Meta games while "
+                     + "the hub is running, and both continue by themselves when you reopen it. Downloads may use network "
+                     + "and storage while you play; pausing them leaves the game alone. Changes apply to downloads started "
+                     + "from now on. Off: downloads only run with the hub open, as before.",
+                     "Sigue descargando mientras juegas o con el hub cerrado: los juegos de Steam con las descargas en segundo "
+                     + "plano de visionOS (sus archivos se comprueban y se colocan al volver a abrir el hub), los de Meta "
+                     + "mientras el hub está en marcha, y ambos continúan solos al volver a abrirlo. Puede usar red y "
+                     + "almacenamiento mientras juegas; si las pausas, el juego no se ve afectado. Los cambios se aplican a "
+                     + "las descargas que empieces desde ahora. Desactivado: solo se descarga con el hub abierto, como antes."))
         }
     }
 }
@@ -2103,6 +2208,7 @@ struct HubLibraryView: View {
             model.logSources("library opened")
             model.metaAccount.refresh { model.logSources("Meta check") }
             #endif
+            model.resumeWantedDownloads()
             #if canImport(SteamDepot)
             // Once per app open: a game session ends by closing the app, so this is "after quit" —
             // where a two-way sync sends that session's saves up.
@@ -2349,6 +2455,9 @@ struct HubLibraryView: View {
     }
 
     private func bulkStateText(_ job: HubBulkDownload.Job) -> String {
+        if job.state != .done, model.activeFraction(job.id) == nil, let b = model.backgroundStatus(job.id), b.active {
+            return klL("In the background", "En segundo plano") + (b.fraction.map { " \(Int(($0 * 100).rounded())) %" } ?? "")
+        }
         switch job.state {
         case .pending: return klL("Waiting", "En espera")
         case .running: return model.activeFraction(job.id).map { klL("Downloading", "Descargando") + " \(Int(($0 * 100).rounded())) %" }

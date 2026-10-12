@@ -247,13 +247,42 @@ final class SteamContentModel: ObservableObject {
     private var forceVerify = false
     private let store = KeychainCredentialStore(service: "SteamDepot.refreshToken", account: "steam")
     var interruptedByBackground = false
+    #if KL_HUB
+    /// The depot the in-app run is on (the background lane it feeds), and its worker count.
+    private var currentDepot: UInt32?
+    private var observers: [NSObjectProtocol] = []
+    #endif
 
     init(game: SteamGameDescriptor) {
         self.game = game
         local = game.status()
         account = (try? store.load())?.accountName
         refreshLocal()
+        #if KL_HUB
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: KLBackgroundDownloads.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.objectWillChange.send() }
+        })
+        // A game is about to boot in this process: the in-app run (decrypt, decompress, write —
+        // 12+ workers) stops; the system goes on fetching the raw chunks, which this run
+        // assembles the next time the hub's library is open. Setting off: as before (it runs on).
+        observers.append(nc.addObserver(forName: KLBackgroundDownloads.gameWillStart, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handOffForGame() }
+        })
+        #endif
     }
+
+    #if KL_HUB
+    /// What the system is fetching for this game (staged raw chunks, tasks in flight).
+    var background: KLBackgroundDownloads.Status { KLBackgroundDownloads.shared.status(target: game.target) }
+
+    private func handOffForGame() {
+        guard KLDownloadSettings.background, task != nil else { return }
+        log("\(game.target): a game is starting — the in-app download stops here, the system keeps fetching")
+        task?.cancel()
+        stage = .paused
+    }
+    #endif
 
     /// Fraction of the game's bytes on disk while downloading/verifying, for the
     /// library's "Downloading x%" — nil when nothing is running.
@@ -288,6 +317,10 @@ final class SteamContentModel: ObservableObject {
     /// Main button: use the saved sign-in if there is one, otherwise show the sign-in form.
     func start(forceVerify: Bool = false) {
         self.forceVerify = forceVerify
+        #if KL_HUB
+        if KLDownloadSettings.background { KLDownloadIntent.set("steam", game.target, true) }
+        KLBackgroundDownloads.shared.setPaused(target: game.target, false)
+        #endif
         UserDefaults.standard.set(false, forKey: game.verifyNextLaunchKey)
         launch(.saved)
     }
@@ -329,6 +362,11 @@ final class SteamContentModel: ObservableObject {
     func pause() {
         task?.cancel()
         stage = .paused
+        #if KL_HUB
+        // The player's Pause holds the system's share too, until Resume.
+        KLDownloadIntent.set("steam", game.target, false)
+        KLBackgroundDownloads.shared.setPaused(target: game.target, true)
+        #endif
     }
 
     func cancelSignIn() {
@@ -451,19 +489,44 @@ final class SteamContentModel: ObservableObject {
             depotCount = depots.count
             for (i, depot) in depots.enumerated() {
                 depotIndex = depots.count > 1 ? i + 1 : 0
-                let opts = DepotDownloadOptions(appID: game.appID, depotID: depot, branch: game.branch,
+                var opts = DepotDownloadOptions(appID: game.appID, depotID: depot, branch: game.branch,
                                                 directory: game.root, filters: SteamGameDescriptor.debugFilters,
                                                 include: game.include,
                                                 maxConcurrentDownloads: game.maxConcurrentDownloads,
                                                 verifyConcurrency: game.verifyConcurrency,
                                                 forceVerify: forceVerify)
+                #if KL_HUB
+                currentDepot = depot
+                // Raw chunks the system fetched meanwhile are taken first (whatever the setting is
+                // now); with the setting on, this run's remaining chunks go to the system too.
+                let bg = KLBackgroundDownloads.shared
+                let staging = bg.stagingDirectory(root: game.root, depot: depot)
+                opts.stagingDirectory = staging
+                if KLDownloadSettings.background {
+                    let target = game.target
+                    opts.onChunkPlan = { plan in
+                        bg.setLane(target: target, depot: plan.depotID, appID: plan.appID, manifest: plan.manifestID,
+                                   servers: plan.servers, staging: staging,
+                                   chunks: plan.chunks.map { ($0.id, $0.compressedLength, $0.uncompressedLength) },
+                                   workers: plan.workers, needsToken: plan.needsCDNToken)
+                    }
+                }
+                #endif
                 let summary = try await downloader.download(opts) { p in
                     Task { @MainActor in self.update(p) }
                 }
+                #if KL_HUB
+                bg.clearLane(target: game.target, depot: depot)
+                currentDepot = nil
+                #endif
                 log("\(game.target) depot \(depot) done: \(summary.files) files, \(summary.skippedFiles) already there, "
-                    + "\(summary.bytesDownloaded) bytes fetched, verified \(summary.verifiedBytes) in \(summary.verifyElapsed)s")
+                    + "\(summary.bytesDownloaded) bytes fetched (\(summary.networkBytes) over the network), "
+                    + "verified \(summary.verifiedBytes) in \(summary.verifyElapsed)s")
             }
             stage = .complete
+            #if KL_HUB
+            KLDownloadIntent.set("steam", game.target, false)
+            #endif
         } catch is CancellationError {
             if case .signIn = stage { return }
             stage = .paused
@@ -479,6 +542,14 @@ final class SteamContentModel: ObservableObject {
     private func update(_ p: DownloadProgress) {
         guard task != nil else { return }
         progress = p
+        #if KL_HUB
+        if let depot = currentDepot, p.phase == .downloading || p.phase == .finished {
+            KLBackgroundDownloads.shared.noteProgress(target: game.target, depot: depot, chunksDone: p.chunksDone,
+                                                      workers: game.maxConcurrentDownloads,
+                                                      doneBytes: p.depotBytes - p.bytesToDownload + p.bytesDownloaded,
+                                                      depotBytes: p.depotBytes)
+        }
+        #endif
         if p.phase == .verifying, p.verifyElapsed > 0 {
             verifySpeed = Double(p.verifyBytesDone) / p.verifyElapsed
         }
@@ -550,14 +621,25 @@ struct SteamContentView: View {
                 }
             }
             content
+            #if KL_HUB
+            SteamBackgroundLine(model: model)
+            #endif
             Spacer(minLength: 0)
             if model.isBusy {
-                Label(klL("Keep this window open and the headset on: visionOS pauses apps in the background, "
-                      + "and the download stops with it. It resumes where it left off on the next launch.",
-                      "Mantén esta ventana abierta y el visor puesto: visionOS pausa las apps en segundo plano "
-                      + "y la descarga se detiene con ellas. Se reanuda donde se quedó en el siguiente arranque."),
-                      systemImage: "exclamationmark.triangle")
-                    .font(.footnote).foregroundStyle(.secondary)
+                #if KL_HUB
+                if KLDownloadSettings.background {
+                    Label(klL("Keeps downloading in the background: while you play or with the hub closed, visionOS "
+                              + "fetches the game's files; they are checked and put in place when you open the hub again.",
+                              "Sigue descargando en segundo plano: mientras juegas o con el hub cerrado, visionOS "
+                              + "descarga los archivos del juego; se comprueban y se colocan al volver a abrir el hub."),
+                          systemImage: "info.circle")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    SteamKeepOpenHint()
+                }
+                #else
+                SteamKeepOpenHint()
+                #endif
             }
         }
         .padding(32)
@@ -675,6 +757,48 @@ struct SteamContentView: View {
     }
 }
 
+/// The in-process download's limits (background downloads off, or the single-game build).
+struct SteamKeepOpenHint: View {
+    var body: some View {
+        Label(klL("Keep this window open and the headset on: visionOS pauses apps in the background, "
+              + "and the download stops with it. It resumes where it left off on the next launch.",
+              "Mantén esta ventana abierta y el visor puesto: visionOS pausa las apps en segundo plano "
+              + "y la descarga se detiene con ellas. Se reanuda donde se quedó en el siguiente arranque."),
+              systemImage: "exclamationmark.triangle")
+            .font(.footnote).foregroundStyle(.secondary)
+    }
+}
+
+#if KL_HUB
+/// What the system fetched (or is fetching) for this game in the background, on its page.
+struct SteamBackgroundLine: View {
+    @ObservedObject var model: SteamContentModel
+    var body: some View {
+        let b = model.background
+        if b.lanes > 0 {
+            VStack(alignment: .leading, spacing: 4) {
+                if b.needsToken {
+                    Label(klL("Steam's server for this game wants a short-lived access token, which is not handed to the "
+                              + "system: this game downloads only while the hub is open.",
+                              "El servidor de Steam de este juego pide un token de acceso temporal, que no se entrega al "
+                              + "sistema: este juego solo se descarga con el hub abierto."),
+                          systemImage: "exclamationmark.triangle")
+                } else if b.paused {
+                    Label(klL("Background download paused.", "Descarga en segundo plano en pausa."), systemImage: "pause.circle")
+                } else {
+                    Label(klL("Background: \(b.staged) pieces ready to assemble (\(gb(b.stagedBytes))), \(b.inFlight) downloading, "
+                              + "\(b.remaining) queued.",
+                              "Segundo plano: \(b.staged) fragmentos listos para montar (\(gb(b.stagedBytes))), \(b.inFlight) descargándose, "
+                              + "\(b.remaining) en cola."),
+                          systemImage: "arrow.down.circle.dotted")
+                        .monospacedDigit()
+                }
+            }
+            .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+}
+#endif
 /// The sign-in steps of a Steam run (and its "connecting" lines): the game's page shows them
 /// inline, the hub's card in a sheet (HubSteamSignInSheet). Signing in carries straight on into
 /// the download — the same run.

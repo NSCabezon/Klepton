@@ -372,6 +372,8 @@ if IS_HUB:
     # itself (compiled out without the MetaStore package).
     swift.append({"name": "KleptonCatalog.swift", "ref": _fixed("HUBCATF"), "bld": _fixed("HUBCATB")})
     swift.append({"name": "KleptonMetaContent.swift", "ref": _fixed("HUBMETAF"), "bld": _fixed("HUBMETAB")})
+    # The system background download session (Steam chunks) and the download settings.
+    swift.append({"name": "KleptonBackgroundDownloads.swift", "ref": _fixed("HUBBGDLF"), "bld": _fixed("HUBBGDLB")})
     swift.append({"name": "../" + HUB_MANIFEST_REL, "ref": _fixed("HUBMANF"), "bld": _fixed("HUBMANB")})
 # Per-session performance summary (the compositor measures, the hub shows it).
 # Every target: the compositor calls it. Fixed ids, so the numbering above is kept.
