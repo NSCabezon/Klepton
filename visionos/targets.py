@@ -685,6 +685,10 @@ TARGETS = {
         # the capped pixels — about a Quest 2's eye — and the in-app slider
         # goes back up if the fps allow (batman uses 0.7 on an M5).
         "render_scale": 0.6,
+        # "Jugar desde el Mac": verified on the loopback harness (2026-10-12) —
+        # OpenXR head pose, controller aim + trigger and audio through the stream
+        # host, consent dialog to the main menu at 45 fps. The hub offers it.
+        "mac_stream": True,
     },
     "vicecity": {
         # GTA Vice City VR (GTAVCVR) — a reVC/re3 (open-source re-implementation)
@@ -1104,6 +1108,8 @@ TARGETS = {
         "kind":    "glibc",
         "product": "KleptonAlyx",
         "display": "Half-Life: Alyx",
+        # "Jugar desde el Mac": the Mac's stream host runs it (OpenVR guest).
+        "mac_stream": True,
     },
 
     # ---- THE HUB: one app, several games ----
@@ -1471,6 +1477,10 @@ def resolve(name):
     t.setdefault("video", False)
     t.setdefault("autoboot", True)
     t.setdefault("foveation", True)
+    # The hub offers "Jugar desde el Mac" (the Mac runs the game, the headset
+    # streams it) only for a row that says so: a game whose stream session was
+    # verified (KleptonHub HubLibraryView.streamable).
+    t.setdefault("mac_stream", False)
     # How a plain gamepad's four face buttons are laid over Touch A/B/X/Y where
     # the default (cross=a, circle=b, square=x, triangle=y) puts an action under
     # the wrong thumb for this game. "" keeps the default.
