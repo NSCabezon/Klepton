@@ -245,6 +245,16 @@ TARGETS = {
         "kind":    "unity",
         "product": "KleptonKTANE",
         "display": "Keep Talking and Nobody Explodes",
+        # The game draws its own controllers/hands where the user's are, so the
+        # system's matte of the real arms would be a second pair (beatsaber128).
+        "hand_matting": False,
+        # Default for an M2, not yet measured on the headset: a light scene (one
+        # room, one bomb) but Unity 2022 GLES through ANGLE/Metal, both eyes
+        # drawn. Headless on the M1 Max (1832x1920 per eye, PNG capture on) the
+        # title and intro ran ~80 fps. 0.8 is ~two thirds of the pixels and
+        # keeps the bomb's small module labels readable; the in-app "Render
+        # resolution" slider starts here.
+        "render_scale": 0.8,
     },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
@@ -1129,6 +1139,12 @@ TARGETS = {
             # to games/ieytd/meta/IEYTD.apk; the hub derives ieytd.apk and
             # ieytd/assets from it (Sources/KleptonHubPrep.swift).
             "ieytd",
+            # Keep Talking and Nobody Explodes 1.10.15
+            # (com.steelcrategames.keeptalkingandnobodyexplodes 87), Meta's store
+            # (app 2010043642376517): one 150 MB APK, no OBB, to
+            # games/ktane/meta/KeepTalkingandNobodyExplodes.apk; the hub derives
+            # ktane.apk and ktane/assets from it (Sources/KleptonHubPrep.swift).
+            "ktane",
             # Metro Awakening, the Steam Frame build (app 2669410, Android depot
             # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
             # chunk OBBs, 19.2 GB). The depot lands straight in the OBB
