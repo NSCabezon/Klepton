@@ -226,6 +226,54 @@ TARGETS = {
         # resolution" slider starts here and can go up if the headset allows.
         "render_scale": 0.7,
     },
+    "ktane": {
+        # Keep Talking and Nobody Explodes (Steel Crate Games), Quest build
+        # 1.10.15 (com.steelcrategames.keeptalkingandnobodyexplodes, versionCode
+        # 87), Meta app 2010043642376517. Unity 2022.3.62f3 + IL2CPP on the XR
+        # SDK path (boot.config `xrsdk-pre-init-library=OculusXRPlugin`):
+        # Beat Saber 1.40's / Walkabout's shape — libOVRPlugin + libOculusXRPlugin
+        # for the display, libovrplatformloader for the Meta platform (kl_ovrp /
+        # kl_ovrplat). libopenxr_loader ships beside them but is OVRPlugin's own
+        # backend, never the title's. Not a split binary: no OBB, everything is
+        # in the 150 MB APK. A two-player game: the second player reads the
+        # manual (bombmanual.com), nothing to ship.
+        # Measured headless on the Mac (2026-10-12): title -> intro cards ->
+        # "manual required" screen (the code is the one printed in the manual
+        # the second player reads: 925 for version 1-es, 241 for 1-en) -> the
+        # controls tutorial (grab the bomb, turn it, cut the blue wire, reset
+        # the room from the dossier menu) -> the Setup Room -> binder -> "1.3
+        # The First Bomb" -> the facility room, where the bomb is picked up,
+        # turned and a wire cut. Text was solid quads until the texture-unit
+        # cap row in kl_guestpoke.c was keyed on "ktane" (it was keyed on
+        # avp-play's store name): 32 -> 64, zero "Invalid texture unit!".
+        # ~100 fps uncapped with no capture (Setup Room), ~50 with a PNG every
+        # 100 frames. ovr_User_GetLoggedInUser -> 0 logs one "Request failed"
+        # and the game carries on offline (leaderboards only), so no
+        # KL_PLAT_USER. The input script is AlyxAVP/local/ktane/scripts/
+        # (play.sh: fresh profile through the tutorial; room.sh: a profile past
+        # it, into the first bomb), not in this repo.
+        "libs":    None,
+        "srcdir":  "ktane/lib/arm64-v8a",
+        "tree":    "ktane",
+        "apk":     "ktane.apk",
+        "assets":  "ktane/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonKTANE",
+        "display": "Keep Talking and Nobody Explodes",
+        # The game draws its own controllers/hands where the user's are, so the
+        # system's matte of the real arms would be a second pair (beatsaber128).
+        "hand_matting": False,
+        # Default for an M2, not yet measured on the headset: a light scene (one
+        # room, one bomb) but Unity 2022 GLES through ANGLE/Metal, both eyes
+        # drawn. Headless on the M1 Max (1832x1920 per eye) ~100 fps uncapped,
+        # ~50 with a PNG capture every 100 frames. 0.8 is ~two thirds of the pixels and
+        # keeps the bomb's small module labels readable; the in-app "Render
+        # resolution" slider starts here.
+        "render_scale": 0.8,
+    },
     "walkabout": {
         # Walkabout Mini Golf 6.7 (Mighty Coconut), package
         # com.MightyCoconut.WalkaboutMiniGolf — Unity + IL2CPP through the stock
@@ -1115,6 +1163,12 @@ TARGETS = {
             # to games/ieytd/meta/IEYTD.apk; the hub derives ieytd.apk and
             # ieytd/assets from it (Sources/KleptonHubPrep.swift).
             "ieytd",
+            # Keep Talking and Nobody Explodes 1.10.15
+            # (com.steelcrategames.keeptalkingandnobodyexplodes 87), Meta's store
+            # (app 2010043642376517): one 150 MB APK, no OBB, to
+            # games/ktane/meta/KeepTalkingandNobodyExplodes.apk; the hub derives
+            # ktane.apk and ktane/assets from it (Sources/KleptonHubPrep.swift).
+            "ktane",
             # Metro Awakening, the Steam Frame build (app 2669410, Android depot
             # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
             # chunk OBBs, 19.2 GB). The depot lands straight in the OBB

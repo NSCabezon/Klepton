@@ -281,7 +281,13 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x10cd2c0 lands in the last RW LOAD's BSS (va 0x104ef20, filesz 0x19180 <
     // memsz 0x103c60), a singleton pointer filled at runtime. Used on this
     // title only; another title on the same build is told it was declined.
-    { "2022.3.62f3", 0x10cd2c0, 0xec, 1, "x2010043642376517" },
+    // Keyed on THIS repo's target name, "ktane" (standalone and in the hub
+    // alike). The row came over from avp-play keyed on its store-row name
+    // "x2010043642376517", which no target here carries, so the raise never
+    // applied: 53k rejects in a 5000-frame run and every TextMeshPro glyph
+    // drawn as a solid quad (the SDF sampler read a stale unit-0 texture).
+    // At 64: zero rejects and the text renders (2026-10-12).
+    { "2022.3.62f3", 0x10cd2c0, 0xec, 1, "ktane" },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 

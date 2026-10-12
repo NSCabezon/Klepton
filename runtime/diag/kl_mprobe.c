@@ -784,8 +784,12 @@ static void probe_static_chain(unsigned frame) {
         fprintf(stderr, "  [mprobe] static: libil2cpp lacks the field API\n");
         return;
     }
-    char buf[1024];
-    snprintf(buf, sizeof buf, "%s", spec);
+    // 8 KiB: a sweep over a list (one chain per element) outgrows 1 KiB fast,
+    // and a cut-off spec is a silently half-run probe.
+    char buf[8192];
+    if (snprintf(buf, sizeof buf, "%s", spec) >= (int)sizeof buf)
+        fprintf(stderr, "  [mprobe] static: KL_PROBE_STATIC longer than %zu bytes, "
+                        "truncated\n", sizeof buf - 1);
     for (char *save = NULL, *it = strtok_r(buf, ",", &save); it;
          it = strtok_r(NULL, ",", &save)) {
         char *colon = strchr(it, ':');
@@ -898,6 +902,13 @@ static void probe_static_chain(unsigned frame) {
                     !strcmp(il.class_get_namespace(c), "UnityEngine"))
                     gn = il.class_get_method_from_name(c, "get_name", 0);
                 if (!il.class_get_parent) break;
+            }
+            // A System.String says its VALUE: the class alone answers nothing,
+            // and the strings are what a script needs (KTANE's manual lock codes).
+            if (ok && !strcmp(il.class_get_name(ok), "String") && il.class_get_namespace &&
+                !strcmp(il.class_get_namespace(ok), "System")) {
+                oname[0] = ' '; oname[1] = '"'; str_ascii((Il2CppObject *)obj, oname + 2, sizeof oname - 4);
+                strlcat(oname, "\"", sizeof oname);
             }
             if (gn) {
                 Il2CppObject *ns2 = invoke_on((Il2CppObject *)obj, gn, NULL, "Object.name");
