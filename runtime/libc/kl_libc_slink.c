@@ -48,6 +48,7 @@ int   kl_open_flags(int linux_flags);       // kl_libc.c
 ssize_t kl_shim_read(int fd, void *buf, size_t n);  // kl_shim.c
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 void  kl_fatal_prepare(void);
+void  kl_errno_set(int darwin_errno);    // kl_libc.c
 
 #include "../guest/kl_obbmap.h"
 #define GUEST_PATH(p) char _kp[1024]; const char *_p = kl_guest_path((p), _kp, sizeof _kp)
@@ -1099,4 +1100,51 @@ void klb___pthread_cleanup_pop(void *c, int execute) {
     if (!rec) return;
     g_cleanups = rec->prev;
     if (execute && rec->routine) rec->routine(rec->arg);
+}
+
+// ------------------------------------------------ more libc surface
+//
+// Each one is either a same-meaning rebuild out of what Darwin has or an
+// honest refusal with the errno the caller already handles; none invents an
+// answer. Half-Life: Alyx's Android launcher is the guest that reached for
+// most of them.
+
+// AT_FDCWD is -100 on Linux and -2 on Darwin, and the two flag bits move:
+// AT_SYMLINK_NOFOLLOW 0x100 -> 0x20, AT_EACCESS 0x200 -> 0x10. A cwd-relative
+// or absolute path goes through the same guest-path mapping access() uses.
+int klb_faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (flags & ~0x300) { errno = EINVAL; return -1; }
+    int df = 0;
+    if (flags & 0x100) df |= AT_SYMLINK_NOFOLLOW;
+    if (flags & 0x200) df |= AT_EACCESS;
+    if (dirfd == -100) dirfd = AT_FDCWD;
+    GUEST_PATH(path);
+    int r = faccessat(dirfd, _p, mode, df);
+    // Into the slot a cached __errno() pointer reads, too (kl_errno_set): the
+    // Half-Life: Alyx launcher's faccessat self-test holds that pointer across the call and
+    // read back the EOPNOTSUPP it had written itself instead of ENOENT.
+    if (r) kl_errno_set(errno);
+    return r;
+}
+
+// mkdtemp was a raw forward, so a template spelled the guest's way (/sdcard,
+// /data/...) went to Darwin as written and failed; and a failure left the
+// errno slot a cached __errno() pointer reads untouched. Like mkstemp's
+// callers, the template is rewritten in place: the host path is made and the
+// XXXXXX the kernel chose is copied back into the guest's own buffer.
+char *klb_mkdtemp(char *tmpl) {
+    if (!tmpl) { kl_errno_set(EINVAL); return NULL; }
+    char kp[1024];
+    const char *hp = kl_guest_path(tmpl, kp, sizeof kp);
+    char host[1024];
+    snprintf(host, sizeof host, "%s", hp);
+    if (!mkdtemp(host)) {
+        int e = errno;
+        fprintf(stderr, "  [klepton] mkdtemp(\"%s\") -> %s\n", tmpl, strerror(e));
+        kl_errno_set(e);
+        return NULL;
+    }
+    size_t tl = strlen(tmpl), hl = strlen(host);
+    if (hl >= 6 && tl >= 6) memcpy(tmpl + tl - 6, host + hl - 6, 6);
+    return tmpl;
 }

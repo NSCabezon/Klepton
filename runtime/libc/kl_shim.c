@@ -1873,8 +1873,14 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
+X(klv_roundl) X(klb_pthread_gettid_np) X(klb_faccessat)
+X(klb_mincore) X(klb_mkdtemp) X(klb_mallopt)
 X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
 X(klb_kill) X(klb_raise) X(klb_signal) X(klb_sigwait) X(klb_sigsuspend) X(klb_sigpending)
+X(klb_fstatat) X(klb_rmdir) X(klb_remove) X(klb_chmod) X(klb_chown) X(klb_lchown)
+X(klb_truncate) X(klb_mkfifo) X(klb_readlink) X(klb_symlink) X(klb_link) X(klb_utimes)
+X(klb_utime) X(klb_unlinkat) X(klb_mkdirat) X(klb_fchmodat) X(klb_fchownat)
+X(klb_readlinkat) X(klb_renameat) X(klb_symlinkat) X(klb_utimensat) X(klb_freopen)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
@@ -2251,6 +2257,22 @@ static const kl_entry g_shim[] = {
     E("kill", klb_kill), E("raise", klb_raise), E("signal", klb_signal),
     E("sigwait", klb_sigwait), E("sigsuspend", klb_sigsuspend),
     E("sigpending", klb_sigpending),
+    // The rest of the path family: translated through kl_guest_path, the Linux
+    // AT_* numbering mapped, and failures published to the guest errno slot
+    // (kl_libc.c, "the rest of the path family"). fstatat also translates the
+    // struct it writes, which a forward wrote in Darwin's layout.
+    E("fstatat", klb_fstatat), E("fstatat64", klb_fstatat),
+    E("faccessat", klb_faccessat), E("mkdtemp", klb_mkdtemp),
+    E("rmdir", klb_rmdir), E("remove", klb_remove),
+    E("chmod", klb_chmod), E("chown", klb_chown), E("lchown", klb_lchown),
+    E("truncate", klb_truncate), E("mkfifo", klb_mkfifo),
+    E("readlink", klb_readlink), E("symlink", klb_symlink), E("link", klb_link),
+    E("utimes", klb_utimes), E("utime", klb_utime),
+    E("unlinkat", klb_unlinkat), E("mkdirat", klb_mkdirat),
+    E("fchmodat", klb_fchmodat), E("fchownat", klb_fchownat),
+    E("readlinkat", klb_readlinkat), E("renameat", klb_renameat),
+    E("symlinkat", klb_symlinkat), E("utimensat", klb_utimensat),
+    E("freopen", klb_freopen),
 
     E("__klepton_unresolved", kl_unresolved),
 };

@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <signal.h>
+#include <utime.h>
 #include <setjmp.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -743,6 +744,27 @@ int klb_lstat(const char *p, bionic_stat *b) { char kp[1024]; const char *q = kl
                                                struct stat s; int r = lstat(q, &s);
                                                kl_fs_trace("lstat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
+// fstatat was a raw forward, so it wrote DARWIN's struct stat into a bionic
+// buffer and handed Darwin the Linux flag bits — AT_SYMLINK_NOFOLLOW is 0x100
+// on Linux and 0x20 here, and 0x100 is not a flag Darwin knows (EINVAL). The
+// Half-Life: Alyx launcher's faccessat self-test measured it: its faccessat is an
+// fstatat(..., AT_SYMLINK_NOFOLLOW) underneath. AT_FDCWD is -100 on Linux, -2
+// here; AT_EMPTY_PATH (0x1000) with an empty path is fstat(dirfd);
+// AT_NO_AUTOMOUNT (0x800) has nothing to do on Darwin.
+int klb_fstat(int fd, bionic_stat *b);
+int klb_fstatat(int dirfd, const char *p, bionic_stat *b, int flags) {
+    if (flags & ~(0x100 | 0x800 | 0x1000)) { errno = EINVAL; return -1; }
+    if ((flags & 0x1000) && p && !*p) return klb_fstat(dirfd, b);
+    if (dirfd == -100) dirfd = AT_FDCWD;
+    char kp[1024];
+    const char *q = kl_guest_path(p, kp, sizeof kp);
+    struct stat s;
+    int r = fstatat(dirfd, q, &s, (flags & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
+    if (r) kl_errno_set(errno);
+    kl_fs_trace("fstatat", p, NULL, r != 0);
+    if (!r) stat_to_bionic(&s, b);
+    return r;
+}
 int klb_fstat(int fd, bionic_stat *b)        { long long osz; int handled;
                                                if (kl_obbmap_fstat_size(fd, &osz, &handled), handled) {
                                                    struct stat s; memset(&s, 0, sizeof s);
@@ -1698,6 +1720,19 @@ static void kl_fs_trace(const char *op, const char *path, const char *extra, int
 }
 
 void kl_file_note(void *f, const char *path);
+// freopen has fopen's path problem and one of its own: the FILE* it is handed
+// is the GUEST's, so it has to be translated the same way every other stdio
+// entry point here does. The common use is redirecting stdout/stderr to a log,
+// which is exactly what QuakeQuest does with it.
+FILE *klb_freopen(const char *path, const char *mode, void *guest_stream) {
+    KL_GUEST_PATH(path);
+    FILE *hf = kl_host_file(guest_stream);
+    FILE *f = freopen(_p, mode, hf);
+    kl_fs_trace("freopen", path, mode, f == NULL);
+    if (f) kl_file_note(f, path);
+    return f;
+}
+
 FILE *klb_fopen(const char *path, const char *mode) {
     // hl1/cs1: the launcher UI lets the player edit commandline.txt, but the picked
     // game folder can be read-only. When KL_XASH_COMMANDLINE_FILE points at a writable
@@ -1878,6 +1913,87 @@ int klb_mkdir(const char *path, mode_t mode) {
     kl_fs_trace("mkdir", path, NULL, r != 0);
     return r;
 }
+// ---- the rest of the path family ----
+// These were raw forwards, so a guest path (/sdcard/..., /data/...) reached
+// Darwin as written: the Half-Life: Alyx launcher's directory self-test made its directories
+// through the translating mkdir and then failed all five rmdir()s of them
+// (ENOENT on the untranslated spelling). Same shape as the shims above: the
+// path goes through kl_guest_path, the call is Darwin's, and kl_fs_trace
+// publishes a failure to the guest's errno slot. The *at forms also map
+// AT_FDCWD (-100 -> -2) and the Linux AT_* flag bits, which Darwin numbers
+// differently (AT_SYMLINK_NOFOLLOW 0x100 -> 0x20, AT_REMOVEDIR 0x200 -> 0x80).
+#define KL_PATH2(a, b) char _ka[1024], _kb[1024]; \
+    const char *_pa = kl_guest_path((a), _ka, sizeof _ka); \
+    const char *_pb = kl_guest_path((b), _kb, sizeof _kb)
+static int kl_at_fd(int fd) { return fd == -100 ? AT_FDCWD : fd; }
+static int kl_at_flags(int f) {
+    int d = 0;
+    if (f & 0x100) d |= AT_SYMLINK_NOFOLLOW;
+    if (f & 0x200) d |= AT_REMOVEDIR;          // unlinkat; AT_EACCESS for faccessat
+    if (f & 0x400) d |= AT_SYMLINK_FOLLOW;     // linkat
+    return d;
+}
+int klb_rmdir(const char *p)          { KL_GUEST_PATH(p); int r = rmdir(_p); kl_fs_trace("rmdir", p, NULL, r != 0); return r; }
+int klb_remove(const char *p)         { KL_GUEST_PATH(p); int r = remove(_p); kl_fs_trace("remove", p, NULL, r != 0); return r; }
+int klb_chmod(const char *p, mode_t m) { KL_GUEST_PATH(p); int r = chmod(_p, m); kl_fs_trace("chmod", p, NULL, r != 0); return r; }
+int klb_chown(const char *p, uid_t u, gid_t g) { KL_GUEST_PATH(p); int r = chown(_p, u, g); kl_fs_trace("chown", p, NULL, r != 0); return r; }
+int klb_lchown(const char *p, uid_t u, gid_t g) { KL_GUEST_PATH(p); int r = lchown(_p, u, g); kl_fs_trace("lchown", p, NULL, r != 0); return r; }
+int klb_truncate(const char *p, off_t n) { KL_GUEST_PATH(p); int r = truncate(_p, n); kl_fs_trace("truncate", p, NULL, r != 0); return r; }
+int klb_mkfifo(const char *p, mode_t m) { KL_GUEST_PATH(p); int r = mkfifo(_p, m); kl_fs_trace("mkfifo", p, NULL, r != 0); return r; }
+ssize_t klb_readlink(const char *p, char *buf, size_t n) {
+    KL_GUEST_PATH(p); ssize_t r = readlink(_p, buf, n); kl_fs_trace("readlink", p, NULL, r < 0); return r;
+}
+int klb_symlink(const char *target, const char *linkp) {
+    // The target is the link's CONTENT: it is stored translated only when it
+    // names a guest path, so the link resolves on this side as it would there.
+    KL_PATH2(target, linkp); int r = symlink(_pa, _pb); kl_fs_trace("symlink", linkp, target, r != 0); return r;
+}
+int klb_link(const char *a, const char *b) { KL_PATH2(a, b); int r = link(_pa, _pb); kl_fs_trace("link", a, b, r != 0); return r; }
+int klb_utimes(const char *p, const struct timeval *tv) { KL_GUEST_PATH(p); int r = utimes(_p, tv); kl_fs_trace("utimes", p, NULL, r != 0); return r; }
+int klb_utime(const char *p, const void *t) {
+    // struct utimbuf is { time_t actime, modtime } on both.
+    KL_GUEST_PATH(p); int r = utime(_p, (const struct utimbuf *)t); kl_fs_trace("utime", p, NULL, r != 0); return r;
+}
+int klb_unlinkat(int fd, const char *p, int f) {
+    if (f & ~0x200) { kl_errno_set(EINVAL); return -1; }
+    KL_GUEST_PATH(p); int r = unlinkat(kl_at_fd(fd), _p, kl_at_flags(f)); kl_fs_trace("unlinkat", p, NULL, r != 0); return r;
+}
+int klb_mkdirat(int fd, const char *p, mode_t m) {
+    KL_GUEST_PATH(p); int r = mkdirat(kl_at_fd(fd), _p, m); kl_fs_trace("mkdirat", p, NULL, r != 0); return r;
+}
+int klb_fchmodat(int fd, const char *p, mode_t m, int f) {
+    KL_GUEST_PATH(p); int r = fchmodat(kl_at_fd(fd), _p, m, kl_at_flags(f & 0x100)); kl_fs_trace("fchmodat", p, NULL, r != 0); return r;
+}
+int klb_fchownat(int fd, const char *p, uid_t u, gid_t g, int f) {
+    KL_GUEST_PATH(p); int r = fchownat(kl_at_fd(fd), _p, u, g, kl_at_flags(f & 0x100)); kl_fs_trace("fchownat", p, NULL, r != 0); return r;
+}
+ssize_t klb_readlinkat(int fd, const char *p, char *buf, size_t n) {
+    KL_GUEST_PATH(p); ssize_t r = readlinkat(kl_at_fd(fd), _p, buf, n); kl_fs_trace("readlinkat", p, NULL, r < 0); return r;
+}
+int klb_renameat(int fa, const char *a, int fb, const char *b) {
+    KL_PATH2(a, b); int r = renameat(kl_at_fd(fa), _pa, kl_at_fd(fb), _pb); kl_fs_trace("renameat", a, b, r != 0); return r;
+}
+int klb_symlinkat(const char *target, int fd, const char *linkp) {
+    KL_PATH2(target, linkp); int r = symlinkat(_pa, kl_at_fd(fd), _pb); kl_fs_trace("symlinkat", linkp, target, r != 0); return r;
+}
+// utimensat: UTIME_NOW / UTIME_OMIT are ((1<<30)-1) / ((1<<30)-2) on Linux
+// and -1 / -2 here, and they ride in tv_nsec.
+int klb_utimensat(int fd, const char *p, const struct timespec *ts, int f) {
+    struct timespec t[2];
+    if (ts) {
+        for (int i = 0; i < 2; i++) {
+            t[i] = ts[i];
+            if (ts[i].tv_nsec == (1l << 30) - 1) t[i].tv_nsec = UTIME_NOW;
+            else if (ts[i].tv_nsec == (1l << 30) - 2) t[i].tv_nsec = UTIME_OMIT;
+        }
+    }
+    int r;
+    if (!p) r = futimens(fd, ts ? t : NULL);        // Linux allows a NULL path: the fd itself
+    else { KL_GUEST_PATH(p); r = utimensat(kl_at_fd(fd), _p, ts ? t : NULL, kl_at_flags(f & 0x100)); }
+    kl_fs_trace("utimensat", p ? p : "(fd)", NULL, r != 0);
+    return r;
+}
+
 int klb_unlink(const char *path) {
     KL_GUEST_PATH(path);
     int r = unlink(_p);
