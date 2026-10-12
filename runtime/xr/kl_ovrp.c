@@ -736,6 +736,12 @@ static int klovrp_headset_type(void) {
         // unimplemented Touch-path ovrp call, not yet isolated. So missioniss stays
         // on the Quest-2 default (stuck-at-menu but stable) until that crash is
         // named; test the Touch path on demand with KL_OVRP_HEADSET=8.
+        // A Fisherman's Tale (UE4) is the same story told through the product
+        // name: AInnerspacePlayerController::DetectDevices (libUE4 0x5f1ea60)
+        // compares it with exactly "Oculus Quest" for Touch controllers, then
+        // "Oculus Go", and anything else falls to head-gaze input with no hands
+        // drawn. The name follows this answer (klovrp_product_name), so such a
+        // title runs with KL_OVRP_HEADSET=8 (or a target default like Liminal's).
         const char *tgt = kl_driver_target_name();
         int dflt = (tgt && strcmp(tgt, "liminalvr") == 0)
                      ? OVRP_HEADSET_OCULUS_QUEST
@@ -1058,9 +1064,17 @@ static uint64_t klovrp_GetPredictedDisplayTime(int node, double *out) {
 // NULL is explicitly tolerated). A static string is therefore both safe and
 // required if we want the name answered at all; "Oculus Quest 2" is what the
 // real plugin returns on the device we are presenting as everywhere else.
+// It follows klovrp_headset_type: a title presented as an original Quest gets
+// that Quest's name too, or a guest that keys on the NAME (A Fisherman's
+// Tale's DetectDevices) still sees a headset it does not know.
+static const char *klovrp_product_name(void) {
+    return klovrp_headset_type() == OVRP_HEADSET_OCULUS_QUEST
+               ? "Oculus Quest" : "Oculus Quest 2";
+}
+
 static const char *klovrp_GetSystemProductName(void) {
     ovrp_hit("ovrp_GetSystemProductName");
-    return "Oculus Quest 2";
+    return klovrp_product_name();
 }
 
 // The 2-form of the same answer: ovrpResult + const char** out — real
@@ -1070,7 +1084,7 @@ static const char *klovrp_GetSystemProductName(void) {
 static uint64_t klovrp_GetSystemProductName2(const char **out) {
     ovrp_hit("ovrp_GetSystemProductName2");
     if (!out) return -1001;
-    *out = "Oculus Quest 2";
+    *out = klovrp_product_name();
     return OVRP_SUCCESS;
 }
 
