@@ -536,6 +536,7 @@ fi
 # iPhone as soon as somebody has one open for another project. (avp-play)
 UDID="${KLEPTON_SIM_UDID:-$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)}"
 if [ -n "$UDID" ]; then SIMDEST="platform=visionOS Simulator,id=$UDID"
+# (ARCHS=arm64 below: a generic destination also asks for x86_64, which the runtime has no slice for)
 elif [ -n "${KL_BUILD_ONLY:-}" ]; then SIMDEST="generic/platform=visionOS Simulator"
 else echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; fi
 
@@ -543,7 +544,7 @@ echo "[3/5] building for the simulator…"
 set +e
 xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" \
   -destination "$SIMDEST" \
-  -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" CODE_SIGNING_ALLOWED=NO build 2>&1 \
+  -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 build 2>&1 \
   | grep -E 'error:|\*\* BUILD'
 BUILD_RC=${PIPESTATUS[0]}
 set -e
