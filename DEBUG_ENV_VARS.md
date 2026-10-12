@@ -1539,6 +1539,13 @@ that reports what came due since the frontend last asked. Platform-independent
   `[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE LATCHED` — six seconds of
   cadence more than 10% off the latched period. Detection only: the guest read
   its rate once and cannot be re-told.
+- `KL_XR_SC_TRACE=N` — print the first N `xrAcquire/Wait/ReleaseSwapchainImage`
+  calls (`kl_openxr.c`): swapchain slot, thread id, newest held image before and
+  after, result, and the guest's return address. How Metro's UE5 order (one
+  image kept acquired across frames: wait, acquire-next, release) was read.
+- `KL_UE_CRITICAL_WATCH=0` — stop watching Metro's `GIsCriticalError`
+  (`kl_ue4.c`, default on for the `metro` build it was measured on): the line
+  `[ue4] GIsCriticalError was SET` names the moment a survived UE fatal fired.
 - `KL_XR_LAYERS=0` — flatten the guest's projection layers into one eye picture
   instead of compositing each as its own quad (default 1, the per-layer
   composite).
