@@ -52,6 +52,9 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// targets.py's "gl_foveation": false for a Vulkan guest, where the
     /// "Foveated rendering" setting has nothing to act on.
     let glFoveation: Bool
+    /// targets.py's "mac_stream": the Mac's stream host runs this game and a
+    /// session was verified, so the card offers "Jugar desde el Mac".
+    let macStream: Bool
     /// apktool.yml / AndroidManifest.xml from the Mac's apktool tree, base64 (empty
     /// for a guest that has none). Written beside <tree>/assets by HubPrep.
     let meta: [String: String]
@@ -2554,11 +2557,11 @@ struct HubLibraryView: View {
         #endif
     }
 
-    /// Which games the Mac can run for the headset. The host side is verified
-    /// for Alyx only (the OpenVR guest); Metro (OpenXR) has the pacing hook in
-    /// the stream host but no verified session yet, so it is not offered. The
-    /// card shows nothing new for the rest.
-    static func streamable(_ g: KLHubGameRow) -> Bool { g.target == "alyx" }
+    /// Which games the Mac can run for the headset: targets.py's per-game
+    /// "mac_stream" (Alyx, the OpenVR guest; Metro Awakening, OpenXR on Vulkan,
+    /// verified on the loopback harness to its main menu). The card shows
+    /// nothing new for the rest.
+    static func streamable(_ g: KLHubGameRow) -> Bool { g.macStream }
 
     /// The second way to play: the game runs on the Mac and streams here. It
     /// needs no game data on the headset, so it ignores the card's download
