@@ -132,6 +132,44 @@ KLEPTON_HUB_NO_GUESTS=1 KL_SKIP_GUEST=1 KLEPTON_TARGET=hub visionos/run.sh sim
                                           # library-only build for the simulator
 ```
 
+### Internal TestFlight build
+
+The hub can also be built as an App Store Connect build, for **internal**
+TestFlight testers of your own team. It is a separate app from the development
+one: give it its own bundle id (and so its own App ID, App Store Connect record
+and data container), and the development build keeps coexisting on the headset.
+
+```bash
+KLEPTON_TEAM=<team> KLEPTON_BUNDLE_ID=<your.app.id> ./build_run_vpro.sh hub --archive
+                                   # Release archive -> App Store signed .ipa in
+                                   # visionos/build/testflight/, + local checks. Uploads nothing.
+... ./build_run_vpro.sh hub --archive --upload     # ...and send it (Xcode's account)
+... make testflight [UPLOAD=1]                     # the same
+```
+
+- Version `KLEPTON_APP_VERSION` (default `0.1.0`); build number
+  `KLEPTON_APP_BUILD` (default the time, `YYYYMMDD.HHMM`, so it always grows).
+- `com.apple.developer.low-latency-streaming` is **dropped** unless
+  `KLEPTON_LOW_LATENCY=1` — it is granted per App ID, and an App ID without it
+  fails distribution signing. The two memory entitlements are always kept.
+- ExportOptions sets `testFlightInternalTestingOnly`: such a build cannot be
+  submitted for review or given to external testers (`KL_TF_INTERNAL_ONLY=0` lifts it).
+- `visionos/tf_check.py` runs on the archived app and on the exported .ipa:
+  plists and usage strings, the privacy manifest, stray files, every embedded
+  framework's Info.plist, arm64 device-only slices, signatures, entitlements,
+  the App Store profile, and the 4 GB / 500 MB-`__TEXT` size limits.
+  `--validate` adds `altool --validate-app` (needs `ASC_KEY_ID`/`ASC_ISSUER_ID`
+  and the app record).
+- No icon art is committed (it is gitignored); `mk_hub_icon.py` draws a neutral
+  one when `AppIcon-hub.solidimagestack` is missing.
+- Signing and provisioning use Xcode's signed-in account; where xcodebuild
+  cannot see it ("No Accounts" from a non-GUI shell), export `ASC_KEY_ID`,
+  `ASC_ISSUER_ID` (and `ASC_KEY_PATH`, default
+  `~/.appstoreconnect/private_keys/AuthKey_<id>.p8`) and it uses that App Store
+  Connect API key instead (Admin role, to make the profile and enable capabilities).
+- An App Store signed app cannot be installed with `devicectl`: TestFlight is
+  the way onto the headset.
+
 ## What lives where, and why
 
 |  | where | why |

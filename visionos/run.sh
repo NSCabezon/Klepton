@@ -3,6 +3,9 @@
 #
 #   ./run.sh              # the booted visionOS simulator (rung 2, dyld)
 #   ./run.sh device       # a physical Vision Pro   (rung 3, AMFI)
+#   ./run.sh archive      # an App Store Connect build for internal TestFlight:
+#                         #   Release archive + App Store export (testflight.sh).
+#                         #   Installs nothing. Use build_run_vpro.sh --archive.
 #
 # Env overrides:
 #   KLEPTON_TARGET=<name>   which guest — `python3 targets.py --list`
@@ -67,8 +70,8 @@ case "${KL_CUSTOM_LAUNCHER:-}" in 1|true|TRUE|yes|Yes|on|On) DD_SUFFIX="-launche
 # run of the app rather than a run of the gate.
 export XROS_PLATFORMS
 case "$MODE" in
-  device) XROS_PLATFORMS=xros  ;;
-  *)      XROS_PLATFORMS=xrsim ;;
+  device|archive) XROS_PLATFORMS=xros  ;;
+  *)              XROS_PLATFORMS=xrsim ;;
 esac
 
 # --- Staging: skip by default, but not blindly ------------------------------
@@ -189,11 +192,13 @@ echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*V
 # capabilities — survive); KL_REGEN_XCODEPROJ=1 regenerates it from targets.py.
 # The hub is always regenerated: its game list (and the Swift manifest generated
 # from it) must match targets.py, and KLEPTON_HUB_NO_GUESTS changes what it embeds.
-if [ "$KLT_KIND" != hub ] && [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
+# An archive always regenerates too: its version, build number and bundle id are
+# baked into the project, and a kept one would carry the previous build's.
+if [ "$KLT_KIND" != hub ] && [ "$MODE" != archive ] && [ -d "$PRODUCT.xcodeproj" ] && [ -z "${KL_REGEN_XCODEPROJ:-}" ]; then
   echo "  keeping existing $PRODUCT.xcodeproj (KL_REGEN_XCODEPROJ=1 to regenerate)"
 else
   # A device build needs a signing team; the generator stops with the fix when none is found.
-  KL_REQUIRE_TEAM="$([ "$MODE" = device ] && echo 1 || true)" python3 gen_xcodeproj.py | head -1
+  KL_REQUIRE_TEAM="$([ "$MODE" != sim ] && echo 1 || true)" python3 gen_xcodeproj.py | head -1
 fi
 # An incremental build never deletes what an earlier one embedded: a hub game this build no
 # longer carries (KLEPTON_HUB_GAMES, or its files gone) would ride along, dead weight, in the
@@ -205,6 +210,13 @@ if [ "$KLT_KIND" = hub ]; then
     case "$G" in *.*) continue ;; esac
     case " $KLT_GAMES " in *" $G "*) ;; *) rm -rf "$D" ;; esac
   done
+fi
+
+# The App Store build: archive + export from the project just generated, with
+# nothing installed or launched. testflight.sh reads PRODUCT / BUNDLE_ID / KLT_*.
+if [ "$MODE" = archive ]; then
+  export PRODUCT BUNDLE_ID KLT_NAME
+  exec ./testflight.sh
 fi
 
 if [ "$MODE" = "device" ]; then
