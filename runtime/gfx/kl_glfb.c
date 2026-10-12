@@ -3024,6 +3024,58 @@ static void klfb_FramebufferTextureLayer(uint32_t target, uint32_t attachment,
 #define GL_TEXTURE_SWIZZLE_R 0x8E42
 #define GL_TEXTURE_SWIZZLE_A 0x8E45
 
+// ---- KL_GLFB_NOMIP: sample level 0 only ------------------------------------
+//
+// KL_GLFB_NOMIP=1 demotes every MIPMAP min filter to its non-mipmapped base
+// (LINEAR_MIPMAP_* -> LINEAR, NEAREST_MIPMAP_* -> NEAREST), on textures and on
+// sampler objects both, so no sample in the run can come from anywhere but
+// level 0.
+//
+// It exists for a title that reads a mip level it should not. Tetris Effect's
+// well backdrop on this path is a fine particle field drawn as one magnifying
+// quad; something drives its LOD far above 0, and at its top levels the texture
+// has collapsed to its own average — a flat dark-blue fill over the scene. With
+// level 0 forced the backdrop renders as it does on a Quest, and the steady-
+// state frame time was unchanged on device. Why a magnifying draw consults the
+// minification chain at all is not settled, which is why this is a knob and not
+// a rule: forcing level 0 everywhere costs minification aliasing and texture
+// bandwidth across the whole title. Default off.
+static int klfb_nomip(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_NOMIP", 0);
+    return on;
+}
+static int klfb_nomip_filter(uint32_t pname, int32_t param) {
+    static unsigned said;
+    if (pname != 0x2801 /* TEXTURE_MIN_FILTER */ || !klfb_nomip()) return param;
+    int32_t out = param;
+    if (param == 0x2700 || param == 0x2702) out = 0x2600;      // NEAREST_MIPMAP_*
+    if (param == 0x2701 || param == 0x2703) out = 0x2601;      // LINEAR_MIPMAP_*
+    if (out != param && said++ < 3)
+        fprintf(stderr, "  [glfb] NOMIP: min filter 0x%04x -> 0x%04x (level 0 only; "
+                        "KL_GLFB_NOMIP=0 restores the guest's choice)\n",
+                (unsigned)param, (unsigned)out);
+    return out;
+}
+
+// The other spellings of the min-filter write. They forward unchanged unless
+// KL_GLFB_NOMIP is on.
+static void (*g_real_TexParameterf)(uint32_t, uint32_t, float);
+static void klfb_TexParameterf(uint32_t target, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_TexParameterf) g_real_TexParameterf(target, pname, param);
+}
+static void (*g_real_SamplerParameteri)(uint32_t, uint32_t, int32_t);
+static void klfb_SamplerParameteri(uint32_t sampler, uint32_t pname, int32_t param) {
+    param = klfb_nomip_filter(pname, param);
+    if (g_real_SamplerParameteri) g_real_SamplerParameteri(sampler, pname, param);
+}
+static void (*g_real_SamplerParameterf)(uint32_t, uint32_t, float);
+static void klfb_SamplerParameterf(uint32_t sampler, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_SamplerParameterf) g_real_SamplerParameterf(sampler, pname, param);
+}
+
 // ---- depth textures sampled with LINEAR, which ES leaves UNDEFINED ---------
 //
 // A depth texture is not filterable unless the driver says so. ES 3.0 §3.8.13:
@@ -3138,6 +3190,7 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
     // those calls have to land on the same object the bind did.
     if (target == 0x8D65 /* TEXTURE_EXTERNAL_OES */) target = 0x0DE1;
+    param = klfb_nomip_filter(pname, param);
     // The depth-texture completeness rule, which needs to know WHICH texture
     // is bound rather than only what was asked for.
     if (target == 0x0DE1 /* TEXTURE_2D */ && a_glGetIntegerv &&
@@ -8381,6 +8434,10 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
     // the other way a program gets linked, and the only one that was silent
     {"glProgramBinary", (void *)klfb_ProgramBinary, (void **)&g_real_ProgramBinary},
+    // the min-filter writes KL_GLFB_NOMIP can demote (glTexParameteri has its own row)
+    {"glTexParameterf", (void *)klfb_TexParameterf, (void **)&g_real_TexParameterf},
+    {"glSamplerParameteri", (void *)klfb_SamplerParameteri, (void **)&g_real_SamplerParameteri},
+    {"glSamplerParameterf", (void *)klfb_SamplerParameterf, (void **)&g_real_SamplerParameterf},
     // the texture storage census — which format the AGX abort follows
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
