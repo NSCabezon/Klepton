@@ -114,19 +114,35 @@ ENTITLEMENTS_FILE = "Klepton.entitlements"
 OPTIONAL_ENTITLEMENTS_DEFAULT = "0"
 _dropped = [k for k, env in OPTIONAL_ENTITLEMENTS.items()
             if (os.environ.get(env) or OPTIONAL_ENTITLEMENTS_DEFAULT) == "0"]
-if ENTITLEMENTS and _dropped:
+
+# iCloud Documents for the hub's save backups (Sources/KleptonICloudSaves.swift): off unless
+# KLEPTON_ICLOUD=1, hub only. On, the generated copy also gets the iCloud keys for the container
+# iCloud.<bundle id> (computed here from KLEPTON_BUNDLE_ID, never written into a tracked file) and
+# Info-hub.plist declares it (NSUbiquitousContainers, below). The App ID must have the iCloud
+# capability with that container; automatic signing adds both on a device build. Off, the code is
+# still compiled and says "iCloud not available" (url(forUbiquityContainerIdentifier:) is nil).
+ICLOUD = KLT["kind"] == "hub" and os.environ.get("KLEPTON_ICLOUD", "0") not in ("", "0")
+ICLOUD_CONTAINER = f"iCloud.{BUNDLE_ID}"
+_icloud_keys = ({
+    "com.apple.developer.icloud-container-identifiers": [ICLOUD_CONTAINER],
+    "com.apple.developer.ubiquity-container-identifiers": [ICLOUD_CONTAINER],
+    "com.apple.developer.icloud-services": ["CloudDocuments"],
+} if ICLOUD else {})
+if (ENTITLEMENTS and _dropped) or _icloud_keys:
     import plistlib
     src = pathlib.Path(__file__).with_name("Klepton.entitlements")
-    d = plistlib.loads(src.read_bytes())
+    # KLEPTON_ENTITLEMENTS=0 with KLEPTON_ICLOUD=1: the iCloud keys alone.
+    d = plistlib.loads(src.read_bytes()) if ENTITLEMENTS else {}
     for k in _dropped:
         d.pop(k, None)
+    d.update(_icloud_keys)
     out = pathlib.Path(__file__).with_name("build") / "Klepton-filtered.entitlements"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(plistlib.dumps(d))
     ENTITLEMENTS_FILE = "build/Klepton-filtered.entitlements"
 
 ENTITLEMENTS_SETTING = (f"\t\t\t\tCODE_SIGN_ENTITLEMENTS = {ENTITLEMENTS_FILE};\n"
-                        if ENTITLEMENTS else "")
+                        if ENTITLEMENTS or ICLOUD else "")
 # The HUB (targets.py kind "hub") embeds several guests at once, ALL flat in the
 # .app's Frameworks/ like a single-target build's: App Store validation rejects
 # anything but a framework or a dylib directly in Frameworks/ (ITMS-90432), so the
@@ -351,6 +367,15 @@ if METASTORE and not os.path.isfile(os.path.join(HERE, METASTORE_PKG, "Package.s
     print(f"!! hub: no MetaStore package at {os.path.join(HERE, METASTORE_PKG)} "
           "(set KL_METASTORE_PKG) - the Meta store source is left out", file=sys.stderr)
     METASTORE = False
+# The save table and the backup vault (Sources/KleptonICloudSaves.swift): the SaveKit package, a
+# sibling of SteamDepot in packages/, shared with the Mac app. Hub only; KL_SAVEKIT_PKG overrides
+# the path (relative to visionos/). Without it the hub has no iCloud save backups.
+SAVEKIT_PKG = os.environ.get("KL_SAVEKIT_PKG", "../../packages/SaveKit")
+SAVEKIT = IS_HUB
+if SAVEKIT and not os.path.isfile(os.path.join(HERE, SAVEKIT_PKG, "Package.swift")):
+    print(f"!! hub: no SaveKit package at {os.path.join(HERE, SAVEKIT_PKG)} "
+          "(set KL_SAVEKIT_PKG) - the iCloud save backups are left out", file=sys.stderr)
+    SAVEKIT = False
 if STEAMDEPOT:
     swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
     # ...and the guest's Steamworks stand-in answered from the real account
@@ -368,6 +393,9 @@ if IS_HUB:
     swift.append({"name": "KleptonHubPrep.swift", "ref": _fixed("HUBPREPF"), "bld": _fixed("HUBPREPB")})
     # Steam Cloud saves per game (experimental, off by default); compiled out without SteamDepot.
     swift.append({"name": "KleptonCloudSaves.swift", "ref": _fixed("HUBCLOUDF"), "bld": _fixed("HUBCLOUDB")})
+    # iCloud backups of the Meta games' saves (SaveKit's SaveVault); compiled out without SaveKit,
+    # and inert ("iCloud not available") in a build without KLEPTON_ICLOUD=1.
+    swift.append({"name": "KleptonICloudSaves.swift", "ref": _fixed("HUBICLOUDF"), "bld": _fixed("HUBICLOUDB")})
     # The closed catalog of games and their store sources (Steam / Meta), and the Meta source
     # itself (compiled out without the MetaStore package).
     swift.append({"name": "KleptonCatalog.swift", "ref": _fixed("HUBCATF"), "bld": _fixed("HUBCATB")})
@@ -460,6 +488,8 @@ if STEAMDEPOT:
     PACKAGES.append(("SteamDepot", STEAMDEPOT_PKG, PKG_REF, PKG_PROD, B_PKG))
 if METASTORE:
     PACKAGES.append(("MetaStore", METASTORE_PKG, _fixed("MSPKGREF"), _fixed("MSPKGPROD"), _fixed("MSPKGBLD")))
+if SAVEKIT:
+    PACKAGES.append(("SaveKit", SAVEKIT_PKG, _fixed("SKPKGREF"), _fixed("SKPKGPROD"), _fixed("SKPKGBLD")))
 PKG_BUILDFILE = "".join(f'\t\t{b} /* {n} in Frameworks */ = {{isa = PBXBuildFile; productRef = {prod}; }};\n'
                         for n, _, _, prod, b in PACKAGES)
 PKG_FRAMEWORK = "".join(f'\t\t\t\t{b} /* {n} in Frameworks */,\n' for n, _, _, _, b in PACKAGES)
@@ -595,6 +625,13 @@ if IS_HUB:
     import plistlib
     _ip = plistlib.loads(pathlib.Path(__file__).with_name("Info.plist").read_bytes())
     _ip["INAlternativeAppNames"] = [{"INAlternativeAppName": n} for n in HUB_ALT_NAMES]
+    # KLEPTON_ICLOUD=1: the iCloud Drive container the save backups go to (see ICLOUD above).
+    if ICLOUD:
+        _ip["NSUbiquitousContainers"] = {ICLOUD_CONTAINER: {
+            "NSUbiquitousContainerIsDocumentScopePublic": True,
+            "NSUbiquitousContainerName": "AVP Game Hub",
+            "NSUbiquitousContainerSupportedFolderLevels": "Any",
+        }}
     _out = pathlib.Path(__file__).with_name("build") / "Info-hub.plist"
     _out.parent.mkdir(parents=True, exist_ok=True)
     _out.write_bytes(plistlib.dumps(_ip))
@@ -976,13 +1013,18 @@ def main():
     # one. A summary that contradicts what went into the pbxproj is worse than
     # no summary — it is the line you would check to rule the filter out.
     print(f"  CODE_SIGN_ENTITLEMENTS = "
-          f"{ENTITLEMENTS_FILE if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}"
+          f"{ENTITLEMENTS_FILE if ENTITLEMENTS or ICLOUD else '(none - KLEPTON_ENTITLEMENTS=0)'}"
           + (f"  (dropped: {', '.join(_dropped)})" if ENTITLEMENTS and _dropped else ""))
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
+    if IS_HUB:
+        print(f"  iCloud save backups       = "
+              + ("on (KLEPTON_ICLOUD=1: iCloud.<bundle id>, CloudDocuments)" if ICLOUD else "off (KLEPTON_ICLOUD=1 to enable)"))
     if STEAMDEPOT:
         print(f"  Swift package SteamDepot: {STEAMDEPOT_PKG} (in-app Steam content download)")
     if METASTORE:
         print(f"  Swift package MetaStore: {METASTORE_PKG} (in-app Meta store download)")
+    if SAVEKIT:
+        print(f"  Swift package SaveKit: {SAVEKIT_PKG} (save backups in iCloud)")
     if IS_HUB:
         for game, libs in GUEST_SETS:
             print(f"  hub game {game:<14} -> Frameworks/{game}__*.framework: "

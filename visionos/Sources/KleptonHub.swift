@@ -28,6 +28,9 @@ import SteamDepot
 #if canImport(MetaStore)
 import MetaStore
 #endif
+#if canImport(SaveKit)
+import SaveKit
+#endif
 
 /// One game the hub carries (generated from targets.py; see gen_xcodeproj.py).
 struct KLHubGameRow: Identifiable, Hashable {
@@ -1691,6 +1694,9 @@ struct HubGameSettingsView: View {
                 #if canImport(SteamDepot)
                 KLCloudSaveSection(target: game.target)
                 #endif
+                #if canImport(SaveKit)
+                KLICloudSaveSection(target: game.target)
+                #endif
 
                 if let onVerify {
                     Section {
@@ -2262,6 +2268,10 @@ struct HubLibraryView: View {
     @ObservedObject private var cloud = KLCloudSaveModel.shared
     @MainActor private static var openedOnce = false
     #endif
+    #if canImport(SaveKit)
+    @ObservedObject private var icloud = KLICloudSaveModel.shared
+    @MainActor private static var icloudOpenedOnce = false
+    #endif
     /// The Macs advertising the stream service, live while the library is up.
     @StateObject private var macs = KLStreamBrowser()
     @State private var detail: String?
@@ -2304,6 +2314,9 @@ struct HubLibraryView: View {
         // when the hub comes back to the front, not only at launch.
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { model.reimportTokens() }
+            #if canImport(SaveKit)
+            if phase == .active, Self.icloudOpenedOnce { KLICloudSaveModel.shared.foregrounded() }
+            #endif
         }
         // No game has booted: nothing to tear down on backgrounding, and exiting
         // would kill a download. HubLaunch.select hands this back.
@@ -2318,6 +2331,10 @@ struct HubLibraryView: View {
             // Once per app open: a game session ends by closing the app, so this is "after quit" —
             // where a two-way sync sends that session's saves up.
             if !Self.openedOnce { Self.openedOnce = true; KLCloudSaveModel.shared.syncAll(why: "app open") }
+            #endif
+            #if canImport(SaveKit)
+            // Same moment for the iCloud backups of the Meta games (KleptonICloudSaves.swift).
+            if !Self.icloudOpenedOnce { Self.icloudOpenedOnce = true; KLICloudSaveModel.shared.uploadAll(why: "app open") }
             #endif
             macs.start()
         }
@@ -2416,10 +2433,20 @@ struct HubLibraryView: View {
         // Steam Cloud saves (off unless turned on for this game): pulled in before the game's
         // files are prepared, bounded, and finished or cancelled before boot (KleptonCloudSaves.swift).
         model.checkOwnership(target) {
-            KLCloudSaveModel.shared.syncBeforePlay(target) { model.prepare(target) { onPlay(target) } }
+            KLCloudSaveModel.shared.syncBeforePlay(target) { restoreThenPrepare(target) }
         }
         #else
-        model.checkOwnership(target) { model.prepare(target) { onPlay(target) } }
+        model.checkOwnership(target) { restoreThenPrepare(target) }
+        #endif
+    }
+
+    /// iCloud backups (a Meta game with no saves on this headset gets its newest backup back,
+    /// bounded; KleptonICloudSaves.swift), then the game's files, then boot.
+    private func restoreThenPrepare(_ target: String) {
+        #if canImport(SaveKit)
+        KLICloudSaveModel.shared.restoreBeforePlay(target) { model.prepare(target) { onPlay(target) } }
+        #else
+        model.prepare(target) { onPlay(target) }
         #endif
     }
 
@@ -2758,6 +2785,11 @@ struct HubLibraryView: View {
                 Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1).lineLimit(1)
             }
             #endif
+            #if canImport(SaveKit)
+            if unavailable == nil, model.playBlock[g.target] == nil, let c = klICloudSaveCardLine(g.target) {
+                Label(c.0, systemImage: "icloud").font(.callout).foregroundStyle(c.1).lineLimit(2)
+            }
+            #endif
             if !g.bundled {
                 Text(klHubNoGuests
                      ? klL("This build carries no game code (library-only build).",
@@ -2815,11 +2847,14 @@ struct HubLibraryView: View {
 
     /// A cloud-save sync for this game is running (Play waits for it).
     private func cloudBusy(_ target: String) -> Bool {
+        var busy = false
         #if canImport(SteamDepot)
-        return cloud.running.contains(target)
-        #else
-        return false
+        busy = busy || cloud.running.contains(target)
         #endif
+        #if canImport(SaveKit)
+        busy = busy || icloud.working[target] != nil
+        #endif
+        return busy
     }
 
     /// Which games the Mac can run for the headset: targets.py's per-game

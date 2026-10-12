@@ -158,6 +158,10 @@ KLEPTON_TEAM=<team> KLEPTON_BUNDLE_ID=<your.app.id> ./build_run_vpro.sh hub --ar
 - `com.apple.developer.low-latency-streaming` is **dropped** unless
   `KLEPTON_LOW_LATENCY=1` — it is granted per App ID, and an App ID without it
   fails distribution signing. The two memory entitlements are always kept.
+- The iCloud entitlements (`iCloud.<bundle id>`, CloudDocuments) and the hub's
+  `NSUbiquitousContainers` are added only with `KLEPTON_ICLOUD=1` (iCloud backups
+  of the Meta games' saves, `Sources/KleptonICloudSaves.swift`); the App ID needs
+  the iCloud capability with that container.
 - ExportOptions sets `testFlightInternalTestingOnly`: such a build cannot be
   submitted for review or given to external testers (`KL_TF_INTERNAL_ONLY=0` lifts it).
 - `visionos/tf_check.py` runs on the archived app and on the exported .ipa:
