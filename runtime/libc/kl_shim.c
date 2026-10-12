@@ -1873,6 +1873,7 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
+X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
@@ -2238,6 +2239,13 @@ static const kl_entry g_shim[] = {
     E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
     E("mallctlbymib", kl_mallctlbymib),
     E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
+
+    // ---- libc and pthread surface that cannot ride the generated table ----
+    // Barriers are a real implementation (kl_pthread.c): Darwin has no
+    // pthread_barrier_t to forward to. QuakeQuest parks renderer workers on one.
+    E("pthread_barrier_init", klb_pthread_barrier_init),
+    E("pthread_barrier_wait", klb_pthread_barrier_wait),
+    E("pthread_barrier_destroy", klb_pthread_barrier_destroy),
 
     E("__klepton_unresolved", kl_unresolved),
 };

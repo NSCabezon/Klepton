@@ -46,36 +46,90 @@
 //   pthread_mutex_t    40 B / 4    (int32_t[10])
 //   pthread_cond_t     48 B / 4    (int32_t[12])
 //   pthread_rwlock_t   56 B / 4    (int32_t[14])
-#define KL_MAX_SYNC 65536
+// The side table is CHUNKED and grows on demand: a fixed directory of
+// pointers to fixed-size chunks, each allocated on first use and never moved
+// or freed, so a slot index (the only thing guest storage holds) and any host
+// pointer read out of a slot stay valid for the life of the process. It used
+// to be a flat static [65536] that aborted when full. Init no longer recycles
+// the slot index it finds in guest storage (see klb_pthread_barrier_init: an
+// engine that memmoves arrays leaves a LIVE index behind in the freed block),
+// so a re-init without destroy leaks its slot by design — and Deadpool VR's
+// Unreal 4.27 runtime did ~5 such re-inits a second, which reaches 65536 in
+// 3-4 hours of play. Cost now: 32 KB of
+// directory per kind up front, then 48 KB per 4096 slots actually used
+// (pointer + free-list word each). The hard ceiling is 2^24 slots, ~3 days of
+// that churn; a log at each power of two past 65536 shows the climb long before.
+#define KL_SYNC_OLD_CEILING 65536u
+#define KL_SYNC_CHUNK_BITS  12
+#define KL_SYNC_CHUNK       (1u << KL_SYNC_CHUNK_BITS)
+#define KL_SYNC_DIR         4096u
+#define KL_MAX_SYNC         (KL_SYNC_CHUNK * KL_SYNC_DIR)      /* 2^24 */
+// Element `idx` of a chunked array; allocates (zeroed) the chunk on first
+// touch. The loser of a racing allocation frees its copy and uses the winner's.
+static void *kl_sync_cell(_Atomic(void *) *dir, uint32_t idx, size_t elem) {
+    _Atomic(void *) *d = &dir[idx >> KL_SYNC_CHUNK_BITS];
+    char *c = atomic_load_explicit(d, memory_order_acquire);
+    if (!c) {
+        char *mine = calloc(KL_SYNC_CHUNK, elem);
+        if (!mine) {
+            fprintf(stderr, "  [klb] FATAL: out of memory growing the sync side table "
+                    "(slot %u)\n", idx);
+            abort();
+        }
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(d, &expect, mine)) c = mine;
+        else { free(mine); c = expect; }
+    }
+    return c + (size_t)(idx & (KL_SYNC_CHUNK - 1)) * elem;
+}
+static void kl_sync_grew(const char *name, uint32_t mine) {
+    if (mine >= KL_MAX_SYNC) {
+        fprintf(stderr, "  [klb] FATAL: sync side table %s is full (%u slots, ~%u MB); "
+                "something is leaking a slot per call far faster than any guest "
+                "observed so far — see the stale-init counters\n",
+                name, KL_MAX_SYNC, (unsigned)((KL_MAX_SYNC * 12ull) >> 20));
+        abort();
+    }
+    if (mine >= KL_SYNC_OLD_CEILING && (mine & (mine - 1)) == 0)
+        fprintf(stderr, "  [klb] sync side table %s grew past %u slots (the old fixed "
+                "ceiling was %u; leaked stale-init slots are the usual cause)\n",
+                name, mine, KL_SYNC_OLD_CEILING);
+}
 // Table slots recycle: with the JNI pool leak fixed, long runs otherwise die
 // here — Unity creates and destroys a mutex or two per frame, and a leaked
 // slot per destroy is 65536 creates at ~frame 40k (observed). The kind object
 // behind a recycled slot is replaced, not shared; the old one leaks (a
 // destroy is the guest saying nobody holds it).
 #define SYNC_TABLE(kind, tab, count, init_expr)                                  \
-    static kind *tab[KL_MAX_SYNC];                                               \
+    static _Atomic(void *) tab##_dir[KL_SYNC_DIR];                               \
     static _Atomic uint32_t count = 1;              /* 0 means uninitialised */  \
-    static uint32_t tab##_free[KL_MAX_SYNC];                                     \
+    static _Atomic(void *) tab##_free_dir[KL_SYNC_DIR];                          \
     static _Atomic uint32_t tab##_nfree;                                         \
+    static kind **tab##_at(uint32_t i) {                                         \
+        return (kind **)kl_sync_cell(tab##_dir, i, sizeof(kind *));              \
+    }                                                                            \
+    static uint32_t *tab##_free_at(uint32_t i) {                                 \
+        return (uint32_t *)kl_sync_cell(tab##_free_dir, i, sizeof(uint32_t));    \
+    }                                                                            \
     static kind *tab##_get(void *g) {                                            \
         _Atomic uint32_t *slot = (_Atomic uint32_t *)(g);                        \
         uint32_t idx = atomic_load(slot);                                        \
-        if (idx) return tab[idx];                                                \
+        if (idx) return *tab##_at(idx);                                          \
         kind *fresh = malloc(sizeof *fresh);                                     \
         init_expr;                                                               \
         uint32_t mine;                                                           \
         uint32_t nf = atomic_load(&tab##_nfree);                                 \
         if (nf && atomic_compare_exchange_strong(&tab##_nfree, &nf, nf - 1))     \
-            mine = tab##_free[nf - 1];                                           \
+            mine = *tab##_free_at(nf - 1);                                       \
         else {                                                                   \
             mine = atomic_fetch_add(&count, 1);                                  \
-            if (mine >= KL_MAX_SYNC) abort();                                    \
+            kl_sync_grew(#tab, mine);                                            \
         }                                                                        \
-        tab[mine] = fresh;                                                       \
+        *tab##_at(mine) = fresh;                                                 \
         uint32_t expect = 0;                                                     \
         if (!atomic_compare_exchange_strong(slot, &expect, mine)) {              \
             /* lost the race; leak this slot rather than free a live object */   \
-            return tab[expect];                                                  \
+            return *tab##_at(expect);                                            \
         }                                                                        \
         return fresh;                                                            \
     }                                                                            \
@@ -84,7 +138,7 @@
         uint32_t idx = atomic_exchange(slot, 0);                                 \
         if (!idx || idx >= count) return;                                        \
         uint32_t nf = atomic_fetch_add(&tab##_nfree, 1);                         \
-        if (nf < KL_MAX_SYNC) tab##_free[nf] = idx;                              \
+        if (nf < KL_MAX_SYNC) *tab##_free_at(nf) = idx;                          \
     }
 
 // Rwlocks are not on this table: see the rwl_entry map below. Refusing to
@@ -1945,5 +1999,110 @@ int klb_sem_getvalue(int *s, int *out) {
     if (!k) { errno = EINVAL; return -1; }
     int v = atomic_load(&k->count);
     *out = v > 0 ? v : 0;
+    return 0;
+}
+
+// ---------- barriers: nothing to forward to ----------
+//
+// Every other kind in this file wraps a Darwin object of the same name. Barriers
+// have none: POSIX makes them optional (_POSIX_BARRIERS) and Apple never shipped
+// them, so `pthread_barrier_t` does not exist in the host headers and the object
+// itself has to be built here out of a mutex and a condition variable.
+//
+// QuakeQuest is the target that needs them (its renderer parks worker threads on
+// one); Beat Saber never calls a barrier, which is why this was absent until now.
+//
+// **The generation counter is the whole construction.** A barrier that only
+// counted arrivals lets a thread that clears the barrier, loops, and arrives
+// again be counted into the round that is still draining — the second round then
+// trips early and the slow threads from the first are never released. So waiters
+// block on the *generation* they arrived in rather than on the count, and the
+// releasing thread bumps it exactly once under the lock.
+//
+// Guest storage is bionic's pthread_barrier_t (32 B, zero-initialised); the
+// SYNC_TABLE slot index lives in its first four bytes like every other kind here.
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    unsigned        threshold;   // arrivals needed to release
+    unsigned        count;       // arrivals so far this generation
+    unsigned        generation;  // bumped once per release
+} kl_barrier;
+
+static void kl_barrier_fresh(kl_barrier *b) {
+    pthread_mutex_init(&b->m, NULL);
+    pthread_cond_init(&b->c, NULL);
+    b->threshold = b->count = b->generation = 0;
+}
+
+SYNC_TABLE(kl_barrier, g_bar, g_bar_n, kl_barrier_fresh(fresh))
+
+// bionic returns this to exactly one waiter per round; it is -1 there, and
+// Darwin has no spelling for it because it has no barriers.
+#define KLB_BARRIER_SERIAL_THREAD (-1)
+
+// init takes a FRESH slot and never recycles what the guest storage holds —
+// the rule rwlocks needed first (a Deadpool VR freeze: Unreal relocates arrays
+// bitwise, and two live rwlocks ended up on one host object). A non-zero word
+// in the storage is usually NOT this
+// barrier's own earlier slot: it is malloc garbage, or the stale index left in
+// a block that was memmove'd elsewhere and freed without destroy, and the moved
+// copy still owns that slot. Recycling it at init put a live slot on the free
+// list, and the very next get (this one) popped it straight back — two live
+// guest barriers on one kl_barrier, whose threshold/count this init then reset
+// under the other's waiters. The cost is a leaked slot on a genuine re-init
+// without destroy; destroy still recycles.
+static _Atomic unsigned g_bar_stale_inits;
+unsigned kl_pthread_bar_stale_inits(void) { return atomic_load(&g_bar_stale_inits); }
+int klb_pthread_barrier_init(void *b, const void *attr, unsigned count) {
+    (void)attr;                                   // process-shared is the only
+    if (!b || count == 0) return EINVAL;          // attribute, and we are one process
+    uint32_t old = atomic_exchange((_Atomic uint32_t *)b, 0);
+    if (old) {
+        unsigned n = atomic_fetch_add(&g_bar_stale_inits, 1);
+        if (n < 4 || (n & (n - 1)) == 0)
+            fprintf(stderr, "  [klb] barrier init over storage already holding slot %u "
+                    "(guest %p, from %p): NOT recycled — a fresh slot instead "
+                    "(%u such init(s) so far; same rule as rwlock init)\n", old, b,
+                    __builtin_return_address(0), n + 1);
+    }
+    kl_barrier *kb = g_bar_get(b);
+    pthread_mutex_lock(&kb->m);
+    kb->threshold  = count;
+    kb->count      = 0;
+    kb->generation = 0;
+    pthread_mutex_unlock(&kb->m);
+    return 0;
+}
+
+int klb_pthread_barrier_wait(void *b) {
+    if (!b) return EINVAL;
+    kl_barrier *kb = g_bar_get(b);
+    pthread_mutex_lock(&kb->m);
+    // A barrier the guest waits on without initialising: threshold 0 would make
+    // every arrival the last one AND never release anybody, depending on which
+    // way the comparison fell. Treat it as a barrier of one — the guest is
+    // already wrong, and a silent hang here is far harder to read than a
+    // barrier that simply does not block.
+    if (kb->threshold == 0) kb->threshold = 1;
+    unsigned gen = kb->generation;
+    if (++kb->count >= kb->threshold) {
+        kb->count = 0;
+        kb->generation++;
+        pthread_cond_broadcast(&kb->c);
+        pthread_mutex_unlock(&kb->m);
+        return KLB_BARRIER_SERIAL_THREAD;
+    }
+    // Loop on the generation, not on a flag: pthread_cond_wait may wake
+    // spuriously, and the release is edge-triggered.
+    while (gen == kb->generation)
+        pthread_cond_wait(&kb->c, &kb->m);
+    pthread_mutex_unlock(&kb->m);
+    return 0;
+}
+
+int klb_pthread_barrier_destroy(void *b) {
+    if (!b) return EINVAL;
+    g_bar_recycle(b);
     return 0;
 }
