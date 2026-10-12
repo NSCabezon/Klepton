@@ -82,8 +82,8 @@ for NAME in $LIBS; do
   FWNAME=$(printf '%s' "$NAME" | tr '+' 'x')
   for PLAT in $PLATS; do
     case "$PLAT" in
-      xros)        KLPLAT=visionos    ;;
-      xrsimulator) KLPLAT=visionossim ;;
+      xros)        KLPLAT=visionos;    BPLAT=XROS          ;;
+      xrsimulator) KLPLAT=visionossim; BPLAT=XRSimulator ;;
     esac
     FW="build/guest/$KLT_NAME/$PLAT/$FWNAME.framework"
     mkdir -p "$FW"
@@ -93,11 +93,14 @@ for NAME in $LIBS; do
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>$FWNAME</string>
   <key>CFBundleIdentifier</key><string>dev.klepton.guest.$ID_NAME</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>$FWNAME</string>
   <key>CFBundlePackageType</key><string>FMWK</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>$BPLAT</string></array>
   <key>CFBundleVersion</key><string>1</string>
   <key>MinimumOSVersion</key><string>26.0</string>
 </dict></plist>
@@ -111,7 +114,7 @@ EOF
   xcodebuild -create-xcframework "${FWARGS[@]}" \
       -output "$OUT/$NAME.xcframework" > /dev/null
   printf '  %-22s %s bytes\n' "$NAME.xcframework" \
-      "$(stat -f%z "build/guest/$KLT_NAME/$FIRST_PLAT/$NAME.framework/$NAME")"
+      "$(stat -f%z "build/guest/$KLT_NAME/$FIRST_PLAT/$FWNAME.framework/$FWNAME")"
 done
 
 echo "[mkguest] $KLT_NAME done -> $OUT/"
