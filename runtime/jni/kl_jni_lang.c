@@ -147,6 +147,12 @@ const klj_binding klj_bind_lang[] = {
 
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
+    // The 1-arg form, and the same again as Unity's AndroidJavaClass spells it
+    // when C# asks CallStatic<AndroidJavaObject>("forName", name): the return
+    // type in the signature is the generic argument's, not Class. Arizona
+    // Sunshine reaches the second through ReflectionHelper.getMethodID.
+    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", klj_Class_forName},
+    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Class_forName},
     {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
     // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/jni/kl_jni_lang.c
     // The same loader and the same lookup reached the way native SDKs do it:
