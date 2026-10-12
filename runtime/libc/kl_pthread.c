@@ -211,11 +211,36 @@ static unsigned mtx_hash(uintptr_t a) {
     return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> (64 - MTX_MAP_BITS));
 }
 
+// KL_MUTEX_POLICY=fairshare hands a guest mutex to its waiter on unlock
+// instead of Darwin's default first-fit, where the unlocking thread that
+// immediately re-locks wins the race nearly every time. Radical's radLoad
+// (The Simpsons: Hit & Run) runs its loader on a second thread and shares ONE
+// mutex with the game thread as a baton -- `Unlock(); Sleep(0); Lock();` on
+// both sides -- so under first-fit the baton changes hands about once per
+// frame and a 1.4 MB zone takes 2+ s to stream (the P3D loader logged
+// "Starved for 79 frames, 1250 ms" on a 192 KB block whose fread took under
+// 10 ms). Fair handoff is what bionic's futex wake gave that code on the
+// Quest. Off unless the environment asks; `firstfit` is the A/B.
+#ifndef _PTHREAD_MUTEX_POLICY_FAIRSHARE
+#define _PTHREAD_MUTEX_POLICY_FAIRSHARE 1
+#endif
+static int mtx_policy_fairshare(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = kl_env_str("KL_MUTEX_POLICY", NULL);
+        on = (s && !strcmp(s, "fairshare")) ? 1 : 0;
+        if (on) fprintf(stderr, "  [thr] guest mutexes use the FAIRSHARE policy "
+                                "(KL_MUTEX_POLICY=firstfit is the A/B)\n");
+    }
+    return on;
+}
 static pthread_mutex_t *mtx_make(void) {
     pthread_mutex_t *fresh = malloc(sizeof *fresh);
     if (!fresh) return NULL;
     pthread_mutexattr_t a; pthread_mutexattr_init(&a);
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    if (mtx_policy_fairshare())
+        pthread_mutexattr_setpolicy_np(&a, _PTHREAD_MUTEX_POLICY_FAIRSHARE);
     pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
     return fresh;
 }
