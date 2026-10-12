@@ -1790,15 +1790,20 @@ struct HubLibraryView: View {
         }
     }
 
+    // Two rows: the title with Settings, then status, accounts and actions. On one row the
+    // actions ran out of width while "Checking library…" showed and "Download all" was cut.
     private var header: some View {
-        HStack(alignment: .center, spacing: 16) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("AVP Game Hub").font(.extraLargeTitle2.bold())
-                Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 16) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("AVP Game Hub").font(.extraLargeTitle2.bold())
+                    Text(klL("Library", "Biblioteca")).font(.title).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
+                    .font(.footnote).fixedSize()
             }
-            Spacer()
-            // Right side on one centred row: the library check first (left of the
-            // accounts), then the accounts, then the actions.
+            // Status first, then the accounts, then the actions.
             HStack(alignment: .center, spacing: 12) {
                 if model.checking || model.metaChecking {
                     HStack(spacing: 8) {
@@ -1825,11 +1830,11 @@ struct HubLibraryView: View {
                 #endif
                 if !(model.checking || model.metaChecking), model.checkError == nil, !model.metaCheckFailed,
                    model.account != nil {
-                    Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }.font(.footnote)
+                    Button(klL("Check for updates", "Buscar actualizaciones")) { model.checkUpdates() }
+                        .font(.footnote).fixedSize()
                 }
                 bulkControl
-                Button { showAppSettings = true } label: { Label(klL("Settings", "Ajustes"), systemImage: "gearshape") }
-                    .font(.footnote)
+                Spacer(minLength: 0)
             }
         }
     }
@@ -1850,7 +1855,7 @@ struct HubLibraryView: View {
             Button {
                 downloadAll = DownloadAllOffer(candidates: model.bulkCandidates(), free: HubLibraryModel.freeBytes())
             } label: { Label(klL("Download all", "Descargar todos"), systemImage: "arrow.down.circle") }
-                .font(.footnote)
+                .font(.footnote).fixedSize()
         }
     }
 
