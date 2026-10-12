@@ -185,6 +185,11 @@ final class KLQuickSettings: @unchecked Sendable {
     func setFoveation(_ on: Bool) -> Reply {
         guard gameRunning else { return notRunning() }
         guard isAlyx else {
+            guard KLRenderPrefs.glFoveation(for: target) else {
+                return Reply(outcome: .notSupported,
+                             text: klL("Foveated rendering is not available in this game.",
+                                       "El renderizado foveado no está disponible en este juego."))
+            }
             KLRenderPrefs.setFoveation(on, for: target)
             NSLog("[qs] foveation \(on ? "ON" : "off") (\(target)): saved for the next launch")
             lock.lock(); menuVersion += 1; lock.unlock()
@@ -412,8 +417,9 @@ final class KLQuickSettings: @unchecked Sendable {
             // what this run is rendering with.
             let restart = es ? "al reiniciar el juego" : "on game restart"
             let f = KLRenderPrefs.foveation(for: target), rs = KLRenderPrefs.renderScale(for: target)
-            rows.append((es ? "Renderizado foveado" : "Foveated rendering", f ? yes : no,
-                         f != gfxFov ? restart : ""))
+            let glFov = KLRenderPrefs.glFoveation(for: target)
+            rows.append((es ? "Renderizado foveado" : "Foveated rendering", glFov ? (f ? yes : no) : "—",
+                         !glFov ? na : f != gfxFov ? restart : ""))
             rows.append((es ? "Resolución" : "Resolution", "\(Int((rs * 100).rounded())) %",
                          abs(rs - gfxScale) > 0.01 ? restart : ""))
         }
