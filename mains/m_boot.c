@@ -188,7 +188,16 @@ static int check_langpack_download(void) {
         void *m = popm();
         if (!m || rid(m) != req || !err(m) || !strstr(emsg(m), "Game Hub"))
             return fail("language-pack download: a missing pack did not get an error completion");
-        printf("  language pack %s not on disk: its download gets an error completion\n", miss);
+        // ...and leaves the hub its note: the tag, then this file's name.
+        char note[1300], got[600] = "";
+        snprintf(note, sizeof note, "%s/klepton-voicepack-request.txt", kl_jni_files_dir());
+        FILE *nf = fopen(note, "r");
+        if (nf) { size_t k = fread(got, 1, sizeof got - 1, nf); got[k] = 0; fclose(nf); }
+        if (!nf || !strstr(got, miss))
+            return fail("language-pack download: no note for the hub naming the missing pack");
+        unlink(note);
+        printf("  language pack %s not on disk: its download gets an error completion "
+               "(and the hub's note)\n", miss);
     }
     fflush(NULL);
     pid_t p = fork();

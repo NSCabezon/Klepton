@@ -778,6 +778,25 @@ static klplat_asset *klplat_langpack_lookup(const char *name, uint64_t id) {
     return a;
 }
 
+// The pack the game asked for and did not get, for the hub's next open: one
+// small file in the game's own files dir (<container>/android-files on the
+// headset), its language tag then its file name, one per line. The hub shows
+// "the game asked for voice pack X — download it here" on the game's card and
+// deletes the file once that pack is installed. Best effort: a write that
+// fails costs the banner only.
+#define KLPLAT_LANGPACK_REQUEST_FILE "klepton-voicepack-request.txt"
+static void klplat_langpack_note_request(const char *tag, const char *file) {
+    const char *files = kl_jni_files_dir();
+    if (!files || !*files) return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/" KLPLAT_LANGPACK_REQUEST_FILE, files);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n%s\n", tag ? tag : "", file ? file : "");
+    fclose(f);
+    fprintf(stderr, "  [plat] noted for the hub: %s (%s)\n", path, tag ? tag : "?");
+}
+
 static uint64_t klplat_langpack_Download(const char *what, uint32_t type,
                                          const char *name, uint64_t id) {
     plat_hit(what);
@@ -803,6 +822,7 @@ static uint64_t klplat_langpack_Download(const char *what, uint32_t type,
     fprintf(stderr, "  [plat] %s: language pack '%s' (%s) is NOT on disk -> error "
                     "completion (it cannot be fetched from here; the hub downloads it)\n",
             what, base, a->tag);
+    klplat_langpack_note_request(a->tag, base);
     return klplat_request_err_msg(what, type, KLPLAT_ERR_LANGPACK);
 }
 static uint64_t klplat_AssetFile_DownloadById(uint64_t id) {
