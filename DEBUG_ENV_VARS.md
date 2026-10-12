@@ -1020,7 +1020,26 @@ puts the camera on the ground with its hands underneath it.
   RIGHT`, right hand unless the name says otherwise (X/Y and the L* pair are
   the left controller, which is OVRPlugin's own convention). A misspelt name is
   NAMED, not skipped — a press that never happens reads as the guest ignoring
-  input. `KL_OVRP_POKE_HOLD_MS` (250) is how long each press is held.
+  input. `KL_OVRP_POKE_HOLD_MS` (250) is how long each press is held;
+  `12:A@3000` holds that one press 3000 ms (a "hold any button" calibration
+  and a trigger click want different lengths in one script). `RT=<bits>`,
+  `LT=<bits>`, `RN=<bits>`, `LN=<bits>` add raw Touches / NearTouches bits with
+  no button: IEYTD only poses a pointing index once it has SEEN the index
+  near-touch, so `90:RN=0x4@1000` arms it. On a GL guest on the legacy path
+  `f<frame>` counts the frame index `ovrp_Update2` names (it never reaches the
+  Vulkan submit counter). At most 128 presses; a longer script says so.
+- `KL_OVRP_HAND_SCRIPT="<s>:<L|R>:x,y,z[,pitch[,yaw]];..."` — the pose half of
+  `KL_OVRP_POKE`: keyframes for a hand, on the same clock (or `f<frame>`;
+  the first keyframe picks the clock), head-relative in OVRPlugin's frame
+  (metres, -z forward; pitch up and yaw left in degrees), interpolated
+  linearly so physics sees a hand MOVE into a collider, with the interpolation's
+  own velocity. Before a hand's first keyframe nothing is overridden, after its
+  last it holds. `<s>:H:x,y,z[,yaw[,pitch]]` moves the HEAD instead, absolute
+  in the frontend's floor frame, published as a frontend would (headless runs
+  only). At most 256 keyframes. This plus `KL_OVRP_POKE` and the probes is how
+  a headless Mac run plays IEYTD from calibration through the language room
+  and the office tutorial into its first mission (the script lives outside the
+  repo, see `visionos/targets.py`'s ieytd row).
   Merged where the guest **reads** its controller state rather than written
   into the published input, so it survives a frontend publishing every frame
   and works with **no frontend at all**: a headless `./build/m_boot re4` gets
