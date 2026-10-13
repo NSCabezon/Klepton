@@ -924,8 +924,16 @@ xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
 # gen_xcodeproj.py's XROS_DEPLOYMENT_TARGET or availability answers differ
 # between this and the real build, which is the one thing that would make it
 # lie.
+# SenseKit (the SenseKit/ submodule) is imported unconditionally, unlike the
+# hub-only packages behind `#if canImport`, so its module is emitted first and
+# put on the import path.
 swiftcheck:
-	@xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 \
+	@test -f SenseKit/Package.swift || { echo "!! no SenseKit/ - git submodule update --init"; exit 1; }
+	@mkdir -p build/swiftcheck
+	@xcrun -sdk xros swiftc -emit-module -module-name SenseKit -swift-version 5 \
+	  -target arm64-apple-xros26.0 -emit-module-path build/swiftcheck/SenseKit.swiftmodule \
+	  SenseKit/Sources/SenseKit/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
+	  xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 -I build/swiftcheck \
 	  -import-objc-header visionos/Sources/Klepton-Bridging-Header.h \
 	  $(RUNTIME_INC) visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
 	  echo "  swiftcheck: the visionOS app typechecks against runtime/*.h"
