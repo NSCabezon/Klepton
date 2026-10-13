@@ -3750,3 +3750,17 @@ parity packets; host and hub must both be v2 (a v1 hub is refused at HELLO).
   STATUS says BOOTING — a game loading), `KL_TESTHOST_VANISH=1` (end without a
   BYE, as a host that died). `make streamtest` runs both against
   `kl_stream_harness --expect-end bye|lost`.
+
+## Unreal / Vulkan performance A/B (Metro Awakening audit, 2026-10-12)
+
+All off by default; unset, behaviour is unchanged.
+
+| Variable | Where | What |
+|---|---|---|
+| `KL_PTHREAD_WIDE_HASH=1` | `runtime/libc/kl_pthread.c` | Mutex-map hash uses all 18 bits of the 2^18-slot table (it used 15, so every key landed in the first 32768 slots). Metro's task-graph workers spent ~37–47% probing in `rwl_entry_for`; with this, ~0%. Candidate default once measured on the headset. |
+| `KL_VK_NO_TIMESTAMPS=1` | `runtime/gfx/kl_vulkan.c` | Report no timestamp support to the guest, so UE stops writing ~22–28 GPU timestamps and ~30–38 query copies per frame (~66 extra Metal encoders, ~0.5 ms GPU on the Mac). |
+| `KL_UE_INI_CVARS="r.X=1,r.Y=0"` | `runtime/guest/kl_ue4.c` | Writes the cvars into the game's saved `Saved/Config/Android/Engine.ini` (`[SystemSettings]` + `[ConsoleVariables]`), marked as Klepton's; removed again when unset. A file not written by Klepton is never touched. Verified: `r.MSAACount=4` switches Metro's scene targets to 4x. |
+| `KL_UE_THREAD_QOS=1` | `runtime/libc/kl_pthread.c`, `runtime/xr/kl_openxr.c` | Raise UE's `GameThread`, `RenderThread*`, `RHIThread` and the `xrWaitFrame` caller to USER_INTERACTIVE QoS (Metro never uses `XR_KHR_android_thread_settings`). |
+| `KL_PERF_RP_LOG=1` | `runtime/gfx/kl_vulkan.c` | Log the structure (attachments, samples, subpasses, load/store ops) of multisampled and multi-subpass render passes, once each. |
+
+`KL_GPU_TIME` now also closes frames for OpenXR Vulkan guests at `xrEndFrame` (before, Metro never reported GPU time). Headset A/B plan: the AVP Game Hub repo's private audit notes (runs D0–D9).

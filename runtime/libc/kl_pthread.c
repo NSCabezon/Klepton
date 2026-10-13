@@ -88,8 +88,27 @@ typedef struct {
 } mtx_entry;
 static mtx_entry g_mtx_map[MTX_MAP_SIZE];
 
+// [perf-audit 2026-10-12] The shift is 49, i.e. a 15-bit hash: it was right
+// for the old 32768-slot table and was not widened when MTX_MAP_SIZE went to
+// 262144, so every key still lands in the first 32768 slots and the rest of
+// the table only fills as linear-probe overflow. Once a UE guest has created
+// tens of thousands of locks (entries are never removed) every lookup walks a
+// long cluster: Metro on the Mac spent ~47% of a task-graph worker and ~7% of
+// its game thread in rwl_entry_for. KL_PTHREAD_WIDE_HASH=1 (default off) uses
+// all 18 bits. Placement only — the same key always hashes the same way within
+// a process (the knob is read once, before the first lock), so no lookup can
+// miss an entry.
+static _Atomic int g_mtx_shift = -1;
 static unsigned mtx_hash(uintptr_t a) {
-    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> 49);
+    int sh = atomic_load_explicit(&g_mtx_shift, memory_order_relaxed);
+    if (sh < 0) {
+        const char *e = getenv("KL_PTHREAD_WIDE_HASH");
+        int want = (e && *e == '1') ? 64 - __builtin_ctz(MTX_MAP_SIZE) : 49;
+        int expect = -1;
+        if (!atomic_compare_exchange_strong(&g_mtx_shift, &expect, want)) want = expect;
+        sh = want;
+    }
+    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> sh);
 }
 
 static pthread_mutex_t *mtx_make(void) {
@@ -1401,6 +1420,19 @@ int klb_pthread_setname_np(pthread_t t, const char *nm) {
     if (pthread_equal(t, pthread_self()) && kl_env_on("KL_TRACE_THREADS", 0)) {
         uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
         fprintf(stderr, "  [thr] tid=%llu named \"%s\"\n", (unsigned long long)tid, nm ? nm : "");
+    }
+    // [perf-audit 2026-10-12] KL_UE_THREAD_QOS=1 (default off): an Unreal
+    // guest's frame-critical threads (RenderThread*, RHIThread, GameThread)
+    // are raised to USER_INTERACTIVE when they name themselves, through the
+    // same door the XR thread hint uses. Unset, nothing changes. The A/B for
+    // "the M2 schedules UE's render/RHI threads on E-cores or coalesces their
+    // waits at default QoS"; the xrWaitFrame caller (UE5's game thread, which
+    // Android leaves unnamed) is boosted in kl_openxr.c under the same knob.
+    if (nm && pthread_equal(t, pthread_self()) && kl_env_on("KL_UE_THREAD_QOS", 0) &&
+        (!strncmp(nm, "RenderThread", 12) || !strcmp(nm, "RHIThread") ||
+         !strcmp(nm, "GameThread"))) {
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        kl_pthread_boost_qos(tid);
     }
     return pthread_equal(t, pthread_self()) ? pthread_setname_np(nm) : 0;
 }

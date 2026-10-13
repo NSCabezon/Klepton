@@ -194,6 +194,72 @@ static int ue4_stdout_default(void) {
     return 0;
 }
 
+
+// [perf-audit 2026-10-12] KL_UE_INI_CVARS="name=value,name=value" (default
+// unset): write those console variables into the game's SAVED Engine.ini
+// (<files>/<native>/<proj>/<proj>/Saved/Config/Android/Engine.ini), under both
+// [SystemSettings] and [ConsoleVariables], before the engine starts. Measured
+// on Metro Awakening (UE 5.2.1 Shipping, Mac, 2026-10-12): the engine opens
+// that file and honours it — r.MSAACount=4 there turned the 2x scene targets
+// into 4x. The per-game cvar A/B for the headset, no repackaging. The file is
+// marked as ours; with the knob unset a file carrying the mark is removed
+// (the game never had one), and a file without it is never touched.
+static const char k_ini_mark[] = "; written by Klepton (KL_UE_INI_CVARS)";
+static void ue_ini_cvars(const char *proj) {
+    char dir[1024], path[1200];
+    snprintf(dir, sizeof dir, "%s/%s/%s/%s/Saved/Config/Android",
+             kl_jni_files_dir(), g_native_dir, proj, proj);
+    snprintf(path, sizeof path, "%s/Engine.ini", dir);
+    const char *cv = getenv("KL_UE_INI_CVARS");
+    if (!cv || !*cv) {
+        FILE *f = fopen(path, "r");
+        if (!f) return;
+        char first[128] = {0};
+        if (!fgets(first, sizeof first, f)) first[0] = 0;
+        fclose(f);
+        if (!strncmp(first, k_ini_mark, sizeof k_ini_mark - 1)) {
+            unlink(path);
+            fprintf(stderr, "  [ue4] KL_UE_INI_CVARS unset: removed our %s\n", path);
+        }
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    if (f) {   // a file that is not ours (the game's, or the user's) is never overwritten
+        char first[128] = {0};
+        if (!fgets(first, sizeof first, f)) first[0] = 0;
+        fclose(f);
+        if (strncmp(first, k_ini_mark, sizeof k_ini_mark - 1)) {
+            fprintf(stderr, "  [ue4] KL_UE_INI_CVARS: %s exists and is not ours — left alone, "
+                            "cvars NOT applied\n", path);
+            return;
+        }
+    }
+    char tmp[1024];
+    for (char *p = dir + 1; ; p++) {           // mkdir -p
+        if (*p == '/' || !*p) {
+            char c = *p; *p = 0;
+            mkdir(dir, 0755);
+            *p = c;
+            if (!c) break;
+        }
+    }
+    f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "  [ue4] KL_UE_INI_CVARS: cannot write %s\n", path); return; }
+    fprintf(f, "%s\n", k_ini_mark);
+    static const char *sections[] = { "[SystemSettings]", "[ConsoleVariables]" };
+    for (int s_ = 0; s_ < 2; s_++) {
+        fprintf(f, "%s\n", sections[s_]);
+        snprintf(tmp, sizeof tmp, "%s", cv);
+        char *save = NULL;
+        for (char *t = strtok_r(tmp, ",;", &save); t; t = strtok_r(NULL, ",;", &save)) {
+            while (*t == ' ') t++;
+            if (*t) fprintf(f, "%s\n", t);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "  [ue4] KL_UE_INI_CVARS: wrote %s (%s)\n", path, cv);
+}
+
 static void ue4_maybe_stdout_cmdline(const char *proj) {
     if (!kl_env_on("KL_UE4_STDOUT", ue4_stdout_default())) return;
     // Start from the packaged command line if we can read it, else synthesize
@@ -396,6 +462,7 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
             char base[1024];
             snprintf(base, sizeof base, "%s/%s/%s", kl_jni_files_dir(), g_native_dir, proj);
             kl_obbmap_init(kl_jni_obb_dir(), base);
+            ue_ini_cvars(proj);
             ue4_maybe_stdout_cmdline(proj);
         }
     }

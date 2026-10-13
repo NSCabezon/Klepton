@@ -68,7 +68,10 @@ int main(int argc, char **argv) {
     double seconds = 6, yaw_dps = 20;
     int game = 0, hands = 0;
     float aim_yaw = 0, aim_pitch = 0;
-    double clicks[16], png_at[32];
+    double clicks[64], png_at[64];
+    // --aim-at T:YAW,PITCH/T:YAW,PITCH...: from time T on, aim the right hand
+    // there instead (a sequence of dialogs, one click each).
+    double aim_t[16]; float aim_ys[16], aim_ps[16]; int n_aim = 0;
     int n_clicks = 0, n_png_at = 0, png_at_i = 0;
     double pose_gap = -1;
     unsigned frames_after_gap = 0;
@@ -94,12 +97,18 @@ int main(int argc, char **argv) {
             sscanf(argv[++i], "%f,%f", &aim_yaw, &aim_pitch);
             hands = 1;
         }
+        else if (!strcmp(argv[i], "--aim-at") && i + 1 < argc) {
+            char *list = argv[++i], *save = NULL;
+            for (char *t = strtok_r(list, "/", &save); t && n_aim < 16; t = strtok_r(NULL, "/", &save))
+                if (sscanf(t, "%lf:%f,%f", &aim_t[n_aim], &aim_ys[n_aim], &aim_ps[n_aim]) == 3) n_aim++;
+            hands = 1;
+        }
         else if ((!strcmp(argv[i], "--click") || !strcmp(argv[i], "--png-at")) && i + 1 < argc) {
             int is_click = argv[i][2] == 'c';
             char *list = argv[++i], *save = NULL;
             for (char *t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
-                if (is_click && n_clicks < 16) clicks[n_clicks++] = atof(t);
-                else if (!is_click && n_png_at < 32) png_at[n_png_at++] = atof(t);
+                if (is_click && n_clicks < 64) clicks[n_clicks++] = atof(t);
+                else if (!is_click && n_png_at < 64) png_at[n_png_at++] = atof(t);
             }
             if (is_click) hands = 1;
         }
@@ -171,6 +180,8 @@ int main(int argc, char **argv) {
         if (hands) {
             // Both controllers at rest in front of the head, the right one
             // aimed: yaw about +Y, then pitch about the yawed +X.
+            for (int k = 0; k < n_aim; k++)
+                if (now - t0 >= aim_t[k]) { aim_yaw = aim_ys[k]; aim_pitch = aim_ps[k]; }
             for (int h = 0; h < 2; h++) {
                 float hy = h ? aim_yaw : 0, hp = h ? aim_pitch : -20.0f;
                 float cy = cosf(hy * (float)M_PI / 360), sy = sinf(hy * (float)M_PI / 360);

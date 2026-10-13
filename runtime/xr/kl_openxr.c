@@ -52,6 +52,7 @@
 // checkout with no MoltenVK vendored (the stub half of kl_vulkan.c answers
 // "not supported" and the extension is then never advertised).
 #include "kl_vulkan.h"
+#include "kl_gpu_time.h"   // KL_GPU_TIME: close an OpenXR Vulkan frame
 #include "klepton.h"
 
 // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/xr/kl_openxr.c:
@@ -5372,6 +5373,19 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     // the temporal doubling the latch exists to prevent.
     if (g_frame_pacer) g_frame_pacer();
 
+    // [perf-audit 2026-10-12] KL_UE_THREAD_QOS=1: the thread that waits for
+    // frames (UE5's game thread, unnamed on Android) to USER_INTERACTIVE, once.
+    // Default off; see klb_pthread_setname_np for the render/RHI threads.
+    {
+        static int on = -1;
+        static uint64_t boosted;
+        if (on < 0) on = kl_env_on("KL_UE_THREAD_QOS", 0);
+        if (on) {
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            if (tid != boosted) { boosted = tid; kl_pthread_boost_qos(tid); }
+        }
+    }
+
     kl_ovrp_frame_latch();
     // ...and open this frame's record against the pose just latched, which is
     // what a compositor reprojects against. The OVRPlugin path does this from
@@ -6538,8 +6552,14 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // frame was submitted" into "the picture is complete" — the eye MTLTextures
     // are the guest's own images, so nothing of ours is in its submissions and
     // there is no MTLSharedEvent to wait on instead.
-    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN)
+    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN) {
         kl_vulkan_frame_done(drawn_stage);
+        // KL_GPU_TIME (and the performance overlay's live timing): close the
+        // guest's frame here, as kl_openvr does when both eyes are in. Without
+        // it an OpenXR Vulkan guest (Metro) never closed a frame and the GPU
+        // time was never reported. Returns at once when timing is off.
+        kl_gpu_time_frame_end();
+    }
 
     // ...and this is the VR path's swap. kl_glfb's capture and the frontend
     // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —

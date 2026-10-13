@@ -6203,6 +6203,121 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
     free(inj);
 }
 
+// [perf-audit 2026-10-12] KL_PERF_RP_LOG=1 (default off; measurement only):
+// the structure of every distinct multisampled or multi-subpass render pass the
+// guest creates (first 48): attachments with load/store ops, each subpass's
+// colour / input / resolve / depth references and view mask. MoltenVK 1.4.2
+// ends the Metal render encoder at EVERY vkCmdNextSubpass and stores/reloads
+// each attachment a later subpass still uses (MVKRenderPass.mm
+// getMTLStoreAction), so a UE mobile scene pass whose later subpass reads
+// scene colour/depth as INPUT attachments pays a full MSAA store + load per
+// subpass boundary on a tiler. This line is how that shape is confirmed.
+static int klvk_perf_rp_log(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_PERF_RP_LOG", 0);
+    return v;
+}
+static void klvk_perf_rp_dump(const char *which, VkRenderPass rp, uint32_t natt,
+                              const int *fmt, const int *samples, const int *load,
+                              const int *store, const int *sload, const int *sstore,
+                              uint32_t nsub, const uint32_t *viewmask,
+                              const uint32_t *ncolor, const uint32_t *const *color,
+                              const uint32_t *const *resolve, const uint32_t *ninput,
+                              const uint32_t *const *input, const int *depth,
+                              uint32_t ndeps) {
+    if (!klvk_perf_rp_log()) return;
+    int interesting = nsub > 1;
+    for (uint32_t i = 0; i < natt; i++) if (samples[i] > 1) interesting = 1;
+    if (!interesting) return;
+    static uint64_t seen[48]; static int nseen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t h = 1469598103934665603ull;
+#define KLRP_H(x) (h = (h ^ (uint64_t)(uint32_t)(x)) * 1099511628211ull)
+    KLRP_H(natt); KLRP_H(nsub);
+    for (uint32_t i = 0; i < natt; i++) { KLRP_H(fmt[i]); KLRP_H(samples[i]); KLRP_H(load[i]); KLRP_H(store[i]); }
+    for (uint32_t sp = 0; sp < nsub; sp++) { KLRP_H(ncolor[sp]); KLRP_H(ninput[sp]); KLRP_H(depth[sp]); KLRP_H(viewmask[sp]); }
+#undef KLRP_H
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < nseen; i++) if (seen[i] == h) { pthread_mutex_unlock(&mu); return; }
+    if (nseen >= 48) { pthread_mutex_unlock(&mu); return; }
+    seen[nseen++] = h;
+    pthread_mutex_unlock(&mu);
+    fprintf(stderr, "  [vk] [perf] RP %s %#llx: %u attachment(s), %u subpass(es), %u dependenc(ies)\n",
+            which, (unsigned long long)(uintptr_t)rp, natt, nsub, ndeps);
+    for (uint32_t i = 0; i < natt; i++)
+        fprintf(stderr, "  [vk] [perf] RP   att%u fmt %d x%d load %d store %d (stencil %d/%d)\n",
+                i, fmt[i], samples[i], load[i], store[i], sload[i], sstore[i]);
+    for (uint32_t sp = 0; sp < nsub; sp++) {
+        char buf[256]; int n = 0;
+        n += snprintf(buf + n, sizeof buf - n, "color");
+        for (uint32_t k = 0; k < ncolor[sp] && n < 200; k++)
+            n += snprintf(buf + n, sizeof buf - n, " %d%s%d", (int)color[sp][k],
+                          resolve[sp] ? "->" : "", resolve[sp] ? (int)resolve[sp][k] : 0);
+        n += snprintf(buf + n, sizeof buf - n, " | input");
+        for (uint32_t k = 0; k < ninput[sp] && n < 240; k++)
+            n += snprintf(buf + n, sizeof buf - n, " %d", (int)input[sp][k]);
+        fprintf(stderr, "  [vk] [perf] RP   subpass %u viewMask %#x: %s | depth %d\n",
+                sp, viewmask[sp], buf, depth[sp]);
+    }
+}
+static void klvk_perf_rp_note1(VkRenderPass rp, const VkRenderPassCreateInfo *ci) {
+    if (!klvk_perf_rp_log() || !ci || ci->attachmentCount > 16 || ci->subpassCount > 8) return;
+    int fmt[16], sm[16], ld[16], st[16], sl[16], ss[16], dp[8];
+    uint32_t vm[8] = {0}, nc[8], ni[8];
+    uint32_t cbuf[8][8], rbuf[8][8], ibuf[8][8];
+    const uint32_t *c[8], *r[8], *in[8];
+    for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+        const VkAttachmentDescription *a = &ci->pAttachments[i];
+        fmt[i] = a->format; sm[i] = a->samples; ld[i] = a->loadOp; st[i] = a->storeOp;
+        sl[i] = a->stencilLoadOp; ss[i] = a->stencilStoreOp;
+    }
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO) {
+            const VkRenderPassMultiviewCreateInfo *m = (const void *)b;
+            for (uint32_t sp = 0; sp < m->subpassCount && sp < 8; sp++) vm[sp] = m->pViewMasks[sp];
+        }
+    for (uint32_t sp = 0; sp < ci->subpassCount; sp++) {
+        const VkSubpassDescription *d = &ci->pSubpasses[sp];
+        nc[sp] = d->colorAttachmentCount < 8 ? d->colorAttachmentCount : 8;
+        ni[sp] = d->inputAttachmentCount < 8 ? d->inputAttachmentCount : 8;
+        for (uint32_t k = 0; k < nc[sp]; k++) {
+            cbuf[sp][k] = d->pColorAttachments[k].attachment;
+            rbuf[sp][k] = d->pResolveAttachments ? d->pResolveAttachments[k].attachment : 0;
+        }
+        for (uint32_t k = 0; k < ni[sp]; k++) ibuf[sp][k] = d->pInputAttachments[k].attachment;
+        c[sp] = cbuf[sp]; r[sp] = d->pResolveAttachments ? rbuf[sp] : NULL; in[sp] = ibuf[sp];
+        dp[sp] = d->pDepthStencilAttachment ? (int)d->pDepthStencilAttachment->attachment : -1;
+    }
+    klvk_perf_rp_dump("v1", rp, ci->attachmentCount, fmt, sm, ld, st, sl, ss, ci->subpassCount,
+                      vm, nc, c, r, ni, in, dp, ci->dependencyCount);
+}
+static void klvk_perf_rp_note2(VkRenderPass rp, const VkRenderPassCreateInfo2 *ci) {
+    if (!klvk_perf_rp_log() || !ci || ci->attachmentCount > 16 || ci->subpassCount > 8) return;
+    int fmt[16], sm[16], ld[16], st[16], sl[16], ss[16], dp[8];
+    uint32_t vm[8], nc[8], ni[8];
+    uint32_t cbuf[8][8], rbuf[8][8], ibuf[8][8];
+    const uint32_t *c[8], *r[8], *in[8];
+    for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+        const VkAttachmentDescription2 *a = &ci->pAttachments[i];
+        fmt[i] = a->format; sm[i] = a->samples; ld[i] = a->loadOp; st[i] = a->storeOp;
+        sl[i] = a->stencilLoadOp; ss[i] = a->stencilStoreOp;
+    }
+    for (uint32_t sp = 0; sp < ci->subpassCount; sp++) {
+        const VkSubpassDescription2 *d = &ci->pSubpasses[sp];
+        vm[sp] = d->viewMask;
+        nc[sp] = d->colorAttachmentCount < 8 ? d->colorAttachmentCount : 8;
+        ni[sp] = d->inputAttachmentCount < 8 ? d->inputAttachmentCount : 8;
+        for (uint32_t k = 0; k < nc[sp]; k++) {
+            cbuf[sp][k] = d->pColorAttachments[k].attachment;
+            rbuf[sp][k] = d->pResolveAttachments ? d->pResolveAttachments[k].attachment : 0;
+        }
+        for (uint32_t k = 0; k < ni[sp]; k++) ibuf[sp][k] = d->pInputAttachments[k].attachment;
+        c[sp] = cbuf[sp]; r[sp] = d->pResolveAttachments ? rbuf[sp] : NULL; in[sp] = ibuf[sp];
+        dp[sp] = d->pDepthStencilAttachment ? (int)d->pDepthStencilAttachment->attachment : -1;
+    }
+    klvk_perf_rp_dump("v2", rp, ci->attachmentCount, fmt, sm, ld, st, sl, ss, ci->subpassCount,
+                      vm, nc, c, r, ni, in, dp, ci->dependencyCount);
+}
+
 // KL_TRACE: render-pass census. Logs each render pass's subpass structure and,
 // always, any that MoltenVK REJECTS. AC Nexus's menu compositing target reaches
 // vkCreateImage but never a framebuffer/render pass ("temporary render texture
@@ -6215,6 +6330,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass_inner(VkDevice dev,
     static PFN_vkCreateRenderPass real;
     if (!real && real_gdpa) real = (PFN_vkCreateRenderPass)real_gdpa(dev, "vkCreateRenderPass");
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (ci && r == VK_SUCCESS && out) klvk_perf_rp_note1(*out, ci);   // KL_PERF_RP_LOG
     if (ci && r == VK_SUCCESS && out && klvk_fdm_spoof()) {
         uint32_t fa = klvk_fdm_rp_att(ci->pNext);
         if (fa != VK_ATTACHMENT_UNUSED) {
@@ -6326,6 +6442,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice dev,
         }
     }
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (ci && r == VK_SUCCESS && out) klvk_perf_rp_note2(*out, ci);   // KL_PERF_RP_LOG
     if (ci && out && r == VK_SUCCESS && klvk_profile())
         for (uint32_t i = 0; i < ci->attachmentCount; i++)
             klvk_prof_rp_note(*out, ci->attachmentCount, (int)i, (int)ci->pAttachments[i].format,
@@ -7028,8 +7145,27 @@ static void klvk_cap_sample_limits(VkPhysicalDeviceProperties *p) {
     static int said;
     if (!said++) VKI("KL_VK_MAX_SAMPLES: sample counts reported to the guest masked to %#x\n", m);
 }
+// [perf-audit 2026-10-12] KL_VK_NO_TIMESTAMPS=1 (default off): tell the guest
+// the device has no timestamps (limits.timestampComputeAndGraphics = FALSE, and
+// timestampValidBits = 0 on every queue family). Metro Awakening (UE 5.2) writes
+// two timestamps around each of its ~11 command buffers a frame and copies the
+// results back; through MoltenVK on Apple GPUs every vkCmdWriteTimestamp is its
+// own "Record GPU Counter Sample" blit encoder and every vkCmdCopyQueryPoolResults
+// a blit + a compute encoder: ~22-28 + ~30-38 extra encoders a frame, ~0.5 ms of
+// GPU a frame in gameplay on an M1 Max (Metal System Trace). An engine told
+// "no timestamps" skips its GPU timers (its GPU frame time then reads 0).
+static int klvk_no_timestamps(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_VK_NO_TIMESTAMPS", 0);
+    return v;
+}
 static void klvk_spoof_props(VkPhysicalDeviceProperties *p) {
     klvk_cap_sample_limits(p);
+    if (p && klvk_no_timestamps()) {
+        p->limits.timestampComputeAndGraphics = VK_FALSE;
+        static int said;
+        if (!said++) VKI("KL_VK_NO_TIMESTAMPS: the guest is told the device has no timestamps\n");
+    }
     if (!p || !klvk_spoof_gpu()) return;
     p->vendorID = 0x5143;                 // Qualcomm
     p->deviceID = 0x43051401;             // an Adreno 740-class id (plausible)
@@ -7130,6 +7266,8 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceQueueFamilyProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceQueueFamilyProperties");
     if (real) real(pd, count, props);
     else if (count) *count = 0;
+    if (props && count && klvk_no_timestamps())          // KL_VK_NO_TIMESTAMPS
+        for (uint32_t i = 0; i < *count; i++) props[i].timestampValidBits = 0;
 }
 
 // The rest of the vkGetPhysicalDevice* family Unity's device init queries on the
