@@ -1,0 +1,3 @@
+[submodule "SenseKit"]
+	path = SenseKit
+	url = https://github.com/NSCabezon/SenseKit.git

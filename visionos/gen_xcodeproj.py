@@ -376,6 +376,10 @@ if SAVEKIT and not os.path.isfile(os.path.join(HERE, SAVEKIT_PKG, "Package.swift
     print(f"!! hub: no SaveKit package at {os.path.join(HERE, SAVEKIT_PKG)} "
           "(set KL_SAVEKIT_PKG) - the iCloud save backups are left out", file=sys.stderr)
     SAVEKIT = False
+# The PS VR2 Sense controllers (Sources/KleptonControllers.swift): the SenseKit package, a git
+# submodule of THIS tree (klepton/SenseKit, github NSCabezon/SenseKit). Every target, and required:
+# the controller seam imports it. KL_SENSEKIT_PKG overrides the path (relative to visionos/).
+SENSEKIT_PKG = os.environ.get("KL_SENSEKIT_PKG", "../SenseKit")
 if STEAMDEPOT:
     swift.append({"name": "KleptonSteamContent.swift", "ref": _fixed("SDSWIFTF"), "bld": _fixed("SDSWIFTB")})
     # ...and the guest's Steamworks stand-in answered from the real account
@@ -492,6 +496,7 @@ if METASTORE:
     PACKAGES.append(("MetaStore", METASTORE_PKG, _fixed("MSPKGREF"), _fixed("MSPKGPROD"), _fixed("MSPKGBLD")))
 if SAVEKIT:
     PACKAGES.append(("SaveKit", SAVEKIT_PKG, _fixed("SKPKGREF"), _fixed("SKPKGPROD"), _fixed("SKPKGBLD")))
+PACKAGES.append(("SenseKit", SENSEKIT_PKG, _fixed("SENSEREF"), _fixed("SENSEPROD"), _fixed("SENSEBLD")))
 PKG_BUILDFILE = "".join(f'\t\t{b} /* {n} in Frameworks */ = {{isa = PBXBuildFile; productRef = {prod}; }};\n'
                         for n, _, _, prod, b in PACKAGES)
 PKG_FRAMEWORK = "".join(f'\t\t\t\t{b} /* {n} in Frameworks */,\n' for n, _, _, _, b in PACKAGES)
@@ -992,6 +997,12 @@ def main():
                       f"(want {game}__<lib>.framework) — re-run KLEPTON_TARGET={game} "
                       f"visionos/mkguest.sh (or drop KL_SKIP_GUEST)", file=sys.stderr)
                 return 1
+    if not os.path.isfile(os.path.join(HERE, SENSEKIT_PKG, "Package.swift")):
+        print(f"!! missing the SenseKit package at {os.path.join(HERE, SENSEKIT_PKG)} — it is a git "
+              "submodule of klepton: run `git submodule update --init` in klepton/ (or "
+              "`git submodule update --init --recursive` from the hub checkout), or set KL_SENSEKIT_PKG",
+              file=sys.stderr)
+        return 1
     if not os.path.isdir(os.path.join(HERE, "..", "build", "Klepton.xcframework")):
         print("!! missing build/Klepton.xcframework — run `make xros` first", file=sys.stderr)
         return 1
@@ -1027,6 +1038,7 @@ def main():
         print(f"  Swift package MetaStore: {METASTORE_PKG} (in-app Meta store download)")
     if SAVEKIT:
         print(f"  Swift package SaveKit: {SAVEKIT_PKG} (save backups in iCloud)")
+    print(f"  Swift package SenseKit: {SENSEKIT_PKG} (PS VR2 Sense controllers)")
     if IS_HUB:
         for game, libs in GUEST_SETS:
             print(f"  hub game {game:<14} -> Frameworks/{game}__*.framework: "

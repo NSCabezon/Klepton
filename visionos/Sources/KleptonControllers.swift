@@ -42,10 +42,17 @@
 //  two functions (kl_view.c) — which is what makes the host a usable A/B for
 //  anything that looks like an input bug here.
 //
+//  **The Sense half lives in SenseKit** (the `SenseKit` submodule beside this
+//  tree): discovery, the accessory anchors and their prediction, the grip
+//  correction, the GameController input poll and the haptics engines. What is
+//  left here is everything that is about THIS guest seam — the `ovrpButton`
+//  layout and every `kl_ovrp_*` call, the KL_* knobs that configure SenseKit,
+//  the hand-tracking fallback and the gamepad merge.
+//
 import Foundation
 import ARKit
-import CoreHaptics
 import GameController
+import SenseKit
 import SwiftUI
 import simd
 
@@ -248,16 +255,6 @@ private func klEulerXYZ(_ degrees: SIMD3<Float>) -> simd_quatf {
          * simd_quatf(angle: r.z, axis: [0, 0, 1])
 }
 
-/// `klEulerXYZ` read back off a transform, in degrees — the same convention a
-/// SteamVR render model's `rotate_xyz` states, so a measured row and a row out
-/// of a model file can be compared term by term.
-func klEulerDegOf(_ m: simd_float4x4) -> SIMD3<Float> {
-    let r = 180 / Float.pi
-    return SIMD3<Float>(atan2(-m.columns.2.y, m.columns.2.z) * r,
-                        asin(max(-1, min(1, m.columns.2.x))) * r,
-                        atan2(-m.columns.1.x, m.columns.0.x) * r)
-}
-
 /// The Sense controllers' own correction — `KL_SENSE_ROT` / `KL_SENSE_POS`, in
 /// the grip's frame, per hand with `_L`/`_R`.
 ///
@@ -299,10 +296,15 @@ func klEulerDegOf(_ m: simd_float4x4) -> SIMD3<Float> {
 /// -42.04. Beat Saber's own `OculusVRHelper.AdjustControllerTransform` pitches
 /// a Touch controller by 40 degrees, and `KL_SENSE_PITCH=-45.037` puts the
 /// total there exactly (-45.037 + 5.037) in one run.
+///
+/// **The maths is SenseKit's** (`SenseGripCorrection.apply`, the velocity gate,
+/// the prediction cap); this struct only reads the KL_* knobs and turns them
+/// into a `SenseConfiguration` (`senseConfiguration`, plus the live grip
+/// correction `KleptonControllers` hands SenseKit per pose).
 struct KLSenseTune {
     /// ALVR's PSVR2 comfort tilt and this guest's hilt pitch, kept apart so the
     /// log line and the source agree on where each degree came from.
-    static let psvr2Tilt: Float = 5.037
+    static let psvr2Tilt: Float = SenseGripCorrection.psvr2TiltDegrees
     static let hiltPitch: Float =
         ProcessInfo.processInfo.environment["KL_SENSE_PITCH"].flatMap { Float($0) } ?? -37
 
@@ -440,14 +442,35 @@ struct KLSenseTune {
            let f = Float(v) { return max(0.0, f) }
         return kl_app_target_is_steamlink() != 0 ? 0.35 : 0.0
     }()
+    // The gate itself (soft magnitude gate: zero below the threshold, minus
+    // the threshold above it) is `SenseVelocityGate.gate`.
 
-    /// Soft magnitude gate: zero below `t`, and above it subtract `t` while
-    /// keeping direction — continuous at the threshold (no pop) and a only a
-    /// small constant trim on a large, deliberate motion.
-    static func gate(_ x: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
-        if t <= 0 { return x }
-        let m = simd_length(x)
-        return m <= t || m == 0 ? .zero : x * ((m - t) / m)
+    /// The live grip correction for one hand, re-read for every pose so a
+    /// slider in the boot window moves the controller while it is being
+    /// dragged (KleptonTuning). Its X term (and yaw and roll) is mirrored for
+    /// the left hand by SenseKit, for the reason KL_SENSE_MIRROR gives.
+    static func liveGrip(_ hand: Int) -> SenseGripCorrection {
+        // First access builds `shared`, which is what logs the KL_SENSE_*
+        // lines — at the first pose, as before the move.
+        _ = shared[hand]
+        let live = KleptonTuning.shared.snapshot()
+        return SenseGripCorrection(tiltDegrees: psvr2Tilt, pitchDegrees: live.sensePitch,
+                                   yawDegrees: live.senseYaw, rollDegrees: live.senseRoll,
+                                   position: live.sensePos, pivot: live.sensePivot,
+                                   mirrorLeft: mirrorX)
+    }
+
+    /// Everything above that SenseKit takes as configuration — the same
+    /// defaults and the same KL_* knobs as before the move, haptics included
+    /// (`KleptonControllers.hapticsConfiguration`).
+    static func senseConfiguration(haptics: SenseHapticsConfiguration) -> SenseConfiguration {
+        var c = SenseConfiguration()
+        c.gripCorrection.mirrorLeft = mirrorX
+        c.predictionCapMs = sensePredictMaxMs
+        c.velocityGate = SenseVelocityGate(linear: velGate, angular: velGateAng)
+        c.velocityInAccessoryFrame = velocityIsLocal
+        c.haptics = haptics
+        return c
     }
 }
 
@@ -456,39 +479,43 @@ final class KleptonControllers {
     private var state: [KleptonHandState] = [KleptonHandState(), KleptonHandState()]
 
     // Poses arrive asynchronously from AccessoryTrackingProvider's anchor
-    // stream, while buttons are polled synchronously on the render thread, so
-    // the two halves genuinely do cross threads and the lock is not defensive.
+    // stream (inside SenseKit), while buttons are polled synchronously on the
+    // render thread and the system pinch arrives on its own queue, so the
+    // halves genuinely do cross threads and the lock is not defensive.
     private let lock = NSLock()
 
-    /// The most recent anchor per hand — **the object, not the pose it carried**.
-    ///
-    /// This used to be the resolved `(position, orientation)` pair, and that is
-    /// what capped the controllers at the anchor stream's own rate. The stream
-    /// is a *sensor* feed: it delivers when the tracker has something new, which
-    /// on this platform is far below display rate, so a render loop reading the
-    /// last delivered pose repeats each sample for several frames. Hands do not
-    /// hold still for two frames at a time, so what that looks like is not
-    /// smooth-but-late motion, it is a controller stepping — 30 Hz motion inside
-    /// a 90 Hz picture.
-    ///
-    /// Keeping the anchor keeps `AccessoryTrackingProvider.predictAnchor(for:at:)`
-    /// available, which is the platform's own extrapolator: ask it for the
-    /// frame's *presentation* time and every frame gets its own pose, forward to
-    /// where the controller will be when the light reaches the eye. That is the
-    /// same thing `queryDeviceAnchor(atTimestamp:)` already does for the head —
-    /// the controllers were simply never given the equivalent.
-    private var accessoryAnchor: [Int: AccessoryAnchor] = [:]
-    /// Held so the render thread can predict against it. `makeAccessoryProvider`
-    /// is the only writer, and it runs before the session that feeds it.
-    private var accessoryProvider: AccessoryTrackingProvider?
+    /// The Sense controllers: discovery, the accessory anchors and their
+    /// prediction, the grip correction, the input poll and the haptics
+    /// engines. Configured from the KL_* knobs (`KLSenseTune`,
+    /// `hapticsConfiguration`), logging on `[cp]`, and wired to kl_ovrp
+    /// through the hooks set in `init`.
+    private let senseKit: SenseControllers
 
-    private(set) var senseConnected = false
-    private var tracked: [GCController] = []
+    init() {
+        senseKit = SenseControllers(configuration:
+            KLSenseTune.senseConfiguration(haptics: Self.hapticsConfiguration))
+        senseKit.logger = { NSLog("%@", "[cp] " + $0) }
+        senseKit.liveGripCorrection = { KLSenseTune.liveGrip($0.rawValue) }
+        senseKit.predictionObserver = { Self.notePredictionHorizon(ahead: $0, cap: $1) }
+        // A controller in the hand is a Touch controller picked up: let the
+        // guest see its fingers near the controls once, so an edge-driven
+        // hand pose (IEYTD) gets the release that opens it (kl_ovrp.c).
+        senseKit.onControllerBound = { kl_ovrp_arm_near_touch(Int32($0.rawValue)) }
+        // The haptics pull: see `pumpHaptics`.
+        senseKit.hapticsSource = { hand in
+            var amplitude: Float = 0, seconds: Float = 0
+            let live = kl_ovrp_haptics_pull(Int32(hand.rawValue), &amplitude, &seconds) != 0
+            return live ? (amplitude, seconds) : nil
+        }
+    }
+
+    /// Whether the last accessory provider found any Sense controller.
+    var senseConnected: Bool { senseKit.accessoriesConnected }
     /// Which hands have a Sense controller connected right now (left, right),
     /// refreshed every frame by `spatialControllersChanged` from the same
     /// GCController poll — the HUD's "controller disconnected" card reads it.
     /// Render thread only, like that poll.
-    private(set) var presentHands = [false, false]
+    var presentHands: [Bool] { senseKit.presentHands }
 
     // MARK: - Ghost controllers (KleptonHUD)
 
@@ -502,146 +529,37 @@ final class KleptonControllers {
     /// The physical controller for the ghost model: the `.grip` frame with the
     /// platform's RENDERED correction (the one meant for drawing content
     /// aligned with the device) and none of the game's calibration, predicted
-    /// to the frame like sensePose. nil when there is no anchor for that hand.
+    /// to the frame like the pose. nil when there is no anchor for that hand.
     func ghostSample(hand: Int, at time: TimeInterval) -> KLGhostSample? {
-        lock.lock()
-        let stored = accessoryAnchor[hand]
-        let provider = accessoryProvider
-        lock.unlock()
-        guard let stored else { return nil }
-        let now = CACurrentMediaTime()
-        let a = provider?.predictAnchor(for: stored, at: now + min(max(time - now, 0), 0.05)) ?? stored
-        let m = a.accessory.locations.contains(.grip)
-            ? a.coordinateSpace(for: .grip, correction: .rendered).ancestorFromSpaceTransformFloat().matrix
-            : a.originFromAnchorTransform
-        let positioned: Bool
-        switch a.trackingState {
-        case .positionOrientationTracked, .positionOrientationTrackedLowAccuracy: positioned = true
-        case .untracked, .orientationTracked: positioned = false
-        @unknown default: positioned = a.isTracked
-        }
-        return KLGhostSample(originFromGrip: m, positionTracked: positioned && a.isTracked,
-                             heldByPlatform: a.heldChirality != nil,
-                             speed: simd_length(a.velocity), angularSpeed: simd_length(a.angularVelocity))
+        guard let h = SenseHand(rawValue: hand),
+              let g = senseKit.ghostSample(h, at: time) else { return nil }
+        return KLGhostSample(originFromGrip: g.originFromGrip, positionTracked: g.positionTracked,
+                             heldByPlatform: g.heldByPlatform,
+                             speed: g.speed, angularSpeed: g.angularSpeed)
     }
 
     // MARK: - Discovery
 
-    /// The spatial controllers paired right now.
-    static func spatialControllers() -> [GCController] {
-        guard #available(visionOS 26.0, *) else { return [] }
-        return GCController.controllers().filter {
-            $0.productCategory == GCProductCategorySpatialController
-        }
-    }
-
     /// Has the paired set changed since the last time this was asked?
-    ///
-    /// Polled rather than driven off `GCControllerDidConnect`, because the set
-    /// is what the provider is built from and a notification would only send us
-    /// back here to read it anyway. Cheap: an array compare of a list that is
-    /// almost always empty or two long.
+    /// (SenseKit's `controllersChanged`; also refreshes `presentHands`.)
     func spatialControllersChanged() -> Bool {
-        let now = Self.spatialControllers()
-        var hands = [false, false]
-        for c in now { hands[Self.hand(of: c)] = true }
-        presentHands = hands
-        guard now != tracked else { return false }
-        tracked = now
-        return true
+        senseKit.controllersChanged()
     }
 
-    /// Build the accessory-tracking provider for whatever is paired now.
-    ///
-    /// Built **unconditionally** when the capability exists, including with an
-    /// empty accessory list. Skipping it while nothing is paired was the wrong
-    /// instinct: the provider set is fixed when `ARKitSession.run` is called,
-    /// so a run that omitted it could never pick a controller up, which is what
-    /// made reconnects look like a platform limitation. They are not — the
-    /// session is simply re-`run()` with a rebuilt list when the set changes
-    /// (`spatialControllersChanged`), without stopping it first.
+    /// Build the accessory-tracking provider for whatever is paired now —
+    /// unconditionally when the capability exists, including with an empty
+    /// accessory list, so a later re-`run()` can pick a controller up (see
+    /// `SenseControllers.makeTrackingProvider`).
     func makeAccessoryProvider() async -> (any DataProvider)? {
-        guard #available(visionOS 26.0, *), AccessoryTrackingProvider.isSupported else { return nil }
-        let spatial = Self.spatialControllers()
-        tracked = spatial
-
-        var accessories: [Accessory] = []
-        for c in spatial {
-            // One failure must not take the other controller with it — they are
-            // paired independently and a half-working pair is the normal state
-            // while one is waking up.
-            do { accessories.append(try await Accessory(device: c)) }
-            catch { NSLog("[cp] accessory init failed for \(c.vendorName ?? "?"): \(error)") }
-        }
-        senseConnected = !accessories.isEmpty
-        NSLog("[cp] spatial controllers: \(accessories.map { $0.name })")
-        for c in spatial { Self.census(c) }
-        let p = AccessoryTrackingProvider(accessories: accessories)
-        lock.lock(); accessoryProvider = p; lock.unlock()
-        return p
-    }
-
-    /// Every element name a controller carries, once, when it attaches.
-    ///
-    /// `pollButtons` reads elements by name, and a name this hardware does not
-    /// publish is indistinguishable from a button nobody pressed — the lookup
-    /// returns nil, `?? false` makes it a release, and the control is silently
-    /// dead for the whole run. Two bugs of exactly that shape were live at once:
-    /// the thumbstick was read as two AXIS elements when `GCInput` models a
-    /// stick as a DPAD, and the PS button (`GCInputButtonHome`) may not be
-    /// delivered to an app at all on this OS. Neither can be seen from the host
-    /// and neither raises anything.
-    ///
-    /// Three collections, because which one an element lives in is exactly what
-    /// was wrong. One line per controller at attach.
-    private static func census(_ c: GCController) {
-        guard #available(visionOS 26.0, *) else { return }
-        let p = c.physicalInputProfile
-        NSLog("[cp] \(c.vendorName ?? "?") elements: "
-              + "buttons \(p.buttons.keys.sorted()) "
-              + "axes \(p.axes.keys.sorted()) "
-              + "dpads \(p.dpads.keys.sorted())")
-    }
-
-    /// Element names seen pressed at least once, across every controller.
-    nonisolated(unsafe) private static var pressSeen = Set<String>()
-
-    /// Name each button element the first time it is actually pressed.
-    ///
-    /// The census says what exists; this says what the hardware sends when a
-    /// person presses it, and only the pair settles a mapping. It is what will
-    /// answer the PS button question on the next device run — an element that
-    /// exists and never presses is the system eating it, an element that
-    /// presses under a name we do not read is a one-line fix, and neither looks
-    /// different from the other in any log we had.
-    ///
-    /// Bounded by construction: one line per distinct name, ever.
-    private static func notePress(_ name: String) {
-        if pressSeen.insert(name).inserted {
-            NSLog("[cp] button element pressed for the first time: \"\(name)\"")
-        }
+        await senseKit.makeTrackingProvider()
     }
 
     /// Drop the pose for any hand whose controller has gone away, so a
     /// disconnect cannot leave the guest holding the last pose forever. The
-    /// hand-tracking fallback takes over on the next frame.
+    /// hand-tracking fallback takes over on the next frame. SenseKit drops the
+    /// anchors, the provider, the input bindings and the haptics engines.
     func forgetAccessoryPoses() {
-        // The haptics engines belong to the GCControllers that are going away.
-        // Kept past a disconnect they are engines on a dead device, and the
-        // next `makePlayer` throws rather than returning nil — which is a
-        // caught error per frame for the rest of the run.
-        releaseHaptics()
-        // ...and the button half re-binds from scratch on the next poll: every
-        // controller's input queue is configured again and logged, after the
-        // accessory provider that is about to wrap the same GCControllers.
-        buttonBinding.removeAll()
-        lock.lock()
-        accessoryAnchor.removeAll()
-        // The provider goes too: predicting against a provider whose session is
-        // being torn down and rebuilt is the one way a stale anchor could still
-        // produce a fresh-looking pose after the controller is gone.
-        accessoryProvider = nil
-        lock.unlock()
+        senseKit.forgetPoses()
         for i in 0...1 {
             lock.lock(); state[i] = KleptonHandState(); lock.unlock()
         }
@@ -649,197 +567,12 @@ final class KleptonControllers {
 
     /// Consume the accessory anchor stream. Runs for the life of the session.
     func consumeAccessoryAnchors(_ provider: any DataProvider) async {
-        guard #available(visionOS 26.0, *),
-              let p = provider as? AccessoryTrackingProvider else { return }
-        for await update in p.anchorUpdates {
-            let anchor = update.anchor
-            // An unspecified chirality is a controller that has not decided
-            // which hand it is in. Treated as the right hand, which is the one
-            // a single controller is overwhelmingly likely to be, and is what
-            // ALVR does.
-            let hand: Int
-            switch anchor.accessory.inherentChirality {
-            case .left:  hand = 0
-            case .right: hand = 1
-            default:     hand = 1
-            }
-            // The anchor itself is stored, not the pose read off it: the pose
-            // this frame wants is the *predicted* one, and only the anchor can
-            // be predicted. See `accessoryAnchor` and `sensePose`.
-            //
-            // Through a non-async helper: taking a lock directly inside an
-            // async function is an error in Swift 6 mode, and the fix is not to
-            // suppress it — the critical section genuinely must not span a
-            // suspension point, and pushing it into a synchronous function is
-            // what guarantees that.
-            store(hand: hand, removed: update.event == .removed, anchor: anchor)
-        }
-    }
-
-    private func store(hand: Int, removed: Bool, anchor: AccessoryAnchor) {
-        if !removed { probeSenseFrames(hand: hand, anchor) }
-        lock.lock()
-        defer { lock.unlock() }
-        accessoryAnchor[hand] = removed ? nil : anchor
-    }
-
-    /// Which hands have already described themselves. Written from the anchor
-    /// stream only, which is one task, so no lock.
-    private var senseFramesProbed: [Bool] = [false, false]
-
-    /// Every frame this controller publishes, in its own `.grip` frame — once
-    /// per hand, the first time it arrives.
-    ///
-    /// The correction this file applies is a transform from what the platform
-    /// publishes to what the guest was built against, and only half of it is
-    /// knowable off-device. The half that is: a SteamVR render model states
-    /// exactly where an Oculus Touch's tracked pose, `openxr_grip` and
-    /// `openxr_aim` sit relative to one another, and those are the poses a
-    /// guest asks for — an OVRPlugin guest is handed the tracked pose, an
-    /// OpenXR guest asks for grip or aim, and on a Touch those are 10.2 cm and
-    /// 20.6 degrees apart. `tools/rendermodel_frames.py` prints that table.
-    ///
-    /// The half that is not: whether Apple's `.grip` means what OpenXR's grip
-    /// means. Nothing off-device answers it, so this measures it. The rows are
-    /// in the render model's units and euler order so the two tables can be
-    /// read side by side, and the Touch's own rows are printed underneath to
-    /// compare against. Agreement looks like an aim that lands forward of and
-    /// below the grip with something near -60 degrees of pitch; a *sign* that
-    /// disagrees is a convention gap and has to be corrected for, while a
-    /// magnitude that disagrees is only a differently shaped controller and
-    /// must not be.
-    ///
-    /// `.none` and `.rendered` are both printed because the gap between them is
-    /// Apple's own comfort correction, and the pose path takes `.rendered` —
-    /// so a constant tuned by playing may be re-deriving something the platform
-    /// already applied.
-    private func probeSenseFrames(hand: Int, _ a: AccessoryAnchor) {
-        if senseFramesProbed[hand] { return }
-        senseFramesProbed[hand] = true
-        let side = hand == 0 ? "left" : "right"
-        guard a.accessory.locations.contains(.grip) else {
-            NSLog("[cp] sense frames (\(side)): \(a.accessory.name) publishes no .grip")
-            return
-        }
-        let grip = a.coordinateSpace(for: .grip, correction: .none)
-            .ancestorFromSpaceTransformFloat().matrix
-        var rows: [(String, simd_float4x4)] = [("tracked", a.originFromAnchorTransform)]
-        if a.accessory.locations.contains(.aim) {
-            rows.append(("aim", a.coordinateSpace(for: .aim, correction: .none)
-                .ancestorFromSpaceTransformFloat().matrix))
-        }
-        if a.accessory.locations.contains(.gripSurface) {
-            rows.append(("gripSurface", a.coordinateSpace(for: .gripSurface, correction: .none)
-                .ancestorFromSpaceTransformFloat().matrix))
-        }
-        rows.append(("grip .rendered", a.coordinateSpace(for: .grip, correction: .rendered)
-            .ancestorFromSpaceTransformFloat().matrix))
-
-        NSLog("[cp] sense frames (\(side)): \(a.accessory.name), relative to .grip")
-        let gi = grip.inverse
-        for (name, m) in rows {
-            let r = gi * m
-            let o = SIMD3<Float>(r.columns.3.x, r.columns.3.y, r.columns.3.z)
-            let e = klEulerDegOf(r)
-            NSLog(String(format: "[cp]   %@ (%9.6f, %9.6f, %9.6f)  (%+7.2f, %+6.2f, %+7.2f)  %.4f",
-                         name.padding(toLength: 14, withPad: " ", startingAt: 0),
-                         o.x, o.y, o.z, e.x, e.y, e.z, simd_length(o)))
-        }
-        // The same two rows for an Oculus Touch, straight out of the render
-        // model, so the comparison is in the log rather than in a notebook.
-        NSLog("[cp]   Touch tracked  ( 0.007000, -0.034157, -0.096073)  ( -20.60,  +0.00,   -0.00)  0.1022")
-        NSLog("[cp]   Touch aim      ( 0.000000, -0.067273, -0.073480)  ( -60.00,  +0.00,   -0.00)  0.0996")
-    }
-
-    /// This hand's Sense controller, predicted to `time` and corrected: grip
-    /// pose plus the motion that goes with it, all in tracking space.
-    ///
-    /// `time` is a `CACurrentMediaTime()`-domain instant — the frame's
-    /// presentation time, the same one `queryDeviceAnchor(atTimestamp:)` gets
-    /// for the head, so the hands and the head describe one instant rather than
-    /// two. Falling back to the raw anchor if prediction refuses keeps a
-    /// controller that has just appeared (or one the tracker has lost) visible
-    /// instead of snapping it to the synthetic head-relative pose.
-    private func sensePose(hand: Int, at time: TimeInterval)
-        -> (SIMD3<Float>, simd_quatf, SIMD3<Float>, SIMD3<Float>)? {
-        lock.lock()
-        let stored = accessoryAnchor[hand]
-        let provider = accessoryProvider
-        lock.unlock()
-        guard let stored, let provider else { return nil }
-        // **KL_SENSE_PREDICT=0 hands over the raw anchor**, and it exists
-        // because a guest can predict a second time. We predict to the frame's
-        // presentation time and publish the velocity alongside; a guest that
-        // takes both and extrapolates again lands past the controller, and the
-        // further ahead its own pipeline reaches the further past. Steam Link
-        // is that case — the pose crosses to a PC and SteamVR predicts it to
-        // the PC's photon time — and it is the one target where the
-        // controllers were reported to overshoot badly while native guests did
-        // not. Off publishes the measured pose with its measured velocity and
-        // leaves all the predicting to whoever is going to do it anyway.
-        // Predicted no further AHEAD than the cap, so a guest that predicts
-        // again downstream is handed a pose that has not already reached into
-        // its territory. The cap is applied to the target INSTANT and the
-        // tracker is asked for that instant, rather than the pose being scaled
-        // after the fact: a pose is not linear in time and the tracker is the
-        // thing that knows how to move it.
-        let now = CACurrentMediaTime()
-        let capS = KLSenseTune.sensePredictMaxMs / 1000.0
-        let ahead = time - now
-        Self.notePredictionHorizon(ahead: ahead, cap: capS)
-        let a = capS > 0.0
-            ? (provider.predictAnchor(for: stored, at: now + min(max(ahead, 0), capS))
-               ?? stored)
-            : stored
-
-        // `.grip` is the location the platform defines for "where a hand holds
-        // this" — the anchor's own transform is the middle of the plastic, and
-        // pointing a saber out of that is the same class of bug as pointing one
-        // out of the wrist. A controller that publishes no grip (a stylus)
-        // falls back to its base.
-        let m = a.accessory.locations.contains(.grip)
-            ? a.coordinateSpace(for: .grip, correction: .rendered)
-                .ancestorFromSpaceTransformFloat().matrix
-            : a.originFromAnchorTransform
-        let raw = simd_quatf(m)
-        let t = KLSenseTune.shared[hand]
-        // The LIVE tune, re-read every pose so a slider in the boot window moves
-        // the controller while it is being dragged (KleptonTuning). Its X term
-        // is mirrored for the left hand for the reason KL_SENSE_MIRROR gives.
-        let live = KleptonTuning.shared.snapshot()
-        let mx: Float = KLSenseTune.mirrorX && hand == 0 ? -1 : 1
-        // Yaw and roll are mirrored with X for the left hand: reflecting the
-        // X axis negates rotations about Y and Z and leaves pitch alone.
-        let rot   = klEulerXYZ(SIMD3<Float>(KLSenseTune.psvr2Tilt + live.sensePitch,
-                                            mx * live.senseYaw, mx * live.senseRoll))
-        let tpos   = SIMD3<Float>(mx * live.sensePos.x, live.sensePos.y, live.sensePos.z)
-        let tpivot = SIMD3<Float>(mx * live.sensePivot.x, live.sensePivot.y, live.sensePivot.z)
-        _ = t
-        let q = simd_normalize(raw * rot)
-        // `pos` slides the corrected pose; `pivot` decides what the correction
-        // turned AROUND. Holding C still across the rotation is
-        // `+ raw·C - q·C`, which is zero when C is — so the default is exactly
-        // the behaviour this path has always had. See KLSenseTune.pivot.
-        var p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(tpos)
-        if tpivot != SIMD3<Float>(0, 0, 0) { p += raw.act(tpivot) - q.act(tpivot) }
-
-        // Motion, rotated out of the accessory's own frame if that is what it
-        // is in — by the UNCORRECTED orientation, because the correction above
-        // is a change of convention applied to the pose we report, not a claim
-        // about the frame the tracker measured in.
-        var v = a.velocity, w = a.angularVelocity
-        if KLSenseTune.velocityIsLocal { v = raw.act(v); w = raw.act(w) }
-        // Gate the PUBLISHED velocity: still-hand noise -> 0 (no SteamVR
-        // extrapolation jitter), real motion passes nearly untouched (flick
-        // stays crisp, and SteamVR still gets the velocity it predicts from, so
-        // no added lag).
-        v = KLSenseTune.gate(v, KLSenseTune.velGate)
-        w = KLSenseTune.gate(w, KLSenseTune.velGateAng)
-        return (p, q, v, w)
+        guard let p = provider as? AccessoryTrackingProvider else { return }
+        await senseKit.consumeAnchors(from: p)
     }
 
     /// Say, once, how far ahead the frame's presentation time actually is and
-    /// whether the cap reaches it.
+    /// whether the cap reaches it (SenseKit's `predictionObserver`).
     ///
     /// Without this the cap is untunable from a log: a horizon of 50 ms over a
     /// pipeline that is 30 ms deep is not a mild setting, it is NO setting —
@@ -1218,70 +951,19 @@ final class KleptonControllers {
         st.stick = h.stick
     }
 
-    // MARK: - Button binding (connect / disconnect at any time)
-
-    /// The Sense controllers pollButtons has configured, by object, with how
-    /// their input has been arriving. Render thread only, like the poll.
-    private var buttonBinding: [ObjectIdentifier: (name: String, hand: Int,
-                                                   queued: Int, captured: Int,
-                                                   saidCapture: Bool)] = [:]
-
-    /// (Re)bind the button path to exactly the spatial controllers present
-    /// NOW. Every frame, from the same `GCController.controllers()` read the
-    /// poll uses, so a controller that connects or reconnects at any moment —
-    /// before the game, mid-game, after a sleep — is configured on the frame it
-    /// appears, the same as one paired at launch. The pose half is rebuilt
-    /// separately (`spatialControllersChanged` → runARKit); this is the button
-    /// half, and it logs each bind/unbind so a headset log shows both.
-    private func rebindButtons(_ spatial: [GCController]) {
-        guard #available(visionOS 26.0, *) else { return }
-        var live = Set<ObjectIdentifier>()
-        for c in spatial {
-            let id = ObjectIdentifier(c)
-            live.insert(id)
-            if buttonBinding[id] != nil { continue }
-            c.input.inputStateQueueDepth = 1
-            let hand = Self.hand(of: c)
-            let name = c.vendorName ?? "?"
-            buttonBinding[id] = (name, hand, 0, 0, false)
-            NSLog("[cp] buttons bound: \(name) -> hand \(hand == 0 ? "L" : "R") "
-                  + "(\(buttonBinding.count) bound)")
-            // A controller in the hand is a Touch controller picked up: let the
-            // guest see its fingers near the controls once, so an edge-driven
-            // hand pose (IEYTD) gets the release that opens it (kl_ovrp.c).
-            kl_ovrp_arm_near_touch(Int32(hand))
-            Self.census(c)
-        }
-        for (id, v) in buttonBinding where !live.contains(id) {
-            buttonBinding[id] = nil
-            NSLog("[cp] buttons unbound: \(v.name) (hand \(v.hand == 0 ? "L" : "R"), "
-                  + "\(v.queued) queued / \(v.captured) captured reads)")
-        }
-    }
-
-    /// Count which path a controller's input came through, and say so ONCE if
-    /// a press is only visible through `capture()` — the measurement that tells
-    /// "the queue stays silent for a late controller" from anything else.
-    private func noteInputPath(_ c: GCController, queued: Bool, state: GCControllerInputState) {
-        let id = ObjectIdentifier(c)
-        guard var v = buttonBinding[id] else { return }
-        if queued { v.queued += 1 } else { v.captured += 1 }
-        if !queued, v.queued == 0, !v.saidCapture,
-           state.buttons.contains(where: { $0.pressedInput.isPressed }) {
-            v.saidCapture = true
-            NSLog("[cp] \(v.name): a press arrived through capture() with the input "
-                  + "queue silent since bind (\(v.captured) reads) — the late-connect case")
-        }
-        buttonBinding[id] = v
-    }
-
     // MARK: - Polling
 
-    /// Poll the Sense controllers' buttons. Called once per frame from the
-    /// render thread, before the guest's frame.
+    /// Poll the Sense controllers' buttons and lay them out as the guest's
+    /// Touch controllers. Called once per frame from the render thread, before
+    /// the guest's frame.
+    ///
+    /// SenseKit's `pollInput` does the GameController half — it (re)binds every
+    /// spatial controller present NOW (connect / disconnect at any time, the
+    /// bind arming kl_ovrp's near-touch edge through `onControllerBound`),
+    /// reads each one through its input queue or `capture()`, and logs the
+    /// census, the first press of each element and the late-connect case.
+    /// What is left here is the `ovrpButton` layout.
     private func pollButtons() {
-        guard #available(visionOS 26.0, *) else { return }
-
         // Clear the hands that have NO CONTROLLER ATTACHED, then fill in the
         // ones that do.
         //
@@ -1298,7 +980,7 @@ final class KleptonControllers {
         // on a new input state having arrived.** `nextInputState()` returns nil
         // when nothing has been queued since the last call — a controller
         // nobody is moving publishes nothing, because there is nothing to
-        // publish — and the loop below `continue`s on that. With both hands
+        // publish — and a loop that `continue`d on that. With both hands
         // cleared up front, every such frame told the guest the exact opposite
         // of what was happening: buttons released, triggers at 0, stick
         // CENTRED, at whatever rate the poll outran the device.
@@ -1315,14 +997,13 @@ final class KleptonControllers {
         // stream, which reports its own `.removed`. Clearing them on the
         // GameController schedule would drop a pose that is still being
         // tracked.
-        let spatial = GCController.controllers()
-            .filter { $0.productCategory == GCProductCategorySpatialController }
-        var attached = [false, false]
-        for c in spatial { attached[Self.hand(of: c)] = true }
-        rebindButtons(spatial)
+        // SenseKit clears its own detached hands the same way; this clears the
+        // guest-side state that goes with them.
+        senseKit.pollInput()
+        let input = [senseKit.inputState(.left), senseKit.inputState(.right)]
 
         lock.lock()
-        for i in 0...1 where !attached[i] {
+        for i in 0...1 where !input[i].connected {
             state[i].buttons = 0; state[i].touches = 0
             state[i].indexTrigger = 0; state[i].handTrigger = 0
             state[i].stick = .zero; state[i].fromController = false
@@ -1333,58 +1014,9 @@ final class KleptonControllers {
         }
         lock.unlock()
 
-        for c in spatial {
-
-            // Chirality by name (`Self.hand(of:)`), because GCController itself
-            // does not carry the hand — Accessory does, and the two objects are
-            // not joined here. The suffix is what the vendor string actually
-            // contains: "PlayStation VR2 Sense Controller (L)".
-            let hand = Self.hand(of: c)
-
-            // nil is "nothing new since you last asked", NOT "everything is
-            // released" — so it must not clear the hand (see the
-            // clear-on-attachment note above). It is answered with `capture()`,
-            // the controller's CURRENT state, instead of `continue`: the same
-            // values for a controller whose queue is merely idle, and the only
-            // input at all from one whose queue never fills. That second case
-            // is a Sense pair switched on AFTER the game started — poses
-            // tracked, and not one button reached the guest for the rest of
-            // the session, while a pair connected at launch worked. Whatever
-            // the platform does to the late controller's queue, the live
-            // snapshot does not depend on it; `rebindButtons` logs which path
-            // a controller's input actually arrives on.
-            let queued = c.input.nextInputState()
-            let s: GCControllerInputState = queued ?? c.input.capture()
-            noteInputPath(c, queued: queued != nil, state: s)
-            let b = s.buttons, ax = s.axes, dp = s.dpads
-
-            // The PSVR2 Sense element names, per controller. Both controllers
-            // use the SAME unprefixed names — the hand is the device, not the
-            // element — which is why this is keyed off `hand` rather than off
-            // "Left …"/"Right …" strings.
-            func pressed(_ n: String) -> Bool { b[n]?.pressedInput.isPressed ?? false }
-            func value(_ n: String) -> Float { b[n]?.pressedInput.value ?? 0 }
-            func touched(_ n: String) -> Bool { b[n]?.touchedInput?.isTouched ?? false }
-            func axis(_ n: String) -> Float { ax[n]?.absoluteInput?.value ?? 0 }
-
-            // Every element name this controller reports pressed, once each.
-            //
-            // A name this hardware does not publish is INDISTINGUISHABLE from a
-            // button nobody pressed: the lookup returns nil, `?? false` makes it
-            // a release, and the control is silently dead for the whole run.
-            // Both of this arc's input bugs are that shape — the thumbstick was
-            // being read as two axis elements that do not exist, and the PS
-            // button is being read as a name that may not either — and neither
-            // has any other symptom. `census()` says what exists; this says what
-            // the hardware actually sends when a person presses it, which is the
-            // half that settles a mapping.
-            // Every alias, not one name: the collection is a Swift Collection of
-            // ELEMENTS (it has no `.keys`), and an element is reachable under
-            // any of `aliases` — which is the whole point here, since the bug
-            // being hunted is reading one under a name it does not answer to.
-            for el in b where el.pressedInput.isPressed {
-                for n in el.aliases { Self.notePress("\(n) [\(hand == 0 ? "L" : "R")]") }
-            }
+        for hand in 0...1 where input[hand].connected {
+            let sk = input[hand]
+            let side: SenseHand = hand == 0 ? .left : .right
 
             // **The Oculus layout, laid over the Sense one.**
             //
@@ -1418,7 +1050,7 @@ final class KleptonControllers {
             // `GCControllerHomeButtonSetting.inAppAction`, which does not exist
             // in the XROS 26.0 SDK this tree builds against. Read anyway, so a
             // visionOS 27 build gets it the moment the system stops eating it —
-            // and `notePresses` above is what will say when that happens,
+            // and SenseKit's first-press log is what will say when that happens,
             // which is worth more than a guessed selector.
             // The Sense Create (L) / Options (R) buttons both arrive as
             // "Button Menu". Split by HAND, per the user's spec:
@@ -1430,56 +1062,19 @@ final class KleptonControllers {
             //  - A real Home/PS element, if this visionOS delivers one (check
             //    the "[cp] ... elements:" line), is the system/home bit alone -
             //    the SteamVR dashboard, the Oculus home.
-            let menuish = pressed("Button Menu") || pressed("Button Share")
-                       || pressed("Button Options")
-            let psish = pressed("Button Home") || pressed("Button PS")
-                     || pressed("Button PS Button")
-            let homeish = (hand == 0 && pressed("Button Menu")) || psish
+            //
+            // In SenseKit's physical names: "Button Menu" is `.create` on the
+            // left and `.options` on the right, "Button Share" / "Button
+            // Options" are `.options` on either hand, and Home / PS is `.ps`.
+            let menuish = !sk.buttons.isDisjoint(with: [.create, .options])
+            let psish = sk.buttons.contains(.ps)
+            let homeish = (hand == 0 && sk.buttons.contains(.create)) || psish
 
             var st = KleptonHandState()
             st.fromController = true
-            st.indexTrigger = value("Trigger")
-            st.handTrigger  = pressed("Grip") ? 1 : 0
-            // **The thumbstick is a DPAD element, not two axes.** `GCInput`
-            // models a stick as one `GCDirectionPadElement` carrying `xAxis` and
-            // `yAxis` — `input.dpads[GCInputLeftThumbstick]`, and the header
-            // says in as many words that looking a dpad up in `axes` fails. The
-            // two names read here before ("Thumbstick X Axis" / "Thumbstick Y
-            // Axis") are not element names on this hardware, so both lookups
-            // returned nil, `?? 0` made that a centred stick, and the guest saw
-            // a controller whose stick never moved — with the Up/Down/Left/Right
-            // BUTTON bits working the whole time, which is why it read as an
-            // analog problem rather than a naming one.
-            //
-            // The axis fallback is kept for anything that does publish them.
-            // ALVR reads `dpads["Thumbstick"]` for the Sense pair; the prefixed
-            // names are what a conventional gamepad uses.
-            // The PSVR2 Sense publishes the stick THREE ways at once (census on
-            // this device: dpad "Thumbstick", axes "Thumbstick X/Y Axis", and
-            // discrete buttons "Thumbstick Left/Right/Up/Down"), and NOT every one
-            // carries the live analog: here the dpad element exists but its
-            // xAxis/yAxis read a flat 0, so the old `if let d = dp[n] { return … }`
-            // returned that zero and never tried the axes — the guest saw a stick
-            // that never moved (no walking, and the analog-derived snap-turn bits
-            // stayed 0 too). Take the first source that is actually deflected: the
-            // analog dpad, then the analog axes, then the discrete direction
-            // buttons as a coarse ±1 so a stick that only reports edges still
-            // walks and turns.
-            func stick2() -> SIMD2<Float> {
-                let eps: Float = 0.02
-                func live(_ v: SIMD2<Float>) -> Bool { v.x*v.x + v.y*v.y > eps*eps }
-                if let d = dp["Thumbstick"] {
-                    let v = SIMD2(d.xAxis.value, d.yAxis.value); if live(v) { return v }
-                }
-                if let d = dp[hand == 0 ? "Left Thumbstick" : "Right Thumbstick"] {
-                    let v = SIMD2(d.xAxis.value, d.yAxis.value); if live(v) { return v }
-                }
-                let axv = SIMD2(axis("Thumbstick X Axis"), axis("Thumbstick Y Axis"))
-                if live(axv) { return axv }
-                return SIMD2(value("Thumbstick Right") - value("Thumbstick Left"),
-                             value("Thumbstick Up")    - value("Thumbstick Down"))
-            }
-            st.stick = stick2()
+            st.indexTrigger = sk.trigger
+            st.handTrigger  = sk.grip
+            st.stick = sk.stick
 
             var bits: UInt32 = 0, touch: UInt32 = 0
             // **A thumb on the stick**, which nothing reported until Half-Life:
@@ -1496,34 +1091,35 @@ final class KleptonControllers {
             // visionos/Sources/KleptonControllers.swift. KL_SENSE_STICK_TOUCH:
             // default on except for our Alyx (OpenVR shim), whose input is
             // tuned without it.
-            if Self.stickTouch, touched("Thumbstick Button")
+            if Self.stickTouch, sk.touches.contains(.stickClick)
                 || st.stick.x * st.stick.x + st.stick.y * st.stick.y > 0.1 * 0.1 {
                 touch |= hand == 0 ? OVRPRawButton.lThumbstick : OVRPRawButton.rThumbstick
             }
+            // The Sense controllers name their face buttons A and B on both
+            // hands (SenseKit: lower / upper face — Square / Triangle on the
+            // left, Cross / Circle on the right); the guest's left hand calls
+            // them X and Y.
+            let lower = SenseButtons.lowerFace(side), upper = SenseButtons.upperFace(side)
+            let trigTouched = Self.triggerTouch
+                && (sk.touches.contains(.trigger) || st.indexTrigger > Self.triggerTouchMin)
             if hand == 0 {
-                // The Sense controllers name their face buttons A and B on both
-                // hands; the guest's left hand calls them X and Y.
-                if pressed("Button A") { bits |= OVRPRawButton.x }
-                if pressed("Button B") { bits |= OVRPRawButton.y }
-                if touched("Button A") { touch |= OVRPRawButton.x }
-                if touched("Button B") { touch |= OVRPRawButton.y }
-                if Self.triggerTouch, touched("Trigger") || st.indexTrigger > Self.triggerTouchMin {
-                    touch |= OVRPRawButton.lIndexTrigger
-                }
-                if pressed("Thumbstick Button") { bits |= OVRPRawButton.lThumbstick }
+                if sk.buttons.contains(lower) { bits |= OVRPRawButton.x }
+                if sk.buttons.contains(upper) { bits |= OVRPRawButton.y }
+                if sk.touches.contains(lower) { touch |= OVRPRawButton.x }
+                if sk.touches.contains(upper) { touch |= OVRPRawButton.y }
+                if trigTouched { touch |= OVRPRawButton.lIndexTrigger }
+                if sk.buttons.contains(.stickClick) { bits |= OVRPRawButton.lThumbstick }
                 if st.indexTrigger > Self.triggerPressMin { bits |= OVRPRawButton.lIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.lHandTrigger }
                 if menuish { bits |= OVRPRawButton.start }
                 if homeish { bits |= OVRPRawButton.back }
             } else {
-                if pressed("Button A") { bits |= OVRPRawButton.a }
-                if pressed("Button B") { bits |= OVRPRawButton.b }
-                if touched("Button A") { touch |= OVRPRawButton.a }
-                if touched("Button B") { touch |= OVRPRawButton.b }
-                if Self.triggerTouch, touched("Trigger") || st.indexTrigger > Self.triggerTouchMin {
-                    touch |= OVRPRawButton.rIndexTrigger
-                }
-                if pressed("Thumbstick Button") { bits |= OVRPRawButton.rThumbstick }
+                if sk.buttons.contains(lower) { bits |= OVRPRawButton.a }
+                if sk.buttons.contains(upper) { bits |= OVRPRawButton.b }
+                if sk.touches.contains(lower) { touch |= OVRPRawButton.a }
+                if sk.touches.contains(upper) { touch |= OVRPRawButton.b }
+                if trigTouched { touch |= OVRPRawButton.rIndexTrigger }
+                if sk.buttons.contains(.stickClick) { bits |= OVRPRawButton.rThumbstick }
                 if st.indexTrigger > Self.triggerPressMin { bits |= OVRPRawButton.rIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.rHandTrigger }
                 // Both bits on both hands. The Oculus Touch interaction profile
@@ -1618,7 +1214,7 @@ final class KleptonControllers {
     //  The only seam here that runs OUT of the guest. Beat Saber queues an
     //  amplitude envelope through OVRPlugin's buffered haptics API and
     //  `kl_ovrp_haptics_pull` hands it over a pulse at a time (kl_ovrp.c holds
-    //  the whole contract); this plays those pulses on the Sense controllers.
+    //  the whole contract); SenseKit plays those pulses on the Sense controllers.
     //
     //  **A hand cannot be vibrated.** There is no actuator on the hand-tracking
     //  path and nothing on the headset stands in for one, so a hand-tracked run
@@ -1643,20 +1239,8 @@ final class KleptonControllers {
     //  floor) — the A/B if the continuous player ever misbehaves on hardware,
     //  and the automatic fallback if the advanced player cannot be made.
 
-    /// One engine and one player per hand, created on that hand's first pulse.
-    /// Guarded by `lock` because `stoppedHandler` fires on CoreHaptics's own
-    /// queue.
-    private var hapticEngine: [Int: CHHapticEngine] = [:]
-    private var hapticPlayer: [Int: CHHapticAdvancedPatternPlayer] = [:]
-    /// Per hand: is the player started, is it paused, when did it last go
-    /// silent, and the burst being logged.
-    private var hapticRunning = [false, false]
-    private var hapticSilentSince: [TimeInterval] = [0, 0]
-    private var hapticBurstPeak: [Float] = [0, 0]
-    private var hapticBurstStart: [TimeInterval] = [0, 0]
-    private var hapticBursts = [0, 0]
-    private var hapticPulseMode = [false, false]     // fell back to discrete?
-    private var notedHaptics = Set<String>()
+    //  The engine and the driving now live in SenseKit (SenseHaptics.swift);
+    //  what stays here is the pull and the KL_HAPTICS_* knobs below.
 
     /// `KL_HAPTICS_OFF=1` turns the path off outright — the pull still runs, so
     /// the guest's queue cannot back up, but nothing is played.
@@ -1679,276 +1263,31 @@ final class KleptonControllers {
     /// can't do 10ms vibrations". The continuous path gets the same floor from
     /// kl_ovrp's side, where it is a hold on the level instead.
     /// `KL_HAPTICS_MIN_MS` moves both.
-    private static let minOn = klEnvFloat("KL_HAPTICS_MIN_MS", 32) / 1000
+    private static let minOnMs = klEnvFloat("KL_HAPTICS_MIN_MS", 32)
 
-    /// Which hand a controller is, by vendor name — the same rule `pollButtons`
-    /// uses, and in one place so the two cannot drift apart. GCController does
-    /// not carry chirality itself; `Accessory` does, and the two objects are
-    /// not joined here.
-    static func hand(of c: GCController) -> Int {
-        (c.vendorName ?? "").hasSuffix("(L)") ? 0 : 1
+    /// The knobs above as SenseKit's haptics configuration.
+    private static var hapticsConfiguration: SenseHapticsConfiguration {
+        SenseHapticsConfiguration(enabled: hapticsEnabled, gain: gain, sharpness: sharpness,
+                                  mode: pulseMode ? .pulse : .continuous,
+                                  minPulseMs: Double(minOnMs))
     }
 
     /// Follow both hands' envelopes. Called once a frame from the compositor,
     /// beside `update`.
     ///
     /// The pull is a LEVEL — what the hand should be feeling right now — not an
-    /// event to schedule. Draining it unconditionally, even with playback off,
-    /// keeps the two sides in step.
-    ///
-    /// **The pull happens here, on the render thread; the playing does not.**
-    /// (Adapted from avp-play, MIT, github.com/myMartek/avp-play.)
-    /// Everything CoreHaptics does is a synchronous message to a system service
-    /// (creating an engine goes through gamecontrollerd), and a synchronous
-    /// message waits for as long as the service takes. In Marvel's Deadpool VR —
-    /// heavy, constant haptics — that service ran into its own memory limit five
-    /// minutes into a session, the engine being re-created for one hand sat in
-    /// `xpc_connection_send_message_with_reply_sync` for over two seconds, and
-    /// because that call was made from here, inside `renderFrame`, the render
-    /// loop sat with it. visionOS ends an immersive app that stops presenting:
-    /// SIGKILL from wakeboard, every thread idle, nothing in our own log
-    /// (2026-10-09). So the levels are pulled here, which keeps the guest's queue
-    /// in step exactly as before, and handed to a queue of their own. While that
-    /// queue is still busy with an earlier frame, this frame's levels are dropped:
-    /// a buzz that arrives seconds late is worse than one that is missed, and the
-    /// picture must not wait for either.
+    /// event to schedule. SenseKit drains it (through `hapticsSource`, i.e.
+    /// `kl_ovrp_haptics_pull`) unconditionally, even with playback off, which
+    /// keeps the two sides in step, and plays it on a queue of its own so the
+    /// render loop never waits for the haptics service (see
+    /// `SenseControllers.pumpHaptics`).
     func pumpHaptics() {
-        let now = ProcessInfo.processInfo.systemUptime
-        var levels: [(level: Float, seconds: Float)] = []
-        for hand in 0...1 {
-            var amplitude: Float = 0, seconds: Float = 0
-            let live = kl_ovrp_haptics_pull(Int32(hand), &amplitude, &seconds) != 0
-            levels.append((live ? min(max(amplitude * Self.gain, 0), 1) : 0, seconds))
-        }
-        guard Self.hapticsEnabled else { return }
-
-        hapticsGate.lock()
-        let busy = hapticsBusy
-        if busy { hapticsSkipped += 1 } else { hapticsBusy = true }
-        hapticsGate.unlock()
-        if busy { return }
-
-        hapticsQueue.async { [self] in
-            for hand in 0...1 {
-                let (level, seconds) = levels[hand]
-                traceBurst(hand: hand, level: level, at: now)
-                if Self.pulseMode || hapticPulseMode[hand] {
-                    if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
-                } else {
-                    drive(hand: hand, level: level, at: now)
-                }
-            }
-            let took = ProcessInfo.processInfo.systemUptime - now
-            hapticsGate.lock()
-            let skipped = hapticsSkipped
-            hapticsSkipped = 0
-            hapticsBusy = false
-            hapticsGate.unlock()
-            if took > 0.25 {
-                NSLog("[cp] haptics: the haptics service took \(String(format: "%.2f", took)) s to answer — "
-                      + "\(skipped) frame(s) of haptics dropped, the render loop did not wait")
-            }
-        }
-    }
-
-    /// Where the haptics calls run (see `pumpHaptics`), and whether a batch is
-    /// still in flight.
-    private let hapticsQueue = DispatchQueue(label: "klepton.haptics", qos: .userInitiated)
-    private let hapticsGate = NSLock()
-    private var hapticsBusy = false
-    private var hapticsSkipped = 0
-
-    /// The continuous path: hold one looping player per hand and move its
-    /// intensity. Starting it costs a `start`; every frame after that is one
-    /// `sendParameters`, which is what keeps the envelope unbroken.
-    private func drive(hand: Int, level: Float, at now: TimeInterval) {
-        if level <= 0 {
-            guard hapticRunning[hand] else { return }
-            // Silence first, then pause once it has been quiet a while: pausing
-            // immediately would make every gap between two clips a stop/start
-            // pair, which is the restart this design exists to avoid.
-            send(hand: hand, level: 0)
-            if hapticSilentSince[hand] == 0 { hapticSilentSince[hand] = now }
-            if now - hapticSilentSince[hand] > 1.0 {
-                try? hapticPlayer[hand]?.pause(atTime: CHHapticTimeImmediate)
-                hapticRunning[hand] = false
-                hapticSilentSince[hand] = 0
-            }
-            return
-        }
-        hapticSilentSince[hand] = 0
-        if !hapticRunning[hand] {
-            guard let player = hapticsPlayer(for: hand) else { return }
-            do { try player.start(atTime: CHHapticTimeImmediate) }
-            catch {
-                NSLog("[cp] haptics: hand \(hand) player would not start: \(error)"
-                      + " — falling back to discrete pulses")
-                hapticPulseMode[hand] = true
-                playPulse(hand: hand, level: level, seconds: Self.minOn)
-                return
-            }
-            hapticRunning[hand] = true
-        }
-        send(hand: hand, level: level)
-    }
-
-    private func send(hand: Int, level: Float) {
-        guard let player = hapticPlayer[hand] else { return }
-        do {
-            try player.sendParameters([CHHapticDynamicParameter(
-                parameterID: .hapticIntensityControl, value: level, relativeTime: 0)],
-                atTime: CHHapticTimeImmediate)
-        } catch {
-            NSLog("[cp] haptics: hand \(hand) parameter send failed: \(error)"
-                  + " — dropping the engine")
-            dropHapticsEngine(hand)
-        }
-    }
-
-    /// ALVR's shape, kept as the fallback and the A/B: one short continuous
-    /// event per frame, never shorter than the floor.
-    private func playPulse(hand: Int, level: Float, seconds: Float) {
-        guard let engine = hapticsEngine(for: hand) else { return }
-        do {
-            let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
-                CHHapticEventParameter(parameterID: .hapticIntensity, value: level),
-                CHHapticEventParameter(parameterID: .hapticSharpness, value: Self.sharpness),
-            ], relativeTime: 0, duration: Double(max(seconds, Self.minOn)))
-            let pattern = try CHHapticPattern(events: [event], parameters: [])
-            try engine.makePlayer(with: pattern).start(atTime: CHHapticTimeImmediate)
-        } catch {
-            // Dropped rather than retried: every failure mode here (the engine
-            // stopped, the device went away, the pattern was rejected) repeats
-            // on the next frame, so keeping it would be one caught error per
-            // frame for the rest of the run. A rebuild is one lazy `createEngine`.
-            NSLog("[cp] haptics: hand \(hand) pulse failed: \(error) — dropping the engine")
-            dropHapticsEngine(hand)
-        }
-    }
-
-    /// One line per BURST rather than per frame: at 90 Hz a held buzz would
-    /// otherwise be ninety log lines a second, and what is worth reading is the
-    /// shape — how loud it got and how long it lasted. The first burst per hand
-    /// is the one that matters most; it is the only evidence the whole chain
-    /// (guest clip → queue → pull → engine) reached an actuator.
-    private func traceBurst(hand: Int, level: Float, at now: TimeInterval) {
-        if level > 0 {
-            if hapticBurstStart[hand] == 0 { hapticBurstStart[hand] = now; hapticBurstPeak[hand] = 0 }
-            hapticBurstPeak[hand] = max(hapticBurstPeak[hand], level)
-            return
-        }
-        guard hapticBurstStart[hand] != 0 else { return }
-        let ms = (now - hapticBurstStart[hand]) * 1000
-        hapticBursts[hand] += 1
-        if hapticBursts[hand] <= 3 || hapticBursts[hand] % 100 == 0 {
-            NSLog(String(format: "[cp] haptics: hand %d burst %d — peak %.2f over %.0f ms",
-                         hand, hapticBursts[hand], hapticBurstPeak[hand], ms))
-        }
-        hapticBurstStart[hand] = 0
-    }
-
-    private func hapticsPlayer(for hand: Int) -> CHHapticAdvancedPatternPlayer? {
-        if let existing = hapticPlayer[hand] { return existing }
-        guard let engine = hapticsEngine(for: hand) else { return nil }
-        do {
-            // Intensity 1.0 in the pattern, because the dynamic parameter
-            // SCALES it — an event authored quieter would cap everything below.
-            // The event's own duration is irrelevant: the player loops.
-            let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
-                CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0),
-                CHHapticEventParameter(parameterID: .hapticSharpness, value: Self.sharpness),
-            ], relativeTime: 0, duration: 1.0)
-            let player = try engine.makeAdvancedPlayer(
-                with: CHHapticPattern(events: [event], parameters: []))
-            player.loopEnabled = true
-            hapticPlayer[hand] = player
-            return player
-        } catch {
-            NSLog("[cp] haptics: hand \(hand) has no continuous player (\(error))"
-                  + " — falling back to discrete pulses")
-            hapticPulseMode[hand] = true
-            return nil
-        }
-    }
-
-    private func hapticsEngine(for hand: Int) -> CHHapticEngine? {
-        lock.lock(); let existing = hapticEngine[hand]; lock.unlock()
-        if let existing { return existing }
-        guard #available(visionOS 26.0, *) else { return nil }
-        guard let device = Self.spatialControllers().first(where: { Self.hand(of: $0) == hand })
-        else { return nil }
-        guard let haptics = device.haptics else {
-            noteHaptics("[cp] haptics: \(device.vendorName ?? "controller") reports none")
-            return nil
-        }
-        // One controller per hand, so the whole device is the locality. ALVR
-        // asks for `.leftHandle`/`.rightHandle` first because its reference
-        // device is one gamepad with two grips; a Sense controller *is* the
-        // hand, and asking it for a handle it does not have returns nil.
-        var made = haptics.createEngine(withLocality: .default)
-        if made == nil { made = haptics.createEngine(withLocality: .all) }
-        if made == nil, let any = haptics.supportedLocalities.first {
-            made = haptics.createEngine(withLocality: any)
-        }
-        guard let engine = made else {
-            noteHaptics("[cp] haptics: no engine for hand \(hand); "
-                        + "localities \(haptics.supportedLocalities)")
-            return nil
-        }
-        engine.stoppedHandler = { [weak self] reason in
-            NSLog("[cp] haptics: hand \(hand) engine stopped (reason \(reason.rawValue))")
-            self?.dropHapticsEngine(hand)
-        }
-        // A reset is the media server having gone away and come back: every
-        // CoreHaptics object in the process is invalid and the engine has to be
-        // started again. Weak on the engine as well as on self — the handler is
-        // held BY the engine, so capturing it strongly is a cycle that outlives
-        // the controller.
-        engine.resetHandler = { [weak self, weak engine] in
-            NSLog("[cp] haptics: hand \(hand) engine reset — restarting")
-            do { try engine?.start() } catch { self?.dropHapticsEngine(hand) }
-        }
-        do { try engine.start() } catch {
-            noteHaptics("[cp] haptics: hand \(hand) engine would not start: \(error)")
-            return nil
-        }
-        NSLog("[cp] haptics: hand \(hand) engine up on \(device.vendorName ?? "?")")
-        lock.lock(); hapticEngine[hand] = engine; lock.unlock()
-        return engine
-    }
-
-    private func dropHapticsEngine(_ hand: Int) {
-        lock.lock()
-        let engine = hapticEngine.removeValue(forKey: hand)
-        // The player belongs to the engine; keeping it past one would be a
-        // player on a dead engine, which throws on every frame's parameter send.
-        hapticPlayer.removeValue(forKey: hand)
-        hapticRunning[hand] = false
-        hapticSilentSince[hand] = 0
-        lock.unlock()
-        engine?.stop()
+        senseKit.pumpHaptics()
     }
 
     /// Every engine, for a disconnect or teardown.
     func releaseHaptics() {
-        lock.lock()
-        let engines = hapticEngine
-        hapticEngine.removeAll()
-        hapticPlayer.removeAll()
-        hapticRunning = [false, false]
-        hapticSilentSince = [0, 0]
-        lock.unlock()
-        for (_, e) in engines { e.stop() }
-    }
-
-    /// Once per distinct message. These are all "this device cannot do
-    /// haptics" shapes, which is a fact about the run rather than an event —
-    /// logged every frame it would drown the pinch trace.
-    private func noteHaptics(_ msg: String) {
-        lock.lock()
-        let fresh = notedHaptics.insert(msg).inserted
-        lock.unlock()
-        if fresh { NSLog("%@", msg) }
+        senseKit.releaseHaptics()
     }
 
     // MARK: - The seam
@@ -2187,8 +1526,8 @@ final class KleptonControllers {
         // reads as "the player switched hands", over and over. So once either
         // hand has a controller, a hand without one is not tracked at all.
         // KL_HANDS_WITH_CONTROLLER=1 restores the per-hand fallback.
-        let sense = [sensePose(hand: 0, at: presentationTime),
-                     sensePose(hand: 1, at: presentationTime)]
+        let sense = [senseKit.pose(.left, at: presentationTime),
+                     senseKit.pose(.right, at: presentationTime)]
         lock.lock()
         let wired = [state[0].fromController, state[1].fromController]
         lock.unlock()
@@ -2212,8 +1551,8 @@ final class KleptonControllers {
             let accPose = sense[hand]
             if let accPose {
                 handSuppressed[hand] = false
-                st.position = accPose.0; st.orientation = accPose.1
-                st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
+                st.position = accPose.position; st.orientation = accPose.orientation
+                st.linearVelocity = accPose.linearVelocity; st.angularVelocity = accPose.angularVelocity
             } else if anyController && !st.fromController {
                 // Released and parked, once, on the way in: whatever the pinch
                 // last held must not stay held, and a hand frozen where
