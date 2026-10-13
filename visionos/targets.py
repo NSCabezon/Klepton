@@ -253,6 +253,14 @@ TARGETS = {
         # 0.7 is half the pixels, Batman's value; the in-app "Render
         # resolution" slider starts here and can go up if the headset allows.
         "render_scale": 0.7,
+        # Post-process antialiasing (KL_POST_AA, kl_glfb.c): the game renders its
+        # eyes single-sampled by its own choice, so edges stair-step. FXAA on the
+        # eye texture at EndFrame is AVAILABLE here (the hub shows the toggle) but
+        # OFF by default: measured on the Mac (M1 Max, 1648x1724 physical per eye
+        # with foveation) at ~0.5-0.9 ms a frame for both eyes, which scales to an
+        # estimated ~1.5-3 ms on the headset's M2 — over the 1 ms budget. Turn it
+        # on in the hub to A/B on the headset; flip this to True if it holds 45 fps.
+        "post_aa": False,
     },
     "ktane": {
         # Keep Talking and Nobody Explodes (Steel Crate Games), Quest build
@@ -1506,6 +1514,12 @@ def resolve(name):
     t.setdefault("video", False)
     t.setdefault("autoboot", True)
     t.setdefault("foveation", True)
+    # Post-process antialiasing on the eye textures (KL_POST_AA): None = not
+    # offered for this game (the hub shows the toggle disabled), False = offered
+    # and off by default, True = offered and on. Only guests whose eyes reach the
+    # compositor through OVRPlugin's GL eye textures can use it (kl_ovrp.c
+    # EndFrame), so a row opts in by stating it.
+    t.setdefault("post_aa", None)
     # The hub offers "Jugar desde el Mac" (the Mac runs the game, the headset
     # streams it) only for a row that says so: a game whose stream session was
     # verified (KleptonHub HubLibraryView.streamable).

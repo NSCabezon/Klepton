@@ -1427,7 +1427,27 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // klvm_note_delta used to ask again, and two reads of a value the guest is
     // advancing pair one stage's picture with another stage's pose — the exact
     // failure this stage-keying exists to prevent.
-    int stage = kl_ovrp_last_complete_stage();
+    //
+    // ...and it is read TOGETHER with the GL fence that covers it. Read apart
+    // (the stage here, the fence further down) they paired the newest filed
+    // stage with the PREVIOUS frame's fence: the guest files a stage at its
+    // EndFrame and publishes that frame's fence only at its present, so in that
+    // window this pass waited on the old value and sampled a stage the GPU had
+    // not finished — a torn or older picture, ~1 frame in 8 on IEYTD.
+    // kl_ovrp_complete_stage_fenced picks a stage whose fence is published and
+    // hands back that fence to wait on.
+    //
+    // The layer list is snapshotted BEFORE the fence is read, as before (see
+    // below): the list may only ever be older than the fence.
+    kl_ovrp_proj_layer g_list[8];
+    int nproj = kl_ovrp_eye_layer_live()
+        ? kl_ovrp_proj_layers_snapshot(g_list, (int)(sizeof g_list / sizeof g_list[0]))
+        : 0;
+    int fenced = 0;
+    uint64_t v = klvm_frame_value(&fenced);
+    uint64_t stage_fence = v;
+    int stage = kl_ovrp_complete_stage_fenced(fenced ? v : 0, &stage_fence, NULL);
+    if (fenced) v = stage_fence;
     if (stage < 0) stage = 0;
     int slice = 0;
     int eye = klvm_eye();
@@ -1444,16 +1464,12 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // same picture, described whole instead of flattened into one texture. Zero
     // is every guest that does not file the list, which is every guest but
     // Steam Link and every run under KL_XR_LAYERS=0.
-    // Snapshotted HERE, before the frame fence is read below, and that order is
+    // Snapshotted ABOVE, before the frame fence was read, and that order is
     // the whole of it: the guest publishes its frame's completion before the
     // records that describe it (klxr_EndFrame), so a list read first can only
     // be older than the fence read second — never newer, which would be drawing
     // layers whose blits this pass never waited for. Seen as one frame of a
     // picture from several frames ago.
-    kl_ovrp_proj_layer g_list[8];
-    int nproj = kl_ovrp_eye_layer_live()
-        ? kl_ovrp_proj_layers_snapshot(g_list, (int)(sizeof g_list / sizeof g_list[0]))
-        : 0;
     // No eye picture is not the same as no picture. A guest can present its
     // whole frame as an OpenXR quad layer and submit no projection layer at all
     // — JKXR does for its entire menu — and returning here showed a black window
@@ -1493,9 +1509,9 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // it is a property of the storage and not of this compositor.
     int flip = kl_glfb_eye_mtl_origin_top_left(eye, stage);
 
-    int fenced = 0;
-    uint64_t v = klvm_frame_value(&fenced);
     if (!v || v == g_last_value) return 0;   // no new guest frame
+    // A fallback to the previous stage is never OLDER than what is on screen.
+    if (fenced && v < g_last_value) return 0;
 
     if (win_w <= 0 || win_h <= 0) return 0;
     CGSize want = CGSizeMake(win_w, win_h);

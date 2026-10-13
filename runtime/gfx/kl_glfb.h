@@ -543,6 +543,23 @@ void kl_glfb_set_foveation_default(int on);
 // so this is called once per axis with the same arguments.
 void kl_glfb_foveation_quality(float *q, int n, float edge);
 
+// Post-process antialiasing on the eye textures, for guests that render their
+// eyes without MSAA (I Expect You To Die). `KL_POST_AA`: 0 off, 1 FXAA. It runs
+// as a GL pass on each eye texture the guest drew this frame, at its EndFrame —
+// once per guest frame, at the rendered resolution, before the frame is filed
+// for the compositor; on a foveated eye it filters the physical rectangle (the
+// comment above the implementation says why).
+#define KL_POST_AA_OFF  0
+#define KL_POST_AA_FXAA 1
+// The mode in force for this run (read once): `KL_POST_AA`, else the default.
+int  kl_glfb_post_aa_mode(void);
+// What `KL_POST_AA` defaults to: off until this is called. The visionOS app
+// calls it with the game's stored setting before the guest boots.
+void kl_glfb_set_post_aa_default(int mode);
+// Filter both eyes of every stage in `stage_mask` (bit n = stage n). Called on
+// the guest's GL thread at EndFrame; a no-op when the mode is off.
+void kl_glfb_post_aa_eyes(uint32_t stage_mask);
+
 // The largest zone count kl_glfb_foveation_wanted will report, so a caller can
 // size a stack array for the curve above without allocating.
 #define KL_FOVEATION_MAX_ZONES 64

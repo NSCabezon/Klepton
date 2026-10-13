@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <math.h>          // powf — the debug tone map in the capture path
+#include <time.h>          // clock_gettime — KL_POST_AA_BENCH
 #include <zlib.h>
 // The decoded-video image path — an AHardwareBuffer here is a
 // CVPixelBuffer, and what ANGLE can take is the IOSurface behind it.
@@ -37,6 +38,10 @@
 // The flat door's zero-readback storage. IOSurfaceRef.h by name: the umbrella
 // IOSurface.h is macOS-only, and visionOS ships only the Ref/Types split.
 #include <IOSurface/IOSurfaceRef.h>
+// One Metal query from plain C (a rate map's physical size, for KL_POST_AA):
+// objc_msgSend rather than an .m file, so this file stays C.
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include "kl_glfb.h"
 #include "kl_cvmtl.h"      // native-format video frames as MTLTextures
 #include "kl_present.h"
@@ -8503,6 +8508,686 @@ static void chunk(FILE *f, const char *t, const uint8_t *d, uint32_t n) {
 // pump otherwise writes 300 full-size PNGs. The throttle applies to the PNG
 // path only: a registered frame sink is a live display, not a batch of files,
 // so it wants every swap and dir may be NULL.
+// ---------------------------------------------------------------------------
+// Post-process antialiasing on the eye textures: KL_POST_AA (kl_glfb.h).
+//
+// For a guest that renders its eyes without MSAA — I Expect You To Die is the
+// first: Unity 2019's legacy Oculus path draws the scene straight into the eye
+// texture, single-sampled, by its own choice (KL_GLFB_KEEP_MSAA changes
+// nothing) — and so shows stair-stepped edges on the headset.
+//
+// WHERE, and why here. Two places could run it:
+//
+//   1. a GL pass on each eye texture the guest just finished, at its EndFrame —
+//      once per GUEST frame (~45 Hz on the headset), at the resolution the guest
+//      rendered, BEFORE the frame is filed for the compositor and before the GPU
+//      fence that tells the compositor it is done (kl_glfb_present); or
+//   2. inside the Metal compositor's shader — once per DISPLAY refresh (90 Hz,
+//      twice the work), and after reprojection has already resampled the
+//      picture, so the edges FXAA has to find are no longer pixel-aligned.
+//
+// So (1). It is also the only place that sees the pixels exactly as they were
+// rasterized, which is what FXAA is a filter for.
+//
+// FOVEATION. When the GL rate map is in force (KL_VRR) the eye texture holds
+// the picture in PHYSICAL layout: the guest's passes are rasterized through the
+// map, the periphery is stored at a fraction of its size in the top-left
+// physical rectangle, and the compositor unwarps it on the way to the display.
+// There is no "VRR upscale" in GL to filter after — the unwarp IS the
+// compositor's sampling. The jaggies, though, are on the physical sample grid
+// (that is where the triangles were rasterized), so the filter runs there:
+// the map is lifted off the eye texture for the length of this pass, the
+// physical rectangle is copied to a scratch texture texel for texel, FXAA reads
+// the scratch and writes the same rectangle back, and the map is put back
+// before the guest's next GL call. The picture stays in exactly the layout the
+// compositor expects, and the pass costs physical pixels (~52% of the eye at
+// the default KL_VRR_EDGE), not screen pixels. Running it with the map ON would
+// rasterize our fullscreen triangle through the map too and make gl_FragCoord
+// mean something else; running it after an unwarp would mean doing the unwarp
+// twice.
+//
+// COLOUR SPACE. FXAA wants perceptual luma. A float (RGBA16F, linear) or sRGB
+// eye texture samples as LINEAR, so luma is taken as sqrt(Y) (gamma ~2.0, the
+// FXAA 3.11 recommendation for linear input); an 8-bit UNORM eye already holds
+// display-encoded values and is used as is. The colour itself is only ever
+// re-sampled, never transformed, so the round trip is exact for every format.
+//
+// The algorithm is FXAA 3.11 "quality" (Timothy Lottes, public domain), preset
+// 12 (5 search steps), written out for GLSL ES 3.00. SMAA 1x would look a
+// little better on long edges but is three passes plus two lookup textures;
+// at this resolution FXAA is the one that fits under a millisecond on an M2.
+// ---------------------------------------------------------------------------
+static int g_post_aa_default = KL_POST_AA_OFF;
+void kl_glfb_set_post_aa_default(int mode) {
+    g_post_aa_default = mode == KL_POST_AA_FXAA ? KL_POST_AA_FXAA : KL_POST_AA_OFF;
+}
+
+int kl_glfb_post_aa_mode(void) {
+    // Read once, at the first frame — after the frontend's setter, which runs
+    // before the guest boots — so one run has one answer.
+    static int mode = -1;
+    if (mode < 0) {
+        int m = kl_env_int("KL_POST_AA", g_post_aa_default);
+        mode = m == KL_POST_AA_FXAA ? KL_POST_AA_FXAA : KL_POST_AA_OFF;
+        if (m != mode)
+            fprintf(stderr, "  [glfb] KL_POST_AA=%d is not a mode (0 off, 1 FXAA) — off\n", m);
+        if (mode)
+            fprintf(stderr, "  [glfb] post-process AA: FXAA on each eye texture at the "
+                            "guest's EndFrame (KL_POST_AA=%d%s)\n", mode,
+                    getenv("KL_POST_AA") ? "" : ", the game's setting");
+    }
+    return mode;
+}
+
+// The rate map's physical rectangle for layer 0, clamped to the texture.
+// MTLSize is three NSUIntegers; arm64's objc_msgSend returns it through x8
+// like any large struct, so no _stret variant is involved.
+static void klfb_rate_map_physical(void *map, int w, int h, int *pw, int *ph) {
+    typedef struct { unsigned long width, height, depth; } klfb_mtl_size;
+    *pw = w; *ph = h;
+    if (!map) return;
+    klfb_mtl_size s = ((klfb_mtl_size (*)(void *, SEL, unsigned long))objc_msgSend)(
+        map, sel_registerName("physicalSizeForLayer:"), 0);
+    if (s.width > 0 && (int)s.width < w)  *pw = (int)s.width;
+    if (s.height > 0 && (int)s.height < h) *ph = (int)s.height;
+}
+
+static const char *const klfb_fxaa_vs =
+    "#version 300 es\n"
+    // One triangle that covers the viewport; no vertex buffer at all.
+    "void main(){\n"
+    "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+    "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+// The copy: the eye's physical rectangle into the scratch, texel for texel
+// (texelFetch, so no filtering and no rate map can move anything), and its
+// perceptual luma into a one-byte texture beside it, so FXAA's dozen luma taps
+// cost a byte each instead of a half-float RGBA texel.
+static const char *const klfb_copy_fs =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform sampler2D uSrc;\n"
+    "uniform float uLinear;\n"  // 1: the texture samples as linear light
+    "layout(location = 0) out vec4 c;\n"
+    "layout(location = 1) out vec4 l;\n"
+    "void main(){\n"
+    "  vec4 v = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0);\n"
+    "  c = v;\n"
+    "  float y = max(dot(v.rgb, vec3(0.299, 0.587, 0.114)), 0.0);\n"
+    "  l = vec4(uLinear > 0.5 ? sqrt(y) : y);\n"
+    "}\n";
+
+static const char *const klfb_fxaa_fs =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform sampler2D uTex;\n"   // the scratch copy: colour
+    "uniform sampler2D uLuma;\n"  // ...and its perceptual luma, R8, from the copy
+    "uniform vec2 uRcp;\n"      // 1 / scratch size (= the physical rectangle)
+    "uniform float uSplit;\n"   // > 0: leave pixels right of this x unfiltered
+    "out vec4 o;\n"
+    // FXAA 3.11 quality knobs: edge threshold 0.166 ('default'), the dark-edge
+    // floor 0.0625 ('high quality' — IEYTD is a dim game), sub-pixel 0.75.
+    "const float EDGE = 0.166;\n"
+    "const float EDGE_MIN = 0.0625;\n"
+    "const float SUBPIX = 0.75;\n"
+    // Every luma tap reads one byte, not eight: the copy pass wrote it.
+    "vec4 T(vec2 p){ return textureLod(uTex, p, 0.0); }\n"
+    "float LT(vec2 p){ return textureLod(uLuma, p, 0.0).r; }\n"
+    "float LO(vec2 p, vec2 off){ return LT(p + off * uRcp); }\n"
+    "void main(){\n"
+    "  vec2 posM = gl_FragCoord.xy * uRcp;\n"
+    "  vec4 rgbyM = T(posM);\n"
+    "  if (uSplit > 0.0 && gl_FragCoord.x > uSplit) { o = rgbyM; return; }\n"
+    "  float lumaM = LT(posM);\n"
+    "  float lumaS = LO(posM, vec2( 0.0,  1.0));\n"
+    "  float lumaE = LO(posM, vec2( 1.0,  0.0));\n"
+    "  float lumaN = LO(posM, vec2( 0.0, -1.0));\n"
+    "  float lumaW = LO(posM, vec2(-1.0,  0.0));\n"
+    "  float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));\n"
+    "  float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));\n"
+    "  float range = rangeMax - rangeMin;\n"
+    "  if (range < max(EDGE_MIN, rangeMax * EDGE)) { o = rgbyM; return; }\n"
+    "  float lumaNW = LO(posM, vec2(-1.0, -1.0));\n"
+    "  float lumaSE = LO(posM, vec2( 1.0,  1.0));\n"
+    "  float lumaNE = LO(posM, vec2( 1.0, -1.0));\n"
+    "  float lumaSW = LO(posM, vec2(-1.0,  1.0));\n"
+    "  float lumaNS = lumaN + lumaS;\n"
+    "  float lumaWE = lumaW + lumaE;\n"
+    "  float subpixRcpRange = 1.0 / range;\n"
+    "  float subpixNSWE = lumaNS + lumaWE;\n"
+    "  float edgeHorz1 = -2.0 * lumaM + lumaNS;\n"
+    "  float edgeVert1 = -2.0 * lumaM + lumaWE;\n"
+    "  float lumaNESE = lumaNE + lumaSE;\n"
+    "  float lumaNWNE = lumaNW + lumaNE;\n"
+    "  float edgeHorz2 = -2.0 * lumaE + lumaNESE;\n"
+    "  float edgeVert2 = -2.0 * lumaN + lumaNWNE;\n"
+    "  float lumaNWSW = lumaNW + lumaSW;\n"
+    "  float lumaSWSE = lumaSW + lumaSE;\n"
+    "  float edgeHorz4 = abs(edgeHorz1) * 2.0 + abs(edgeHorz2);\n"
+    "  float edgeVert4 = abs(edgeVert1) * 2.0 + abs(edgeVert2);\n"
+    "  float edgeHorz3 = -2.0 * lumaW + lumaNWSW;\n"
+    "  float edgeVert3 = -2.0 * lumaS + lumaSWSE;\n"
+    "  float edgeHorz = abs(edgeHorz3) + edgeHorz4;\n"
+    "  float edgeVert = abs(edgeVert3) + edgeVert4;\n"
+    "  float subpixNWSWNESE = lumaNWSW + lumaNESE;\n"
+    "  float lengthSign = uRcp.x;\n"
+    "  bool horzSpan = edgeHorz >= edgeVert;\n"
+    "  float subpixA = subpixNSWE * 2.0 + subpixNWSWNESE;\n"
+    "  if (!horzSpan) { lumaN = lumaW; lumaS = lumaE; } else { lengthSign = uRcp.y; }\n"
+    "  float subpixB = subpixA * (1.0 / 12.0) - lumaM;\n"
+    "  float gradientN = lumaN - lumaM;\n"
+    "  float gradientS = lumaS - lumaM;\n"
+    "  float lumaNN = lumaN + lumaM;\n"
+    "  float lumaSS = lumaS + lumaM;\n"
+    "  bool pairN = abs(gradientN) >= abs(gradientS);\n"
+    "  float gradient = max(abs(gradientN), abs(gradientS));\n"
+    "  if (pairN) lengthSign = -lengthSign;\n"
+    "  float subpixC = clamp(abs(subpixB) * subpixRcpRange, 0.0, 1.0);\n"
+    "  vec2 posB = posM;\n"
+    "  vec2 offNP = horzSpan ? vec2(uRcp.x, 0.0) : vec2(0.0, uRcp.y);\n"
+    "  if (!horzSpan) posB.x += lengthSign * 0.5; else posB.y += lengthSign * 0.5;\n"
+    "  vec2 posN = posB - offNP;\n"
+    "  vec2 posP = posB + offNP;\n"
+    "  float subpixD = -2.0 * subpixC + 3.0;\n"
+    "  float lumaEndN = LT(posN);\n"
+    "  float subpixE = subpixC * subpixC;\n"
+    "  float lumaEndP = LT(posP);\n"
+    "  if (!pairN) lumaNN = lumaSS;\n"
+    "  float gradientScaled = gradient * 0.25;\n"
+    "  float lumaMM = lumaM - lumaNN * 0.5;\n"
+    "  float subpixF = subpixD * subpixE;\n"
+    "  bool lumaMLTZero = lumaMM < 0.0;\n"
+    "  lumaEndN -= lumaNN * 0.5;\n"
+    "  lumaEndP -= lumaNN * 0.5;\n"
+    "  bool doneN = abs(lumaEndN) >= gradientScaled;\n"
+    "  bool doneP = abs(lumaEndP) >= gradientScaled;\n"
+    "  if (!doneN) posN -= offNP * 1.5;\n"
+    "  if (!doneP) posP += offNP * 1.5;\n"
+    // Preset 12's remaining steps: 2, 4, 12.
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    if (doneN && doneP) break;\n"
+    "    if (!doneN) lumaEndN = LT(posN) - lumaNN * 0.5;\n"
+    "    if (!doneP) lumaEndP = LT(posP) - lumaNN * 0.5;\n"
+    "    doneN = abs(lumaEndN) >= gradientScaled;\n"
+    "    doneP = abs(lumaEndP) >= gradientScaled;\n"
+    "    float s = i == 0 ? 2.0 : (i == 1 ? 4.0 : 12.0);\n"
+    "    if (!doneN) posN -= offNP * s;\n"
+    "    if (!doneP) posP += offNP * s;\n"
+    "  }\n"
+    "  float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;\n"
+    "  float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;\n"
+    "  bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero;\n"
+    "  bool goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;\n"
+    "  float spanLength = dstP + dstN;\n"
+    "  bool directionN = dstN < dstP;\n"
+    "  float dst = min(dstN, dstP);\n"
+    "  bool goodSpan = directionN ? goodSpanN : goodSpanP;\n"
+    "  float subpixG = subpixF * subpixF;\n"
+    "  float pixelOffset = dst * (-1.0 / spanLength) + 0.5;\n"
+    "  float subpixH = subpixG * SUBPIX;\n"
+    "  float pixelOffsetGood = goodSpan ? pixelOffset : 0.0;\n"
+    "  float pixelOffsetSubpix = max(pixelOffsetGood, subpixH);\n"
+    "  if (!horzSpan) posM.x += pixelOffsetSubpix * lengthSign;\n"
+    "  else           posM.y += pixelOffsetSubpix * lengthSign;\n"
+    "  o = vec4(T(posM).rgb, rgbyM.a);\n"
+    "}\n";
+
+// Everything the pass owns. Made once, in the context that first runs it: the
+// FBOs and the VAO are container objects, which a share group does NOT share,
+// so a pass from any other context is refused rather than handed names that
+// mean nothing there (KL_GLFB_SHARED; the default single root context never
+// hits it).
+static struct {
+    int tried, ok;
+    void *ctx;
+    uint32_t prog, copy, vao, smp, fb_eye, fb_tmp, tmp, luma;
+    uint32_t tmp_fmt; int tmp_w, tmp_h;
+    int32_t loc_tex, loc_luma, loc_rcp, loc_split, loc_src, loc_lin;
+} g_aa;
+
+static uint32_t (*aa_CreateShader)(uint32_t);
+static void (*aa_ShaderSource)(uint32_t, int32_t, const char *const *, const int32_t *);
+static void (*aa_CompileShader)(uint32_t);
+static void (*aa_GetShaderiv)(uint32_t, uint32_t, int32_t *);
+static void (*aa_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
+static uint32_t (*aa_CreateProgram)(void);
+static void (*aa_AttachShader)(uint32_t, uint32_t);
+static void (*aa_LinkProgram)(uint32_t);
+static void (*aa_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+static void (*aa_UseProgram)(uint32_t);
+static int32_t (*aa_GetUniformLocation)(uint32_t, const char *);
+static void (*aa_Uniform1i)(int32_t, int32_t);
+static void (*aa_Uniform1f)(int32_t, float);
+static void (*aa_Uniform2f)(int32_t, float, float);
+static void (*aa_GenVertexArrays)(int32_t, uint32_t *);
+static void (*aa_BindVertexArray)(uint32_t);
+static void (*aa_DrawArrays)(uint32_t, int32_t, int32_t);
+static void (*aa_ActiveTexture)(uint32_t);
+static void (*aa_BindTexture)(uint32_t, uint32_t);
+static void (*aa_BindSampler)(uint32_t, uint32_t);
+static void (*aa_GenTextures)(int32_t, uint32_t *);
+static void (*aa_DeleteTextures)(int32_t, const uint32_t *);
+static void (*aa_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+static void (*aa_TexParameteri)(uint32_t, uint32_t, int32_t);
+static void (*aa_Enable)(uint32_t);
+static void (*aa_Disable)(uint32_t);
+static uint8_t (*aa_IsEnabled)(uint32_t);
+static void (*aa_GetBooleanv)(uint32_t, uint8_t *);
+static void (*aa_ColorMask)(uint8_t, uint8_t, uint8_t, uint8_t);
+static void (*aa_Viewport)(int32_t, int32_t, int32_t, int32_t);
+static void (*aa_GenFramebuffers)(int32_t, uint32_t *);
+static void (*aa_BindFramebuffer)(uint32_t, uint32_t);
+static void (*aa_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+static uint32_t (*aa_CheckFramebufferStatus)(uint32_t);
+static void (*aa_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                  int32_t, int32_t, uint32_t, uint32_t);
+static void (*aa_Finish)(void);
+static void (*aa_GenSamplers)(int32_t, uint32_t *);
+static void (*aa_SamplerParameteri)(uint32_t, uint32_t, int32_t);
+static void (*aa_DrawBuffers)(int32_t, const uint32_t *);
+static void (*aa_BlendFuncSeparate)(uint32_t, uint32_t, uint32_t, uint32_t);
+static uint32_t (*aa_GetError)(void);
+
+static uint32_t klfb_aa_shader(uint32_t type, const char *src) {
+    uint32_t s = aa_CreateShader(type);
+    int32_t ok = 0;
+    aa_ShaderSource(s, 1, &src, NULL);
+    aa_CompileShader(s);
+    aa_GetShaderiv(s, 0x8B81 /* COMPILE_STATUS */, &ok);
+    if (!ok) {
+        char log[1024] = "";
+        if (aa_GetShaderInfoLog) aa_GetShaderInfoLog(s, sizeof log, NULL, log);
+        fprintf(stderr, "  [glfb] post AA: %s shader failed to compile: %s\n",
+                type == 0x8B31 ? "vertex" : "fragment", log);
+        return 0;
+    }
+    return s;
+}
+
+static int klfb_aa_setup(void *ctx) {
+    if (g_aa.tried) {
+        if (g_aa.ok && ctx != g_aa.ctx) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [glfb] post AA: EndFrame arrived in context %p, the "
+                                "pass was built in %p — skipped (its FBOs do not exist "
+                                "there)\n", ctx, g_aa.ctx);
+            return 0;
+        }
+        return g_aa.ok;
+    }
+    g_aa.tried = 1;
+#define AA_SYM(p, n) (p = asym(n))
+    AA_SYM(aa_CreateShader, "glCreateShader");
+    AA_SYM(aa_ShaderSource, "glShaderSource");
+    AA_SYM(aa_CompileShader, "glCompileShader");
+    AA_SYM(aa_GetShaderiv, "glGetShaderiv");
+    AA_SYM(aa_GetShaderInfoLog, "glGetShaderInfoLog");
+    AA_SYM(aa_CreateProgram, "glCreateProgram");
+    AA_SYM(aa_AttachShader, "glAttachShader");
+    AA_SYM(aa_LinkProgram, "glLinkProgram");
+    AA_SYM(aa_GetProgramiv, "glGetProgramiv");
+    AA_SYM(aa_UseProgram, "glUseProgram");
+    AA_SYM(aa_GetUniformLocation, "glGetUniformLocation");
+    AA_SYM(aa_Uniform1i, "glUniform1i");
+    AA_SYM(aa_Uniform1f, "glUniform1f");
+    AA_SYM(aa_Uniform2f, "glUniform2f");
+    AA_SYM(aa_GenVertexArrays, "glGenVertexArrays");
+    AA_SYM(aa_BindVertexArray, "glBindVertexArray");
+    AA_SYM(aa_DrawArrays, "glDrawArrays");
+    AA_SYM(aa_ActiveTexture, "glActiveTexture");
+    AA_SYM(aa_BindTexture, "glBindTexture");
+    AA_SYM(aa_BindSampler, "glBindSampler");
+    AA_SYM(aa_GenTextures, "glGenTextures");
+    AA_SYM(aa_DeleteTextures, "glDeleteTextures");
+    AA_SYM(aa_TexStorage2D, "glTexStorage2D");
+    AA_SYM(aa_TexParameteri, "glTexParameteri");
+    AA_SYM(aa_Enable, "glEnable");
+    AA_SYM(aa_Disable, "glDisable");
+    AA_SYM(aa_IsEnabled, "glIsEnabled");
+    AA_SYM(aa_GetBooleanv, "glGetBooleanv");
+    AA_SYM(aa_ColorMask, "glColorMask");
+    AA_SYM(aa_Viewport, "glViewport");
+    AA_SYM(aa_GenFramebuffers, "glGenFramebuffers");
+    AA_SYM(aa_BindFramebuffer, "glBindFramebuffer");
+    AA_SYM(aa_FramebufferTexture2D, "glFramebufferTexture2D");
+    AA_SYM(aa_CheckFramebufferStatus, "glCheckFramebufferStatus");
+    AA_SYM(aa_BlitFramebuffer, "glBlitFramebuffer");
+    AA_SYM(aa_Finish, "glFinish");
+    AA_SYM(aa_GenSamplers, "glGenSamplers");
+    AA_SYM(aa_SamplerParameteri, "glSamplerParameteri");
+    AA_SYM(aa_DrawBuffers, "glDrawBuffers");
+    AA_SYM(aa_BlendFuncSeparate, "glBlendFuncSeparate");
+    AA_SYM(aa_GetError, "glGetError");
+#undef AA_SYM
+    if (!aa_CreateShader || !aa_ShaderSource || !aa_CompileShader ||
+        !aa_GetShaderiv || !aa_CreateProgram || !aa_AttachShader || !aa_LinkProgram ||
+        !aa_GetProgramiv || !aa_UseProgram || !aa_GetUniformLocation || !aa_Uniform1i ||
+        !aa_Uniform1f || !aa_Uniform2f || !aa_GenVertexArrays || !aa_BindVertexArray ||
+        !aa_DrawArrays || !aa_ActiveTexture || !aa_BindTexture || !aa_BindSampler ||
+        !aa_GenTextures || !aa_DeleteTextures || !aa_TexStorage2D || !aa_TexParameteri ||
+        !aa_Enable || !aa_Disable || !aa_IsEnabled || !aa_GetBooleanv || !aa_ColorMask ||
+        !aa_Viewport || !aa_GenFramebuffers || !aa_BindFramebuffer ||
+        !aa_FramebufferTexture2D || !aa_CheckFramebufferStatus || !aa_BlitFramebuffer ||
+        !aa_Finish || !aa_BlendFuncSeparate || !aa_GenSamplers || !aa_SamplerParameteri ||
+        !aa_DrawBuffers || !a_glGetIntegerv) {
+        fprintf(stderr, "  [glfb] post AA: a GL entry point is missing — off\n");
+        return 0;
+    }
+    uint32_t vs = klfb_aa_shader(0x8B31 /* VERTEX_SHADER */, klfb_fxaa_vs);
+    uint32_t fs = klfb_aa_shader(0x8B30 /* FRAGMENT_SHADER */, klfb_fxaa_fs);
+    uint32_t cs = klfb_aa_shader(0x8B30, klfb_copy_fs);
+    if (!vs || !fs || !cs) return 0;
+    int32_t prev_prog = 0, linked = 0, linked2 = 0;
+    g_aa.prog = aa_CreateProgram();
+    aa_AttachShader(g_aa.prog, vs);
+    aa_AttachShader(g_aa.prog, fs);
+    aa_LinkProgram(g_aa.prog);
+    aa_GetProgramiv(g_aa.prog, 0x8B82 /* LINK_STATUS */, &linked);
+    g_aa.copy = aa_CreateProgram();
+    aa_AttachShader(g_aa.copy, vs);
+    aa_AttachShader(g_aa.copy, cs);
+    aa_LinkProgram(g_aa.copy);
+    aa_GetProgramiv(g_aa.copy, 0x8B82, &linked2);
+    if (!linked || !linked2) {
+        fprintf(stderr, "  [glfb] post AA: the FXAA or copy program did not link — off\n");
+        return 0;
+    }
+    g_aa.loc_tex   = aa_GetUniformLocation(g_aa.prog, "uTex");
+    g_aa.loc_luma  = aa_GetUniformLocation(g_aa.prog, "uLuma");
+    g_aa.loc_rcp   = aa_GetUniformLocation(g_aa.prog, "uRcp");
+    g_aa.loc_split = aa_GetUniformLocation(g_aa.prog, "uSplit");
+    g_aa.loc_src   = aa_GetUniformLocation(g_aa.copy, "uSrc");
+    g_aa.loc_lin   = aa_GetUniformLocation(g_aa.copy, "uLinear");
+    // The sampler units never change, so they are set once (glUniform needs
+    // the program current; the guest's goes straight back).
+    a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prev_prog);
+    aa_UseProgram(g_aa.prog);
+    aa_Uniform1i(g_aa.loc_tex, 0);
+    aa_Uniform1i(g_aa.loc_luma, 1);
+    aa_UseProgram(g_aa.copy);
+    aa_Uniform1i(g_aa.loc_src, 0);
+    aa_UseProgram((uint32_t)prev_prog);
+    aa_GenVertexArrays(1, &g_aa.vao);
+    aa_GenFramebuffers(1, &g_aa.fb_eye);
+    aa_GenFramebuffers(1, &g_aa.fb_tmp);
+    // NEAREST for the copy's read of the EYE texture: texelFetch ignores the
+    // filter, but completeness does not, and an EGLImage-backed eye texture
+    // keeps GL's default mipmapped MIN_FILTER (incomplete -> reads as zero).
+    // A sampler object overrides it without touching the guest's texture.
+    aa_GenSamplers(1, &g_aa.smp);
+    if (g_aa.smp) {
+        aa_SamplerParameteri(g_aa.smp, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
+        aa_SamplerParameteri(g_aa.smp, 0x2800 /* MAG_FILTER */, 0x2600);
+    }
+    if (!g_aa.vao || !g_aa.fb_eye || !g_aa.fb_tmp || !g_aa.smp) {
+        fprintf(stderr, "  [glfb] post AA: could not create its GL objects — off\n");
+        return 0;
+    }
+    g_aa.ctx = ctx;
+    g_aa.ok = 1;
+    fprintf(stderr, "  [glfb] post AA: FXAA 3.11 (quality preset 12) ready in context %p\n", ctx);
+    return 1;
+}
+
+// The scratch texture: the eye's format, the size of the rectangle filtered.
+// Reallocated only when either changes (a guest that resizes its swapchain).
+static int klfb_aa_scratch(uint32_t fmt, int w, int h) {
+    if (g_aa.tmp && g_aa.tmp_fmt == fmt && g_aa.tmp_w == w && g_aa.tmp_h == h) return 1;
+    if (g_aa.tmp) aa_DeleteTextures(1, &g_aa.tmp);
+    if (g_aa.luma) aa_DeleteTextures(1, &g_aa.luma);
+    g_aa.tmp = g_aa.luma = 0;
+    aa_GenTextures(1, &g_aa.tmp);
+    aa_GenTextures(1, &g_aa.luma);
+    if (!g_aa.tmp || !g_aa.luma) return 0;
+    for (int i = 0; i < 2; i++) {
+        aa_BindTexture(0x0DE1 /* TEXTURE_2D */, i ? g_aa.luma : g_aa.tmp);
+        aa_TexStorage2D(0x0DE1, 1, i ? 0x8229 /* R8 */ : fmt, w, h);
+        // LINEAR: FXAA's search and its final read land between texels on
+        // purpose. CLAMP: the rectangle's border is the picture's border.
+        aa_TexParameteri(0x0DE1, 0x2801 /* MIN_FILTER */, 0x2601 /* LINEAR */);
+        aa_TexParameteri(0x0DE1, 0x2800 /* MAG_FILTER */, 0x2601);
+        aa_TexParameteri(0x0DE1, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+        aa_TexParameteri(0x0DE1, 0x2803 /* WRAP_T */, 0x812F);
+    }
+    aa_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, g_aa.fb_tmp);
+    aa_FramebufferTexture2D(0x8CA9, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, g_aa.tmp, 0);
+    aa_FramebufferTexture2D(0x8CA9, 0x8CE1 /* COLOR_ATTACHMENT1 */, 0x0DE1, g_aa.luma, 0);
+    static const uint32_t bufs[2] = { 0x8CE0, 0x8CE1 };
+    aa_DrawBuffers(2, bufs);   // framebuffer state: fb_tmp's own, set once
+    uint32_t st = aa_CheckFramebufferStatus(0x8CA9);
+    g_aa.tmp_fmt = fmt; g_aa.tmp_w = w; g_aa.tmp_h = h;
+    fprintf(stderr, "  [glfb] post AA: scratch 0x%x %dx%d (%.1f MB)%s\n", fmt, w, h,
+            (double)klfb_storage_bytes(fmt, w, h, 1, 1) / (1024.0 * 1024.0),
+            st == 0x8CD5 ? "" : " — NOT framebuffer-complete");
+    return st == 0x8CD5;
+}
+
+// One eye: copy its rectangle out, filter it back in. GL state is the caller's
+// to save; this only binds. Returns 1 when it filtered.
+// `copies` / `draws`: how many times to issue each half — 1 / 1 normally,
+// more only for KL_POST_AA_BENCH, which repeats the GPU work while issuing the
+// state changes once, so the measurement is the GPU's and not ANGLE's CPU.
+static int klfb_aa_eye(int eye, int stage, int copies, int draws) {
+    if (stage < 0 || stage >= KLFB_MAX_STAGES) return 0;
+    uint32_t tex = g_eye_tex_stage[eye][stage];
+    uint32_t fmt = 0;
+    int32_t w = 0, h = 0;
+    if (!tex || !klfb_tex_info(tex, &fmt, &w, &h) || w <= 0 || h <= 0) return 0;
+
+    // Is THIS texture foveated? The same test the bind and the re-register use
+    // (kl_glfb_bind_eye_mtl_texture, kl_glfb_set_eye_rate_map): a map was
+    // attached only when its size matched the texture's.
+    void *mtl = NULL, *map = NULL;
+    if (stage < KL_MTL_MAX_STAGES && g_eye_mtl[eye][stage].gl_tex == tex &&
+        g_eye_mtl[eye][stage].tex && g_eye_rate_map && a_SetRateMap &&
+        g_eye_mtl[eye][stage].w == g_eye_rate_w && g_eye_mtl[eye][stage].h == g_eye_rate_h) {
+        mtl = g_eye_mtl[eye][stage].tex;
+        map = g_eye_rate_map;
+    }
+    int pw = w, ph = h;
+    klfb_rate_map_physical(map, w, h, &pw, &ph);
+    if (!klfb_aa_scratch(fmt, pw, ph)) return 0;
+
+    // Lift the map: our two passes address the physical rectangle directly.
+    if (map) a_SetRateMap(mtl, NULL);
+
+    int lin = fmt == 0x881A /* RGBA16F */ || fmt == 0x8814 /* RGBA32F */ ||
+              fmt == 0x881B /* RGB16F */ || fmt == 0x8C43 /* SRGB8_ALPHA8 */ ||
+              fmt == 0x8C41 /* SRGB8 */;
+
+    // 1: the eye's physical rectangle -> scratch colour + luma, texel for
+    // texel (texelFetch at gl_FragCoord; the scratch is not foveated).
+    aa_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, g_aa.fb_tmp);
+    aa_Viewport(0, 0, pw, ph);
+    aa_UseProgram(g_aa.copy);
+    aa_Uniform1f(g_aa.loc_lin, lin ? 1.0f : 0.0f);
+    aa_ActiveTexture(0x84C0 /* TEXTURE0 */);
+    aa_BindTexture(0x0DE1, tex);
+    aa_BindSampler(0, g_aa.smp);
+    for (int i = 0; i < copies; i++) aa_DrawArrays(0x0004 /* TRIANGLES */, 0, 3);
+    aa_BindSampler(0, 0);
+
+    // 2: FXAA, scratch -> the same rectangle of the eye. The eye FBO was synced
+    // above as a READ target only; binding it for drawing is what makes ANGLE
+    // build its render pass now — with the map lifted, so unfoveated.
+    if (draws > 0) {
+        aa_BindFramebuffer(0x8CA9, g_aa.fb_eye);
+        aa_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, tex, 0);
+        aa_UseProgram(g_aa.prog);
+        aa_BindTexture(0x0DE1, g_aa.tmp);
+        aa_ActiveTexture(0x84C1 /* TEXTURE1 */);
+        aa_BindTexture(0x0DE1, g_aa.luma);
+        aa_ActiveTexture(0x84C0);
+        static int split = -1;
+        if (split < 0) split = kl_env_on("KL_POST_AA_SPLIT", 0);
+        aa_Uniform2f(g_aa.loc_rcp, 1.0f / (float)pw, 1.0f / (float)ph);
+        aa_Uniform1f(g_aa.loc_split, split ? 0.5f * (float)pw : 0.0f);
+        if (draws == 1) {
+            aa_DrawArrays(0x0004 /* TRIANGLES */, 0, 3);
+        } else {
+            // Bench only. Blending ON with (ONE, ZERO) writes exactly what the
+            // plain draw writes, but an Apple GPU no longer treats the draws as
+            // opaque: without it, hidden-surface removal shades only the LAST
+            // of N identical fullscreen draws and the bench measures nothing.
+            int32_t bs[4] = {1, 0, 1, 0};
+            a_glGetIntegerv(0x80C9 /* BLEND_SRC_RGB */, &bs[0]);
+            a_glGetIntegerv(0x80C8 /* BLEND_DST_RGB */, &bs[1]);
+            a_glGetIntegerv(0x80CB /* BLEND_SRC_ALPHA */, &bs[2]);
+            a_glGetIntegerv(0x80CA /* BLEND_DST_ALPHA */, &bs[3]);
+            aa_BlendFuncSeparate(1 /* ONE */, 0 /* ZERO */, 1, 0);
+            aa_Enable(0x0BE2 /* BLEND */);
+            for (int i = 0; i < draws; i++) aa_DrawArrays(0x0004 /* TRIANGLES */, 0, 3);
+            aa_Disable(0x0BE2);
+            aa_BlendFuncSeparate((uint32_t)bs[0], (uint32_t)bs[1], (uint32_t)bs[2], (uint32_t)bs[3]);
+        }
+    }
+
+    // Detach (a texture left attached to a framebuffer that is not bound is
+    // kept alive by it — the eye textures are released at swapchain teardown)
+    // and put the map back before anything of the guest's can sync.
+    aa_BindFramebuffer(0x8CA9, g_aa.fb_eye);
+    aa_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, 0, 0);
+    if (map) a_SetRateMap(mtl, map);
+
+    static int said[2];
+    if (!said[eye]++)
+        fprintf(stderr, "  [glfb] post AA: eye %d stage %d tex %u 0x%x %dx%d, filtering "
+                        "%dx%d%s (%s luma)\n", eye, stage, tex, fmt, w, h, pw, ph,
+                map ? " — the foveated texture's physical rectangle" : "",
+                (fmt == 0x881A || fmt == 0x8814 || fmt == 0x881B || fmt == 0x8C43 ||
+                 fmt == 0x8C41) ? "sqrt-of-linear" : "as-stored");
+    return 1;
+}
+
+static int klfb_aa_run(uint32_t stage_mask, int copies, int draws) {
+    // Save every piece of state the pass disturbs. The guest is mid-frame from
+    // its own point of view (Unity caches GL state and trusts the cache), so
+    // what it set must be what it finds.
+    int32_t s_prog = 0, s_vao = 0, s_at = 0, s_tex = 0, s_smp = 0, s_rfb = 0, s_dfb = 0;
+    int32_t s_vp[4] = {0};
+    uint8_t s_cm[4] = {1, 1, 1, 1};
+    static const uint32_t caps[] = {
+        0x0BE2 /* BLEND */, 0x0B71 /* DEPTH_TEST */, 0x0B90 /* STENCIL_TEST */,
+        0x0B44 /* CULL_FACE */, 0x0C11 /* SCISSOR_TEST */, 0x8C89 /* RASTERIZER_DISCARD */,
+        0x809E /* SAMPLE_ALPHA_TO_COVERAGE */, 0x80A0 /* SAMPLE_COVERAGE */,
+        0x8037 /* POLYGON_OFFSET_FILL */,
+    };
+    enum { NCAPS = sizeof caps / sizeof caps[0] };
+    uint8_t s_cap[NCAPS];
+    a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &s_prog);
+    a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &s_vao);
+    a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &s_at);
+    aa_ActiveTexture(0x84C0 /* TEXTURE0 */);
+    a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &s_tex);
+    a_glGetIntegerv(0x8919 /* SAMPLER_BINDING */, &s_smp);
+    int32_t s_tex1 = 0, s_smp1 = 0;
+    aa_ActiveTexture(0x84C1 /* TEXTURE1 */);
+    a_glGetIntegerv(0x8069, &s_tex1);
+    a_glGetIntegerv(0x8919, &s_smp1);
+    aa_BindSampler(1, 0);
+    aa_ActiveTexture(0x84C0);
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &s_rfb);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &s_dfb);
+    a_glGetIntegerv(0x0BA2 /* VIEWPORT */, s_vp);
+    aa_GetBooleanv(0x0C23 /* COLOR_WRITEMASK */, s_cm);
+    for (int i = 0; i < NCAPS; i++) {
+        s_cap[i] = aa_IsEnabled(caps[i]);
+        if (s_cap[i]) aa_Disable(caps[i]);
+    }
+    aa_ColorMask(1, 1, 1, 1);
+    aa_BindVertexArray(g_aa.vao);
+    aa_BindSampler(0, 0);
+
+    int done = 0;
+    for (int s = 0; s < KLFB_MAX_STAGES; s++)
+        if (stage_mask & (1u << s))
+            for (int e = 0; e < 2; e++) done += klfb_aa_eye(e, s, copies, draws);
+
+    // Restore, in reverse.
+    aa_ActiveTexture(0x84C1);
+    aa_BindTexture(0x0DE1, (uint32_t)s_tex1);
+    aa_BindSampler(1, (uint32_t)s_smp1);
+    aa_ActiveTexture(0x84C0);
+    aa_BindTexture(0x0DE1, (uint32_t)s_tex);
+    aa_BindSampler(0, (uint32_t)s_smp);
+    aa_ActiveTexture((uint32_t)s_at);
+    aa_BindVertexArray((uint32_t)s_vao);
+    aa_UseProgram((uint32_t)s_prog);
+    aa_ColorMask(s_cm[0], s_cm[1], s_cm[2], s_cm[3]);
+    for (int i = 0; i < NCAPS; i++)
+        if (s_cap[i]) aa_Enable(caps[i]);
+    aa_Viewport(s_vp[0], s_vp[1], s_vp[2], s_vp[3]);
+    aa_BindFramebuffer(0x8CA8, (uint32_t)s_rfb);
+    aa_BindFramebuffer(0x8CA9, (uint32_t)s_dfb);
+    return done;
+}
+
+static double klfb_aa_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+void kl_glfb_post_aa_eyes(uint32_t stage_mask) {
+    if (!stage_mask || !g_ready || kl_glfb_post_aa_mode() == KL_POST_AA_OFF) return;
+    pthread_once(&g_tls_once, klfb_tls_init);
+    klfb_thread_gl *tg = pthread_getspecific(g_tls_key);
+    if (!tg || !tg->ctx) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] post AA: EndFrame on a thread with no GL context "
+                            "— skipped (and every frame like it)\n");
+        return;
+    }
+    // The context is kl_glfb's own record of this thread's (the guest's
+    // eglGetCurrentContext answers with the guest's handle, not ANGLE's).
+    if (!klfb_aa_setup(tg->ctx)) return;
+    static int errs = -1;
+    if (errs < 0) errs = kl_env_on("KL_POST_AA_CHECK", 0);
+    if (errs && aa_GetError) while (aa_GetError()) {}
+    int done = klfb_aa_run(stage_mask, 1, 1);
+    if (errs && aa_GetError) {
+        uint32_t e = aa_GetError();
+        static unsigned n, bad;
+        n++;
+        if (e) bad++;
+        if (e && bad <= 8)
+            fprintf(stderr, "  [glfb] post AA: GL error 0x%x after the pass\n", e);
+        if (n % 600 == 0)
+            fprintf(stderr, "  [glfb] post AA: %u passes, %u raised a GL error\n", n, bad);
+    }
+
+    // KL_POST_AA_BENCH=N: every 300th frame, the GPU cost of the pass, per
+    // guest frame, both eyes. Each half is timed by issuing its GPU work N+1
+    // times against once (same bindings, same state changes) between two
+    // glFinish, so the difference is N times the GPU work and ANGLE's per-call
+    // CPU cost cancels out. That frame is filtered a few extra times (FXAA of
+    // the same scratch is idempotent; the copies are too): an instrument, not
+    // a mode.
+    static int bench = -1;
+    if (bench < 0) bench = kl_env_int("KL_POST_AA_BENCH", 0);
+    static unsigned frames;
+    if (bench > 0 && done && ++frames % 300 == 0) {
+        double t[5];
+        aa_Finish(); t[0] = klfb_aa_now_ms();
+        klfb_aa_run(stage_mask, 1, 2);
+        aa_Finish(); t[1] = klfb_aa_now_ms();
+        klfb_aa_run(stage_mask, 1, bench + 2);
+        aa_Finish(); t[2] = klfb_aa_now_ms();
+        klfb_aa_run(stage_mask, bench + 1, 1);
+        aa_Finish(); t[3] = klfb_aa_now_ms();
+        klfb_aa_run(stage_mask, 1, 1);
+        aa_Finish(); t[4] = klfb_aa_now_ms();
+        double one = 0.5 * ((t[1] - t[0]) + (t[4] - t[3]));
+        double fx = (t[2] - t[1] - one) / bench, cp = (t[3] - t[2] - one) / bench;
+        fprintf(stderr, "  [glfb] post AA bench (%d eye(s), GPU per frame): FXAA %.3f ms + "
+                        "copy %.3f ms = %.3f ms; one whole pass incl. CPU %.3f ms (N=%d)\n",
+                done, fx, cp, fx + cp, one, bench);
+    }
+}
+
 unsigned kl_glfb_present(const char *dir) {
     if (!g_ready || (!dir && !g_frame_sink && !g_gpu_fence)) return g_presented;
     // A registered GPU fence replaces the readback entirely — the compositor

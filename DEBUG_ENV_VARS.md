@@ -1307,6 +1307,44 @@ puts the camera on the ground with its hands underneath it.
   of the curve (`kl_reproject.h`). Same "ignored on device when the display's
   curve was sampled" caveat — there the count comes from the drawable map's
   physical granularity.
+- `KL_POST_AA=0|1` — **post-process antialiasing** on the eye textures
+  (`kl_glfb.c`, `kl_glfb_post_aa_eyes`): `0` off (the default for every guest),
+  `1` FXAA 3.11 (quality preset 12). For guests that render their eyes without
+  MSAA — I Expect You To Die draws its scene single-sampled straight into the
+  eye texture by its own choice. It runs as two GL passes on each eye texture
+  the guest drew this frame, at the OVRPlugin EndFrame (`kl_ovrp.c`): a
+  texel-exact copy into a scratch texture plus a one-byte luma texture, then
+  FXAA back into the eye. That is once per GUEST frame, at the rendered
+  resolution, before the frame is filed for the compositor and before the GPU
+  fence that releases it, so no reprojection ever samples an unfiltered or
+  half-filtered eye. On a foveated eye (`KL_VRR`) the rate map is lifted for
+  the length of the pass and only the physical rectangle is filtered (the
+  jaggies are on the physical sample grid; the compositor's unwarp is
+  unchanged). A float or sRGB eye is treated as linear (luma = sqrt Y), an 8-bit
+  UNORM one as display-encoded. The headset app sets the default per game:
+  targets.py `"post_aa"` (None = not offered, False/True = offered, off/on) and the
+  hub's "Antialiasing (filter)" toggle. An explicit `KL_POST_AA` wins.
+  Only OVRPlugin GL guests are covered (not OpenXR, not Vulkan).
+  - `KL_POST_AA_SPLIT=1` — filter only the left half of each eye: an A/B inside
+    one picture.
+  - `KL_POST_AA_CHECK=1` — drain and read `glGetError` around the pass, and print
+    a running count of passes that raised one.
+  - `KL_POST_AA_BENCH=N` — every 300th frame, time the passes with `glFinish`
+    (N extra repeats of each half). Rough only: back-to-back fullscreen draws
+    are partly folded by the GPU. Use Metal System Trace (encoders "Render
+    Command 4..7" after the eye passes) for real numbers. Measured on an M1 Max
+    with foveation (1648x1724 physical per eye): about 0.08-0.13 ms copy +
+    0.16-0.33 ms FXAA per eye, i.e. about 0.5-0.9 ms a frame.
+- `KL_STAGE_FENCE=0` — the A/B for the stage/fence pairing
+  (`kl_ovrp_complete_stage_fenced`, used by the Mac viewer and
+  KleptonCompositor). By default a compositor gets the last complete eye stage
+  together with the GL fence value that covers it. If that fence is not
+  published yet (the guest files its stage at EndFrame but publishes the fence
+  at its present), it gets the previous stage instead. `0` restores the old
+  pairing: the newest stage plus the latest published fence. On IEYTD's Mac
+  viewer that sampled an unfinished stage in ~30% of composites (3191 of 10800).
+  Paired: 0 of 10800. Both modes print `[ovrp] stage/fence: …` every 1800
+  composites.
 - `KL_OVRP_MSAA=<n>` — how many samples `ovrp_GetSystemRecommendedMSAALevel2`
   reports the device recommends for the eye render target, default **4** (what a
   Quest 2 answers, for the reason `Build.MODEL` says Quest 2). It is a

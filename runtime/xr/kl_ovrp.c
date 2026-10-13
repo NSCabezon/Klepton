@@ -2370,6 +2370,13 @@ static float klovrp_quat_degrees(const klovrp_pose *a, const klovrp_pose *b) {
 // aligns its world to where the head faces when a level starts: a yaw given
 // from the start is simply "forward", and looking anywhere else means turning
 // afterwards.
+// Who is publishing the head: the frontend (kl_view.c, the visionOS app), or one
+// of the two diagnostic writers below, which exist "for runs with no frontend"
+// and must yield when there is one. The from_* flags are set around their own
+// calls, on the guest's latch thread; a frontend's call never sees them set
+// (and a torn read would only delay the hand-over by a frame).
+static int g_head_from_script, g_head_from_headless, g_head_frontend;
+
 static void klovrp_headless_pose(void) {
     static int state;                       // 0 unread, 1 none, 2 first pose, 3 second pose
     static float p[9];
@@ -2386,7 +2393,9 @@ static void klovrp_headless_pose(void) {
         if (nparam < 4) p[3] = 0;
         t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         float half = p[3] * 0.008726646f;
+        g_head_from_headless = 1;
         kl_ovrp_set_head_pose(p[0], p[1], p[2], 0, sinf(half), 0, cosf(half));
+        g_head_from_headless = 0;
         fprintf(stderr, "  [ovrp] KL_OVRP_HEAD: no frontend, head put at (%.2f %.2f %.2f) yaw %.0f\n",
                 (double)p[0], (double)p[1], (double)p[2], (double)p[3]);
         state = nparam >= 6 ? 2 : 3;
@@ -2395,7 +2404,9 @@ static void klovrp_headless_pose(void) {
     if ((double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9 < (double)p[4]) return;
     float x = nparam >= 9 ? p[6] : p[0], y = nparam >= 9 ? p[7] : p[1], z = nparam >= 9 ? p[8] : p[2];
     float half = p[5] * 0.008726646f;
+    g_head_from_headless = 1;
     kl_ovrp_set_head_pose(x, y, z, 0, sinf(half), 0, cosf(half));
+    g_head_from_headless = 0;
     fprintf(stderr, "  [ovrp] KL_OVRP_HEAD: head moved to (%.2f %.2f %.2f) yaw %.0f\n",
             (double)x, (double)y, (double)z, (double)p[5]);
     state = 3;
@@ -2581,6 +2592,9 @@ double kl_ovrp_head_lead_s(void) { return g_head_lead_s; }   // one writer; a to
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
+    // Anyone but our own diagnostic writers is a frontend (see klovrp_head_script).
+    if (!g_head_from_script && !g_head_from_headless)
+        __atomic_store_n(&g_head_frontend, 1, __ATOMIC_RELEASE);
     if (g_head_pose_time > 0) {
         struct timespec u;
         clock_gettime(CLOCK_UPTIME_RAW, &u);
@@ -2982,8 +2996,20 @@ static struct {
     uint64_t            named_disagree;
     uint64_t            serial;         // frames begun
     int                 last_complete;  // stage of the last completed frame, -1 = none
+    // The stage/fence pairing (kl_ovrp_complete_stage_fenced). A frame is filed
+    // at EndFrame, but the GL fence that says its draws are done is published
+    // LATER, at the guest's next present (kl_glfb_present: eglSwapBuffers, or
+    // the end of EndFrame) — so "the last complete stage" and "the latest
+    // fence" read separately pair a stage with the PREVIOUS frame's fence, and a
+    // compositor in that window samples a stage the GPU has not finished (or
+    // ANGLE has not even submitted). fence[s] is the fence value that covers
+    // stage s's picture; prev_complete is the stage filed before last_complete,
+    // which is safe to show while last_complete's fence is still unpublished.
+    uint64_t            fence[KLOVRP_MAX_STAGES];
+    int                 prev_complete;
+    uint64_t            picks, unsafe_picks, fallbacks;
     pthread_mutex_t     mu;
-} g_frames = { .last_complete = -1, .last_named = -1,
+} g_frames = { .last_complete = -1, .prev_complete = -1, .last_named = -1,
                .mu = PTHREAD_MUTEX_INITIALIZER };
 
 // How many swapchain stages the guest is told it has. KL_OVRP_STAGES is the
@@ -3224,6 +3250,18 @@ static void klovrp_census_submits(const void *layer_submits, int count);
 // ...and the overlay list a compositor draws on top of the eye picture.
 static void klovrp_record_overlays(const void *layer_submits, int count);
 
+// The fence value that will cover a frame filed NOW: the next one kl_glfb
+// publishes, because the guest's present follows its EndFrame (IEYTD: EndFrame,
+// then eglSwapBuffers; the swap-less path presents at the end of EndFrame). 0
+// when no GL fence is in use (Vulkan guests, hosts without a compositor): those
+// stages are always "ready". If a guest ever presented BEFORE its EndFrame this
+// would wait one frame longer than needed — never shorter, which is the
+// direction that cannot show an unfinished picture.
+static uint64_t klovrp_fence_for_filing(void) {
+    if (!kl_glfb_has_gpu_fence()) return 0;
+    return kl_glfb_gpu_fence_value() + 1;
+}
+
 // `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
 // (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
 // guest. NULL leaves the record's zeroes in place, i.e. "the whole texture".
@@ -3252,6 +3290,14 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
     int observed = kl_glfb_render_stages(&mask, &binds, &draw_tid);
     int stages = kl_ovrp_stage_count();
     int nstages = __builtin_popcount(mask);
+
+    // KL_POST_AA: filter the eye images this frame drew — the stages in `mask`,
+    // which is exactly what the guest rendered between BeginFrame and here —
+    // BEFORE the frame is filed below and before kl_glfb_present signals the
+    // compositor's GPU fence, so no reprojection ever samples them unfiltered.
+    // Once per guest frame, on the guest's GL thread (kl_glfb skips it where
+    // there is no context). Off by default: a single NULL-ish test.
+    if (mask) kl_glfb_post_aa_eyes(mask);
 
     // The three ways the window can close badly, each named the first time it
     // happens. All three are silent under a sticky global — that is the point.
@@ -3393,6 +3439,9 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
         g_frames.pending.stage = stage;
         g_frames.pending.complete = 1;
         g_frames.r[stage] = g_frames.pending;
+        if (g_frames.last_complete >= 0 && g_frames.last_complete != stage)
+            g_frames.prev_complete = g_frames.last_complete;
+        g_frames.fence[stage] = klovrp_fence_for_filing();
         g_frames.last_complete = stage;
         g_frames.filed[stage]++;
         if (!binds) g_frames.guessed++;
@@ -3615,6 +3664,45 @@ void kl_ovrp_association_stats(uint64_t *dropped, uint64_t *multi,
     pthread_mutex_unlock(&g_frames.mu);
 }
 
+int kl_ovrp_complete_stage_fenced(uint64_t published, uint64_t *wait_value, int *safe) {
+    // KL_STAGE_FENCE=0: the old pairing — the last complete stage, waited on
+    // with whatever fence was published — still COUNTED, which is the A/B.
+    static int pair = -1;
+    if (pair < 0) pair = kl_env_on("KL_STAGE_FENCE", 1);
+    pthread_mutex_lock(&g_frames.mu);
+    int s = g_frames.last_complete;
+    uint64_t f = s >= 0 ? g_frames.fence[s] : 0;
+    int ok = s < 0 || f <= published;      // its fence is out: committed, finishable
+    int fell = 0;
+    if (!ok && pair) {
+        int p = g_frames.prev_complete;
+        if (p >= 0 && p != s && g_frames.r[p].complete && g_frames.fence[p] <= published) {
+            s = p; f = g_frames.fence[p]; ok = 1; fell = 1;
+        }
+    }
+    if (s >= 0) {
+        g_frames.picks++;
+        if (!ok) g_frames.unsafe_picks++;
+        if (fell) g_frames.fallbacks++;
+    }
+    uint64_t picks = g_frames.picks, unsafe = g_frames.unsafe_picks, fb = g_frames.fallbacks;
+    pthread_mutex_unlock(&g_frames.mu);
+    // Old pairing: wait on the latest published value, as the callers did.
+    // New: wait on the stage's own value — or, with no safe stage yet (the
+    // first frames), on the latest published one rather than on a value that
+    // is not even queued.
+    if (wait_value) *wait_value = (!pair || !ok) ? published : f;
+    if (safe) *safe = ok;
+    if (s >= 0 && picks % 1800 == 0)
+        fprintf(stderr, "  [ovrp] stage/fence (%s): %llu composites, %llu sampled a stage "
+                        "whose fence was not yet published (an unfinished picture), "
+                        "%llu fell back to the previous stage\n",
+                pair ? "paired" : "KL_STAGE_FENCE=0, unpaired",
+                (unsigned long long)picks, (unsigned long long)unsafe,
+                (unsigned long long)fb);
+    return s;
+}
+
 int kl_ovrp_last_complete_stage(void) {
     pthread_mutex_lock(&g_frames.mu);
     int s = g_frames.last_complete;
@@ -3757,6 +3845,9 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
         g_frames.pending.stage = stage;
         g_frames.pending.complete = 1;
         g_frames.r[stage] = g_frames.pending;
+        if (g_frames.last_complete >= 0 && g_frames.last_complete != stage)
+            g_frames.prev_complete = g_frames.last_complete;
+        g_frames.fence[stage] = klovrp_fence_for_filing();
         g_frames.last_complete = stage;
         g_frames.filed[stage]++;
     }
@@ -4453,6 +4544,18 @@ static int klovrp_hs_find(int h, double *tout, int *ao, int *bo) {
 // runs with no frontend. Called once a guest frame from the latch.
 static void klovrp_head_script(void) {
     double t; int a, b;
+    // A frontend is publishing the head (the Mac viewer, `--view`): the script
+    // yields. Two writers of one pose is a head that alternates between them
+    // frame to frame — measured with IEYTD's tutorial script under --view: Y
+    // 1.6 from the viewer, 0.0 from the script's "H:0,0,0", so every few frames
+    // were rendered 1.6 m lower, from under the office floor (the "void" frames).
+    if (__atomic_load_n(&g_head_frontend, __ATOMIC_ACQUIRE)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [ovrp] KL_OVRP_HAND_SCRIPT: a frontend publishes the head, "
+                            "so the script's head track (H) is ignored; hands still run\n");
+        return;
+    }
     if (!klovrp_hs_find(2, &t, &a, &b)) return;
     float u = 0.0f;
     if (b >= 0 && g_hs[b].t > g_hs[a].t) u = (float)((t - g_hs[a].t) / (g_hs[b].t - g_hs[a].t));
@@ -4464,7 +4567,9 @@ static void klovrp_head_script(void) {
     // q = yaw(+Y) * pitch(+X)
     float hy = v[3] * 0.008726646f, hp = v[4] * 0.008726646f;
     float sy = sinf(hy), cy = cosf(hy), sp = sinf(hp), cp = cosf(hp);
+    g_head_from_script = 1;
     kl_ovrp_set_head_pose(v[0], v[1], v[2], cy * sp, sy * cp, -sy * sp, cy * cp);
+    g_head_from_script = 0;
 }
 
 // 1 when the script owns this hand right now (and *hand is written).

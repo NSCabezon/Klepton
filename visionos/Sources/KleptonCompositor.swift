@@ -2030,7 +2030,31 @@ final class KleptonCompositor {
         // guest decoupled it may well be *mid-draw* into exactly that texture,
         // so the frames before the first EndFrame would be a torn picture
         // rather than an empty one, and reprojected against no pose at all.
-        let completeStage = Int(kl_ovrp_last_complete_stage())
+        //
+        // The stage is picked TOGETHER with the GL fence that covers it. Read
+        // apart (the stage here, the fence below) they paired the newest filed
+        // stage with the PREVIOUS frame's fence: kl_ovrp files a stage at the
+        // guest's EndFrame and that frame's fence is only published at its
+        // present, so in that window the wait below was on the old value and
+        // the pass sampled a stage the GPU had not finished — measured on the
+        // Mac viewer as ~30% of composites on IEYTD (torn / older pictures).
+        // kl_ovrp_complete_stage_fenced returns a stage whose fence is already
+        // published (the previous one while the newest is not) and that fence.
+        //
+        // The guest's projection layers are snapshotted BEFORE the fence is
+        // read, and that order is the whole of it: the guest publishes its
+        // frame's completion before the records that describe it
+        // (klxr_EndFrame), so a list read first can only be OLDER than the
+        // fence read second — never newer, which would be drawing layers whose
+        // blits this pass never waited for.
+        projLayerCount = projLayers.withUnsafeMutableBufferPointer {
+            kl_ovrp_eye_layer_live() != 0
+                ? Int(kl_ovrp_proj_layers_snapshot($0.baseAddress, Int32($0.count)))
+                : 0
+        }
+        let publishedGlFence = kl_glfb_gpu_fence_value()
+        var stageGlFence = publishedGlFence
+        let completeStage = Int(kl_ovrp_complete_stage_fenced(publishedGlFence, &stageGlFence, nil))
         let stage = max(0, completeStage)
         var rendered = kl_ovrp_render_pose()
         var haveRendered = withUnsafeMutablePointer(to: &rendered) {
@@ -2062,12 +2086,9 @@ final class KleptonCompositor {
         // fence read second — never newer, which would be drawing layers whose
         // blits this pass never waited for. Seen as one frame of the display
         // showing a picture from several frames ago, a few seconds apart.
-        projLayerCount = projLayers.withUnsafeMutableBufferPointer {
-            kl_ovrp_eye_layer_live() != 0
-                ? Int(kl_ovrp_proj_layers_snapshot($0.baseAddress, Int32($0.count)))
-                : 0
-        }
-        let glFence = kl_glfb_gpu_fence_value()
+        // (The projection layers are snapshotted above, before the fence is
+        // read — see the stage pick.)
+        let glFence = stageGlFence
         lastGlFenceSeen = glFence; lastProjLayersSeen = projLayerCount
         let frameValue = stream.map { UInt64($0.lastFrameId) }
             ?? (glFence != 0 ? glFence : kl_vulkan_frame_serial())

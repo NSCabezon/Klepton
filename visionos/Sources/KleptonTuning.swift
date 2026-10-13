@@ -333,6 +333,14 @@ final class KleptonRendering: ObservableObject {
         kl_ovrp_set_render_scale_default(Float(scale))
         kl_mediandk_set_video_default(video ? 1 : -1)
         NSLog("[cp] in-game video: \(video ? "on" : "runtime default") (target default \(Self.targetVideo ? "on" : "off"))")
+        // Post-process antialiasing (KL_POST_AA): off where the game does not
+        // offer it, whatever was stored.
+        let aa = KLRenderPrefs.postAAAvailable(for: t) && KLRenderPrefs.postAA(for: t)
+        kl_glfb_set_post_aa_default(aa ? KL_POST_AA_FXAA : KL_POST_AA_OFF)
+        let envAA = ProcessInfo.processInfo.environment["KL_POST_AA"]
+        NSLog("[cp] antialiasing filter (\(t)): \(aa ? "FXAA" : "off")"
+              + (KLRenderPrefs.storedPostAA(for: t) == nil ? " (game default)" : " (chosen)")
+              + (envAA.map { " — overridden by KL_POST_AA=\($0)" } ?? ""))
         let envScale = ProcessInfo.processInfo.environment["KL_OVRP_RENDER_SCALE"]
         NSLog(String(format: "[cp] render resolution (%@): setting %.0f%% (game default %.0f%%)",
                      t, scale * 100, targetScale * 100)
@@ -352,6 +360,7 @@ enum KLRenderPrefs {
     private static let legacyFoveationKey = "klepton.foveation"
     private static let legacyScaleKey = "klepton.renderScale"
     static func foveationKey(_ t: String) -> String { "\(legacyFoveationKey).\(t)" }
+    static func postAAKey(_ t: String) -> String { "klepton.postAA.\(t)" }
     static func scaleKey(_ t: String) -> String { "\(legacyScaleKey).\(t)" }
 
     /// The pre-per-game GLOBAL keys, moved once: in the hub the value was set
@@ -391,6 +400,35 @@ enum KLRenderPrefs {
         if let row = klHubGameRows.first(where: { $0.target == t }) { return row.glFoveation }
         #endif
         return true
+    }
+
+    /// Whether "Antialiasing (filter)" applies to this game (targets.py
+    /// "post_aa" stated at all): only guests whose eyes come through OVRPlugin's
+    /// GL eye textures can be filtered.
+    static func postAAAvailable(for t: String) -> Bool {
+        #if KL_HUB
+        if let row = klHubGameRows.first(where: { $0.target == t }) { return row.postAA != nil }
+        #endif
+        return false   // single-game builds: not offered (the hub reads targets.py)
+    }
+
+    static func defaultPostAA(for t: String) -> Bool {
+        #if KL_HUB
+        if let row = klHubGameRows.first(where: { $0.target == t }) { return row.postAA ?? false }
+        #endif
+        return false
+    }
+
+    static func storedPostAA(for t: String) -> Bool? {
+        UserDefaults.standard.object(forKey: postAAKey(t)) as? Bool
+    }
+
+    static func postAA(for t: String) -> Bool { storedPostAA(for: t) ?? defaultPostAA(for: t) }
+
+    /// nil forgets the choice (back to the game's default).
+    static func setPostAA(_ on: Bool?, for t: String) {
+        if let on { UserDefaults.standard.set(on, forKey: postAAKey(t)) }
+        else { UserDefaults.standard.removeObject(forKey: postAAKey(t)) }
     }
 
     static func defaultRenderScale(for t: String) -> Double {

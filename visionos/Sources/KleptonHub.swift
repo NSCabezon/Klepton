@@ -55,6 +55,10 @@ struct KLHubGameRow: Identifiable, Hashable {
     /// targets.py's "gl_foveation": false for a Vulkan guest, where the
     /// "Foveated rendering" setting has nothing to act on.
     let glFoveation: Bool
+    /// targets.py's "post_aa": nil when post-process antialiasing is not offered
+    /// for this game, else what "Antialiasing (filter)" means until the player
+    /// changes it (KLRenderPrefs, KL_POST_AA).
+    let postAA: Bool?
     /// targets.py's "mac_stream": the Mac's stream host runs this game and a
     /// session was verified, so the card offers "Jugar desde el Mac".
     let macStream: Bool
@@ -1578,6 +1582,8 @@ struct HubGameSettingsView: View {
     /// default), KLRenderPrefs; read at boot by KleptonRendering.apply.
     @State private var fovChoice: Bool?
     @State private var scaleChoice: Double?
+    /// "Antialiasing (filter)" as chosen for this game (nil = the game's default).
+    @State private var aaChoice: Bool?
 
     private var base: KLTune { KleptonTuning.shared.baseline }
 
@@ -1738,6 +1744,8 @@ struct HubGameSettingsView: View {
                         fovChoice = nil; scaleChoice = nil
                         KLRenderPrefs.setFoveation(nil, for: game.target)
                         KLRenderPrefs.setRenderScale(nil, for: game.target)
+                        aaChoice = nil
+                        KLRenderPrefs.setPostAA(nil, for: game.target)
                     }
                 }
             }
@@ -1752,6 +1760,7 @@ struct HubGameSettingsView: View {
             sessions = Array(KLSessionHistory.load(game.target).suffix(6).reversed())
             fovChoice = KLRenderPrefs.storedFoveation(for: game.target)
             scaleChoice = KLRenderPrefs.storedRenderScale(for: game.target)
+            aaChoice = KLRenderPrefs.storedPostAA(for: game.target)
         }
     }
 
@@ -1798,6 +1807,23 @@ struct HubGameSettingsView: View {
             }
             Text(klL("Default: \(pct(dScale))", "Por defecto: \(pct(dScale))"))
                 .font(.footnote).foregroundStyle(.secondary)
+            // Post-process antialiasing (KL_POST_AA): an FXAA pass on each eye
+            // picture, for games that render without MSAA. Only where the game
+            // offers it (targets.py "post_aa").
+            let aaOK = KLRenderPrefs.postAAAvailable(for: t)
+            let dAA = KLRenderPrefs.defaultPostAA(for: t)
+            HStack {
+                Toggle(klL("Antialiasing (filter)", "Antialiasing (filtro)"), isOn: Binding(
+                    get: { aaOK && (aaChoice ?? dAA) },
+                    set: { aaChoice = $0; KLRenderPrefs.setPostAA($0, for: t) }))
+                    .disabled(!aaOK)
+                resetButton(disabled: aaChoice == nil || !aaOK) {
+                    aaChoice = nil; KLRenderPrefs.setPostAA(nil, for: t)
+                }
+            }
+            Text(aaOK ? klL("Default: \(onOff(dAA))", "Por defecto: \(onOff(dAA))")
+                      : klL("Not available in this game", "Deshabilitado en este juego"))
+                .font(.footnote).foregroundStyle(.secondary)
             if KLGameSettingsStore.hasPrecompile(t) {
                 Toggle(klL("Precompile graphics", "Precompilar gráficos"), isOn: Binding(
                     get: { s.precompileGraphics ?? KLGameSettingsStore.defaultPrecompile(t) },
@@ -1816,12 +1842,15 @@ struct HubGameSettingsView: View {
             Text(klL("Applies the next time the game starts. Foveated rendering keeps the centre sharp "
                      + "and renders the edges at a lower rate (fixed, not eye-tracked); off renders every "
                      + "pixel at full rate. Render resolution is the size of the picture the game renders, "
-                     + "per axis: lower it if looking around stutters.",
+                     + "per axis: lower it if looking around stutters. Antialiasing (filter) smooths "
+                     + "jagged edges in games that render without antialiasing, at a small GPU cost "
+                     + "each frame.",
                      "Se aplica la próxima vez que arranque el juego. El renderizado foveado mantiene "
                      + "nítido el centro y dibuja los bordes a menor resolución (fijo, no sigue la mirada); "
                      + "desactivado, todo se dibuja a resolución completa. La resolución de render es el "
                      + "tamaño de la imagen que dibuja el juego, por eje: bájala si al mirar alrededor "
-                     + "va a tirones.")
+                     + "va a tirones. Antialiasing (filtro) suaviza los bordes dentados en los juegos "
+                     + "que se dibujan sin antialiasing, con un pequeño coste de GPU en cada imagen.")
                  + (KLGameSettingsStore.hasPrecompile(t)
                     ? klL("\n\nPrecompile graphics: before the game starts, compiles the shaders it will need, "
                           + "so walking into a new area does not freeze the picture. Takes a while each "

@@ -355,6 +355,18 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
 
+// The stage a compositor should sample AND the GL fence value that covers it,
+// read together. `published` is kl_glfb_gpu_fence_value() as the caller just
+// read it. The last complete stage is returned when its fence is already
+// published (its draws are committed to ANGLE's queue, so waiting on
+// *wait_value cannot hang); otherwise the stage completed before it, whose
+// fence is, and *safe is 1 either way. Only when neither qualifies (the first
+// frames) is the last complete stage returned with *safe = 0 — what
+// kl_ovrp_last_complete_stage alone would have said. *wait_value is 0 for a
+// guest with no GL fence (Vulkan): nothing to wait on. -1 before any frame.
+// Counts unsafe picks; KL_STAGE_FENCE=0 restores the old pairing (A/B).
+int kl_ovrp_complete_stage_fenced(uint64_t published, uint64_t *wait_value, int *safe);
+
 // ---------------------------------------------------------------------------
 // The OTHER layers — what a compositor has to draw ON TOP of the eye picture
 //
