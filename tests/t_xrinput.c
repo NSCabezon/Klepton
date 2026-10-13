@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "../runtime/xr/kl_openxr.h"
+#include "../runtime/xr/kl_ovrp.h"
 
 int main(void) {
     // The frontend seam in kl_ovrp parks the hands at a head-relative default
@@ -24,6 +25,8 @@ int main(void) {
 
     printf("=== OpenXR actions, poses and haptics ===\n");
     int ok = kl_openxr_input_selftest(stdout);
+    printf("=== OVRPlugin Touches / NearTouches ===\n");
+    ok = kl_ovrp_touch_selftest(stdout) && ok;
     ok = kl_openxr_swapchain_selftest(stdout) && ok;
     printf("%s: the action surface reads the input kl_ovrp holds\n",
            ok ? "PASS" : "FAIL");

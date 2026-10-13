@@ -3868,12 +3868,14 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
 // was measured, which put them below the floor and out of view.
 static int g_hand_set[2];
 
-// Buttons/touches are ovrpButton/ovrpTouch bit values straight from the
-// metadata (Button: One=1 Two=2 Start=0x100 PrimaryIndexTrigger=0x2000
-// PrimaryHandTrigger=0x4000 PrimaryThumbstick=0x8000 ..., and the Secondary*
-// block at <<20-ish for the other hand — the frontend hands us final bits).
+// `buttons` and `touches` are both RAW ovrpButton bits (KL_OVRP_RAW_*, see
+// kl_ovrp.h): pressed, and touched. The guest's Touches / NearTouches words are
+// a different layout and are made from these only in fill_controller_state.
+// `ovrp_touches` / `ovrp_near` are already in the guest's layouts: what a
+// KL_OVRP_POKE script's RT=/RN= adds, for a state no control produces.
 typedef struct {
-    uint32_t buttons, touches, neartouches;
+    uint32_t buttons, touches;
+    uint32_t ovrp_touches, ovrp_near;
     float    index_trigger, hand_trigger, stick_x, stick_y;
 } klovrp_input_state;
 static klovrp_input_state g_input[2];
@@ -4075,7 +4077,6 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
       } }
     g_input[hand].buttons = buttons;
     g_input[hand].touches = touches;
-    g_input[hand].neartouches = touches;   // capacitive proximity ~ touch
     g_input[hand].index_trigger = index_trigger;
     g_input[hand].hand_trigger = hand_trigger;
     g_input[hand].stick_x = stick_x;
@@ -4181,6 +4182,8 @@ static unsigned klovrp_script_frame(void) {
 static int klovrp_poke_name(const char *n, size_t len, struct klovrp_poke *p) {
     // `RT=0x10`, `LN=0x1`: raw Touches (T) / NearTouches (N) bits for a hand,
     // with no button — a capacitive state no named control produces on its own.
+    // In the guest's ovrpTouch / ovrpNearTouch layouts (KL_OVRP_TOUCH_* /
+    // KL_OVRP_NEAR_*), added after the conversion, so OVRPlugin guests only.
     if (len > 3 && (n[0] == 'R' || n[0] == 'L' || n[0] == 'r' || n[0] == 'l') &&
         (n[1] == 'T' || n[1] == 'N' || n[1] == 't' || n[1] == 'n') && n[2] == '=') {
         char tmp[24];
@@ -4305,11 +4308,10 @@ static klovrp_input_state klovrp_input(int hand) {
                             "buttons L=%#x R=%#x touches L=%#x R=%#x near L=%#x R=%#x\n",
                     t, frame, p->b[0], p->b[1], p->tch[0], p->tch[1], p->near[0], p->near[1]);
         }
-        v.buttons    |= p->b[hand];
-        v.touches    |= p->b[hand];
-        v.neartouches |= p->b[hand];
-        v.touches     |= p->tch[hand];
-        v.neartouches |= p->near[hand];
+        v.buttons      |= p->b[hand];
+        v.touches      |= p->b[hand];
+        v.ovrp_touches |= p->tch[hand];
+        v.ovrp_near    |= p->near[hand];
         if (p->idx[hand] > v.index_trigger) v.index_trigger = p->idx[hand];
         if (p->grip[hand] > v.hand_trigger) v.hand_trigger = p->grip[hand];
         if (hand == 1) {
@@ -4841,8 +4843,8 @@ static klovrp_vec3 klovrp_GetBoundaryDimensions(void) {
 //   +0x20 vec2 LThumbstick           +0x28 vec2 RThumbstick
 // v2 appends +0x30/+0x38 vec2 L/RTouchpad; v4 appends +0x40.. bytes
 // L/RBatteryPercentRemaining, L/RRecenterCount, then 28 reserved.
-// KL_OVRP_FAKE_BUTTONS=<hex>: OR this mask into both hands' Buttons and
-// Touches, toggling on/off on a duty cycle so GetDown/GetUp transitions
+// KL_OVRP_FAKE_BUTTONS=<hex>: OR this mask into both hands' Buttons (and
+// what it touches into Touches), toggling on/off on a duty cycle so GetDown/GetUp transitions
 // actually occur — a held-from-boot bit never reads as a press.
 //
 // Which bits reach the game, measured from libunity's joystick fill
@@ -4894,6 +4896,43 @@ static float klovrp_fake_trigger(void) {
     return klovrp_fake_phase() ? v : 0.0f;
 }
 
+// Touched controls (ovrpButton layout, the seam's) -> the guest's ovrpTouch.
+// Only this hand's own controls: see kl_ovrp.h.
+uint32_t kl_ovrp_touch_word(int hand, uint32_t t) {
+    uint32_t o = 0;
+    if (hand == 0) {
+        if (t & KL_OVRP_RAW_X)              o |= KL_OVRP_TOUCH_X;
+        if (t & KL_OVRP_RAW_Y)              o |= KL_OVRP_TOUCH_Y;
+        if (t & KL_OVRP_RAW_LTHUMBSTICK)    o |= KL_OVRP_TOUCH_LTHUMBSTICK;
+        if (t & KL_OVRP_RAW_LINDEX_TRIGGER) o |= KL_OVRP_TOUCH_LINDEX_TRIGGER;
+    } else {
+        if (t & KL_OVRP_RAW_A)              o |= KL_OVRP_TOUCH_A;
+        if (t & KL_OVRP_RAW_B)              o |= KL_OVRP_TOUCH_B;
+        if (t & KL_OVRP_RAW_RTHUMBSTICK)    o |= KL_OVRP_TOUCH_RTHUMBSTICK;
+        if (t & KL_OVRP_RAW_RINDEX_TRIGGER) o |= KL_OVRP_TOUCH_RINDEX_TRIGGER;
+    }
+    return o;
+}
+
+// ...and -> ovrpNearTouch: thumb over any of this hand's thumb controls, finger
+// on its trigger. The Sense controllers have no proximity sensing short of
+// contact, so near-touch is touch — the superset relation OVRPlugin keeps.
+uint32_t kl_ovrp_neartouch_word(int hand, uint32_t t) {
+    uint32_t touch = kl_ovrp_touch_word(hand, t), o = 0;
+    if (hand == 0) {
+        if (touch & (KL_OVRP_TOUCH_X | KL_OVRP_TOUCH_Y | KL_OVRP_TOUCH_LTHUMBSTICK |
+                     KL_OVRP_TOUCH_LTHUMBREST))
+            o |= KL_OVRP_NEAR_LTHUMB_BUTTONS;
+        if (touch & KL_OVRP_TOUCH_LINDEX_TRIGGER) o |= KL_OVRP_NEAR_LINDEX_TRIGGER;
+    } else {
+        if (touch & (KL_OVRP_TOUCH_A | KL_OVRP_TOUCH_B | KL_OVRP_TOUCH_RTHUMBSTICK |
+                     KL_OVRP_TOUCH_RTHUMBREST))
+            o |= KL_OVRP_NEAR_RTHUMB_BUTTONS;
+        if (touch & KL_OVRP_TOUCH_RINDEX_TRIGGER) o |= KL_OVRP_NEAR_RINDEX_TRIGGER;
+    }
+    return o;
+}
+
 static void fill_controller_state(int mask, void *out, int version) {
     memset(out, 0, version >= 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
     uint32_t m = (uint32_t)mask;
@@ -4918,10 +4957,32 @@ static void fill_controller_state(int mask, void *out, int version) {
         in[0].touches |= KL_OVRP_RAW_START;
     }
     w[0] = conn;                                        // ConnectedControllers
+    // Touches and NearTouches are NOT the Buttons layout: converted here and
+    // only here (kl_ovrp_touch_word). A press is a touch.
+    for (int h = 0; h < 2; h++) {
+        uint32_t t = in[h].buttons | in[h].touches;
+        in[h].ovrp_touches |= kl_ovrp_touch_word(h, t);
+        in[h].ovrp_near    |= kl_ovrp_neartouch_word(h, t);
+    }
+    // KL_OVRP_VERBOSE: every change of either hand's Touches / NearTouches as
+    // the guest will read them (the [ctrl] poll log shows Buttons only), so a
+    // headset run says which in-game finger a touch should have moved.
+    { static int verbose = -1;
+      static uint32_t last[2][2] = { { ~0u, ~0u }, { ~0u, ~0u } };
+      static unsigned n;
+      if (verbose < 0) verbose = (int)kl_env_uint("KL_OVRP_VERBOSE", 0);
+      for (int h = 0; verbose && h < 2; h++) {
+          if (last[h][0] == in[h].ovrp_touches && last[h][1] == in[h].ovrp_near) continue;
+          last[h][0] = in[h].ovrp_touches; last[h][1] = in[h].ovrp_near;
+          if (n++ < 2000)
+              fprintf(stderr, "  [ctrl] touch %c: Touches=%#x NearTouches=%#x "
+                      "(from touched buttons %#x)\n", h ? 'R' : 'L',
+                      in[h].ovrp_touches, in[h].ovrp_near, in[h].buttons | in[h].touches);
+      } }
     if (conn & OVRP_CTRL_LTOUCH) {
         w[1] |= in[0].buttons;                          // Buttons
-        w[2] |= in[0].touches;                          // Touches
-        w[3] |= in[0].neartouches;                      // NearTouches
+        w[2] |= in[0].ovrp_touches;                     // Touches
+        w[3] |= in[0].ovrp_near;                        // NearTouches
         f[4] = in[0].index_trigger;                     // LIndexTrigger
         f[6] = in[0].hand_trigger;                      // LHandTrigger
         f[8] = in[0].stick_x; f[9] = in[0].stick_y;
@@ -4930,8 +4991,8 @@ static void fill_controller_state(int mask, void *out, int version) {
     }
     if (conn & OVRP_CTRL_RTOUCH) {
         w[1] |= in[1].buttons;
-        w[2] |= in[1].touches;
-        w[3] |= in[1].neartouches;
+        w[2] |= in[1].ovrp_touches;
+        w[3] |= in[1].ovrp_near;
         f[5] = in[1].index_trigger;                     // RIndexTrigger
         f[7] = in[1].hand_trigger;                      // RHandTrigger
         f[10] = in[1].stick_x; f[11] = in[1].stick_y;
@@ -4949,7 +5010,7 @@ static void fill_controller_state(int mask, void *out, int version) {
                     (double)f[10], (double)f[11], w[1]);
     }
     w[1] |= fake;                                       // Buttons
-    w[2] |= fake;                                       // Touches
+    w[2] |= kl_ovrp_touch_word(0, fake) | kl_ovrp_touch_word(1, fake); // Touches
     if (fake_trig > 0.0f) {
         if (conn & OVRP_CTRL_LTOUCH) f[4] = fake_trig;  // LIndexTrigger
         if (conn & OVRP_CTRL_RTOUCH) f[5] = fake_trig;  // RIndexTrigger
@@ -5032,6 +5093,64 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
     fill_controller_state(mask, out, 1);
     ctrl_state_log("GetControllerState", mask, out);
     return OVRP_SUCCESS;
+}
+
+// The touch-word gate (`make xrinput`): publish through the frontend seam,
+// poll through the real ovrp_GetControllerState4 fill, read Touches (+0x08) and
+// NearTouches (+0x0C) back. Every row is a statement about which in-game finger
+// moves, so each one names the control the user would have touched.
+int kl_ovrp_touch_selftest(FILE *f) {
+    static const struct {
+        const char *what;
+        uint32_t lb, lt, rb, rt;        // published buttons/touches, per hand
+        int mask;                        // ovrp controller mask polled
+        uint32_t touches, near;          // what the guest must read
+    } c[] = {
+        { "left X touched, left poll",   0, KL_OVRP_RAW_X, 0, 0, 1,
+          KL_OVRP_TOUCH_X, KL_OVRP_NEAR_LTHUMB_BUTTONS },
+        { "left stick touched, both",    0, KL_OVRP_RAW_LTHUMBSTICK, 0, 0, 3,
+          KL_OVRP_TOUCH_LTHUMBSTICK, KL_OVRP_NEAR_LTHUMB_BUTTONS },
+        { "left Y pressed, Active",      KL_OVRP_RAW_Y, 0, 0, 0, (int)0x80000000u,
+          KL_OVRP_TOUCH_Y, KL_OVRP_NEAR_LTHUMB_BUTTONS },
+        // The reported bug: right B touched moved the LEFT thumb (NearTouch 0x2).
+        { "right B touched, both",       0, 0, 0, KL_OVRP_RAW_B, 3,
+          KL_OVRP_TOUCH_B, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        { "right A touched, Active",     0, 0, 0, KL_OVRP_RAW_A, (int)0x80000000u,
+          KL_OVRP_TOUCH_A, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        { "right A touched, left poll",  0, 0, 0, KL_OVRP_RAW_A, 1, 0, 0 },
+        { "right stick touched, both",   0, 0, 0, KL_OVRP_RAW_RTHUMBSTICK, 3,
+          KL_OVRP_TOUCH_RTHUMBSTICK, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        { "left trigger touched",        0, KL_OVRP_RAW_LINDEX_TRIGGER, 0, 0, 3,
+          KL_OVRP_TOUCH_LINDEX_TRIGGER, KL_OVRP_NEAR_LINDEX_TRIGGER },
+        { "right trigger pressed",       0, 0, KL_OVRP_RAW_RINDEX_TRIGGER, 0, 3,
+          KL_OVRP_TOUCH_RINDEX_TRIGGER, KL_OVRP_NEAR_RINDEX_TRIGGER },
+        // Stick DIRECTION bits are buttons only: 0x10 is RIndexTrigger in Touches.
+        // (0x80 is LThumbstickRight; the frontends put it in both words.)
+        { "left stick pushed right",     0x80u, KL_OVRP_RAW_LTHUMBSTICK | 0x80u, 0, 0, 3,
+          KL_OVRP_TOUCH_LTHUMBSTICK, KL_OVRP_NEAR_LTHUMB_BUTTONS },
+        { "right stick pushed up",       0, 0, KL_OVRP_RAW_RTHUMBSTICK_UP,
+          KL_OVRP_RAW_RTHUMBSTICK | KL_OVRP_RAW_RTHUMBSTICK_UP, 3,
+          KL_OVRP_TOUCH_RTHUMBSTICK, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        // A bit on the wrong hand stays on its own hand's half: nothing.
+        { "A published on the left",     0, KL_OVRP_RAW_A, 0, 0, 3, 0, 0 },
+        { "grip, menu: no touch bits",   KL_OVRP_RAW_LHAND_TRIGGER | KL_OVRP_RAW_START,
+          0, KL_OVRP_RAW_RHAND_TRIGGER | KL_OVRP_RAW_BACK, 0, 3, 0, 0 },
+    };
+    int ok = 1;
+    klovrp_input_state saved[2] = { g_input[0], g_input[1] };
+    for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
+        kl_ovrp_set_controller_input(0, c[i].lb, c[i].lt, 0, 0, 0, 0);
+        kl_ovrp_set_controller_input(1, c[i].rb, c[i].rt, 0, 0, 0, 0);
+        uint32_t st[0x60 / 4];
+        klovrp_GetControllerState4(c[i].mask, st);
+        int pass = st[2] == c[i].touches && st[3] == c[i].near;
+        fprintf(f, "  %s %-28s mask=%#x Touches=%#x (want %#x) NearTouches=%#x (want %#x)\n",
+                pass ? "ok  " : "FAIL", c[i].what, (unsigned)c[i].mask,
+                st[2], c[i].touches, st[3], c[i].near);
+        ok = ok && pass;
+    }
+    g_input[0] = saved[0]; g_input[1] = saved[1];
+    return ok;
 }
 
 // ---------------------------------------------------------------------------

@@ -111,9 +111,12 @@ void kl_ovrp_set_frame_pacer(void (*wait)(void));
 
 // The rest of the pose-in seam: the two Touch controllers. `hand` is
 // 0 = left (node 3), 1 = right (node 4). Poses live in the same tracking
-// space as the head. Buttons/touches are ovrpButton/ovrpTouch bit values as
-// the guest's own OVRPlugin enum defines them (the frontend composes final
-// bits); triggers are 0..1, thumbstick -1..1 on both axes.
+// space as the head. BOTH words are in the ovrpButton layout (KL_OVRP_RAW_*
+// below): `buttons` is what is pressed, `touches` is what is TOUCHED — the
+// same bit for the same control, never the ovrpTouch layout. kl_ovrp converts
+// to ovrpTouch / ovrpNearTouch itself, at the one place an OVRPlugin guest
+// reads them (kl_ovrp_touch_word / kl_ovrp_neartouch_word), and kl_openxr reads
+// `touches` in this layout as it is. Triggers are 0..1, thumbstick -1..1.
 // The head pose for an INSTANT, supplied by the frontend.
 //
 // kl_ovrp otherwise publishes one current pose, which is all a guest that
@@ -880,6 +883,49 @@ enum {
     KL_OVRP_RAW_LINDEX_TRIGGER   = 0x10000000,
     KL_OVRP_RAW_LHAND_TRIGGER    = 0x20000000,
 };
+
+// `ovrpTouch` and `ovrpNearTouch`: the OTHER two words of ovrpControllerState,
+// and NOT the ovrpButton layout above (OVRInput.RawTouch / RawNearTouch).
+// They share A/B/X/Y and the stick clicks with it and nothing else — the index
+// trigger is 0x10/0x1000 here, not 0x04000000/0x10000000 — so a touched-buttons
+// word copied into them verbatim says the wrong thing exactly where it matters:
+// the left stick's direction bits (0x10..) read as the RIGHT index finger, and
+// the right controller's A/B as the LEFT hand's index and thumb near-touches.
+// That is how IEYTD's left thumb came to follow the right controller's B button.
+// Values cross-checked against the guest's own enums (KL_PROBE_ENUM) and against
+// IEYTD's OculusTouchInput.ProcessCapactiveActions, which asks RawNearTouch
+// 0x1/0x2 for its left hand and 0x4/0x8 for its right.
+enum {
+    KL_OVRP_TOUCH_A              = 0x00000001,
+    KL_OVRP_TOUCH_B              = 0x00000002,
+    KL_OVRP_TOUCH_RTHUMBSTICK    = 0x00000004,
+    KL_OVRP_TOUCH_RTHUMBREST     = 0x00000008,
+    KL_OVRP_TOUCH_RINDEX_TRIGGER = 0x00000010,
+    KL_OVRP_TOUCH_X              = 0x00000100,
+    KL_OVRP_TOUCH_Y              = 0x00000200,
+    KL_OVRP_TOUCH_LTHUMBSTICK    = 0x00000400,
+    KL_OVRP_TOUCH_LTHUMBREST     = 0x00000800,
+    KL_OVRP_TOUCH_LINDEX_TRIGGER = 0x00001000,
+};
+enum {
+    KL_OVRP_NEAR_LINDEX_TRIGGER  = 0x00000001,
+    KL_OVRP_NEAR_LTHUMB_BUTTONS  = 0x00000002,
+    KL_OVRP_NEAR_RINDEX_TRIGGER  = 0x00000004,
+    KL_OVRP_NEAR_RTHUMB_BUTTONS  = 0x00000008,
+};
+
+// The conversion, from a hand's touched-or-pressed word in the ovrpButton
+// layout. Only that hand's own controls are carried — a left controller has no
+// A to touch — so a bit published on the wrong hand cannot reach the other
+// hand's half of a both-hands poll. NearTouch is the thumb hovering over any of
+// that hand's thumb controls (face buttons, stick) and the finger on its index
+// trigger; a touch is a near-touch, which is what OVRPlugin reports on Touch.
+uint32_t kl_ovrp_touch_word(int hand, uint32_t touched_buttons);
+uint32_t kl_ovrp_neartouch_word(int hand, uint32_t touched_buttons);
+
+// `make xrinput` gate for the above, through the real ovrp_GetControllerState4
+// fill: per-hand and both-hands polls, Touches and NearTouches. 1 = pass.
+int kl_ovrp_touch_selftest(FILE *f);
 
 // ...and the OTHER direction, for a guest whose haptics API is not OVRPlugin's.
 //

@@ -1056,7 +1056,9 @@ puts the camera on the ground with its hands underneath it.
   `12:A@3000` holds that one press 3000 ms (a "hold any button" calibration
   and a trigger click want different lengths in one script). `RT=<bits>`,
   `LT=<bits>`, `RN=<bits>`, `LN=<bits>` add raw Touches / NearTouches bits with
-  no button: IEYTD only poses a pointing index once it has SEEN the index
+  no button, in the guest's own ovrpTouch / ovrpNearTouch layouts
+  (`KL_OVRP_TOUCH_*` / `KL_OVRP_NEAR_*` in kl_ovrp.h, OVRPlugin guests only —
+  every named control is converted to those words in fill_controller_state): IEYTD only poses a pointing index once it has SEEN the index
   near-touch, so `90:RN=0x4@1000` arms it. On a GL guest on the legacy path
   `f<frame>` counts the frame index `ovrp_Update2` names (it never reaches the
   Vulkan submit counter). At most 128 presses; a longer script says so.

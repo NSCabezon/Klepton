@@ -2,7 +2,9 @@
 //  KleptonControllers.swift — the controller seam on visionOS.
 //
 //  The guest wants two Oculus Touch controllers: poses for nodes 3 and 4, and
-//  `ovrpButton`/`ovrpTouch` raw bits, an index trigger, a hand trigger and a
+//  `ovrpButton` raw bits (pressed, and touched — both words in the BUTTON
+//  layout; kl_ovrp makes the guest's ovrpTouch / ovrpNearTouch words from the
+//  touched one), an index trigger, a hand trigger and a
 //  thumbstick per hand (`kl_ovrp_set_hand_pose`, `kl_ovrp_set_controller_input`).
 //  This platform can answer that two ways, and which one is available is a
 //  runtime fact, not a build-time one:
@@ -629,6 +631,10 @@ final class KleptonControllers {
         // next `makePlayer` throws rather than returning nil — which is a
         // caught error per frame for the rest of the run.
         releaseHaptics()
+        // ...and the button half re-binds from scratch on the next poll: every
+        // controller's input queue is configured again and logged, after the
+        // accessory provider that is about to wrap the same GCControllers.
+        buttonBinding.removeAll()
         lock.lock()
         accessoryAnchor.removeAll()
         // The provider goes too: predicting against a provider whose session is
@@ -1212,6 +1218,59 @@ final class KleptonControllers {
         st.stick = h.stick
     }
 
+    // MARK: - Button binding (connect / disconnect at any time)
+
+    /// The Sense controllers pollButtons has configured, by object, with how
+    /// their input has been arriving. Render thread only, like the poll.
+    private var buttonBinding: [ObjectIdentifier: (name: String, hand: Int,
+                                                   queued: Int, captured: Int,
+                                                   saidCapture: Bool)] = [:]
+
+    /// (Re)bind the button path to exactly the spatial controllers present
+    /// NOW. Every frame, from the same `GCController.controllers()` read the
+    /// poll uses, so a controller that connects or reconnects at any moment —
+    /// before the game, mid-game, after a sleep — is configured on the frame it
+    /// appears, the same as one paired at launch. The pose half is rebuilt
+    /// separately (`spatialControllersChanged` → runARKit); this is the button
+    /// half, and it logs each bind/unbind so a headset log shows both.
+    private func rebindButtons(_ spatial: [GCController]) {
+        guard #available(visionOS 26.0, *) else { return }
+        var live = Set<ObjectIdentifier>()
+        for c in spatial {
+            let id = ObjectIdentifier(c)
+            live.insert(id)
+            if buttonBinding[id] != nil { continue }
+            c.input.inputStateQueueDepth = 1
+            let hand = Self.hand(of: c)
+            let name = c.vendorName ?? "?"
+            buttonBinding[id] = (name, hand, 0, 0, false)
+            NSLog("[cp] buttons bound: \(name) -> hand \(hand == 0 ? "L" : "R") "
+                  + "(\(buttonBinding.count) bound)")
+            Self.census(c)
+        }
+        for (id, v) in buttonBinding where !live.contains(id) {
+            buttonBinding[id] = nil
+            NSLog("[cp] buttons unbound: \(v.name) (hand \(v.hand == 0 ? "L" : "R"), "
+                  + "\(v.queued) queued / \(v.captured) captured reads)")
+        }
+    }
+
+    /// Count which path a controller's input came through, and say so ONCE if
+    /// a press is only visible through `capture()` — the measurement that tells
+    /// "the queue stays silent for a late controller" from anything else.
+    private func noteInputPath(_ c: GCController, queued: Bool, state: GCControllerInputState) {
+        let id = ObjectIdentifier(c)
+        guard var v = buttonBinding[id] else { return }
+        if queued { v.queued += 1 } else { v.captured += 1 }
+        if !queued, v.queued == 0, !v.saidCapture,
+           state.buttons.contains(where: { $0.pressedInput.isPressed }) {
+            v.saidCapture = true
+            NSLog("[cp] \(v.name): a press arrived through capture() with the input "
+                  + "queue silent since bind (\(v.captured) reads) — the late-connect case")
+        }
+        buttonBinding[id] = v
+    }
+
     // MARK: - Polling
 
     /// Poll the Sense controllers' buttons. Called once per frame from the
@@ -1256,6 +1315,7 @@ final class KleptonControllers {
             .filter { $0.productCategory == GCProductCategorySpatialController }
         var attached = [false, false]
         for c in spatial { attached[Self.hand(of: c)] = true }
+        rebindButtons(spatial)
 
         lock.lock()
         for i in 0...1 where !attached[i] {
@@ -1277,11 +1337,21 @@ final class KleptonControllers {
             // contains: "PlayStation VR2 Sense Controller (L)".
             let hand = Self.hand(of: c)
 
-            c.input.inputStateQueueDepth = 1
             // nil is "nothing new since you last asked", NOT "everything is
-            // released". Leave this hand's last sample standing — see the
-            // clear-on-attachment note above, which is the other half of this.
-            guard let s = c.input.nextInputState() else { continue }
+            // released" — so it must not clear the hand (see the
+            // clear-on-attachment note above). It is answered with `capture()`,
+            // the controller's CURRENT state, instead of `continue`: the same
+            // values for a controller whose queue is merely idle, and the only
+            // input at all from one whose queue never fills. That second case
+            // is a Sense pair switched on AFTER the game started — poses
+            // tracked, and not one button reached the guest for the rest of
+            // the session, while a pair connected at launch worked. Whatever
+            // the platform does to the late controller's queue, the live
+            // snapshot does not depend on it; `rebindButtons` logs which path
+            // a controller's input actually arrives on.
+            let queued = c.input.nextInputState()
+            let s: GCControllerInputState = queued ?? c.input.capture()
+            noteInputPath(c, queued: queued != nil, state: s)
             let b = s.buttons, ax = s.axes, dp = s.dpads
 
             // The PSVR2 Sense element names, per controller. Both controllers
@@ -1521,6 +1591,13 @@ final class KleptonControllers {
             // above are additive to that, not a replacement: OVRInput treats
             // touch as a superset of press and a press that is not also a touch
             // reads as a hardware fault.
+            //
+            // `touches` stays in the ovrpButton layout on purpose: it is
+            // "which of these controls is touched", which kl_openxr reads as is.
+            // The guest's ovrpTouch / ovrpNearTouch words are a different
+            // layout and are built from it in ONE place, kl_ovrp's
+            // fill_controller_state (kl_ovrp_touch_word). Copying this word into
+            // them verbatim is what put IEYTD's left thumb on the right B.
             st.buttons = bits
             st.touches = touch | bits
 
