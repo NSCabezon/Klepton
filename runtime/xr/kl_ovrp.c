@@ -4933,6 +4933,88 @@ uint32_t kl_ovrp_neartouch_word(int hand, uint32_t t) {
     return o;
 }
 
+// ---- the near-touch "arming" pulse ---------------------------------------
+//
+// A guest that poses fingers from near-touch EDGES never leaves its starting
+// pose on a Sense controller. IEYTD is the measured case: its
+// OculusTouchInput.ProcessCapactiveActions asks only GetDown / GetUp of
+// RawNearTouch (0x1/0x2 left, 0x4/0x8 right, Controller.Active) and hands them
+// to VRHandInput.RequestHandAnimation; the hand starts resting on the controls
+// and points / raises its thumb only on a GetUp. On a Quest that edge is free —
+// the hand picking up a Touch controller near-touches it, and lifting a finger
+// is the Up. A Sense controller near-touches nothing until it is TOUCHED, so a
+// finger that was never put down can never be lifted, and the hand stays
+// closed until the player happens to touch and release each control. (The
+// headless tutorial script needed `90:RN=0x4+LN=0x1@1000` for exactly this.)
+//
+// So, as a Quest would: report that hand's thumb and index near-touch for a
+// short while when the hand is picked up, and then the truth. A finger that is
+// really resting stays down (no edge at all); one that is not gets its Up.
+// "Picked up" is: the guest's first poll that sees the hand, the frontend
+// (re)binding a controller (kl_ovrp_arm_near_touch), and the guest coming back
+// from a polling gap — a scene load, which is where a title builds new hands
+// that have not seen any edge yet.
+//   KL_OVRP_NEAR_ARM_MS=<ms>     pulse length, default 500; 0 turns this off
+//   KL_OVRP_NEAR_ARM_GAP_MS=<ms> polling gap that re-arms, default 1000; 0 = never
+static double (*g_near_clock)(void) = klovrp_mono_now;   // the selftest swaps it
+static double g_near_until[2];                            // pulse end, per hand
+static unsigned g_near_polls[2];                          // polls left in the pulse
+static int    g_near_seen[2];                             // first poll seen
+
+// Read once (the poll is hot); the selftest sets them directly.
+static double g_near_len = -1, g_near_gap = -1;
+static void klovrp_near_cfg(void) {
+    if (g_near_len < 0) g_near_len = kl_env_int("KL_OVRP_NEAR_ARM_MS", 500) / 1000.0;
+    if (g_near_gap < 0) g_near_gap = kl_env_int("KL_OVRP_NEAR_ARM_GAP_MS", 1000) / 1000.0;
+}
+
+static void klovrp_near_arm_hand(int hand, double now, const char *why) {
+    klovrp_near_cfg();
+    double len = g_near_len;
+    if (len <= 0) return;
+    g_near_until[hand] = now + len;
+    // ...and never fewer than this many guest polls: the first frames after a
+    // scene load can be long, and a pulse that lapses inside one frame is a
+    // GetDown and GetUp the guest never sees.
+    g_near_polls[hand] = 60;
+    static unsigned n;
+    if (n++ < 64)
+        fprintf(stderr, "  [ctrl] near-touch armed for hand %c (%s): thumb + index "
+                "near for %.0f ms, then the controller's own reading\n",
+                hand ? 'R' : 'L', why, len * 1000.0);
+}
+
+void kl_ovrp_arm_near_touch(int hand) {
+    if ((unsigned)hand > 1) return;
+    klovrp_near_arm_hand(hand, g_near_clock(), "controller bound");
+}
+
+// Called once per guest poll; returns the extra NearTouches bits per hand.
+static void klovrp_near_pulse(uint32_t conn, uint32_t extra[2]) {
+    static double last_poll;
+    double now = g_near_clock();
+    klovrp_near_cfg();
+    double gap = g_near_gap;
+    int resumed = last_poll > 0 && gap > 0 && now - last_poll >= gap;
+    // KL_OVRP_VERBOSE: name the gaps, so a log says whether a title's scene
+    // loads stall the poll long enough to re-arm (and how long they are).
+    { static int verbose = -1;
+      if (verbose < 0) verbose = (int)kl_env_uint("KL_OVRP_VERBOSE", 0);
+      if (verbose && last_poll > 0 && now - last_poll >= 0.25)
+          fprintf(stderr, "  [ctrl] guest polling resumed after %.2f s\n", now - last_poll); }
+    last_poll = now;
+    for (int h = 0; h < 2; h++) {
+        extra[h] = 0;
+        if (!(conn & (h ? OVRP_CTRL_RTOUCH : OVRP_CTRL_LTOUCH))) continue;
+        if (!g_near_seen[h]) { g_near_seen[h] = 1; klovrp_near_arm_hand(h, now, "first poll"); }
+        else if (resumed) klovrp_near_arm_hand(h, now, "polling resumed after a gap");
+        if (g_near_polls[h]) g_near_polls[h]--;
+        if (now < g_near_until[h] || g_near_polls[h])
+            extra[h] = h ? KL_OVRP_NEAR_RTHUMB_BUTTONS | KL_OVRP_NEAR_RINDEX_TRIGGER
+                         : KL_OVRP_NEAR_LTHUMB_BUTTONS | KL_OVRP_NEAR_LINDEX_TRIGGER;
+    }
+}
+
 static void fill_controller_state(int mask, void *out, int version) {
     memset(out, 0, version >= 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
     uint32_t m = (uint32_t)mask;
@@ -4959,10 +5041,12 @@ static void fill_controller_state(int mask, void *out, int version) {
     w[0] = conn;                                        // ConnectedControllers
     // Touches and NearTouches are NOT the Buttons layout: converted here and
     // only here (kl_ovrp_touch_word). A press is a touch.
+    uint32_t arm[2];
+    klovrp_near_pulse(conn, arm);
     for (int h = 0; h < 2; h++) {
         uint32_t t = in[h].buttons | in[h].touches;
         in[h].ovrp_touches |= kl_ovrp_touch_word(h, t);
-        in[h].ovrp_near    |= kl_ovrp_neartouch_word(h, t);
+        in[h].ovrp_near    |= kl_ovrp_neartouch_word(h, t) | arm[h];
     }
     // KL_OVRP_VERBOSE: every change of either hand's Touches / NearTouches as
     // the guest will read them (the [ctrl] poll log shows Buttons only), so a
@@ -5095,6 +5179,9 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
     return OVRP_SUCCESS;
 }
 
+static double *klovrp_selftest_now;
+static double klovrp_selftest_clock(void) { return *klovrp_selftest_now; }
+
 // The touch-word gate (`make xrinput`): publish through the frontend seam,
 // poll through the real ovrp_GetControllerState4 fill, read Touches (+0x08) and
 // NearTouches (+0x0C) back. Every row is a statement about which in-game finger
@@ -5138,6 +5225,16 @@ int kl_ovrp_touch_selftest(FILE *f) {
     };
     int ok = 1;
     klovrp_input_state saved[2] = { g_input[0], g_input[1] };
+    // The table is about the conversion: run it on a frozen clock with both
+    // hands already armed-and-expired, so the pulse adds nothing.
+    static double fake_now;
+    double (*saved_clock)(void) = g_near_clock;
+    g_near_clock = klovrp_selftest_clock;
+    klovrp_selftest_now = &fake_now;
+    fake_now = 1000.0;
+    g_near_seen[0] = g_near_seen[1] = 1;
+    g_near_until[0] = g_near_until[1] = 0;
+    g_near_polls[0] = g_near_polls[1] = 0;
     for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
         kl_ovrp_set_controller_input(0, c[i].lb, c[i].lt, 0, 0, 0, 0);
         kl_ovrp_set_controller_input(1, c[i].rb, c[i].rt, 0, 0, 0, 0);
@@ -5149,6 +5246,61 @@ int kl_ovrp_touch_selftest(FILE *f) {
                 st[2], c[i].touches, st[3], c[i].near);
         ok = ok && pass;
     }
+
+    // The arming pulse: nothing touched, so NearTouches is the pulse alone.
+    // A guest polling at 90 Hz must see it ON, then OFF (its GetUp), and a
+    // finger really resting must stay on with no edge.
+    double saved_len = g_near_len, saved_gap = g_near_gap;
+    g_near_len = 0.5; g_near_gap = 1.0;
+    kl_ovrp_set_controller_input(0, 0, 0, 0, 0, 0, 0);
+    kl_ovrp_set_controller_input(1, 0, KL_OVRP_RAW_A, 0, 0, 0, 0);
+    g_near_seen[0] = g_near_seen[1] = 0;
+    // `polls`: extra polls first, on the same instant (a pulse also lasts at
+    // least 60 polls, so a long first frame cannot swallow it).
+    struct { const char *what; double dt; int polls; uint32_t near; } a[] = {
+        { "first poll arms both hands",        0.000,  0, 0xf },
+        { "...still armed at 0.4 s",           0.400,  0, 0xf },
+        { "0.6 s but only 3 polls: held",      0.200,  0, 0xf },
+        { "...released after 60 polls (GetUp)",0.000, 60, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        { "steady polling: no re-arm",         0.011,  0, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+        { "back after a 1.5 s gap: re-armed",  1.500,  0, 0xf },
+        { "...released again",                 0.600, 60, KL_OVRP_NEAR_RTHUMB_BUTTONS },
+    };
+    g_near_polls[0] = g_near_polls[1] = 0;
+    for (size_t i = 0; i < sizeof a / sizeof a[0]; i++) {
+        fake_now += a[i].dt;
+        uint32_t st[0x60 / 4];
+        for (int k = 0; k < a[i].polls; k++) klovrp_GetControllerState4(3, st);
+        klovrp_GetControllerState4(3, st);
+        int pass = st[3] == a[i].near;
+        fprintf(f, "  %s arm: %-34s NearTouches=%#x (want %#x)\n",
+                pass ? "ok  " : "FAIL", a[i].what, st[3], a[i].near);
+        ok = ok && pass;
+    }
+    fake_now += 0.011;
+    kl_ovrp_arm_near_touch(0);                 // the frontend bound a left controller
+    { uint32_t st[0x60 / 4]; klovrp_GetControllerState4(3, st);
+      int pass = st[3] == (KL_OVRP_NEAR_RTHUMB_BUTTONS | KL_OVRP_NEAR_LTHUMB_BUTTONS |
+                           KL_OVRP_NEAR_LINDEX_TRIGGER);
+      fprintf(f, "  %s arm: %-34s NearTouches=%#x\n", pass ? "ok  " : "FAIL",
+              "a bound controller arms its hand", st[3]);
+      ok = ok && pass; }
+    g_near_len = 0;
+    fake_now += 5.0;
+    g_near_until[0] = g_near_until[1] = 0;
+    g_near_polls[0] = g_near_polls[1] = 0;
+    g_near_seen[0] = g_near_seen[1] = 0;
+    { uint32_t st[0x60 / 4]; klovrp_GetControllerState4(3, st);
+      int pass = st[3] == KL_OVRP_NEAR_RTHUMB_BUTTONS;
+      fprintf(f, "  %s arm: %-34s NearTouches=%#x\n", pass ? "ok  " : "FAIL",
+              "KL_OVRP_NEAR_ARM_MS=0 turns it off", st[3]);
+      ok = ok && pass; }
+    g_near_len = saved_len; g_near_gap = saved_gap;
+
+    g_near_clock = saved_clock;
+    g_near_seen[0] = g_near_seen[1] = 0;
+    g_near_until[0] = g_near_until[1] = 0;
+    g_near_polls[0] = g_near_polls[1] = 0;
     g_input[0] = saved[0]; g_input[1] = saved[1];
     return ok;
 }

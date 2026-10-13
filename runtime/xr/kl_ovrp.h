@@ -923,6 +923,13 @@ enum {
 uint32_t kl_ovrp_touch_word(int hand, uint32_t touched_buttons);
 uint32_t kl_ovrp_neartouch_word(int hand, uint32_t touched_buttons);
 
+// The frontend has just (re)bound a controller to `hand`: report that hand's
+// thumb and index near-touch for a moment, as a Touch controller being picked
+// up does, so a guest that poses fingers from near-touch EDGES sees the GetUp
+// that releases them (kl_ovrp.c, "the near-touch arming pulse").
+// KL_OVRP_NEAR_ARM_MS=0 turns the pulse off.
+void kl_ovrp_arm_near_touch(int hand);
+
 // `make xrinput` gate for the above, through the real ovrp_GetControllerState4
 // fill: per-hand and both-hands polls, Touches and NearTouches. 1 = pass.
 int kl_ovrp_touch_selftest(FILE *f);

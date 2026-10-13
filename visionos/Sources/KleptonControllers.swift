@@ -1246,6 +1246,10 @@ final class KleptonControllers {
             buttonBinding[id] = (name, hand, 0, 0, false)
             NSLog("[cp] buttons bound: \(name) -> hand \(hand == 0 ? "L" : "R") "
                   + "(\(buttonBinding.count) bound)")
+            // A controller in the hand is a Touch controller picked up: let the
+            // guest see its fingers near the controls once, so an edge-driven
+            // hand pose (IEYTD) gets the release that opens it (kl_ovrp.c).
+            kl_ovrp_arm_near_touch(Int32(hand))
             Self.census(c)
         }
         for (id, v) in buttonBinding where !live.contains(id) {

@@ -1062,6 +1062,14 @@ puts the camera on the ground with its hands underneath it.
   near-touch, so `90:RN=0x4@1000` arms it. On a GL guest on the legacy path
   `f<frame>` counts the frame index `ovrp_Update2` names (it never reaches the
   Vulkan submit counter). At most 128 presses; a longer script says so.
+- `KL_OVRP_NEAR_ARM_MS=<ms>` (default 500; 0 = off) / `KL_OVRP_NEAR_ARM_GAP_MS=<ms>`
+  (default 1000; 0 = never) — the near-touch arming pulse (kl_ovrp.c): each
+  hand's thumb + index NearTouches read ON for this long when the guest first
+  polls that hand, when the frontend binds a controller to it, and when guest
+  polling resumes after a gap of at least GAP_MS (a scene load), then the real
+  reading. A Touch controller being picked up does the same; without it a guest
+  that poses fingers from near-touch EDGES (IEYTD: GetDown/GetUp only) never sees
+  the GetUp that points the index and lifts the thumb.
 - `KL_OVRP_HAND_SCRIPT="<s>:<L|R>:x,y,z[,pitch[,yaw]];..."` — the pose half of
   `KL_OVRP_POKE`: keyframes for a hand, on the same clock (or `f<frame>`;
   the first keyframe picks the clock), head-relative in OVRPlugin's frame
