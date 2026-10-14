@@ -914,7 +914,7 @@ static unsigned nocompute_apply(const char *base, kl_gp_at at, void *ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// unity-cpu-skinning: FOUND, for the 2021.3 shape.
+// unity-cpu-skinning: FOUND, for the 2021.3 and 2019.4 shapes.
 //
 // unity-no-compute clears SystemInfo.supportsComputeShaders, but that is NOT
 // what decides skinning. IsGPUSkinningEnabled() (Iron Rebellion's libunity
@@ -929,7 +929,11 @@ static unsigned nocompute_apply(const char *base, kl_gp_at at, void *ctx) {
 // test (`mov wM, #0x3838` mask) that sets the compute bit — and stores 0 below
 // 3.1. Storing 0x90 drops bit 0 and the two variant bits and keeps the rest, so
 // GPU skinning is off and Unity skins on the CPU, as it does on any device
-// without it. 2019.x builds set this differently and are refused by name.
+// without it. 2019.4 has the same store at caps+0x408 (I Expect You To Die's
+// libunity 0x3ed434, read by IsGPUSkinningEnabled at 0x50eb10), behind the
+// level test written as `sub wT, wL, #0xb` / `cmp wT, #0x3`; both are taken.
+// Without it, unity-no-compute alone leaves 2019.4 dispatching the skinning
+// kernels that cannot compile, and its hands and lighter are never drawn.
 static int cpuskin_find(kl_gp_at at, void *ctx, uint64_t *site, uint32_t *word,
                         const char **why) {
     unsigned n = 0;
@@ -945,13 +949,21 @@ static int cpuskin_find(kl_gp_at at, void *ctx, uint64_t *site, uint32_t *word,
         int gated = 0;
         for (int b = 1; b <= 14 && !gated && va >= (uint64_t)b * 4; b++) {
             uint32_t *pb = at(ctx, va - b * 4);
-            gated = pb && (*pb & 0xFFFFFFE0u) == 0x52870700u;         // mov wM, #0x3838
+            if (!pb) break;
+            gated = (*pb & 0xFFFFFFE0u) == 0x52870700u;               // mov wM, #0x3838
+            // 2019.4: `sub wT, wL, #0xb` / `cmp wT, #0x3` / `b.hs` — the same
+            // ES-3.1-level test, written as a range check on the level enum.
+            if (!gated && (*pb & 0xFFFFFC00u) == 0x51002C00u) {      // sub wT, wL, #0xb
+                uint32_t *pc = at(ctx, va - b * 4 + 4);
+                unsigned t = *pb & 31;
+                gated = pc && *pc == (0x71000C1Fu | (t << 5));      // cmp wT, #0x3
+            }
         }
         if (stored && gated) { if (!n) { *site = va; *word = w; } n++; }
     }
     if (n == 1) return 1;
     *why = n ? "the skinning-caps store appears more than once"
-             : "no level-gated `mov wN, #0xf1` store (not the 2021.3 shape)";
+             : "no level-gated `mov wN, #0xf1` store";
     return 0;
 }
 
