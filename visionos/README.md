@@ -133,7 +133,9 @@ if Steam can supply its data — one `SteamGameDescriptor` in `SteamGames.all`.
 ```bash
 ./build_run_vpro.sh hub --build-only      # build + sign for the device, no headset
 ./build_run_vpro.sh hub                   # build, install, launch (library)
-KL_SKIP_GUEST=1 ./build_run_vpro.sh hub   # ...reusing the translated frameworks
+KL_SKIP_GUEST=1 ./build_run_vpro.sh hub   # ...without even checking the translations
+                                          # (mkguest.sh already reuses slices whose .so
+                                          # and klepton-ld are unchanged; KL_FORCE_GUEST=1 redoes all)
 KLEPTON_HUB_NO_GUESTS=1 KL_SKIP_GUEST=1 KLEPTON_TARGET=hub visionos/run.sh sim
                                           # library-only build for the simulator
 ```

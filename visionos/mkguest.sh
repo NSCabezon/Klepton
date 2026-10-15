@@ -54,11 +54,30 @@ FIRST_PLAT=$(printf '%s' "$PLATS" | awk '{print $1}')
 
 [ -x "$LD" ] || { echo "!! $LD missing — run 'make build/klepton-ld' first"; exit 1; }
 
-# The target's own subdirectory is cleared, not the whole of Frameworks/ — that
-# is shared with mkangle.sh, and wiping it here made the two scripts
-# order-dependent in a way nothing would have reported except a missing ANGLE at
-# runtime.
-rm -rf "build/guest/$KLT_NAME" "$OUT"; mkdir -p "build/guest/$KLT_NAME" "$OUT"
+# Incremental: a translation is redone only when its inputs changed. A slice
+# (build/guest/<target>/<plat>/<fw>.framework/<fw>) is FRESH when it is newer
+# than the .so it came from and than klepton-ld itself — the translator bakes
+# the TSD slot and the guest patch table (kl_guestpatch.c) into what it emits,
+# so a new klepton-ld invalidates every slice, which is the right thing. The
+# .xcframework is rebuilt when a slice was, when it lacks one of the slices on
+# disk, or when the set it carries changed. A hub archive that touched only
+# Swift or a plist thus skips all ~200 translations (minutes) and only wraps.
+# KL_FORCE_GUEST=1 wipes the target's outputs first (the old behaviour);
+# KL_GUEST_PATCH_OFF changes what the translator emits, so it also forces.
+# Libraries that left the target's list are pruned at the end.
+#
+# The target's own subdirectory is what is wiped or pruned, not the whole of
+# Frameworks/ — that is shared with mkangle.sh, and wiping it here made the two
+# scripts order-dependent in a way nothing would have reported except a missing
+# ANGLE at runtime.
+FORCE=""
+if [ -n "${KL_FORCE_GUEST:-}" ]; then FORCE="KL_FORCE_GUEST"; fi
+if [ -n "${KL_GUEST_PATCH_OFF:-}" ]; then FORCE="KL_GUEST_PATCH_OFF=$KL_GUEST_PATCH_OFF"; fi
+if [ -n "$FORCE" ]; then
+  echo "[mkguest] $KLT_NAME: retranslating everything ($FORCE)"
+  rm -rf "build/guest/$KLT_NAME" "$OUT"
+fi
+mkdir -p "build/guest/$KLT_NAME" "$OUT"
 
 # A glibc target's libraries come from several directories under versioned
 # names, so each NAME (a framework stem) is looked up in the manifest the host
@@ -71,6 +90,13 @@ src_of() {
     printf '%s\n' "$SRC/$1.so"
   fi
 }
+# The directory an .xcframework keeps a slice under, by platform.
+slice_dir() { case "$1" in xros) echo xros-arm64 ;; xrsimulator) echo xros-arm64-simulator ;; esac; }
+# Newer than both inputs (the .so and klepton-ld): the slice can be reused.
+fresh() { [ -f "$1" ] && [ "$1" -nt "$2" ] && [ "$1" -nt "$LD" ]; }
+
+N_TRANSLATED=0; N_REUSED=0; N_WRAPPED=0
+KEEP_STEMS=""
 for NAME in $LIBS; do
   SOFILE="$(src_of "$NAME")"
   [ -n "$SOFILE" ] && [ -f "$SOFILE" ] || { echo "!! source for $NAME missing (${SOFILE:-not in $MANIFEST})"; exit 1; }
@@ -89,16 +115,20 @@ for NAME in $LIBS; do
   # resolves the path (dylib_candidate in kl_image.c). Only the .so SOURCE and the
   # .xcframework CONTAINER keep the original name.
   FWNAME=$(printf '%s__%s' "$KLT_NAME" "$NAME" | tr '+' 'x')
+  KEEP_STEMS="$KEEP_STEMS $FWNAME"
+  TRANSLATED=0
   for PLAT in $PLATS; do
     case "$PLAT" in
       xros)        KLPLAT=visionos;    BPLAT=XROS          ;;
       xrsimulator) KLPLAT=visionossim; BPLAT=XRSimulator ;;
     esac
     FW="build/guest/$KLT_NAME/$PLAT/$FWNAME.framework"
-    mkdir -p "$FW"
+    if fresh "$FW/$FWNAME" "$SOFILE"; then continue; fi
+    TRANSLATED=1
+    rm -rf "$FW"; mkdir -p "$FW"
     "$LD" "$SOFILE" -o "$FW/$FWNAME" --platform "$KLPLAT" \
           --install-name "@rpath/$FWNAME.framework/$FWNAME" --quiet
-    cat > "$FW/Info.plist" <<EOF
+    cat > "$FW/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -113,17 +143,49 @@ for NAME in $LIBS; do
   <key>CFBundleVersion</key><string>1</string>
   <key>MinimumOSVersion</key><string>26.0</string>
 </dict></plist>
-EOF
+PLIST
   done
-  rm -rf "$OUT/$NAME.xcframework"
-  FWARGS=()
-  for PLAT in $PLATS; do
-    FWARGS+=(-framework "build/guest/$KLT_NAME/$PLAT/$FWNAME.framework")
+  # Wrap every fresh slice on disk — the ones just asked for plus any the other
+  # mode left and that is still current — so a device build after a simulator
+  # build (or the reverse) neither drops the other's slice nor redoes it.
+  XC="$OUT/$NAME.xcframework"
+  FWARGS=(); WANT=""; REWRAP=$TRANSLATED
+  for PLAT in xros xrsimulator; do
+    FW="build/guest/$KLT_NAME/$PLAT/$FWNAME.framework"
+    fresh "$FW/$FWNAME" "$SOFILE" || continue
+    FWARGS+=(-framework "$FW"); WANT="$WANT $(slice_dir "$PLAT")"
+    [ -d "$XC/$(slice_dir "$PLAT")" ] || REWRAP=1
   done
-  xcodebuild -create-xcframework "${FWARGS[@]}" \
-      -output "$OUT/$NAME.xcframework" > /dev/null
-  printf '  %-22s %s bytes\n' "$NAME.xcframework" \
-      "$(stat -f%z "build/guest/$KLT_NAME/$FIRST_PLAT/$FWNAME.framework/$FWNAME")"
+  [ -f "$XC/Info.plist" ] || REWRAP=1
+  if [ "$REWRAP" = 0 ]; then
+    HAVE=$(ls "$XC" | grep '^xros-' | sort | tr '\n' ' ')
+    [ "$(printf '%s' "$WANT" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')" = "$HAVE" ] || REWRAP=1
+  fi
+  if [ "$REWRAP" = 1 ]; then
+    rm -rf "$XC"
+    xcodebuild -create-xcframework "${FWARGS[@]}" -output "$XC" > /dev/null
+    N_WRAPPED=$((N_WRAPPED+1))
+  fi
+  if [ "$TRANSLATED" = 1 ]; then
+    N_TRANSLATED=$((N_TRANSLATED+1))
+    printf '  %-22s %s bytes\n' "$NAME.xcframework" \
+        "$(stat -f%z "build/guest/$KLT_NAME/$FIRST_PLAT/$FWNAME.framework/$FWNAME")"
+  else
+    N_REUSED=$((N_REUSED+1))
+  fi
 done
 
-echo "[mkguest] $KLT_NAME done -> $OUT/"
+# Prune what the target no longer lists (gen_xcodeproj.py embeds by the target's
+# own list, so a leftover is only disk and confusion, but it is both).
+for XC in "$OUT"/*.xcframework; do
+  [ -e "$XC" ] || continue
+  STEM=$(basename "$XC" .xcframework)
+  case " $LIBS " in *" $STEM "*) ;; *) echo "  pruned $STEM.xcframework (no longer in the target)"; rm -rf "$XC" ;; esac
+done
+for FW in build/guest/"$KLT_NAME"/*/*.framework; do
+  [ -e "$FW" ] || continue
+  STEM=$(basename "$FW" .framework)
+  case " $KEEP_STEMS " in *" $STEM "*) ;; *) rm -rf "$FW" ;; esac
+done
+
+echo "[mkguest] $KLT_NAME done -> $OUT/  (translated $N_TRANSLATED, reused $N_REUSED, wrapped $N_WRAPPED of $(echo $LIBS | wc -w | tr -d ' '))"

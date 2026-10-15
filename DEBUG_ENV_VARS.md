@@ -515,7 +515,9 @@ word it was measured against — that is a build fingerprint, so these cannot
 corrupt an APK they were not measured on. On device a klepton-ld dylib's text is
 signed, so the table is applied OFFLINE by `build/klepton-ld` when
 `visionos/mkguest.sh` translates the guest: a change to the table reaches the
-headset only through a re-translation (a build without `KL_SKIP_GUEST=1`), and
+headset only through a re-translation — automatic, since the table is compiled
+into `klepton-ld` and `mkguest.sh` retranslates every slice older than it (a
+build without `KL_SKIP_GUEST=1`) — and
 `KL_GUEST_PATCH_OFF` there is read at translate time, not at launch.
 
 Half-Life: Alyx's `alyx-startup-no-pause` row (libclient's level-start pause

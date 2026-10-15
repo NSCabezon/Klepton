@@ -171,8 +171,9 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 # The hub carries several games: translate each into its own visionos/Frameworks/<game>/
 # (source side; in the .app they all land flat, as <game>__<lib>.framework).
-# KL_SKIP_GUEST=1 reuses the frameworks already there (a glibc guest is ~90
-# translations; the hub's own Swift is what usually changed).
+# mkguest.sh is incremental (a slice is redone only when its .so or klepton-ld
+# is newer), so this usually reuses everything; KL_SKIP_GUEST=1 skips even the
+# check, KL_FORCE_GUEST=1 retranslates everything.
 if [ -n "${KL_SKIP_GUEST:-}" ]; then
   echo "  guest translations: reused (KL_SKIP_GUEST=1)"
 elif [ "$KLT_KIND" = hub ]; then
