@@ -1,5 +1,5 @@
 // kl_stream_proto.h — "Jugar desde el Mac": the wire protocol between the
-// headset (KleptonHub, the CLIENT) and the Mac running the game (the HOST).
+// headset (AVPGameHub, the CLIENT) and the Mac running the game (the HOST).
 //
 // The headset keeps owning the Full Space: head, Sense controllers and hands
 // are tracked there exactly as in standalone mode, and sent to the host. The

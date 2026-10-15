@@ -80,7 +80,7 @@ on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
 - **Frameworks, flat and prefixed.** App Store validation allows nothing but
   `.framework` bundles and `.dylib`s directly in `Frameworks/` — a per-game
   subfolder is rejected at processing (ITMS-90432), and `tf_check.py` fails on
-  one. So every game's translations sit flat in `KleptonHub.app/Frameworks/`,
+  one. So every game's translations sit flat in `AVPGameHub.app/Frameworks/`,
   each named `<game>__<lib>.framework/<game>__<lib>` by `mkguest.sh` (the same
   name for a single-target app, a Debug run and an archive), so the games'
   same-named libraries (`libunity`, `libil2cpp`, `libmain`, `libc++_shared`)
@@ -124,7 +124,7 @@ on an in-app library (`Sources/KleptonHub.swift`) instead of auto-booting:
   data). Stamped with the APK's size and mtime, so it reruns only after an
   update. Nothing is staged from the Mac.
 - **Bundle id** `KLEPTON_BUNDLE_ID` from `local/config.env` (the container with Alyx's 72 GB);
-  product `KleptonHub`, display name "Klepton".
+  product `AVPGameHub` (the .xcodeproj, scheme and .app), display name "AVP Game Hub".
 
 Adding a game: build its frameworks (`KLEPTON_TARGET=<game> ./mkguest.sh`, which
 `run.sh` does for every hub game), add its name to the hub row's `games`, and —

@@ -1222,7 +1222,7 @@ TARGETS = {
             "metro",
         ],
         "bundle_id": "com.example.avpgamehub",   # placeholder: KLEPTON_BUNDLE_ID (local/config.env)
-        "product": "KleptonHub",
+        "product": "AVPGameHub",
         # The Home View name and what Siri calls the app in its phrases
         # ("Activa el visor de FPS en AVP Game Hub", KleptonIntents.swift). Siri also
         # takes "Hub" / "Game Hub" (INAlternativeAppNames, gen_xcodeproj.py).
