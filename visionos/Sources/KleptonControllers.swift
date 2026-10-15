@@ -530,12 +530,10 @@ final class KleptonControllers {
     /// platform's RENDERED correction (the one meant for drawing content
     /// aligned with the device) and none of the game's calibration, predicted
     /// to the frame like the pose. nil when there is no anchor for that hand.
-    func ghostSample(hand: Int, at time: TimeInterval) -> KLGhostSample? {
-        guard let h = SenseHand(rawValue: hand),
-              let g = senseKit.ghostSample(h, at: time) else { return nil }
-        return KLGhostSample(originFromGrip: g.originFromGrip, positionTracked: g.positionTracked,
-                             heldByPlatform: g.heldByPlatform,
-                             speed: g.speed, angularSpeed: g.angularSpeed)
+    /// SenseKit's own sample, straight through to `SenseGhosts`.
+    func ghostSample(hand: Int, at time: TimeInterval) -> SenseGhostSample? {
+        guard let h = SenseHand(rawValue: hand) else { return nil }
+        return senseKit.ghostSample(h, at: time)
     }
 
     // MARK: - Discovery

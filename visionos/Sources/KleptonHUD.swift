@@ -4,8 +4,11 @@
 //     invisible. When one is NOT in a hand (resting on a table, on the floor),
 //     a plain light-grey ring + grip is drawn at its real tracked pose so it can
 //     be found; the moment it is picked up it fades out and only the game's own
-//     hands remain. Per game: "Show controllers when not held" (KLGameSettings,
-//     default on), env KL_GHOST_CTRL=0/1.
+//     hands remain. The decision, the model and the Metal drawing live in
+//     SenseKit (SenseGhosts, SenseGhostMesh, SenseGhostRenderer); this file
+//     owns them, feeds them the frame and maps the KL_GHOST_* env knobs into a
+//     SenseGhostConfiguration. Per game: "Show controllers when not held"
+//     (KLGameSettings, default on), env KL_GHOST_CTRL=0/1.
 //
 //   * THE ACHIEVEMENT TOAST. kl_steam.c calls the unlock handler registered
 //     here for every achievement a StoreStats confirmed (the bridge's
@@ -59,6 +62,7 @@ import CoreGraphics
 import ImageIO
 import QuartzCore
 import simd
+import SenseKit
 
 // MARK: - Toast queue
 
@@ -222,110 +226,6 @@ enum KLToastRaster {
     }
 }
 
-// MARK: - Ghost controllers: is it in a hand?
-
-/// One Sense controller as the ghost logic sees it, sampled per frame by
-/// KleptonControllers.ghostSample.
-struct KLGhostSample {
-    var originFromGrip: simd_float4x4      // ARKit origin, `.grip`, rendered correction
-    var positionTracked: Bool              // false: untracked or orientation-only
-    var heldByPlatform: Bool               // AccessoryAnchor.heldChirality != nil
-    var speed: Float                       // m/s
-    var angularSpeed: Float                // rad/s
-}
-
-/// The in-hand decision for one controller, with hysteresis.
-///
-/// HELD (ghost hidden) the moment any of these is true:
-///   1. the platform says so (`AccessoryAnchor.heldChirality`, visionOS 26);
-///      KL_GHOST_PLATFORM_HELD=0 ignores it if it proves unreliable;
-///   2. input from that controller in the last 2 s (any button, capacitive
-///      touch, trigger, grip or stick off-centre) — KL_GHOST_INPUT_S;
-///   3. the controller MOVED in the last 0.6 s (velocity > 8 cm/s or
-///      > 0.9 rad/s, or > 2.5 cm from where it last rested) while a tracked
-///      palm is within 9 cm of its grip point (12 cm to leave, so it does not
-///      flicker at the edge) — or while hand tracking has no hand at all,
-///      which is the normal state when the hands are full of controllers:
-///      visionOS stops reporting hands that hold them.
-/// A palm near a controller that is NOT moving does not hide it: that is the
-/// hand reaching for it, and that is exactly when it has to stay visible.
-///
-/// RESTING (ghost shown) again only after none of the above for 1 s when a
-/// tracked hand is visibly away from it, else for KL_GHOST_SHOW_S (2.5 s) —
-/// the fallback "show after N s still" when hand tracking cannot vouch.
-/// Not tracked (no anchor, untracked, orientation only): hidden.
-struct KLGhostHand {
-    var visible = false
-    var alpha: Float = 0
-    var lastHeldEvidence: TimeInterval = -100
-    var lastMotion: TimeInterval = -100
-    var restPos: SIMD3<Float>?
-    var palmNear = false
-    var pose = matrix_identity_float4x4
-    var lastReason = ""
-    var platformHeld = false
-
-    static let inputWindow = Double(klEnvFloat("KL_GHOST_INPUT_S", 2.0))
-    static let showAfter = Double(klEnvFloat("KL_GHOST_SHOW_S", 2.5))
-    static let usePlatformHeld = klEnvOn("KL_GHOST_PLATFORM_HELD", default: true)
-    static let nearIn: Float = 0.09, nearOut: Float = 0.12
-
-    mutating func update(hand: Int, sample: KLGhostSample?, palms: [SIMD3<Float>],
-                         handTrackingSeesHands: Bool, lastInput: TimeInterval,
-                         now: TimeInterval, dt: Float) {
-        var show = false
-        var reason: String
-        if let s = sample, s.positionTracked {
-            pose = s.originFromGrip
-            let p = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
-            if s.speed > 0.08 || s.angularSpeed > 0.9 { lastMotion = now }
-            if let r = restPos {
-                if simd_distance(p, r) > 0.025 { lastMotion = now; restPos = p }
-            } else { restPos = p }
-            let d = palms.map { simd_distance($0, p) }.min() ?? .infinity
-            palmNear = d < (palmNear ? Self.nearOut : Self.nearIn)
-            let moved = now - lastMotion < 0.6
-            let platform = Self.usePlatformHeld && s.heldByPlatform
-            let input = now - lastInput < Self.inputWindow
-            let grabbed = moved && (palmNear || !handTrackingSeesHands)
-            if platform || input || grabbed {
-                lastHeldEvidence = now
-                reason = platform ? "held (platform)" : input ? "held (input)"
-                       : palmNear ? "held (hand near + moving)" : "held (moving, no hands tracked)"
-            } else {
-                let handAway = handTrackingSeesHands && !palmNear
-                let wait = handAway ? 1.0 : Self.showAfter
-                show = now - lastHeldEvidence > wait
-                reason = show ? (handAway ? "resting (hand away)" : "resting (still \(Self.showAfter) s)")
-                              : "settling"
-            }
-        } else {
-            restPos = nil
-            palmNear = false
-            reason = sample == nil ? "no anchor" : "not position-tracked"
-        }
-        // Said on every change of visibility, and on every change of the
-        // platform's own held flag — the one input this logic cannot check
-        // off-device, so the log has to say whether it agrees with reality.
-        let side = hand == 0 ? "left" : "right"
-        if show != visible {
-            NSLog("[ghost] \(side): \(show ? "SHOWN" : "hidden") — \(reason)")
-        } else if reason != lastReason && (reason.hasPrefix("no") || reason.hasPrefix("not")) {
-            NSLog("[ghost] \(side): \(reason)")
-        }
-        let ph = sample?.heldByPlatform ?? false
-        if ph != platformHeld {
-            platformHeld = ph
-            NSLog("[ghost] \(side): platform heldChirality \(ph ? "SET" : "cleared")")
-        }
-        visible = show
-        lastReason = reason
-        // ~200 ms fades.
-        let step = dt / 0.2
-        alpha = visible ? min(1, alpha + step) : max(0, alpha - step)
-    }
-}
-
 // MARK: - The renderer
 
 /// The per-view matrix the HUD shaders index by [[amplification_id]].
@@ -339,7 +239,6 @@ private struct KLHObj {
 
 final class KleptonHUD {
     private let device: MTLDevice
-    private var solidPipe: MTLRenderPipelineState?
     private var texPipe: MTLRenderPipelineState?
     private var fadePipe: MTLRenderPipelineState?
     private var fadeDepth: MTLDepthStencilState?
@@ -353,16 +252,15 @@ final class KleptonHUD {
     private var promptAlpha: Float = 0
     private var promptPos: SIMD3<Float>?
     private var promptModel = matrix_identity_float4x4
-    private var ghostDepth: MTLDepthStencilState?
     private var toastDepth: MTLDepthStencilState?
     /// Set by the compositor for each encode: the eye pass under this HUD wrote
     /// the GAME's depth (KL_REPROJECT_DEPTH_MODE=2), not a 500 m plane, so the
     /// ghost's `.greater` would let any nearer piece of the virtual world hide
     /// a real controller. The body is then drawn always-pass (writing its own
-    /// depth) and only the rim keeps the test, against the body it outlines.
+    /// depth) and only the rim keeps the test, against the body it outlines
+    /// (SenseGhostRenderer's `depthOverScene`).
     var depthOverScene = false
     private var sampler: MTLSamplerState?
-    private var mesh: [(vb: MTLBuffer, ib: MTLBuffer, count: Int)] = []
     private var quad: MTLBuffer?
 
     /// Read live (getenv, cheap) rather than latched: the hub sets KL_GHOST_CTRL
@@ -371,9 +269,10 @@ final class KleptonHUD {
         guard let v = getenv("KL_GHOST_CTRL") else { return true }
         return !["", "0", "no", "off", "false"].contains(String(cString: v).lowercased())
     }
-    private var ghosts = [KLGhostHand(), KLGhostHand()]
-    private var lastTick: TimeInterval = 0
-    private let ghostFix: simd_float4x4
+    /// The two in-hand state machines (SenseKit), configured from the
+    /// KL_GHOST_* env in `init`, logging on the `[ghost]` channel.
+    let ghosts = SenseGhosts()
+    private var ghostRenderer: SenseGhostRenderer?
 
     private var toast: KLToast?
     private var toastTex: MTLTexture?
@@ -454,13 +353,6 @@ final class KleptonHUD {
         out.uv = v.uv;
         return out;
     }
-    fragment float4 kl_hud_solid_f(KLHOut in [[stage_in]], constant KLHObj &o [[buffer(0)]]) {
-        float3 L = normalize(float3(0.3, 1.0, 0.45));
-        float3 n = normalize(in.n);
-        float lit = o.params.z > 0.5 ? (0.58 + 0.42 * max(dot(n, L), 0.0)) : 1.0;
-        float a = o.color.a * o.params.y;
-        return float4(o.color.rgb * lit * a, a);
-    }
     fragment float4 kl_hud_tex_f(KLHOut in [[stage_in]], constant KLHObj &o [[buffer(0)]],
                                  texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
         return t.sample(s, in.uv) * o.params.y;
@@ -479,8 +371,15 @@ final class KleptonHUD {
 
     init(device: MTLDevice, colorFormat: MTLPixelFormat, amplification: Int) {
         self.device = device
+        // The ghost knobs: KL_GHOST_INPUT_S, KL_GHOST_SHOW_S and
+        // KL_GHOST_PLATFORM_HELD (see SenseGhostConfiguration), and
         // KL_GHOST_ROT=x,y,z degrees (about the grip) and KL_GHOST_POS=x,y,z
         // metres: the model's fit to the real plastic, for a device session.
+        // SenseKit reads no env; this is where the KL_* names become values.
+        var cfg = SenseGhostConfiguration()
+        cfg.inputWindow = Double(klEnvFloat("KL_GHOST_INPUT_S", 2.0))
+        cfg.showAfter = Double(klEnvFloat("KL_GHOST_SHOW_S", 2.5))
+        cfg.usePlatformHeld = klEnvOn("KL_GHOST_PLATFORM_HELD", default: true)
         var fix = matrix_identity_float4x4
         let env = ProcessInfo.processInfo.environment
         func triple(_ k: String) -> SIMD3<Float>? {
@@ -495,7 +394,9 @@ final class KleptonHUD {
             fix = simd_float4x4(q)
         }
         if let p = triple("KL_GHOST_POS") { fix.columns.3 = SIMD4(p.x, p.y, p.z, 1) }
-        ghostFix = fix
+        cfg.fit = fix
+        ghosts.configuration = cfg
+        ghosts.logger = { NSLog("[ghost] \($0)") }
 
         do {
             let lib = try device.makeLibrary(source: Self.msl, options: nil)
@@ -514,18 +415,21 @@ final class KleptonHUD {
                 c.destinationAlphaBlendFactor = .oneMinusSourceAlpha
                 return try device.makeRenderPipelineState(descriptor: d)
             }
-            solidPipe = try pipe("kl_hud_solid_f")
             texPipe = try pipe("kl_hud_tex_f")
             fadePipe = try pipe("kl_hud_fade_f", vertex: "kl_hud_fade_v")
         } catch {
-            NSLog("[hud] pipelines failed: \(error) — no ghost controllers, toasts only logged")
+            NSLog("[hud] pipelines failed: \(error) — toasts only logged")
         }
-        // Reverse-Z: .greater is "nearer". Only the ghost's own surfaces
-        // compete — the game's picture is 500 m away.
-        let g = MTLDepthStencilDescriptor()
-        g.depthCompareFunction = .greater
-        g.isDepthWriteEnabled = true
-        ghostDepth = device.makeDepthStencilState(descriptor: g)
+        // The ghost pipeline, depth states (reverse-Z: .greater is "nearer";
+        // only the ghost's own surfaces compete — the game's picture is 500 m
+        // away) and meshes, all SenseKit's.
+        do {
+            ghostRenderer = try SenseGhostRenderer(device: device, colorFormat: colorFormat,
+                                                   depthFormat: .depth32Float,
+                                                   amplification: amplification, reverseZ: true)
+        } catch {
+            NSLog("[hud] ghost renderer failed: \(error) — no ghost controllers")
+        }
         let t = MTLDepthStencilDescriptor()
         t.depthCompareFunction = .always
         t.isDepthWriteEnabled = true
@@ -541,7 +445,6 @@ final class KleptonHUD {
         sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
         sampler = device.makeSamplerState(descriptor: sd)
 
-        for hand in 0...1 { if let m = Self.controllerMesh(device, right: hand == 1) { mesh.append(m) } }
         // Unit quad, -0.5...0.5, facing +Z, uv (0,0) at the top left. Strip order.
         let q: [Float] = [-0.5,  0.5, 0,  0, 0, 1,  0, 0,
                            0.5,  0.5, 0,  0, 0, 1,  1, 0,
@@ -560,20 +463,16 @@ final class KleptonHUD {
 
     // MARK: Per frame
 
-    /// Once per frame, from updatePoses: the in-hand state machines.
-    func updateGhosts(samples: [KLGhostSample?], lastInput: [TimeInterval],
+    /// Once per frame, from updatePoses: the in-hand state machines (SenseKit's
+    /// `SenseGhosts`, which keeps the frame clock for the fade).
+    func updateGhosts(samples: [SenseGhostSample?], lastInput: [TimeInterval],
                       left: HandAnchor?, right: HandAnchor?, handTrackingRunning: Bool) {
-        let now = CACurrentMediaTime()
-        let dt = lastTick > 0 ? Float(min(now - lastTick, 0.1)) : 0
-        lastTick = now
         guard ghostsEnabled else { return }
         var palms: [SIMD3<Float>] = []
-        for a in [left, right] { if let a, let p = Self.palm(a) { palms.append(p) } }
-        for h in 0...1 {
-            ghosts[h].update(hand: h, sample: samples[h], palms: palms,
-                             handTrackingSeesHands: handTrackingRunning && !palms.isEmpty,
-                             lastInput: lastInput[h], now: now, dt: dt)
-        }
+        for a in [left, right] { if let a { palms.append(SenseGhostHands.palm(a)) } }
+        ghosts.update(samples: samples, palms: palms,
+                      handTrackingSeesHands: handTrackingRunning && !palms.isEmpty,
+                      lastInput: lastInput, now: CACurrentMediaTime())
     }
 
     /// Once per frame, from updatePoses: which hands have a Sense controller
@@ -667,18 +566,6 @@ final class KleptonHUD {
         if ctrlAlpha <= 0 { ctrlPos = nil; ctrlTex = nil; ctrlKey = ""; return }
         ctrlModel = Self.panelModel(originFromHead: originFromHead, dist: 1.0, drop: 0.25,
                                     tau: 0.12, dt: dt, pos: &ctrlPos)
-    }
-
-    /// The middle of the palm: halfway between the middle finger's metacarpal
-    /// base and its knuckle, where a fist closes around a grip.
-    private static func palm(_ a: HandAnchor) -> SIMD3<Float>? {
-        let o = a.originFromAnchorTransform
-        guard let sk = a.handSkeleton else {
-            return SIMD3(o.columns.3.x, o.columns.3.y, o.columns.3.z)
-        }
-        let b = (o * sk.joint(.middleFingerMetacarpal).anchorFromJointTransform).columns.3
-        let k = (o * sk.joint(.middleFingerKnuckle).anchorFromJointTransform).columns.3
-        return SIMD3((b.x + k.x) / 2, (b.y + k.y) / 2, (b.z + k.z) / 2)
     }
 
     /// Once per frame, before the drawables are encoded: the toast queue and
@@ -832,7 +719,7 @@ final class KleptonHUD {
     }
 
     var hasContent: Bool {
-        (toastTex != nil && toastAlpha > 0) || ghosts.contains { $0.alpha > 0 }
+        (toastTex != nil && toastAlpha > 0) || ghosts.hands.contains { $0.alpha > 0 }
             || fade.w > 0 || (promptTex != nil && promptAlpha > 0)
             || (ctrlTex != nil && ctrlAlpha > 0)
             || (perfTex != nil && perfAlpha > 0) || (menuTex != nil && menuAlpha > 0)
@@ -843,7 +730,7 @@ final class KleptonHUD {
     /// Draw into the encoder the composite already has open: viewports and
     /// amplification mappings are the caller's (they are the eye pass's).
     func encode(_ enc: MTLRenderCommandEncoder, views: [KLHUDView], recenter: simd_float4x4) {
-        guard hasContent, let solidPipe, let texPipe, !views.isEmpty else { return }
+        guard hasContent, let texPipe, !views.isEmpty else { return }
         enc.setFrontFacing(.counterClockwise)
 
         // The fade first: over the game, under Klepton's own things.
@@ -858,34 +745,11 @@ final class KleptonHUD {
 
         views.withUnsafeBytes { enc.setVertexBytes($0.baseAddress!, length: $0.count, index: 1) }
 
-        if ghostsEnabled, mesh.count == 2 {
-            enc.setRenderPipelineState(solidPipe)
-            if let ghostDepth { enc.setDepthStencilState(ghostDepth) }
-            for h in 0...1 where ghosts[h].alpha > 0 {
-                if depthOverScene, let toastDepth { enc.setDepthStencilState(toastDepth) }
-                let m = mesh[h]
-                let model = recenter * ghosts[h].pose * ghostFix
-                // Body (light grey, lit), then the soft outline: the same mesh
-                // pushed out 2.5 mm along its normals with its FRONT faces
-                // culled, so only the rim around the silhouette survives.
-                var body = KLHObj(model: model, color: SIMD4(0.80, 0.81, 0.84, 1),
-                                  params: SIMD4(0, ghosts[h].alpha, 1, 0))
-                var rim = KLHObj(model: model, color: SIMD4(0.10, 0.11, 0.13, 0.85),
-                                 params: SIMD4(0.0025, ghosts[h].alpha, 0, 0))
-                enc.setVertexBuffer(m.vb, offset: 0, index: 0)
-                enc.setCullMode(.back)
-                enc.setVertexBytes(&body, length: MemoryLayout<KLHObj>.stride, index: 2)
-                enc.setFragmentBytes(&body, length: MemoryLayout<KLHObj>.stride, index: 0)
-                enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,
-                                          indexBuffer: m.ib, indexBufferOffset: 0)
-                enc.setCullMode(.front)
-                if depthOverScene, let ghostDepth { enc.setDepthStencilState(ghostDepth) }
-                enc.setVertexBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 2)
-                enc.setFragmentBytes(&rim, length: MemoryLayout<KLHObj>.stride, index: 0)
-                enc.drawIndexedPrimitives(type: .triangle, indexCount: m.count, indexType: .uint16,
-                                          indexBuffer: m.ib, indexBufferOffset: 0)
-            }
-            enc.setCullMode(.none)
+        // The ghosts: body then rim, their own pipeline and depth states
+        // (SenseGhostRenderer), the eye pass's views and viewports.
+        if ghostsEnabled, let ghostRenderer {
+            ghostRenderer.encode(enc, views: views.map { SenseGhostView(viewProj: $0.viewProj) },
+                                 recenter: recenter, ghosts: ghosts, depthOverScene: depthOverScene)
         }
 
         if let tex = toastTex, toastAlpha > 0, let quad, let sampler {
@@ -946,85 +810,5 @@ final class KleptonHUD {
         }
         panel(perfTex, perfAlpha, perfModel)
         panel(menuTex, menuAlpha, menuModel)
-    }
-
-    // MARK: The controller model
-
-    /// A PSVR2 Sense, roughly: a capsule grip along the grip frame's Z axis
-    /// (OpenXR / visionOS `.grip`: Z runs through the fist) and a flattened
-    /// band that loops round the BACK of the hand from the grip's top to its
-    /// bottom — the Sense's tracking ring. Built for the right hand (back of
-    /// the hand toward +X) and mirrored for the left. ~1.4k triangles.
-    private static func controllerMesh(_ device: MTLDevice, right: Bool)
-        -> (vb: MTLBuffer, ib: MTLBuffer, count: Int)? {
-        var v: [Float] = []
-        var idx: [UInt16] = []
-        let sx: Float = right ? 1 : -1
-
-        /// A (nu+1)x(nv+1) grid surface. `f(u, v)` returns position and outward
-        /// normal; each triangle's winding is checked against the normal so the
-        /// mirror (and any parametrisation slip) cannot turn a mesh inside out.
-        func surface(_ nu: Int, _ nv: Int,
-                     _ f: (Float, Float) -> (SIMD3<Float>, SIMD3<Float>)) {
-            let base = v.count / 8
-            var pos: [SIMD3<Float>] = [], nrm: [SIMD3<Float>] = []
-            for i in 0...nu {
-                for j in 0...nv {
-                    var (p, n) = f(Float(i) / Float(nu), Float(j) / Float(nv))
-                    p.x *= sx; n.x *= sx
-                    n = simd_normalize(n)
-                    pos.append(p); nrm.append(n)
-                    v += [p.x, p.y, p.z, n.x, n.y, n.z, Float(i) / Float(nu), Float(j) / Float(nv)]
-                }
-            }
-            func at(_ i: Int, _ j: Int) -> Int { i * (nv + 1) + j }
-            func tri(_ a: Int, _ b: Int, _ c: Int) {
-                let fn = simd_cross(pos[b] - pos[a], pos[c] - pos[a])
-                let n = nrm[a] + nrm[b] + nrm[c]
-                if simd_length(fn) < 1e-12 { return }           // degenerate (a pole)
-                if simd_dot(fn, n) >= 0 { idx += [UInt16(base + a), UInt16(base + b), UInt16(base + c)] }
-                else { idx += [UInt16(base + a), UInt16(base + c), UInt16(base + b)] }
-            }
-            for i in 0..<nu {
-                for j in 0..<nv {
-                    tri(at(i, j), at(i + 1, j), at(i + 1, j + 1))
-                    tri(at(i, j), at(i + 1, j + 1), at(i, j + 1))
-                }
-            }
-        }
-
-        // Grip: capsule, radius 1.9 cm, from z = +5.5 cm (bottom) to -4.5 cm (top).
-        let r: Float = 0.019, zBot: Float = 0.055 - r, zTop: Float = -0.045 + r
-        surface(24, 24) { u, w in
-            let th = u * .pi, ph = w * 2 * .pi
-            let n = SIMD3<Float>(sin(th) * cos(ph), sin(th) * sin(ph), cos(th))
-            let zc = n.z >= 0 ? zBot : zTop
-            return (SIMD3(n.x * r, n.y * r, zc + n.z * r), n)
-        }
-        // Ring: a flattened band (6 mm in its plane, 14 mm tall) on a circle of
-        // radius 5.5 cm in the XZ plane, centred 3 cm toward the back of the
-        // hand — the part of the circle beyond the grip, i.e. about ±123°.
-        let c = SIMD3<Float>(0.030, 0, 0.005), R: Float = 0.055
-        let a0 = acos(-c.x / R)
-        let r1: Float = 0.006, r2: Float = 0.014
-        surface(48, 16) { u, w in
-            let al = -a0 + u * 2 * a0, be = w * 2 * .pi
-            let e1 = SIMD3<Float>(cos(al), 0, sin(al)), e2 = SIMD3<Float>(0, 1, 0)
-            let p = c + R * e1 + r1 * cos(be) * e1 + r2 * sin(be) * e2
-            let n = (cos(be) / r1) * e1 + (sin(be) / r2) * e2
-            return (p, n)
-        }
-        // Top face: a small disc where the stick and buttons sit, so the top
-        // end reads as the top.
-        surface(1, 24) { u, w in
-            let ph = w * 2 * .pi, rr = u * r * 0.85
-            return (SIMD3(rr * cos(ph), rr * sin(ph), zTop - r - 0.002), SIMD3(0, 0, -1))
-        }
-
-        guard v.count / 8 < 65535,
-              let vb = device.makeBuffer(bytes: v, length: v.count * 4, options: .storageModeShared),
-              let ib = device.makeBuffer(bytes: idx, length: idx.count * 2, options: .storageModeShared)
-        else { return nil }
-        return (vb, ib, idx.count)
     }
 }
