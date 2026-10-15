@@ -165,6 +165,25 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
 // not known here, so anything landing inside the block routes to stderr. Known
 // gap: the true stride is recoverable from the GLOB_DAT addend.
 static char g_sF[4096] __attribute__((aligned(16)));
+// Where a bogus FILE * goes: NOT stderr itself. A read through it fails, and a
+// failed read sets the stream's error flag — on Darwin's stderr that makes every
+// later fprintf(stderr) of this runtime return -1 and print nothing (one
+// fgets(NULL) in Half-Life: Alyx's tier0 silenced the rest of the log, fault
+// report included). So a stream of its own: writes go to fd 2 (the log, as
+// before), reads are EOF.
+static int kl_bogus_read(void *c, char *b, int n)        { (void)c; (void)b; (void)n; return 0; }
+static int kl_bogus_write(void *c, const char *b, int n) { (void)c; return (int)write(2, b, (size_t)n); }
+static FILE *kl_bogus_file_sink(void) {
+    static FILE *f;
+    if (!f) {
+        FILE *n = funopen(NULL, kl_bogus_read, kl_bogus_write, NULL, NULL);
+        if (!n) return stderr;
+        setvbuf(n, NULL, _IONBF, 0);
+        f = n;
+    }
+    clearerr(f);
+    return f;
+}
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
@@ -186,7 +205,7 @@ FILE *kl_host_file(void *guest) {
             seen[n++] = guest;
             fprintf(stderr, "[klepton] bogus guest FILE * %p — routed to stderr\n", guest);
         }
-        return stderr;
+        return kl_bogus_file_sink();
     }
     return (FILE *)guest;
 }
@@ -1812,6 +1831,17 @@ static char *kl_strchr_chk(char *s, int ch, size_t dl) {
     kl_strlen_chk(s, dl);                  // proves the object is dl bytes
     return strchr(s, ch);
 }
+// bionic: __strlcat_chk(dst, src, supplied_size, compiler_size). strlcat itself
+// is on Darwin, so this is only the bounds half of the contract. Same shape for
+// strlcpy.
+static size_t kl_strlcat_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcat_chk overflow");
+    return strlcat(d, s, n);
+}
+static size_t kl_strlcpy_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcpy_chk overflow");
+    return strlcpy(d, s, n);
+}
 // bionic: __vsnprintf_chk(dest, supplied_size, flags, compiler_size, fmt, va).
 static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
                             const char *fmt, void *gva) {
@@ -1879,6 +1909,20 @@ static int kl_execv(const char *p, char *const argv[]) {
     errno = ENOSYS;
     return -1;
 }
+// bionic's `timezone` is a long VARIABLE (seconds west of UTC, standard
+// time). Darwin has only the BSD timezone() FUNCTION under that name, so the
+// variable is ours, filled once at load from the host's idea of standard
+// time (January: no DST). tzset is forwarded rather than wrapped, so a guest
+// that calls it and re-reads the variable still sees this value.
+static long kl_timezone_var;
+__attribute__((constructor)) static void kl_init_timezone(void) {
+    tzset();
+    struct tm jan = {0};
+    jan.tm_year = 120; jan.tm_mon = 0; jan.tm_mday = 15;
+    time_t t = mktime(&jan);
+    struct tm lt;
+    if (t != (time_t)-1 && localtime_r(&t, &lt)) kl_timezone_var = -lt.tm_gmtoff;
+}
 
 // ---------- small bionic-isms ----------
 static void kl_set_abort_message(const char *m) { fprintf(stderr, "[guest abort] %s\n", m ? m : ""); }
@@ -1897,6 +1941,16 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
+X(klv_roundl) X(klb_pthread_gettid_np) X(klb_faccessat)
+X(klb_mincore) X(klb_mkdtemp) X(klb_mallopt)
+X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
+X(klb_kill) X(klb_raise) X(klb_signal) X(klb_sigwait) X(klb_sigsuspend) X(klb_sigpending)
+X(klb_fstatat) X(klb_rmdir) X(klb_remove) X(klb_chmod) X(klb_chown) X(klb_lchown)
+X(klb_truncate) X(klb_mkfifo) X(klb_readlink) X(klb_symlink) X(klb_link) X(klb_utimes)
+X(klb_utime) X(klb_unlinkat) X(klb_mkdirat) X(klb_fchmodat) X(klb_fchownat)
+X(klb_readlinkat) X(klb_renameat) X(klb_symlinkat) X(klb_utimensat) X(klb_freopen)
+X(klb_wcscasecmp) X(klb_wcsncasecmp) X(klb___fpclassifyd) X(klb_popen) X(klb_pclose)
+X(klb_statfs64) X(klb_execlp)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
@@ -1904,7 +1958,7 @@ X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction
 X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
-X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename) X(klb_link)
+X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
@@ -1921,6 +1975,7 @@ X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rd
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
 X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+X(klb_pthread_attr_setinheritsched)
 X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
@@ -2137,19 +2192,6 @@ static int klb_sched_setscheduler(int pid, int policy, const void *param) {
     return 0;
 }
 
-// pthread_attr_setinheritsched: whether a new thread takes its scheduling from
-// the attr or from the thread that creates it. Marvel's Deadpool VR (UE4) sets it
-// on every thread it starts, and with no answer the game aborted in
-// GameActivity.onCreate — "called unresolved import" — before its first frame
-// (2026-10-09). The policy and priority in a guest attr are not applied here at
-// all: thread creation reads the stack size and the detach state out of it and
-// visionOS owns scheduling, so both values lead to the same thread. Accepted for
-// bionic's two values (0 explicit, 1 inherit), EINVAL otherwise, as bionic does.
-static int klb_pthread_attr_setinheritsched(void *attr, int inherit) {
-    (void)attr;
-    return (inherit == 0 || inherit == 1) ? 0 : EINVAL;
-}
-
 // sched_getscheduler: the getter of the pair above. No thread here is ever given
 // a real-time policy (a request for one becomes a QoS boost, see
 // klb_sched_setscheduler), so SCHED_OTHER (0) is what every thread has.
@@ -2218,7 +2260,6 @@ static const kl_entry g_shim[] = {
     // bionic's `long timezone` (seconds west of UTC, set by tzset) is a DATA
     // import; Darwin's <time.h> global is the same type and tzset fills it the
     // same way, so the guest reads the host's (libUnreal imports it).
-    E("timezone", &timezone),
     // Xash3D (cs1/hl1) imports: a data global and the POSIX timer trio (stubbed).
     E("in6addr_any", &in6addr_any),
     E("timer_create", klb_timer_create), E("timer_settime", klb_timer_settime),
@@ -2229,7 +2270,6 @@ static const kl_entry g_shim[] = {
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
-    E("link", klb_link),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
     E("scandir", klb_scandir), E("alphasort", klb_alphasort),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
@@ -2390,6 +2430,7 @@ static const kl_entry g_shim[] = {
     E("pthread_attr_destroy", klb_pthread_attr_destroy),
     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),
     E("pthread_getattr_np", klb_pthread_getattr_np),
     E("pthread_key_create", klb_pthread_key_create),
@@ -2409,12 +2450,9 @@ static const kl_entry g_shim[] = {
     E("pthread_getname_np", pthread_getname_np),
     E("sched_setscheduler", klb_sched_setscheduler),
     E("sched_getscheduler", klb_sched_getscheduler),
-    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
-    // Deadpool VR's other imports with a plain answer. fesetround: the rounding
-    // modes are FPCR bits and have the same values on both sides, so a direct
-    // forward. mkdtemp: forwarded like mkstemp next to it in the table.
+    // Deadpool VR's other imports with a plain answer (clock_nanosleep validates
+    // its clock and timespec before sleeping; __poll_chk names the counts).
     E("clock_nanosleep", klb_clock_nanosleep), E("__poll_chk", klb___poll_chk),
-    E("fesetround", fesetround), E("mkdtemp", mkdtemp),
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),
@@ -2444,7 +2482,7 @@ static const kl_entry g_shim[] = {
     // Adapted from avp-play (MIT, github.com/myMartek/avp-play) runtime/libc/kl_shim.c
     // Tea For God (x6323807174332876): wide-string helpers it imports. wchar_t
     // is 32-bit on both sides, so these forward unchanged.
-    E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
+    E("wctomb", wctomb),
     E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
     E("quick_exit", klb__exit),
 
@@ -2457,6 +2495,49 @@ static const kl_entry g_shim[] = {
     E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
     E("mallctlbymib", kl_mallctlbymib),
     E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
+
+    // ---- libc and pthread surface that cannot ride the generated table ----
+    // Barriers are a real implementation (kl_pthread.c): Darwin has no
+    // pthread_barrier_t to forward to. QuakeQuest parks renderer workers on one.
+    E("pthread_barrier_init", klb_pthread_barrier_init),
+    E("pthread_barrier_wait", klb_pthread_barrier_wait),
+    E("pthread_barrier_destroy", klb_pthread_barrier_destroy),
+    E("pthread_gettid_np", klb_pthread_gettid_np),
+    // (sched_setscheduler/sched_getscheduler/clock_nanosleep are in the pthread
+    // block above: the setter turns a real-time request into a QoS boost.)
+    // Signal numbers: the SIGUSR2/SIGSYS swap — see kl_sig_to_darwin.
+    E("kill", klb_kill), E("raise", klb_raise), E("signal", klb_signal),
+    E("sigwait", klb_sigwait), E("sigsuspend", klb_sigsuspend),
+    E("sigpending", klb_sigpending),
+    // The rest of the path family: translated through kl_guest_path, the Linux
+    // AT_* numbering mapped, and failures published to the guest errno slot
+    // (kl_libc.c, "the rest of the path family"). fstatat also translates the
+    // struct it writes, which a forward wrote in Darwin's layout.
+    E("fstatat", klb_fstatat), E("fstatat64", klb_fstatat),
+    E("faccessat", klb_faccessat), E("mkdtemp", klb_mkdtemp),
+    E("rmdir", klb_rmdir), E("remove", klb_remove),
+    E("chmod", klb_chmod), E("chown", klb_chown), E("lchown", klb_lchown),
+    E("truncate", klb_truncate), E("mkfifo", klb_mkfifo),
+    E("readlink", klb_readlink), E("symlink", klb_symlink), E("link", klb_link),
+    E("utimes", klb_utimes), E("utime", klb_utime),
+    E("unlinkat", klb_unlinkat), E("mkdirat", klb_mkdirat),
+    E("fchmodat", klb_fchmodat), E("fchownat", klb_fchownat),
+    E("readlinkat", klb_readlinkat), E("renameat", klb_renameat),
+    E("symlinkat", klb_symlinkat), E("utimensat", klb_utimensat),
+    E("freopen", klb_freopen),
+    // Layout or numbering mismatches the compiler cannot see: bionic's FP_*
+    // numbering, the wcs case pair Darwin lacks, popen("getprop ...") answered
+    // without a subprocess, statfs64 (= statfs on LP64), execlp (refused).
+    E("__fpclassifyd", klb___fpclassifyd),
+    E("wcscasecmp", klb_wcscasecmp), E("wcsncasecmp", klb_wcsncasecmp),
+    E("popen", klb_popen), E("pclose", klb_pclose),
+    E("statfs64", klb_statfs64), E("execlp", klb_execlp),
+    E("mincore", klb_mincore), E("mallopt", klb_mallopt),
+    E("roundl", klv_roundl),
+    // FORTIFY forms and a DATA symbol.
+    E("__strlcat_chk", kl_strlcat_chk), E("__strlcpy_chk", kl_strlcpy_chk),
+    E("timezone", &kl_timezone_var),
+    E("fesetround", fesetround),
 
     E("__klepton_unresolved", kl_unresolved),
 };

@@ -505,7 +505,8 @@ static int klg_sigaction(int sig, const klg_sigaction_t *in, klg_sigaction_t *ol
 // whatever the guest asks: SIGILL 4, SIGTRAP 5, SIGABRT 6, SIGBUS 7, SIGFPE 8,
 // SIGSEGV 11 (Linux numbering, bit signo-1 of the first word). One more bit,
 // and it is ours rather than Glovebox's: klb_pthread_sigmask hands the word to
-// Darwin WITHOUT renumbering, and Darwin's SIGBUS is 10 — the bit a guest sets
+// Darwin renumbering only SIGUSR2<->SIGSYS (bits 11 and 30, kl_sigmask_to_darwin;
+// none of the bits cleared here), and Darwin's SIGBUS is 10 — the bit a guest sets
 // for Linux SIGUSR1, and the one sigfillset sets anyway — while Darwin raises
 // SIGBUS for most bad accesses. So bit 9 is cleared too; a guest that really
 // blocks Linux SIGUSR1 loses that block (it was blocking Darwin SIGBUS).
