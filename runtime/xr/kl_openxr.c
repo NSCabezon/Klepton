@@ -121,11 +121,14 @@ enum {
     XR_TYPE_ACTION_SPACE_CREATE_INFO    = 38,
     XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
     XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
-    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 54,
+    // 62/63 are Khronos's values (openxr.h 1.1.49). 54/62 were transcribed
+    // wrong, and every correct caller of these two getters was refused with
+    // VALIDATION_FAILURE. Vivecraft calls bound-sources for every action read.
+    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 62,
     XR_TYPE_ACTION_STATE_GET_INFO       = 58,
     XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
     XR_TYPE_ACTIONS_SYNC_INFO           = 61,
-    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 62,
+    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 63,
     XR_TYPE_SWAPCHAIN_CREATE_INFO       = 9,
     XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO = 55,
     XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO   = 56,
@@ -1245,7 +1248,7 @@ static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId syst
 // frusta here are the display's own (kl_ovrp_eye_view / the compositor's
 // measured tangents). A guest told it could mutate them would submit a picture
 // rendered for a projection the compositor is not going to use.
-#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 42
+#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 45   /* Khronos; was 42 (= SPACE_LOCATION) */
 static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId system_id,
                                                     int32_t view_config_type, void *props) {
     if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
@@ -3149,7 +3152,11 @@ static XrResult klxr_GetReferenceSpaceBoundsRect(void *session, int32_t ref_type
 // inactive is the truth.
 enum { KLXR_MAGIC_ACTION_SET = 0x584b4c41 /* 'XKLA' */,
        KLXR_MAGIC_ACTION     = 0x584b4c61 /* 'XKLa' */ };
-enum { KLXR_PATH_MAX = 256, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 128 };
+// Sized for Vivecraft, the largest action map so far. It creates one action
+// per Minecraft key mapping plus Vivecraft's hidden keys (~100 before mods)
+// across 8 sets. At 128, a modded instance hit LIMIT_REACHED, and the guest
+// then suggests a NULL action, which fails its whole profile.
+enum { KLXR_PATH_MAX = 512, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 256 };
 
 enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
        KLXR_ACTION_TYPE_VECTOR2F = 3, KLXR_ACTION_TYPE_POSE = 4,
@@ -3474,10 +3481,16 @@ static klxr_action_set *klxr_action_set_of(void *h) {
         if (h == &g_action_sets[i] && g_action_sets[i].magic) return &g_action_sets[i];
     return NULL;
 }
+// The action pool is checked by address arithmetic rather than a scan. A
+// scan costs O(pool) on every getter, and Vivecraft makes ~4 getter calls per
+// action per frame over ~100 actions. The answer is the same: an in-pool,
+// element-aligned address with a live magic word.
 static klxr_action *klxr_action_of(void *h) {
-    for (int i = 0; i < KLXR_ACTION_MAX; i++)
-        if (h == &g_actions[i] && g_actions[i].magic) return &g_actions[i];
-    return NULL;
+    uintptr_t base = (uintptr_t)g_actions, p = (uintptr_t)h;
+    if (p < base || p >= base + sizeof g_actions) return NULL;
+    if ((p - base) % sizeof g_actions[0]) return NULL;
+    klxr_action *a = h;
+    return a->magic ? a : NULL;
 }
 
 static XrResult klxr_DestroyActionSet(void *action_set) {

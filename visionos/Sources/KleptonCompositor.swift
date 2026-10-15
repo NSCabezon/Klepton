@@ -1554,6 +1554,42 @@ final class KleptonCompositor {
             }
             t.label = "klepton eye stage \(stage)"
             tex = t
+            // CLEARED, once, before the guest is ever handed it.
+            //
+            // A `.private` allocation of half a gigabyte holds whatever was in
+            // that memory, and the guest does not write all of it: under a
+            // foveation rate map Tetris Effect rasterizes 31.5% of the fragments
+            // (12288x4928 screen -> 7874x2422 physical), so about two thirds of
+            // every stage is never touched by anything at all. Any sampling
+            // that reaches past the written region — an off-by-one at the grid's
+            // outer ring, a rect measured against the wrong texture, a rate map
+            // one generation stale — reads that memory and shows it, and it
+            // shows it as a CONSTANT COLOUR because that is what recycled
+            // texture memory looks like.
+            //
+            // Tetris Effect's blue fill was that shape of defect: a large flat
+            // colour with a boundary that moves with the head and is not in the
+            // game's own art. This does not diagnose such a thing, but it
+            // removes the only thing this class of bug can be filled WITH, for
+            // one clear per stage at allocation.
+            // If the blue survives this, it is in the picture the guest drew and
+            // the hunt moves inside the guest.
+            if let cmd = queue?.makeCommandBuffer() {
+                for slice in 0..<t.arrayLength {
+                    let pass = MTLRenderPassDescriptor()
+                    pass.colorAttachments[0].texture     = t
+                    pass.colorAttachments[0].slice       = slice
+                    pass.colorAttachments[0].loadAction  = .clear
+                    pass.colorAttachments[0].storeAction = .store
+                    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1)
+                    cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+                }
+                cmd.commit()
+            } else {
+                NSLog("[cp] stage \(stage): no queue yet — the eye texture is "
+                      + "handed over UNCLEARED, and anything sampled outside the "
+                      + "guest's rendered region is recycled memory")
+            }
             // The real cost, not the arithmetic one. Metal reports what it
             // actually reserved, so this is the only honest input to "is the
             // eye swapchain why we are at 3.5 GB".
@@ -2465,6 +2501,10 @@ final class KleptonCompositor {
     ///
     /// The `.dedicated` layout keeps the old per-view pass, with that view's
     /// own single-layer rate map, because there is nothing to amplify.
+    /// KL_CP_AMPLIFY, read once: encodeComposite runs per drawable per frame,
+    /// and klEnvOn rebuilds the whole environment dictionary on every call.
+    private static let amplifyOn = klEnvOn("KL_CP_AMPLIFY", default: true)
+
     private func encodeComposite(_ drawable: LayerRenderer.Drawable,
                                  cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
                                  rendered: kl_ovrp_render_pose, haveRendered: Bool,
@@ -2485,7 +2525,7 @@ final class KleptonCompositor {
         let layered = layerRenderer.configuration.layout == .layered
                       && drawable.views.count > 1
                       && amplification >= drawable.views.count
-                      && klEnvOn("KL_CP_AMPLIFY", default: true)
+                      && Self.amplifyOn
         if layered {
             return encodeViews(Array(drawable.views.indices), drawable: drawable,
                                layered: true,
@@ -4028,14 +4068,20 @@ final class KleptonCompositor {
         return t * deviceFromView
     }
 
+    /// KL_HEAD_MIDPOINT, read ONCE. pushEyeOffsets runs every frame, and every
+    /// `ProcessInfo.environment` access rebuilds the whole dictionary (a strdup
+    /// per variable) under libc's environ lock — Batman: Arkham Shadow died
+    /// inside exactly that strdup, on this line, at render rate.
+    private static let headMidpointOn =
+        ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0"
+
     private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
         // Latched, not re-read per frame. A streaming guest sends its eye
         // transform to the host ONCE and the host will not revise it, so the
         // number the guest was given has to stay the number it was given; the
         // display side is free to move underneath it, and bridging the two is
         // the composite's job rather than something to hide by re-pushing.
-        if ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0",
-           drawable.views.count >= 2 {
+        if Self.headMidpointOn, drawable.views.count >= 2 {
             let a = drawable.views[0].transform.columns.3
             let b = drawable.views[1].transform.columns.3
             eyeMidpointInDevice = SIMD3<Float>((a.x + b.x) * 0.5,
