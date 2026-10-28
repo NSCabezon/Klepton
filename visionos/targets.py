@@ -605,6 +605,17 @@ TARGETS = {
         "kind":    "ue4",
         "product": "KleptonRE4",
         "display": "Resident Evil 4",
+        # Foveation is the OpenGL guests' rate map (kl_glfb); RE4 renders through
+        # Vulkan (MoltenVK), whose passes are MoltenVK's, so the hub shows the
+        # setting as unavailable.
+        "gl_foveation": False,
+        # The game draws its own hands (and the weapons in them); the
+        # passthrough pair on top would be a second, mismatched one.
+        "hand_matting": False,
+        # Not measured on a headset yet: UE4 4.25 through MoltenVK with no fixed
+        # foveation, on an M2. Metro's 0.6 (about a Quest 2's eye); the in-app
+        # "Render resolution" slider starts here and can go up if the fps allow.
+        "render_scale": 0.6,
     },
     "redmatter2": {
         # Red Matter 2 (Vertical Robot), package com.VerticalRobot.RedMatter2 —
@@ -1212,6 +1223,14 @@ TARGETS = {
             # games/ktane/meta/KeepTalkingandNobodyExplodes.apk; the hub derives
             # ktane.apk and ktane/assets from it (Sources/KleptonHubPrep.swift).
             "ktane",
+            # Resident Evil 4 VR 2.3 (com.Armature.VR4 203), Meta's store only (a
+            # Quest exclusive, app 2637179839719680): the APK to
+            # games/re4/meta/VR4-Android-Shipping-arm64.apk, main.203 and
+            # patch.203 (8.5 GB, 7.9 GiB) straight into the OBB directory UE4
+            # builds itself (android-files/Android/obb/com.Armature.VR4), Metro's
+            # layout; the hub derives re4.apk and re4/assets from the APK
+            # (Sources/KleptonHubPrep.swift).
+            "re4",
             # Metro Awakening, the Steam Frame build (app 2669410, Android depot
             # 2669412: Impact-Android-Shipping-arm64.apk + main.944116 and 13
             # chunk OBBs, 19.2 GB). The depot lands straight in the OBB

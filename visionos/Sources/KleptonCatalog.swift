@@ -60,6 +60,10 @@ enum KLCatalog {
         // Meta only (the Steam build is PC VR): the Quest build 1.10.15 (versionCode 87) — a single
         //        150 MB APK, no OBB; byte-identical to the APK this port is translated from.
         KLCatalogEntry(target: "ktane", display: "Keep Talking and Nobody Explodes", steamApp: nil, metaRecipe: "ktane"),
+        // Meta only (a Quest exclusive): the Quest build 2.3 (versionCode 203) — APK, main and patch
+        //        OBB (7.9 GB), the OBBs in UE4's own Android/obb/com.Armature.VR4; the APK is
+        //        byte-identical to the one this port is translated from.
+        KLCatalogEntry(target: "re4", display: "Resident Evil 4", steamApp: nil, metaRecipe: "re4"),
         // Steam only: the Steam Frame build (depot 2669412 = Impact-Android-Shipping-arm64.apk,
         //        com.vertigogames.ImpactDevelopment 944116, + 14 OBBs, 19.2 GB). The Quest build on
         //        Meta's store is a different APK and is not what this port is translated from.
