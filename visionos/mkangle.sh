@@ -23,6 +23,18 @@ ROOT=".."
 OUT="Frameworks"
 LIBS="libEGL libGLESv2"
 
+# vendor/ is ~20 GB and only needed to rebuild ANGLE; once the xcframeworks are
+# staged it can be deleted (`make angle-all` brings it back). With no vendor/out
+# at all, keep the staged copies instead of failing the build.
+if [ ! -d "$ROOT/vendor/out" ]; then
+  have=1
+  for NAME in $LIBS; do [ -d "$OUT/ANGLE_$NAME.xcframework" ] || have=0; done
+  if [ "$have" = 1 ]; then
+    echo "[mkangle] no vendor/out — keeping the staged $OUT/ANGLE_*.xcframework"
+    exit 0
+  fi
+fi
+
 missing=0
 for NAME in $LIBS; do
   for D in xros xrsim; do
