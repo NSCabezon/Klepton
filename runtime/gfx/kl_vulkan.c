@@ -4817,6 +4817,17 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
                 ci->usage, mod.usage, ci->extent.width, ci->extent.height, (int)ci->format); }
         ci = &mod;
     }
+    // KL_VK_3D_NO_2DCOMPAT (test): drop 2D_ARRAY_COMPATIBLE / 2D_VIEW_COMPATIBLE from
+    // sampled-only 3D images, so MoltenVK makes a plain 3D MTLTexture instead of a
+    // heap-placed, layout-unoptimised one aliased onto the VkDeviceMemory.
+    if (ci && ci->imageType == VK_IMAGE_TYPE_3D && (ci->flags & (0x20u | 0x20000u))
+        && kl_env_on("KL_VK_3D_NO_2DCOMPAT", 0)) {
+        if (ci != &mod) { mod = *ci; ci = &mod; }
+        mod.flags &= ~(0x20u | 0x20000u);
+        static int said; if (said < 16) { said++;
+            VKI("vkCreateImage: 3D %ux%ux%u fmt %d — 2D-view-compatible flag dropped\n",
+                mod.extent.width, mod.extent.height, mod.extent.depth, (int)mod.format); }
+    }
     // DECISIVE TEST (KL_VK_ASTC_RGBA8=1): create every ASTC image as RGBA8 instead.
     // The guest's ASTC upload then lands in an RGBA8 store (garbled bytes reinterpreted
     // as colour). If the gray WORLD turns GARBLED/COLOURFUL, the ASTC albedo was
@@ -4953,15 +4964,15 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
         }
     }
     static int logged;
-    if (logged < 4096 && (r != VK_SUCCESS || (ci && ci->mipLevels > 1) || logged < 64)) {
+    if (logged < 4096 && (r != VK_SUCCESS || (ci && (ci->mipLevels > 1 || ci->imageType == VK_IMAGE_TYPE_3D)) || logged < 64)) {
         logged++;
         VKI("vkCreateImage: -> %#llx result %d type %d format %d %ux%u mips %u layers %u "
-            "usage %#x flags %#x\n",
+            "usage %#x flags %#x depth %u\n",
             (unsigned long long)(uintptr_t)(out ? *out : 0), (int)r,
             ci ? (int)ci->imageType : -1, ci ? (int)ci->format : -1,
             ci ? ci->extent.width : 0, ci ? ci->extent.height : 0,
             ci ? ci->mipLevels : 0, ci ? ci->arrayLayers : 0,
-            ci ? ci->usage : 0, ci ? ci->flags : 0);
+            ci ? ci->usage : 0, ci ? ci->flags : 0, ci ? ci->extent.depth : 0);
     }
     return r;
 }
@@ -5165,6 +5176,43 @@ static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out);
+// KL_VK_SUBPASS_EARLY_Z twins (see klvk_spirv_subpass_early_tests): guest
+// fragment module -> its EarlyFragmentTests copy. A full table drops the twin
+// (that shader keeps MoltenVK's depth write, as before the fix).
+#define KLVK_EZ_TWINS 2048
+static struct { uint64_t mod, twin; } g_ez_twin[KLVK_EZ_TWINS];
+static int g_ez_twin_n;   // high-water mark
+static pthread_mutex_t g_ez_twin_mu = PTHREAD_MUTEX_INITIALIZER;
+static void klvk_ez_twin_put(VkDevice dev, uint64_t mod, uint64_t twin) {
+    int done = 0;
+    pthread_mutex_lock(&g_ez_twin_mu);
+    for (int i = 0; i < KLVK_EZ_TWINS && !done; i++)
+        if (!g_ez_twin[i].mod) {
+            g_ez_twin[i].mod = mod; g_ez_twin[i].twin = twin; done = 1;
+            if (i >= g_ez_twin_n) g_ez_twin_n = i + 1;
+        }
+    pthread_mutex_unlock(&g_ez_twin_mu);
+    if (!done) {
+        void (*destroy)(VkDevice, uint64_t, const VkAllocationCallbacks *) = real_gdpa ?
+            (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))real_gdpa(dev, "vkDestroyShaderModule") : NULL;
+        if (destroy) destroy(dev, twin, NULL);
+    }
+}
+// take != 0 removes the entry (the caller then owns the twin).
+static uint64_t klvk_ez_twin_get(uint64_t mod, int take) {
+    uint64_t t = 0;
+    if (!mod || !__atomic_load_n(&g_ez_twin_n, __ATOMIC_RELAXED)) return 0;
+    pthread_mutex_lock(&g_ez_twin_mu);
+    for (int i = 0; i < g_ez_twin_n; i++)
+        if (g_ez_twin[i].mod == mod) {
+            t = g_ez_twin[i].twin;
+            if (take) g_ez_twin[i].mod = g_ez_twin[i].twin = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_ez_twin_mu);
+    return t;
+}
+
 static unsigned g_subpass_pipes;
 static VkResult klvk_ap_create(VkDevice dev, VkPipelineCache cache, uint32_t n,
         const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out);
@@ -5531,6 +5579,8 @@ static void klvk_vin_guest_bound(void *cb, uint32_t first, uint32_t count,
     if (t_vin.k >= 0 && (uint32_t)t_vin.k >= first && (uint32_t)t_vin.k < first + count && g_devs[0])
         klvk_vin_bindvb(cb, (uint32_t)t_vin.k, (uint64_t)(uintptr_t)g_devs[0]->vin_buf, 0);
 }
+static int klvk_dt_on(void);   // KL_VK_DRAW_TRACE, defined with the render-pass hooks
+static void klvk_dt_pipe_note(uint64_t p, uint32_t vs, uint32_t fs, int sp, int dop, int dw);
 static void klvk_vin_pipeline_bound(void *cb, uint64_t pipeline) {
     if (!__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED)) return;
     klvk_vin_ent e;
@@ -5614,6 +5664,67 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         mod[i].pMultisampleState = &mss[i];
         zero_samples++;
     }
+    // KL_VK_SUBPASS_EARLY_Z, the discard case: a subpass-reading fragment shader
+    // that can discard has an EarlyFragmentTests twin (klvk_ez_twin_put). Use it
+    // when this pipeline writes neither depth nor stencil — then testing before
+    // the shader changes nothing but spares it MoltenVK's gl_FragDepth write,
+    // which is what failed UE's depth-EQUAL base pass for masked materials.
+    VkPipelineShaderStageCreateInfo **ezs = NULL;
+    for (uint32_t i = 0; ci && i < n && __atomic_load_n(&g_ez_twin_n, __ATOMIC_RELAXED); i++) {
+        const VkPipelineDepthStencilStateCreateInfo *d = ci[i].pDepthStencilState;
+        int writes = d && ((d->depthTestEnable && d->depthWriteEnable) ||
+            (d->stencilTestEnable && (d->front.failOp || d->front.passOp || d->front.depthFailOp ||
+                                      d->back.failOp || d->back.passOp || d->back.depthFailOp)));
+        const VkPipelineDynamicStateCreateInfo *dy = ci[i].pDynamicState;
+        for (uint32_t k = 0; dy && k < dy->dynamicStateCount; k++) {
+            uint32_t st = (uint32_t)dy->pDynamicStates[k];
+            // depth test / depth write / stencil test / stencil op set at draw time
+            if (st == 1000267005u || st == 1000267006u || st == 1000267010u || st == 1000267011u) writes = 1;
+        }
+        if (writes || !ci[i].pStages) continue;
+        for (uint32_t k = 0; k < ci[i].stageCount; k++) {
+            if (ci[i].pStages[k].stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
+            uint64_t twin = klvk_ez_twin_get((uint64_t)(uintptr_t)ci[i].pStages[k].module, 0);
+            if (!twin) continue;
+            if (!mod) {
+                mod = malloc((size_t)n * sizeof *mod);
+                if (!mod) break;
+                memcpy(mod, ci, (size_t)n * sizeof *mod);
+            }
+            if (!ezs && !(ezs = calloc(n, sizeof *ezs))) break;
+            if (!ezs[i]) {
+                if (!(ezs[i] = malloc(ci[i].stageCount * sizeof **ezs))) break;
+                memcpy(ezs[i], ci[i].pStages, ci[i].stageCount * sizeof **ezs);
+                mod[i].pStages = ezs[i];
+            }
+            ezs[i][k].module = (VkShaderModule)(uintptr_t)twin;
+            static int said; if (!said++) VKI("KL_VK_SUBPASS_EARLY_Z: a discarding subpass reader in a "
+                "pipeline without depth/stencil writes uses its EarlyFragmentTests twin\n");
+        }
+    }
+
+    // KL_VK_DEPTH_EQ_RELAX=<op> (diagnostic): a pipeline that tests depth EQUAL
+    // without writing it (UE's base pass after a full depth prepass) tests with
+    // VkCompareOp <op> instead (6 = GREATER_OR_EQUAL for reversed Z). If pixels
+    // the base pass never shaded come back, the prepass and the base pass disagree
+    // on depth (vertex position not bit-identical between the two shaders).
+    VkPipelineDepthStencilStateCreateInfo *dss = NULL;
+    static int eq_relax = -2;
+    if (eq_relax == -2) { const char *e = getenv("KL_VK_DEPTH_EQ_RELAX"); eq_relax = e && *e ? atoi(e) : -1; }
+    for (uint32_t i = 0; eq_relax >= 0 && ci && i < n; i++) {
+        const VkPipelineDepthStencilStateCreateInfo *d = ci[i].pDepthStencilState;
+        if (!d || !d->depthTestEnable || d->depthWriteEnable || d->depthCompareOp != VK_COMPARE_OP_EQUAL) continue;
+        if (!mod) {
+            mod = malloc((size_t)n * sizeof *mod);
+            if (!mod) break;
+            memcpy(mod, ci, (size_t)n * sizeof *mod);
+        }
+        if (!dss && !(dss = malloc((size_t)n * sizeof *dss))) break;
+        dss[i] = *d;
+        dss[i].depthCompareOp = (VkCompareOp)eq_relax;
+        mod[i].pDepthStencilState = &dss[i];
+        static int said; if (said++ < 4) VKI("KL_VK_DEPTH_EQ_RELAX: depth EQUAL -> op %d\n", eq_relax);
+    }
     if (zero_samples) { static int said; if (!said++)
         VKI("CreateGraphicsPipelines: rasterizationSamples 0 read as 1 on %d "
             "pipeline(s) — Metal rejects the zero that Linux drivers accept\n", zero_samples); }
@@ -5654,7 +5765,24 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         if (!left) r = VK_SUCCESS;
     }
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
-    free(mod); free(ias); free(mss);
+    free(mod); free(ias); free(mss); free(dss);
+    for (uint32_t i = 0; ezs && i < n; i++) free(ezs[i]);
+    free(ezs);
+    for (uint32_t i = 0; klvk_dt_on() && ci && out && i < n; i++) {
+        if (!out[i]) continue;
+        uint32_t hv = 0, hf = 0;
+        for (uint32_t k = 0; k < ci[i].stageCount && ci[i].pStages; k++) {
+            uint32_t h = klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)ci[i].pStages[k].module);
+            if (ci[i].pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT) hv = h; else if (ci[i].pStages[k].stage == VK_SHADER_STAGE_FRAGMENT_BIT) hf = h;
+        }
+        const VkPipelineDepthStencilStateCreateInfo *d = ci[i].pDepthStencilState;
+        const VkPipelineRasterizationStateCreateInfo *rs = ci[i].pRasterizationState;
+        // dw packs: bit0 depth write, bits 4-5 cull mode, bit 8 front face, bit 12 depth bias, bit 13 depth clamp
+        int pk = (d ? (int)d->depthWriteEnable : 0) | (rs ? ((int)rs->cullMode << 4) | ((int)rs->frontFace << 8)
+                 | ((int)rs->depthBiasEnable << 12) | ((int)rs->depthClampEnable << 13) : 0);
+        klvk_dt_pipe_note((uint64_t)(uintptr_t)out[i], hv, hf, (int)ci[i].subpass,
+                          d && d->depthTestEnable ? (int)d->depthCompareOp : -1, pk);
+    }
     if (fixed) { static int said; if (said < 8) { said++;
         VKI("CreateGraphicsPipelines: forced primitiveRestartEnable=TRUE on %d "
             "strip pipeline(s) MoltenVK would otherwise reject (invisible "
@@ -6105,6 +6233,8 @@ static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, cons
         real_gdpa(dev, "vkDestroyShaderModule");
     klvk_ap_drain();
     if (klvk_vin_on()) klvk_vin_del(g_vin_mod, mod);
+    uint64_t twin = klvk_ez_twin_get(mod, 1);   // KL_VK_SUBPASS_EARLY_Z
+    if (twin && real) real(dev, twin, alloc);
     if (real) real(dev, mod, alloc);
 }
 static void VKAPI_CALL klvk_DestroyPipelineLayout(VkDevice dev, uint64_t layout, const VkAllocationCallbacks *alloc) {
@@ -6261,8 +6391,13 @@ static VkClearValue *klvk_probe_inject_clears(const VkRenderPassBeginInfo *bi,
     if (!cv) return NULL;
     if (bi->clearValueCount && bi->pClearValues)
         memcpy(cv, bi->pClearValues, bi->clearValueCount * sizeof *cv);
+    float a0 = cv[att].color.float32[3];
+    { static int said; if (said < 4) { said++;
+        VKI("clear probe: guest clear of att%u was %.3f %.3f %.3f %.3f\n", att,
+            cv[att].color.float32[0], cv[att].color.float32[1], cv[att].color.float32[2], a0); } }
     cv[att].color.float32[0] = 1.0f; cv[att].color.float32[1] = 0.0f;   // bright magenta
     cv[att].color.float32[2] = 1.0f; cv[att].color.float32[3] = 1.0f;
+    { const char *e = getenv("KL_VK_SCENE_TINT"); if (e && !strcmp(e, "2")) cv[att].color.float32[3] = a0; }
     *tmp = *bi; tmp->clearValueCount = n; tmp->pClearValues = cv;
     return cv;
 }
@@ -6451,6 +6586,138 @@ static void klvk_prof_frame(double wait_s) {
     pthread_mutex_unlock(&g_prof_mu);
 }
 
+// ---- KL_VK_DRAW_TRACE=<n> (diagnostic) ---------------------------------------
+// Dumps every draw of the n-th and (n+1)-th multiview scene pass (>= 3 subpasses):
+// subpass, pipeline's VS/FS SPIR-V hashes (needs KL_VK_FS_STATS set so module
+// hashes are kept), depth op/write, index/vertex buffer bindings, draw params and
+// descriptor-set dynamic offsets. Pairs a depth-prepass draw with its base-pass
+// draw of the same geometry, to see what differs between the two. Only draws
+// recorded into the primary command buffer that began the pass are seen.
+static int klvk_dt_on(void) {
+    static int v = -2;
+    if (v == -2) { const char *e = getenv("KL_VK_DRAW_TRACE"); v = e && *e ? atoi(e) : 0; }
+    return v;
+}
+#define KLVK_DT_PI 16384u
+static struct { uint64_t p; uint32_t vs, fs; int sp, dop, dw; } g_dt_pi[KLVK_DT_PI];
+static pthread_mutex_t g_dt_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_dt_rp[64]; static int g_dt_rp_n;
+static unsigned g_dt_count;
+static void *g_dt_cb; static int g_dt_sp;
+static __thread uint64_t g_dt_pipe, g_dt_ib, g_dt_iboff, g_dt_vb[12], g_dt_vboff[12];
+static int g_dt_window, g_dt_ends;
+static struct { void *cb; int sp; } g_dt_sec[256]; static unsigned g_dt_sec_n;
+static void klvk_dt_sec_note(void *cb, uint64_t rp, int sp) {
+    if (!klvk_dt_on() || !g_dt_window) return;
+    int scene = 0;
+    pthread_mutex_lock(&g_dt_lock);
+    for (int i = 0; i < g_dt_rp_n; i++) if (g_dt_rp[i] == rp) scene = 1;
+    if (scene) { unsigned i = g_dt_sec_n++ % 256; g_dt_sec[i].cb = cb; g_dt_sec[i].sp = sp; }
+    pthread_mutex_unlock(&g_dt_lock);
+    if (scene) fprintf(stderr, "[dt] SECONDARY cb %p begun for subpass %d\n", cb, sp);
+}
+// -1: not traced; else the subpass the draws on cb belong to (secondaries: +100)
+static int klvk_dt_cb(void *cb) {
+    if (!cb) return -1;
+    if (cb == g_dt_cb) return g_dt_sp;
+    if (!g_dt_window) return -1;
+    int r = -1;
+    pthread_mutex_lock(&g_dt_lock);
+    for (unsigned i = 0; i < 256 && i < g_dt_sec_n; i++) if (g_dt_sec[i].cb == cb) r = 100 + g_dt_sec[i].sp;
+    pthread_mutex_unlock(&g_dt_lock);
+    return r;
+}
+static void klvk_dt_pipe_note(uint64_t p, uint32_t vs, uint32_t fs, int sp, int dop, int dw) {
+    if (!p) return;
+    pthread_mutex_lock(&g_dt_lock);
+    uint32_t i = (uint32_t)((p >> 4) * 2654435761u) % KLVK_DT_PI;
+    for (uint32_t n = 0; n < KLVK_DT_PI; n++, i = (i + 1) % KLVK_DT_PI)
+        if (!g_dt_pi[i].p || g_dt_pi[i].p == p) {
+            g_dt_pi[i].p = p; g_dt_pi[i].vs = vs; g_dt_pi[i].fs = fs;
+            g_dt_pi[i].sp = sp; g_dt_pi[i].dop = dop; g_dt_pi[i].dw = dw; break; }
+    pthread_mutex_unlock(&g_dt_lock);
+}
+static int klvk_dt_pipe_get(uint64_t p, uint32_t *vs, uint32_t *fs, int *sp, int *dop, int *dw) {
+    int ok = 0;
+    pthread_mutex_lock(&g_dt_lock);
+    uint32_t i = (uint32_t)((p >> 4) * 2654435761u) % KLVK_DT_PI;
+    for (uint32_t n = 0; n < KLVK_DT_PI; n++, i = (i + 1) % KLVK_DT_PI) {
+        if (g_dt_pi[i].p == p) { *vs = g_dt_pi[i].vs; *fs = g_dt_pi[i].fs; *sp = g_dt_pi[i].sp;
+            *dop = g_dt_pi[i].dop; *dw = g_dt_pi[i].dw; ok = 1; break; }
+        if (!g_dt_pi[i].p) break;
+    }
+    pthread_mutex_unlock(&g_dt_lock);
+    return ok;
+}
+static void klvk_dt_rp_note(uint64_t rp) {
+    pthread_mutex_lock(&g_dt_lock);
+    if (g_dt_rp_n < 64) g_dt_rp[g_dt_rp_n++] = rp;
+    pthread_mutex_unlock(&g_dt_lock);
+}
+static void klvk_dt_begin(void *cb, uint64_t rp) {
+    if (!klvk_dt_on()) return;
+    int scene = 0;
+    pthread_mutex_lock(&g_dt_lock);
+    for (int i = 0; i < g_dt_rp_n; i++) if (g_dt_rp[i] == rp) scene = 1;
+    pthread_mutex_unlock(&g_dt_lock);
+    if (!scene) return;
+    unsigned k = __atomic_add_fetch(&g_dt_count, 1, __ATOMIC_RELAXED);
+    // KL_VK_DRAW_TRACE_AT=<file>: capture the two scene passes that follow the
+    // moment <file> appears (checked every 30 passes; the file is then removed).
+    static unsigned armed_at;
+    const char *at = getenv("KL_VK_DRAW_TRACE_AT");
+    if (at && *at && k % 30 == 0 && !armed_at && access(at, F_OK) == 0) { armed_at = k + 1; unlink(at); g_dt_window = 1; }
+    unsigned want = at && *at ? armed_at : (unsigned)klvk_dt_on();
+    if (want && (k == want || k == want + 1)) {
+        g_dt_cb = cb; g_dt_sp = 0; g_dt_pipe = 0;
+        fprintf(stderr, "[dt] BEGIN scene pass #%u cb %p\n", k, cb);
+    } else if (g_dt_cb == cb) g_dt_cb = NULL;
+}
+static void klvk_dt_next(void *cb) { if (g_dt_cb && g_dt_cb == cb) { g_dt_sp++; fprintf(stderr, "[dt] SUBPASS %d\n", g_dt_sp); } }
+static void klvk_dt_end(void *cb) { if (g_dt_cb && g_dt_cb == cb) { fprintf(stderr, "[dt] END\n"); g_dt_cb = NULL; if (++g_dt_ends >= 2) g_dt_window = 0; } }
+static void VKAPI_CALL klvk_CmdNextSubpass(VkCommandBuffer cb, VkSubpassContents c) {
+    static void *real;
+    if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdNextSubpass");
+    klvk_dt_next(cb);
+    if (real) ((void (*)(VkCommandBuffer, VkSubpassContents))real)(cb, c);
+}
+static void VKAPI_CALL klvk_CmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo *b, const VkSubpassEndInfo *e) {
+    static void *real;
+    if (!real && real_gdpa) { real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdNextSubpass2");
+        if (!real) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdNextSubpass2KHR"); }
+    klvk_dt_next(cb);
+    if (real) ((void (*)(VkCommandBuffer, const VkSubpassBeginInfo *, const VkSubpassEndInfo *))real)(cb, b, e);
+}
+static void VKAPI_CALL klvk_CmdEndRenderPass(VkCommandBuffer cb) {
+    static void *real;
+    if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdEndRenderPass");
+    klvk_dt_end(cb);
+    if (real) ((void (*)(VkCommandBuffer))real)(cb);
+}
+static void VKAPI_CALL klvk_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo *e) {
+    static void *real;
+    if (!real && real_gdpa) { real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdEndRenderPass2");
+        if (!real) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdEndRenderPass2KHR"); }
+    klvk_dt_end(cb);
+    if (real) ((void (*)(VkCommandBuffer, const VkSubpassEndInfo *))real)(cb, e);
+}
+static void VKAPI_CALL klvk_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *v) {
+    static void *real;
+    if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetViewport");
+    if (g_dt_cb && g_dt_cb == cb && v && n)
+        fprintf(stderr, "[dt] VIEWPORT %.1f %.1f %.1f %.1f depth %.4f..%.4f\n", v[0].x, v[0].y, v[0].width, v[0].height, v[0].minDepth, v[0].maxDepth);
+    if (real) ((void (*)(VkCommandBuffer, uint32_t, uint32_t, const VkViewport *))real)(cb, first, n, v);
+}
+static void VKAPI_CALL klvk_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *cbs) {
+    static void *real;
+    if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdExecuteCommands");
+    if (g_dt_cb && g_dt_cb == cb) {
+        fprintf(stderr, "[dt] EXECUTE %u secondary cb(s) in subpass %d:", n, g_dt_sp);
+        for (uint32_t i = 0; i < n && i < 16; i++) fprintf(stderr, " %p", (void *)cbs[i]);
+        fprintf(stderr, "\n");
+    }
+    if (real) ((void (*)(VkCommandBuffer, uint32_t, const VkCommandBuffer *))real)(cb, n, cbs);
+}
 static void VKAPI_CALL klvk_CmdBeginRenderPass(VkCommandBuffer cb,
         const VkRenderPassBeginInfo *bi, VkSubpassContents c) {
     static PFN_vkCmdBeginRenderPass real;
@@ -6463,6 +6730,7 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass(VkCommandBuffer cb,
             bi->renderArea.extent.width, bi->renderArea.extent.height);
     }
     if (bi) klvk_prof_pass(bi->renderPass, bi->renderArea.extent.width, bi->renderArea.extent.height);
+    if (bi) klvk_dt_begin(cb, (uint64_t)(uintptr_t)bi->renderPass);
     VkRenderPassBeginInfo tmp; VkClearValue *inj = klvk_probe_inject_clears(bi, &tmp);
     if (real) real(cb, inj ? &tmp : bi, c);
     free(inj);
@@ -6480,6 +6748,7 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
             bi->renderArea.extent.width, bi->renderArea.extent.height);
     }
     if (bi) klvk_prof_pass(bi->renderPass, bi->renderArea.extent.width, bi->renderArea.extent.height);
+    if (bi) klvk_dt_begin(cb, (uint64_t)(uintptr_t)bi->renderPass);
     VkRenderPassBeginInfo tmp; VkClearValue *inj = klvk_probe_inject_clears(bi, &tmp);
     if (real) real(cb, inj ? &tmp : bi, sbi);
     free(inj);
@@ -6732,6 +7001,24 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2_inner(VkDevice dev,
                               (int)ci->pAttachments[i].storeOp);
     if (r == VK_SUCCESS && out && probe_att != VK_ATTACHMENT_UNUSED)
         klvk_clearpass_add(*out, probe_att);
+    if (r == VK_SUCCESS && out && ci && ci->subpassCount >= 3 && ci->pSubpasses[0].viewMask && klvk_dt_on())
+        klvk_dt_rp_note((uint64_t)(uintptr_t)*out);
+    // KL_VK_SCENE_TINT=1 (diagnostic): clear the multiview scene colour (subpass 0's
+    // first CLEARed colour attachment) to magenta instead of the guest's colour, so a
+    // pixel no draw ever wrote is told apart from one a draw wrote black.
+    if (r == VK_SUCCESS && out && ci && ci->subpassCount && ci->pSubpasses[0].viewMask
+        && probe_att == VK_ATTACHMENT_UNUSED && kl_env_on("KL_VK_SCENE_TINT", 0)) {
+        const VkSubpassDescription2 *d0 = &ci->pSubpasses[0];
+        for (uint32_t k = 0; d0->pColorAttachments && k < d0->colorAttachmentCount; k++) {
+            uint32_t ai = d0->pColorAttachments[k].attachment;
+            if (ai < ci->attachmentCount &&
+                ci->pAttachments[ai].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                klvk_clearpass_add(*out, ai);
+                VKI("CreateRenderPass2: KL_VK_SCENE_TINT — att%u cleared to magenta\n", ai);
+                break;
+            }
+        }
+    }
     if (ci && r == VK_SUCCESS && out && klvk_fdm_spoof()) {
         uint32_t fa = klvk_fdm_rp_att(ci->pNext);
         if (fa != VK_ATTACHMENT_UNUSED) {
@@ -7986,6 +8273,11 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
     klvk_cb_set_idx(cb, 0);
     klvk_vin_begin(cb);
+    if (bi && klvk_dt_on()) {
+        const VkCommandBufferBeginInfo *b = bi;
+        if (b->pInheritanceInfo && b->pInheritanceInfo->renderPass)
+            klvk_dt_sec_note(cb, (uint64_t)(uintptr_t)b->pInheritanceInfo->renderPass, (int)b->pInheritanceInfo->subpass);
+    }
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
 static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
@@ -8000,6 +8292,7 @@ static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
                 (unsigned long long)offset, indexType); }
     }
     klvk_cb_set_idx(cb, buffer);
+    if (klvk_dt_cb(cb) >= 0) { g_dt_ib = buffer; g_dt_iboff = offset; }
     if (real) real(cb, buffer, offset, indexType);
 }
 // The actual crash site. MoltenVK will feed the index binding's MTLBuffer to
@@ -8024,6 +8317,7 @@ static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
     if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, name)
 static void VKAPI_CALL klvk_CmdDraw(void *cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     KLVK_REAL_DEV("vkCmdDraw");
+    if (klvk_dt_cb(cb) >= 0) fprintf(stderr, "[dt] DRAWNI sp %d pipe %llx verts %u inst %u\n", klvk_dt_cb(cb), (unsigned long long)g_dt_pipe, a, b);
     if (klvk_ap_skip(cb)) return;
     if (klvk_profile()) __atomic_add_fetch(&g_prof_nonindexed, 1, __ATOMIC_RELAXED);
     if (klvk_fs_draw()) return;
@@ -8032,6 +8326,7 @@ static void VKAPI_CALL klvk_CmdDraw(void *cb, uint32_t a, uint32_t b, uint32_t c
 static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
     KLVK_REAL_DEV("vkCmdDrawIndirect");
+    if (klvk_dt_cb(cb) >= 0) fprintf(stderr, "[dt] DRAWI sp %d pipe %llx count %u\n", klvk_dt_cb(cb), (unsigned long long)g_dt_pipe, count);
     if (klvk_ap_skip(cb)) return;
     if (klvk_profile()) __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
@@ -8039,6 +8334,7 @@ static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize
 static void VKAPI_CALL klvk_CmdDrawIndexedIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
     KLVK_REAL_DEV("vkCmdDrawIndexedIndirect");
+    if (klvk_dt_cb(cb) >= 0) fprintf(stderr, "[dt] DRAWII sp %d pipe %llx count %u\n", klvk_dt_cb(cb), (unsigned long long)g_dt_pipe, count);
     if (klvk_ap_skip(cb)) return;
     if (klvk_profile()) __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
@@ -8188,6 +8484,17 @@ static void VKAPI_CALL klvk_CmdDrawIndexed(void *cb, uint32_t indexCount,
     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdDrawIndexed");
     if (klvk_profile()) __atomic_add_fetch(&g_prof_draws, 1, __ATOMIC_RELAXED);
+    if (klvk_dt_cb(cb) >= 0) {
+        uint32_t vs = 0, fs = 0; int sp = -1, dop = -9, dw = 0;
+        klvk_dt_pipe_get(g_dt_pipe, &vs, &fs, &sp, &dop, &dw);
+        char line[1024]; int o = snprintf(line, sizeof line,
+            "[dt] DRAW sp %d pipe %llx vs %08x fs %08x dop %d dw %#x ib %llx+%llu idx %u first %u voff %d inst %u finst %u vb",
+            klvk_dt_cb(cb), (unsigned long long)g_dt_pipe, vs, fs, dop, dw, (unsigned long long)g_dt_ib,
+            (unsigned long long)g_dt_iboff, indexCount, firstIndex, vertexOffset, instanceCount, firstInstance);
+        for (int i = 0; i < 12 && o < 1000; i++) if (g_dt_vb[i])
+            o += snprintf(line + o, sizeof line - (size_t)o, " %d:%llx+%llu", i, (unsigned long long)g_dt_vb[i], (unsigned long long)g_dt_vboff[i]);
+        fprintf(stderr, "%s\n", line);
+    }
     if (klvk_ap_skip(cb)) return;
     if (klvk_fs_draw()) return;
     // KL_VK_DRAW_GUARD (default OFF): the skip below drops a draw whenever it
@@ -8246,6 +8553,7 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
         if (t_bind_reads) klvk_after_note(0, 1);
         if (t_bind_reads) klvk_ev_start();
     }
+    if (bindPoint == 0 && klvk_dt_cb(cb) >= 0) g_dt_pipe = pipeline;
     int drop = 0;
     pipeline = klvk_ap_bind(cb, bindPoint, pipeline, &drop);
     if (drop) return;
@@ -8262,6 +8570,13 @@ static void VKAPI_CALL klvk_CmdBindDescriptorSets(void *cb, uint32_t bindPoint,
     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint64_t, uint32_t, uint32_t, const uint64_t *, uint32_t, const uint32_t *))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdBindDescriptorSets");
     if (sets) for (uint32_t i = 0; i < count; i++) klvk_ev(" B%llu:%llx", firstSet + i, sets[i] & 0xffffff);
+    if (bindPoint == 0 && sets && klvk_dt_cb(cb) >= 0) {
+        char line[1024]; int o = snprintf(line, sizeof line, "[dt]  sets first %u:", firstSet);
+        for (uint32_t i = 0; i < count && o < 900; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %llx", (unsigned long long)sets[i]);
+        o += snprintf(line + o, sizeof line - (size_t)o, " dyn");
+        for (uint32_t i = 0; dyn && i < dynCount && o < 1000; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %u", dyn[i]);
+        fprintf(stderr, "%s\n", line);
+    }
     if (sets) for (uint32_t i = 0; i < count; i++) if (!sets[i]) {
         static int said; if (said < 8) { said++;
             VKI("vkCmdBindDescriptorSets: NULL descriptor set at %u — a draw using "
@@ -8295,6 +8610,8 @@ static void VKAPI_CALL klvk_CmdBindVertexBuffers(void *cb, uint32_t first,
                 "using it will dereference null in MoltenVK\n", first + i); }
         break;
     }
+    if (buffers && offsets && klvk_dt_cb(cb) >= 0)
+        for (uint32_t i = 0; i < count && first + i < 12; i++) { g_dt_vb[first + i] = buffers[i]; g_dt_vboff[first + i] = offsets[i]; }
     if (real) real(cb, first, count, buffers, offsets);
     klvk_vin_guest_bound(cb, first, count, buffers, offsets);
 }
@@ -9229,6 +9546,79 @@ static uint32_t *klvk_spirv_mirror_rewrite(const uint32_t *in, size_t nwords,
     return out;
 }
 
+// KL_VK_SUBPASS_EARLY_Z (default ON; =0 turns it off): a fragment shader that
+// reads a subpass input and can neither discard nor write depth / sample mask /
+// stencil ref gets `OpExecutionMode EarlyFragmentTests`. For such a shader the
+// mode changes nothing in Vulkan terms; it is there for what MoltenVK does
+// without it. When a subpass uses its depth attachment as an input attachment
+// too (UE mobile's base pass: depth prepass in subpass 0, then depth read-only +
+// DepthFetch), MoltenVK sets SPIRV-Cross's input_attachment_is_ds_attachment and
+// every subpass-reading fragment shader that lacks explicit early tests is given
+//     out.gl_FragDepth = gl_FragCoord.z;
+// (to make Metal write depth after the shader ran). That replaces the
+// rasterizer's per-sample depth with one value interpolated in the shader, which
+// is not bit-identical to it and, under MSAA, is one depth for all samples. UE's
+// base pass tests depth EQUAL against its prepass, so every such draw is
+// rejected: Metro Awakening's hands, NPCs and props came out as the clear colour
+// (black) while meshes whose material reads no subpass input were fine.
+// SPIRV-Cross skips the pass-through when the shader declares early fragment
+// tests, and UE's shaders write no depth, so declaring them restores the
+// rasterizer's depth. NULL = leave the module alone.
+//
+// A shader that CAN discard (UE's masked materials: hair cards, foliage) is not
+// safe to patch for every use: with early tests a pipeline that writes depth or
+// stencil would write them for discarded fragments too. Those (allow_kill) get
+// a patched TWIN module instead, which klvk_CreateGraphicsPipelines0 swaps in
+// only for pipelines that write neither depth nor stencil — where a discard
+// after the tests can only drop colour, exactly as before them.
+static uint32_t *klvk_spirv_subpass_early_tests(const uint32_t *code, size_t nwords, size_t *out_nwords, int allow_kill) {
+    if (!code || nwords < 6 || code[0] != 0x07230203u) return NULL;
+    size_t ins = 0; uint32_t entry = 0; int nentry = 0, reads = 0;
+    for (size_t i = 5; i < nwords; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nwords) return NULL;
+        switch (op) {
+        case 15: /* OpEntryPoint */
+            if (len < 3 || code[i + 1] != 4 /* Fragment */ || nentry++) return NULL;
+            entry = code[i + 2]; ins = i + len; break;
+        case 16: /* OpExecutionMode */
+            if (len >= 3) switch (code[i + 2]) {
+                case 9: /* EarlyFragmentTests */ case 12: /* DepthReplacing */
+                case 14: case 15: /* DepthGreater / DepthLess */
+                case 5027: /* StencilRefReplacingEXT */ return NULL;
+                default: break; }
+            break;
+        case 71: /* OpDecorate */
+            if (len >= 4 && code[i + 2] == 11 /* BuiltIn */ &&
+                (code[i + 3] == 22 /* FragDepth */ || code[i + 3] == 20 /* SampleMask */ ||
+                 code[i + 3] == 5014 /* FragStencilRefEXT */)) return NULL;
+            break;
+        case 72: /* OpMemberDecorate */
+            if (len >= 5 && code[i + 3] == 11 && (code[i + 4] == 22 || code[i + 4] == 20 || code[i + 4] == 5014)) return NULL;
+            break;
+        case 25: /* OpTypeImage */
+            if (len >= 4 && code[i + 3] == 6 /* SubpassData */) reads = 1;
+            break;
+        case 252: /* OpKill */ case 4416: /* OpTerminateInvocation */
+        case 5380: /* OpDemoteToHelperInvocation */
+            if (!allow_kill) return NULL;
+            break;
+        case 99: /* OpImageWrite */
+            return NULL;   // side effects the depth test must not pre-empt
+        default: break;
+        }
+        i += len;
+    }
+    if (!reads || nentry != 1 || !ins) return NULL;
+    uint32_t *out = malloc((nwords + 3) * sizeof *out);
+    if (!out) return NULL;
+    memcpy(out, code, ins * sizeof *out);
+    out[ins] = (3u << 16) | 16u; out[ins + 1] = entry; out[ins + 2] = 9u;
+    memcpy(out + ins + 3, code + ins, (nwords - ins) * sizeof *out);
+    *out_nwords = nwords + 3;
+    return out;
+}
+
 // vkCreateShaderModule — gated SPIR-V rewrite. emu_on() false, or a module with
 // no texel-buffer image, is EXACT passthrough. A rewrite MoltenVK rejects falls
 // back to the original module (buggy but never a hard failure).
@@ -9288,7 +9678,39 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule_inner(VkDevice dev,
         }
         nk = *ci; nk.pCode = nokill; ci = &nk;
     }
-    VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
+    // KL_VK_SUBPASS_EARLY_Z (see klvk_spirv_subpass_early_tests). MoltenVK is
+    // handed the patched module; everything below (hashes, dumps, the pipeline
+    // recorder in the caller) keeps seeing the guest's own SPIR-V.
+    static int early_z = -1;
+    if (early_z < 0) early_z = kl_env_on("KL_VK_SUBPASS_EARLY_Z", 1);
+    uint32_t *ez = NULL; size_t ez_nw = 0;
+    if (early_z && ci && ci->pCode && !(ci->codeSize & 3u))
+        ez = klvk_spirv_subpass_early_tests(ci->pCode, ci->codeSize / 4, &ez_nw, 0);
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    if (ez) {
+        VkShaderModuleCreateInfo em = *ci;
+        em.pCode = ez; em.codeSize = ez_nw * 4;
+        r = klvk_CreateShaderModule0(dev, &em, alloc, out);
+        free(ez);
+        static int said;
+        if (r == VK_SUCCESS) { if (!said++) VKI("KL_VK_SUBPASS_EARLY_Z: subpass-reading fragment shaders get "
+            "EarlyFragmentTests (keeps MoltenVK from replacing their depth with gl_FragCoord.z)\n"); }
+        else ez = NULL;   // rejected: fall through to the guest's module
+    }
+    if (!ez) {
+        r = klvk_CreateShaderModule0(dev, ci, alloc, out);
+        // The discard case: keep the guest's module as it is and make the twin.
+        uint32_t *tw = NULL; size_t tw_nw = 0;
+        if (r == VK_SUCCESS && out && early_z && ci && ci->pCode && !(ci->codeSize & 3u) &&
+            (tw = klvk_spirv_subpass_early_tests(ci->pCode, ci->codeSize / 4, &tw_nw, 1))) {
+            VkShaderModuleCreateInfo tm = *ci;
+            VkShaderModule twin = VK_NULL_HANDLE;
+            tm.pCode = tw; tm.codeSize = tw_nw * 4;
+            if (klvk_CreateShaderModule0(dev, &tm, alloc, &twin) == VK_SUCCESS && twin)
+                klvk_ez_twin_put(dev, (uint64_t)(uintptr_t)*out, (uint64_t)(uintptr_t)twin);
+            free(tw);
+        }
+    }
     if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
         klvk_vin_ent in;
         if (klvk_spirv_vertex_inputs(ci->pCode, ci->codeSize / 4, &in))
@@ -10138,6 +10560,9 @@ static const entry g_ours[] = {
     E(CreateFramebuffer), E(CmdBeginRenderPass),
     E(CmdBeginRenderPass2),
     { "vkCmdBeginRenderPass2KHR", (PFN_vkVoidFunction)klvk_CmdBeginRenderPass2 },
+    E(CmdNextSubpass), E(CmdNextSubpass2), E(CmdEndRenderPass), E(CmdEndRenderPass2), E(CmdExecuteCommands), E(CmdSetViewport),
+    { "vkCmdNextSubpass2KHR", (PFN_vkVoidFunction)klvk_CmdNextSubpass2 },
+    { "vkCmdEndRenderPass2KHR", (PFN_vkVoidFunction)klvk_CmdEndRenderPass2 },
     E(CreateRenderPass), E(CreateRenderPass2),
     { "vkCreateRenderPass2KHR", (PFN_vkVoidFunction)klvk_CreateRenderPass2 },
     { "vkCreateRenderPassKHR",  (PFN_vkVoidFunction)klvk_CreateRenderPass },

@@ -3069,6 +3069,74 @@ vendored the whole path refuses by name and none of these do anything.
   the GPU-idle bubble from the previous frame's GPU completion (0 when the next
   frame's first submit was already queued) and adds how long xrEndFrame blocked
   on the previous publish and the publisher's fence wait.
+- `KL_VK_SUBPASS_EARLY_Z` — **default 1** (kl_vulkan.c,
+  `klvk_spirv_subpass_early_tests`). A fragment shader that reads a subpass
+  input and has no discard, no depth / sample-mask / stencil-ref output and no
+  image write is handed to MoltenVK with `OpExecutionMode EarlyFragmentTests`
+  added. In a subpass whose depth attachment is also an input attachment (UE
+  mobile's base pass after its depth prepass), MoltenVK otherwise appends
+  `gl_FragDepth = gl_FragCoord.z` to every subpass-reading fragment shader
+  (SPIRV-Cross `input_attachment_is_ds_attachment`); that shader-computed depth
+  is not the rasterizer's per-sample depth, so UE's depth-EQUAL base pass
+  rejects those draws and the meshes stay at the clear colour (Metro Awakening:
+  black hands, NPC, props). A shader that can discard (masked materials: hair)
+  is not patched in place — early tests would let a depth- or stencil-writing
+  pipeline write for discarded fragments — but gets a patched twin module that
+  is swapped in only for pipelines that write neither depth nor stencil (static
+  state; none of the four extended-dynamic-state toggles). `0` restores the
+  unpatched modules — the A/B.
+  Changes the MSL of those shaders, so the first run after flipping it
+  recompiles them. Recorded `.foz` databases keep the guest's original SPIR-V.
+- `KL_VK_SCENE_TINT=1` — **diagnostic, default off** (kl_vulkan.c,
+  `klvk_CreateRenderPass2_inner`). Clears the multiview scene colour (the first
+  CLEAR-loaded colour attachment of subpass 0 of a multiview render pass) to
+  magenta instead of the guest's clear colour, so a pixel no draw ever wrote is
+  told apart from one a draw wrote black. `2` keeps the guest's clear alpha.
+  Used with `KL_VK_DEPTH_EQ_RELAX` and `KL_VK_DRAW_TRACE` to find the Metro
+  Awakening black-mesh cause: MoltenVK appending `gl_FragDepth =
+  gl_FragCoord.z` to subpass-reading fragment shaders when the depth attachment
+  is also an input attachment (fixed by `KL_VK_SUBPASS_EARLY_Z`).
+- `KL_VK_DEPTH_EQ_RELAX=<op>` — **diagnostic, default off** (kl_vulkan.c,
+  `klvk_CreateGraphicsPipelines0`). A pipeline that tests depth EQUAL without
+  writing it (UE's base pass after a full depth prepass) is created with
+  VkCompareOp `<op>` instead (`6` = GREATER_OR_EQUAL for reversed Z). Pixels the
+  base pass never shaded coming back means the prepass and the base pass
+  disagree on depth. Used to find the Metro Awakening black-mesh cause:
+  MoltenVK appending `gl_FragDepth = gl_FragCoord.z` to subpass-reading
+  fragment shaders when the depth attachment is also an input attachment.
+- `KL_VK_DRAW_TRACE=<n>` — **diagnostic, default off** (kl_vulkan.c). Prints
+  `[dt]` lines for every draw of the n-th and (n+1)-th multiview scene pass
+  (three or more subpasses): subpass, the pipeline's vertex / fragment SPIR-V
+  hashes (needs `KL_VK_FS_STATS` set so module hashes are kept), depth op and
+  write, index / vertex buffer bindings, draw parameters, descriptor-set
+  dynamic offsets. Pairs a depth-prepass draw with its base-pass draw of the
+  same geometry. Only draws recorded into the primary command buffer that began
+  the pass, plus secondaries begun for it, are seen. `KL_VK_DRAW_TRACE_AT=<file>`
+  (with `KL_VK_DRAW_TRACE` set) instead captures the two scene passes that
+  follow the moment `<file>` appears (checked every 30 passes; the file is then
+  removed). Used to find the Metro Awakening black-mesh cause: MoltenVK
+  appending `gl_FragDepth = gl_FragCoord.z` to subpass-reading fragment shaders
+  when the depth attachment is also an input attachment.
+- `KL_VK_FS_STATS=<file>` / `KL_VK_SKIP_FS=<hash>,<hash>,...` — **diagnostic,
+  default off** (kl_vulkan.c). Which fragment shader draws what: every graphics
+  pipeline is known by a hash (hex) of its fragment shader's SPIR-V, stable from
+  run to run. `KL_VK_FS_STATS` counts draws per hash and writes the table
+  (`<hash> <draws>` per line) to `<file>`; `KL_VK_SKIP_FS` drops every draw
+  whose pipeline has one of the listed hashes. Halving the list until a thing on
+  screen disappears names the shader that draws it. `KL_VK_DRAW_TRACE` needs
+  `KL_VK_FS_STATS` set to have module hashes.
+- `KL_MVK_NO_ARGBUF=<0|1>` — **default 1 for the wanderer target, 0 elsewhere**
+  (kl_vulkan.c, `vk_init`). Sets `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` so
+  SPIRV-Cross emits discrete `buffer(N)` bindings instead of argument buffers.
+  It dodges a codegen bug where a fragment material referencing two Material
+  Parameter Collections gets an MSL struct missing the second one, the pipeline
+  fails to compile and that material never draws (black world). `0` is the A/B;
+  an `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS` already in the environment wins.
+- `KL_VK_3D_NO_2DCOMPAT=1` — **diagnostic, default off** (kl_vulkan.c,
+  `klvk_CreateImage`). Drops `2D_ARRAY_COMPATIBLE` / `2D_VIEW_COMPATIBLE` from 3D
+  images, so MoltenVK makes a plain 3D MTLTexture instead of a heap-placed one
+  aliased onto the VkDeviceMemory. Also makes the `vkCreateImage:` log line
+  report 3D images and their depth.
 - `KL_VK_TRACE=1` — the loader's own chatter: which MoltenVK was opened, which
   extension names were dropped, acquire/submit failures.
 - `KL_VK_WIDTH` / `KL_VK_HEIGHT` — the synthetic Android surface's size
