@@ -3546,7 +3546,7 @@ static struct {
 int kl_vulkan_frame_async_on(void) {
     static int on = -1;
     if (on < 0) {
-        on = kl_env_on("KL_VK_ASYNC_PUBLISH", 0);
+        on = kl_env_on("KL_VK_ASYNC_PUBLISH", 1);
         if (on)
             VKI("frame end publishes from a thread of ours once the GPU is done "
                 "(KL_VK_ASYNC_PUBLISH) — the guest's render thread no longer waits "
