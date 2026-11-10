@@ -167,6 +167,33 @@ void kl_vulkan_capture_layers(void);
 void kl_vulkan_frame_done(int stage);
 unsigned long long kl_vulkan_frame_serial(void);
 
+// The same seam without the stall (KL_VK_ASYNC_PUBLISH=1, default 0; only while
+// KL_VK_FRAME_SYNC is on, since it replaces that wait). Instead of idling the
+// guest's queue on the guest's thread, a fence-only submit goes onto that queue
+// and a publisher thread waits on it — then advances the serial and calls
+// `publish(payload)`, in that order, so "serial before records" holds exactly as
+// it does after kl_vulkan_frame_done. `payload` is COPIED here (`size` bytes):
+// whatever the publisher files is the frame as it stood at this call, never live
+// state the guest moves on the next frame.
+//
+// At most ONE frame is ever between this call and its publish: the next call
+// blocks until the previous frame is published (see the implementation for why
+// one, and not two, with a three-image swapchain).
+//
+// Returns 1 when the frame was taken — the caller must then file NOTHING itself
+// for it. Returns 0, having done nothing, when the async path is off or cannot
+// serve this frame; the caller then does what it always did:
+// kl_vulkan_frame_done(stage) followed by its own publishing.
+int  kl_vulkan_frame_async_on(void);
+int  kl_vulkan_frame_done_async(int stage, void (*publish)(const void *payload),
+                                const void *payload, unsigned long size);
+// Wait until any frame handed to kl_vulkan_frame_done_async is published. With
+// `stop`, also end the publisher thread and destroy its fence (it is recreated
+// on the next async frame). A no-op when the async path never ran. Anything that
+// tears down what a pending frame names — a session, a swapchain, the device —
+// calls this first, so nothing is published after it is gone.
+void kl_vulkan_frame_drain(int stop);
+
 // How many frames have been presented, and how many were written out. The
 // end-of-run report reads these; a run with a healthy frame loop and zero
 // captures is a different bug from one that never presented.

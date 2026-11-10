@@ -99,6 +99,12 @@ int   kl_vulkan_display_luid(uint8_t out[8]) { (void)out; return 0; }
 void *kl_vulkan_display_phys(void) { return NULL; }
 void  kl_vulkan_frame_done(int s) { (void)s; }
 unsigned long long kl_vulkan_frame_serial(void) { return 0; }
+int   kl_vulkan_frame_async_on(void) { return 0; }
+int   kl_vulkan_frame_done_async(int s, void (*p)(const void *), const void *pl,
+                                 unsigned long n) {
+    (void)s; (void)p; (void)pl; (void)n; return 0;
+}
+void  kl_vulkan_frame_drain(int stop) { (void)stop; }
 // The OpenXR seam. Answering "not supported" here is what keeps
 // XR_KHR_vulkan_enable OUT of the advertised extension list on a checkout with
 // no MoltenVK, so a Vulkan OpenXR guest is refused at xrCreateInstance — where
@@ -1160,6 +1166,9 @@ void klvk_ap_drain_all(void);
 static void klvk_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *alloc) {
     PFN_vkDestroyDevice real = real_gdpa ? (PFN_vkDestroyDevice)real_gdpa(dev, "vkDestroyDevice") : NULL;
     klvk_ap_drain_all();
+    // KL_VK_ASYNC_PUBLISH: a frame still waiting on its fence, and the fence
+    // itself, belong to this device. Returns at once when that path never ran.
+    kl_vulkan_frame_drain(1);
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_ndev; i++)
         if (g_devs[i]->dev == dev) {
@@ -3072,6 +3081,10 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
 // nothing has yet measured. `KL_VK_FRAME_SYNC=0` removes the wait and keeps the
 // serial — the A/B for "is the compositor showing a torn frame?", and the shape
 // the timeline-semaphore version would have.
+//
+// KL_VK_ASYNC_PUBLISH=1 keeps the guarantee and moves the wait off the guest's
+// thread: a fence-only submit on the guest's queue, waited on by a publisher
+// thread of ours that then advances the serial — see kl_vulkan_frame_done_async.
 static uint64_t g_frame_serial;
 
 // ---- [perf-audit 2026-10-07] KL_PERF_FRAME (default on): the frame seam's ----
@@ -3093,6 +3106,10 @@ static struct {
     double t_done, t_last_submit, win_start;
     double bubble, encode, waitidle, seam, period;
     unsigned frames, submits, open;
+    // KL_VK_ASYNC_PUBLISH only (see kl_vulkan_frame_done_async): the frame's
+    // first big submit, and the GPU-idle gap measured against the publisher's
+    // view of the previous frame's completion instead of against frame_done.
+    double t_first, gpu_gap, pub_wait;
 } g_pf;
 static double pf_now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -3474,6 +3491,271 @@ void kl_vulkan_frame_done(int stage) {
             g_pf.frames = g_pf.submits = 0;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The frame seam without the stall — KL_VK_ASYNC_PUBLISH=1 (default 0)
+// ---------------------------------------------------------------------------
+//
+// kl_vulkan_frame_done's vkQueueWaitIdle is the whole of the CPU<->GPU
+// serialisation at frame end: the guest's render thread sleeps until the GPU
+// finishes frame N, and only then starts preparing N+1 — during which the GPU
+// has nothing to do. Measured on Metro Awakening (Mac, gameplay): a 3.7-3.9 ms
+// GPU-idle bubble in an 8.4-9.8 ms period. Nothing about the CORRECTNESS of the
+// seam needs the guest's thread to be the one that waits; it only needs the
+// serial — and every record a compositor reads behind it — to move after the
+// picture is complete.
+//
+// So the wait moves to a thread of ours. A fence-only vkQueueSubmit goes onto
+// the guest's queue (MoltenVK commits an empty MTLCommandBuffer for it and
+// signals the fence from its completion — the exact mechanism its waitIdle uses,
+// so "the fence signalled" means what "waitIdle returned" meant). The publisher
+// thread waits on the fence, then advances the serial, then runs the caller's
+// publish callback with a copy of everything the caller would have filed after
+// kl_vulkan_frame_done. The caller's ORDER is untouched; only the thread that
+// carries it out changes.
+//
+// ONE frame in flight, not two, and that number is the swapchain's: a guest's
+// OpenXR swapchain has three images. While frame N is waiting to publish, the
+// compositor shows N-1 and the guest draws N+1 into the third image. A second
+// pending frame would have the guest drawing N+2 into N-1's image — the picture
+// the compositor is still showing. So the next frame end blocks until the
+// previous frame is published, and the time it blocks is reported as such
+// (the frame-seam line), which is the back-pressure a GPU-bound guest needs.
+//
+// The fence is ours and is reused frame to frame: one frame in flight means it
+// is never reset while the publisher waits on it. It is destroyed by
+// kl_vulkan_frame_drain(1) — session end and vkDestroyDevice call that.
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  work, done;
+    pthread_t       thr;
+    int             running, stop;
+    int             queued;          // a frame is handed over and not yet published
+    klvk_device    *d;               // the device `fence` belongs to
+    VkFence         fence;
+    void          (*publish)(const void *);
+    void           *payload;
+    size_t          cap;
+    // [perf] written by the publisher, read by the next frame end, under `mu`.
+    double          t_signal;        // pf_now() when the last fence was seen signalled
+    double          fence_wait;      // publisher time inside vkWaitForFences, summed
+} g_fp = { .mu = PTHREAD_MUTEX_INITIALIZER, .work = PTHREAD_COND_INITIALIZER,
+           .done = PTHREAD_COND_INITIALIZER };
+
+int kl_vulkan_frame_async_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_VK_ASYNC_PUBLISH", 0);
+        if (on)
+            VKI("frame end publishes from a thread of ours once the GPU is done "
+                "(KL_VK_ASYNC_PUBLISH) — the guest's render thread no longer waits "
+                "for its queue to go idle%s\n",
+                kl_env_on("KL_VK_FRAME_SYNC", 1) ? ""
+                    : "; INERT here, because KL_VK_FRAME_SYNC=0 already removed the wait");
+    }
+    // Read every call, as kl_vulkan_frame_done reads it: this REPLACES that
+    // wait, so with the wait switched off there is nothing to replace.
+    return on && kl_env_on("KL_VK_FRAME_SYNC", 1);
+}
+
+static void *klvk_fp_main(void *arg) {
+    (void)arg;
+    pthread_setname_np("kl-frame-publish");
+    pthread_mutex_lock(&g_fp.mu);
+    for (;;) {
+        while (!g_fp.queued && !g_fp.stop) pthread_cond_wait(&g_fp.work, &g_fp.mu);
+        if (!g_fp.queued) break;                     // stopping, nothing left
+        klvk_device *d = g_fp.d;
+        VkFence f = g_fp.fence;
+        pthread_mutex_unlock(&g_fp.mu);
+
+        // In one-second slices so a GPU that never answers is NAMED, and so a
+        // drain that is tearing the device down is not held forever by it.
+        double t0 = pf_now();
+        VkResult r;
+        int slices = 0;
+        for (;;) {
+            r = d->WaitForFences(d->dev, 1, &f, VK_TRUE, 1000000000ull);
+            if (r != VK_TIMEOUT) break;
+            if (++slices == 1)
+                VKI("frame publisher: the guest's frame has not completed on the GPU "
+                    "after 1 s — still waiting (KL_VK_ASYNC_PUBLISH)\n");
+            if (__atomic_load_n(&g_fp.stop, __ATOMIC_ACQUIRE) && slices >= 2) break;
+        }
+        double t1 = pf_now();
+        if (r != VK_SUCCESS) {
+            static int said;
+            if (!said++)
+                VKI("frame publisher: waiting for the guest's frame answered %d — a "
+                    "compositor may sample an eye the GPU is still writing\n", (int)r);
+        }
+        // The same two steps, in the same order, as the synchronous seam: the
+        // completion first, the records that describe it second.
+        __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
+        g_fp.publish(g_fp.payload);
+
+        pthread_mutex_lock(&g_fp.mu);
+        g_fp.t_signal = t1;
+        g_fp.fence_wait += t1 - t0;
+        g_fp.queued = 0;
+        pthread_cond_broadcast(&g_fp.done);
+    }
+    g_fp.running = 0;
+    pthread_cond_broadcast(&g_fp.done);
+    pthread_mutex_unlock(&g_fp.mu);
+    return NULL;
+}
+
+void kl_vulkan_frame_drain(int stop) {
+    pthread_mutex_lock(&g_fp.mu);
+    if (!g_fp.running && !g_fp.fence) { pthread_mutex_unlock(&g_fp.mu); return; }
+    while (g_fp.queued) pthread_cond_wait(&g_fp.done, &g_fp.mu);
+    if (!stop) { pthread_mutex_unlock(&g_fp.mu); return; }
+    int join = g_fp.running;
+    pthread_t thr = g_fp.thr;
+    if (join) {
+        __atomic_store_n(&g_fp.stop, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_fp.work);
+    }
+    pthread_mutex_unlock(&g_fp.mu);
+    if (join) pthread_join(thr, NULL);
+    pthread_mutex_lock(&g_fp.mu);
+    // Nothing waits on the fence now: the queue is empty and the thread is gone.
+    if (g_fp.fence && g_fp.d) g_fp.d->DestroyFence(g_fp.d->dev, g_fp.fence, NULL);
+    g_fp.fence = VK_NULL_HANDLE;
+    g_fp.d = NULL;
+    g_fp.stop = 0;
+    pthread_mutex_unlock(&g_fp.mu);
+}
+
+int kl_vulkan_frame_done_async(int stage, void (*publish)(const void *payload),
+                               const void *payload, unsigned long size) {
+    if (!publish || !kl_vulkan_guest_active() || !kl_vulkan_frame_async_on()) return 0;
+    klvk_device *d = g_devs[0];
+    if (!d || !d->queue || !d->QueueSubmit || !d->CreateFence || !d->ResetFences ||
+        !d->WaitForFences || !d->DestroyFence)
+        return 0;
+    double pf_in = pf_on() ? pf_now() : 0;          // [perf-audit] KL_PERF_FRAME
+    double prof_t0 = klvk_profile() ? klvk_prof_now() : 0;
+
+    // Back-pressure: the previous frame must be published before this one is
+    // handed over (one in flight — see above). This is the only place the
+    // guest's render thread can still wait for the GPU, and it waits for the
+    // PREVIOUS frame while this one's work is already queued behind it.
+    pthread_mutex_lock(&g_fp.mu);
+    while (g_fp.queued) pthread_cond_wait(&g_fp.done, &g_fp.mu);
+    double t_prev_signal = g_fp.t_signal, fence_wait = g_fp.fence_wait;
+    g_fp.fence_wait = 0;
+    pthread_mutex_unlock(&g_fp.mu);
+    double pf_waited = pf_in > 0 ? pf_now() : 0;
+
+    klvk_fs_tick();
+    static int eye_shadow = -1;                      // as in kl_vulkan_frame_done
+    if (eye_shadow < 0) eye_shadow = kl_env_on("KL_EYE_SHADOW", 0);
+    if (eye_shadow) klvk_eye_shadow_copy(d, stage);
+
+    // The fence, created on first use and again after a drain(1) or a device
+    // change. The publisher is idle here (nothing queued), so nobody else is
+    // touching it.
+    if (g_fp.fence && g_fp.d != d) {
+        g_fp.d->DestroyFence(g_fp.d->dev, g_fp.fence, NULL);
+        g_fp.fence = VK_NULL_HANDLE;
+    }
+    VkResult r = VK_SUCCESS;
+    if (!g_fp.fence) {
+        VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        r = d->CreateFence(d->dev, &fi, NULL, &g_fp.fence);
+        if (r == VK_SUCCESS) g_fp.d = d; else g_fp.fence = VK_NULL_HANDLE;
+    } else {
+        r = d->ResetFences(d->dev, 1, &g_fp.fence);
+    }
+    // Fence-only: every command buffer the guest submitted before this point
+    // completes before it signals. Through the REAL entry point, so it is not
+    // counted as a guest submit by the frame-seam measurement.
+    if (r == VK_SUCCESS) r = d->QueueSubmit(d->queue, 0, NULL, g_fp.fence);
+
+    // The thread, started on first use and again after a drain(1).
+    if (r == VK_SUCCESS) {
+        pthread_mutex_lock(&g_fp.mu);
+        if (!g_fp.running) {
+            pthread_attr_t at; pthread_attr_init(&at);
+            // It publishes the frame the compositor is waiting for: as urgent as
+            // the render thread it took the wait from.
+            pthread_attr_set_qos_class_np(&at, QOS_CLASS_USER_INTERACTIVE, 0);
+            g_fp.stop = 0;
+            if (pthread_create(&g_fp.thr, &at, klvk_fp_main, NULL) == 0) g_fp.running = 1;
+            pthread_attr_destroy(&at);
+        }
+        int ok = g_fp.running;
+        pthread_mutex_unlock(&g_fp.mu);
+        if (!ok) r = VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (r == VK_SUCCESS && size > g_fp.cap) {
+        void *p = realloc(g_fp.payload, size);
+        if (p) { g_fp.payload = p; g_fp.cap = size; } else r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    if (r != VK_SUCCESS) {
+        // The frame is still published, synchronously and in the same order, so
+        // a failure here costs the stall this path exists to remove and nothing
+        // else. If the fence-only submit went in but something after it failed,
+        // the idle below covers it too.
+        static int said;
+        if (!said++)
+            VKI("frame end could not hand the frame to the publisher (%d) — "
+                "publishing it synchronously (KL_VK_ASYNC_PUBLISH)\n", (int)r);
+        if (d->QueueWaitIdle) d->QueueWaitIdle(d->queue);
+        __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
+        publish(payload);
+    } else {
+        // The copy: the caller's records are its stack, and the guest's next
+        // frame starts the moment this returns.
+        if (size) memcpy(g_fp.payload, payload, size);
+        pthread_mutex_lock(&g_fp.mu);
+        g_fp.publish = publish;
+        g_fp.queued = 1;
+        pthread_cond_signal(&g_fp.work);
+        pthread_mutex_unlock(&g_fp.mu);
+    }
+
+    if (klvk_profile()) klvk_prof_frame(klvk_prof_now() - prof_t0);
+    if (pf_in > 0) {                                 // [perf-audit] KL_PERF_FRAME
+        double t = pf_now();
+        g_pf.waitidle += pf_waited - pf_in;          // here: blocked on the previous publish
+        g_pf.pub_wait += fence_wait;
+        if (g_pf.t_last_submit > 0 && pf_in > g_pf.t_last_submit) g_pf.seam += pf_in - g_pf.t_last_submit;
+        // The GPU-idle bubble, as the synchronous line means it: from the
+        // previous frame's GPU completion to this frame's first big submit. With
+        // the stall gone the submit usually comes FIRST, and the GPU then had
+        // this frame queued behind the last one — no bubble at all. The
+        // completion instant is when the publisher saw the fence, which is a
+        // hair after the GPU's own, so this reads slightly low, never high.
+        if (g_pf.open && t_prev_signal > 0 && g_pf.t_first > t_prev_signal)
+            g_pf.gpu_gap += g_pf.t_first - t_prev_signal;
+        if (g_pf.t_done > 0) g_pf.period += t - g_pf.t_done;
+        g_pf.frames++;
+        g_pf.t_done = t; g_pf.open = 0;
+        if (!g_pf.win_start) g_pf.win_start = t;
+        if (t - g_pf.win_start >= 5000.0 && g_pf.frames > 1) {
+            double n = g_pf.frames;
+            VKI("[perf] frame seam over %u frames: period %.2f ms; GPU-idle bubble (previous "
+                "frame's GPU completion -> this frame's first submit committed, 0 when they "
+                "overlap) %.2f ms; render thread xrEndFrame return -> first submit %.2f ms; "
+                "vkQueueSubmit encode %.2f ms in %.1f submits; render thread blocked on GPU at "
+                "Submit (last guest submit -> frame end) %.2f ms; frame end blocked on the "
+                "previous frame's publish %.2f ms; publisher fence wait %.2f ms (per frame; "
+                "KL_VK_ASYNC_PUBLISH)\n",
+                g_pf.frames, g_pf.period / n, g_pf.gpu_gap / n, g_pf.bubble / n,
+                g_pf.encode / n, g_pf.submits / n, g_pf.seam / n, g_pf.waitidle / n,
+                g_pf.pub_wait / n);
+            g_pf.win_start = t;
+            g_pf.bubble = g_pf.encode = g_pf.waitidle = g_pf.seam = g_pf.period = 0;
+            g_pf.gpu_gap = g_pf.pub_wait = 0;
+            g_pf.frames = g_pf.submits = 0;
+        }
+    }
+    return 1;
 }
 
 static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
@@ -7546,7 +7828,9 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
         if (big < 0) { const char *e = getenv("KL_PERF_BIG_MS"); big = e ? atof(e) : 0.25; }
         if (ncb && t - pf_t0 >= big) {
             g_pf.t_last_submit = t;
-            if (!g_pf.open && g_pf.t_done > 0) { g_pf.bubble += t - g_pf.t_done; g_pf.open = 1; }
+            if (!g_pf.open && g_pf.t_done > 0) {
+                g_pf.bubble += t - g_pf.t_done; g_pf.open = 1; g_pf.t_first = t;
+            }
         }
     }
     // Same thread, same queue, right after the guest's work: copy every wanted

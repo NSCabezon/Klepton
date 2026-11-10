@@ -3837,7 +3837,14 @@ void kl_ovrp_frame_set_depth(int eye, float m22, float m23, float range_min,
     pthread_mutex_unlock(&g_frames.mu);
 }
 
-void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8) {
+// kl_ovrp_frame_end_external in three parts, so KL_VK_ASYNC_PUBLISH can SEAL
+// the record at xrEndFrame (on the guest's thread, against the pending record as
+// it stands then) and FILE it later from the frame publisher, once the GPU has
+// finished the picture. The publisher runs while the guest is already into its
+// next frame, whose xrWaitFrame reopens `pending` — so what is filed has to be
+// a copy taken at the frame's own end, never `pending` read at filing time.
+// The one-call path below does exactly what it always did, under one lock.
+static int klovrp_end_stage_ok(int stage) {
     if ((unsigned)stage >= KLOVRP_MAX_STAGES) {
     // Not clamped. A stage outside the ring means the swapchain has more
         // images than the record ring has slots, and folding it onto a slot
@@ -3851,7 +3858,7 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
                             "record ring — this frame's pose is NOT filed\n",
                     stage, KLOVRP_MAX_STAGES);
         }
-        return;
+        return 0;
     }
         // Louder than a comment, once: the compositor's own per-stage report walks
     // 0..kl_ovrp_stage_count(), so a stage past that is composited correctly
@@ -3866,60 +3873,95 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
                     stage, kl_ovrp_stage_count());
         }
     }
+    return 1;
+}
+
+static void klovrp_end_seal_locked(int stage, const float *pose7, const float *tan8) {
+    // The guest's own statement of what it drew, where it has one. See the
+    // header: this is what keeps a compositor from correcting a delta the
+    // guest has already corrected.
+    // ...and by how much, which is the measurement the whole change rests
+    // on rather than an assertion about it. A guest that renders at the
+    // pose it was handed submits that same pose and this is 0; a streaming
+    // client that warps the host's frame to the predicted display pose
+    // before submitting it reports the frame's own head motion, and THAT is
+    // the delta a compositor must not apply a second time. Printed on the
+    // first frame and then rarely, because the number only has to settle
+    // which of the two guests this is.
+    if (pose7) {
+        klovrp_pose a = { .qx = g_frames.pending.qx, .qy = g_frames.pending.qy,
+                          .qz = g_frames.pending.qz, .qw = g_frames.pending.qw };
+        klovrp_pose b = { .qx = pose7[3], .qy = pose7[4],
+                          .qz = pose7[5], .qw = pose7[6] };
+        float deg = klovrp_quat_degrees(&a, &b);
+        float dx = pose7[0] - g_frames.pending.px;
+        float dy = pose7[1] - g_frames.pending.py;
+        float dz = pose7[2] - g_frames.pending.pz;
+        static unsigned n;
+        static float worst_deg, worst_m;
+        float m = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (deg > worst_deg) worst_deg = deg;
+        if (m > worst_m) worst_m = m;
+        if (n == 0 || ++n % 600 == 0)
+            fprintf(stderr, "  [ovrp] the guest submitted a pose %.3f deg / "
+                            "%.4f m from the one it was handed (worst %.3f deg "
+                            "/ %.4f m) — it %s\n", (double)deg, (double)m,
+                    (double)worst_deg, (double)worst_m,
+                    worst_deg > 0.05f || worst_m > 0.002f
+                        ? "REPROJECTS ITS OWN FRAMES, so ours must not repeat it"
+                        : "renders at the pose it is given");
+        if (n == 0) n = 1;
+        g_frames.pending.px = pose7[0];
+        g_frames.pending.py = pose7[1];
+        g_frames.pending.pz = pose7[2];
+        g_frames.pending.qx = pose7[3];
+        g_frames.pending.qy = pose7[4];
+        g_frames.pending.qz = pose7[5];
+        g_frames.pending.qw = pose7[6];
+    }
+    if (tan8) memcpy(g_frames.pending.tangents, tan8, sizeof g_frames.pending.tangents);
+    g_frames.pending.stage = stage;
+    g_frames.pending.complete = 1;
+}
+
+static void klovrp_end_file_locked(int stage, const kl_ovrp_render_pose *rec) {
+    g_frames.r[stage] = *rec;
+    if (g_frames.last_complete >= 0 && g_frames.last_complete != stage)
+        g_frames.prev_complete = g_frames.last_complete;
+    g_frames.fence[stage] = klovrp_fence_for_filing();
+    g_frames.last_complete = stage;
+    g_frames.filed[stage]++;
+}
+
+void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8) {
+    if (!klovrp_end_stage_ok(stage)) return;
     pthread_mutex_lock(&g_frames.mu);
     if (g_frames.serial) {
-    // The guest's own statement of what it drew, where it has one. See the
-        // header: this is what keeps a compositor from correcting a delta the
-        // guest has already corrected.
-        // ...and by how much, which is the measurement the whole change rests
-        // on rather than an assertion about it. A guest that renders at the
-        // pose it was handed submits that same pose and this is 0; a streaming
-        // client that warps the host's frame to the predicted display pose
-        // before submitting it reports the frame's own head motion, and THAT is
-        // the delta a compositor must not apply a second time. Printed on the
-        // first frame and then rarely, because the number only has to settle
-        // which of the two guests this is.
-        if (pose7) {
-            klovrp_pose a = { .qx = g_frames.pending.qx, .qy = g_frames.pending.qy,
-                              .qz = g_frames.pending.qz, .qw = g_frames.pending.qw };
-            klovrp_pose b = { .qx = pose7[3], .qy = pose7[4],
-                              .qz = pose7[5], .qw = pose7[6] };
-            float deg = klovrp_quat_degrees(&a, &b);
-            float dx = pose7[0] - g_frames.pending.px;
-            float dy = pose7[1] - g_frames.pending.py;
-            float dz = pose7[2] - g_frames.pending.pz;
-            static unsigned n;
-            static float worst_deg, worst_m;
-            float m = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (deg > worst_deg) worst_deg = deg;
-            if (m > worst_m) worst_m = m;
-            if (n == 0 || ++n % 600 == 0)
-                fprintf(stderr, "  [ovrp] the guest submitted a pose %.3f deg / "
-                                "%.4f m from the one it was handed (worst %.3f deg "
-                                "/ %.4f m) — it %s\n", (double)deg, (double)m,
-                        (double)worst_deg, (double)worst_m,
-                        worst_deg > 0.05f || worst_m > 0.002f
-                            ? "REPROJECTS ITS OWN FRAMES, so ours must not repeat it"
-                            : "renders at the pose it is given");
-            if (n == 0) n = 1;
-            g_frames.pending.px = pose7[0];
-            g_frames.pending.py = pose7[1];
-            g_frames.pending.pz = pose7[2];
-            g_frames.pending.qx = pose7[3];
-            g_frames.pending.qy = pose7[4];
-            g_frames.pending.qz = pose7[5];
-            g_frames.pending.qw = pose7[6];
-        }
-        if (tan8) memcpy(g_frames.pending.tangents, tan8, sizeof g_frames.pending.tangents);
-        g_frames.pending.stage = stage;
-        g_frames.pending.complete = 1;
-        g_frames.r[stage] = g_frames.pending;
-        if (g_frames.last_complete >= 0 && g_frames.last_complete != stage)
-            g_frames.prev_complete = g_frames.last_complete;
-        g_frames.fence[stage] = klovrp_fence_for_filing();
-        g_frames.last_complete = stage;
-        g_frames.filed[stage]++;
+        klovrp_end_seal_locked(stage, pose7, tan8);
+        klovrp_end_file_locked(stage, &g_frames.pending);
     }
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+void kl_ovrp_frame_end_external_seal(int stage, const float *pose7, const float *tan8,
+                                     kl_ovrp_frame_seal *out) {
+    if (!out) return;
+    out->ok = 0;
+    out->stage = stage;
+    if (!klovrp_end_stage_ok(stage)) return;
+    pthread_mutex_lock(&g_frames.mu);
+    if (g_frames.serial) {
+        klovrp_end_seal_locked(stage, pose7, tan8);
+        out->rec = g_frames.pending;
+        out->ok = 1;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+void kl_ovrp_frame_end_external_file(const kl_ovrp_frame_seal *seal) {
+    if (!seal || !seal->ok) return;
+    pthread_mutex_lock(&g_frames.mu);
+    if (g_frames.serial) klovrp_end_file_locked(seal->stage, &seal->rec);
     pthread_mutex_unlock(&g_frames.mu);
 }
 

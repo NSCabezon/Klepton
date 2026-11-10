@@ -481,6 +481,23 @@ void kl_loadingvideo_stop(void);
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
 
+// ...the same, in two halves, for a caller that publishes the frame from
+// another thread once the GPU has finished it (KL_VK_ASYNC_PUBLISH, kl_openxr's
+// xrEndFrame). `seal` runs at the frame's end, on the guest's thread, and
+// captures the record exactly as kl_ovrp_frame_end_external would file it;
+// `file` files that copy later, and is the half that a compositor can see. The
+// split exists because the guest's NEXT xrWaitFrame reopens the pending record
+// while this frame is still waiting to be published — filing the live record
+// then would put the next frame's latch under this frame's picture.
+typedef struct {
+    kl_ovrp_render_pose rec;
+    int stage;
+    int ok;            // 0: nothing to file (stage out of range, no frame open)
+} kl_ovrp_frame_seal;
+void kl_ovrp_frame_end_external_seal(int stage, const float *pose7, const float *tan8,
+                                     kl_ovrp_frame_seal *out);
+void kl_ovrp_frame_end_external_file(const kl_ovrp_frame_seal *seal);
+
 // ...and the same for the OTHER layers, which for an OpenXR guest is the whole
 // of `xrEndFrame`'s list that is not a projection layer.
 //

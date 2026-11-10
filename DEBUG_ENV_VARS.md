@@ -3056,6 +3056,19 @@ vendored the whole path refuses by name and none of these do anything.
   VkQueue here, so nothing of ours is in its submissions. `0` keeps the serial
   and drops the wait — the A/B for "is the compositor showing a torn frame?",
   and the shape a timeline-semaphore version would have.
+- `KL_VK_ASYNC_PUBLISH` — **default 0** (kl_vulkan.c, kl_openxr.c). `1` keeps
+  the `KL_VK_FRAME_SYNC` guarantee and takes the stall off the guest's thread,
+  for OpenXR Vulkan guests (Metro Awakening): xrEndFrame puts a fence-only
+  `vkQueueSubmit` on the guest's queue and hands the frame — the serial and,
+  behind it, the frame record, projection layers, panels and eye-layer flag,
+  copied at xrEndFrame — to a publisher thread that waits on the fence and files
+  them in the synchronous order. One frame in flight: the next xrEndFrame blocks
+  until the previous frame is published (three-image swapchains leave no room
+  for a second). Inert with `KL_VK_FRAME_SYNC=0`. The OVRPlugin and OpenVR
+  frame ends stay synchronous. The `[vk] [perf] frame seam` line then measures
+  the GPU-idle bubble from the previous frame's GPU completion (0 when the next
+  frame's first submit was already queued) and adds how long xrEndFrame blocked
+  on the previous publish and the publisher's fence wait.
 - `KL_VK_TRACE=1` — the loader's own chatter: which MoltenVK was opened, which
   extension names were dropped, acquire/submit failures.
 - `KL_VK_WIDTH` / `KL_VK_HEIGHT` — the synthetic Android surface's size

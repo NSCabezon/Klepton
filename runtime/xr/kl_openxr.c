@@ -1340,6 +1340,9 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
 static XrResult klxr_DestroyInstance(void *instance) {
     klxr_instance *inst = klxr_inst(instance);
     if (!inst) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    // KL_VK_ASYNC_PUBLISH: publish the last frame and end the publisher before
+    // the session it describes is gone. A no-op when that path never ran.
+    kl_vulkan_frame_drain(1);
     inst->magic = 0;
     return KLXR_SUCCESS;
 }
@@ -2278,6 +2281,7 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
 static XrResult klxr_DestroySession(void *session) {
     klxr_session *s = klxr_sess(session);
     if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    kl_vulkan_frame_drain(1);            // KL_VK_ASYNC_PUBLISH; see DestroyInstance
     s->magic = 0;
     return KLXR_SUCCESS;
 }
@@ -2330,6 +2334,7 @@ static XrResult klxr_EndSession(void *session) {
     if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
     if (s->state != KLXR_SESSION_STATE_STOPPING) KLXR_RET(KLXR_ERROR_SESSION_NOT_STOPPING);
+    kl_vulkan_frame_drain(1);            // KL_VK_ASYNC_PUBLISH; see DestroyInstance
     s->running = 0;
     klxr_post_state(s, KLXR_SESSION_STATE_IDLE);
     klxr_post_state(s, s->exit_requested ? KLXR_SESSION_STATE_EXITING
@@ -5172,6 +5177,10 @@ int kl_xr_android_surface_present(void *scv) {
 static XrResult klxr_DestroySwapchain(void *swapchain) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    // KL_VK_ASYNC_PUBLISH: a frame still waiting to publish may name this
+    // swapchain's slots. Publish it first, so the order against the teardown
+    // below is the synchronous path's. A no-op when that path never ran.
+    kl_vulkan_frame_drain(0);
     // The compositor slots this swapchain's images were copied into, which are
     // ours and are keyed on the swapchain rather than on its image index — so
     // they cannot be found from `count` the way the eye textures below are.
@@ -5627,6 +5636,38 @@ static void klxr_pose_trace_report(klxr_session *s) {
     memset(both, 0, sizeof both);
     memset(worst_deg, 0, sizeof worst_deg);
     memset(worst_m, 0, sizeof worst_m);
+}
+
+// KL_VK_ASYNC_PUBLISH: everything xrEndFrame files AFTER the frame's completion
+// — the frame record, the projection layers, the panels, the eye-layer flag —
+// captured whole at xrEndFrame and filed by kl_vulkan's frame publisher once the
+// GPU has finished the picture, in the order the synchronous path below files
+// them (see "Publishing this frame, and the ORDER of it is load-bearing"). A
+// copy, because the guest is into its next frame by the time it is filed, and
+// its next xrWaitFrame reopens the pending record this one was built from.
+typedef struct {
+    kl_ovrp_frame_seal rec;      // kl_ovrp_frame_end_external, sealed (ok 0 = none)
+    int                file_pl;  // whether kl_ovrp_proj_layers_external runs
+    int                npl;
+    kl_ovrp_proj_layer pl[8];
+    int                nquads;
+    kl_ovrp_overlay    quads[4];
+    int                eye_layer;
+} klxr_frame_pub;
+// The publisher keeps ONE frame in flight, which is safe only because the guest
+// cannot draw into the image the compositor is showing: shown N-1, pending N,
+// drawing N+1 needs three images in the rotation. See kl_vulkan_frame_done_async.
+_Static_assert(KLXR_SWAPCHAIN_IMAGES >= 3,
+               "KL_VK_ASYNC_PUBLISH's one frame in flight needs three swapchain images");
+
+// Runs on the publisher thread, after the serial has advanced — or inline,
+// after kl_vulkan_frame_done, when the frame could not be handed over.
+static void klxr_frame_publish(const void *p) {
+    const klxr_frame_pub *f = p;
+    kl_ovrp_frame_end_external_file(&f->rec);
+    if (f->file_pl) kl_ovrp_proj_layers_external(f->pl, f->npl);
+    kl_ovrp_overlays_external(f->quads, f->nquads);
+    kl_ovrp_eye_layer_external(f->eye_layer);
 }
 
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
@@ -6627,7 +6668,23 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // frame was submitted" into "the picture is complete" — the eye MTLTextures
     // are the guest's own images, so nothing of ours is in its submissions and
     // there is no MTLSharedEvent to wait on instead.
-    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN) {
+    //
+    // KL_VK_ASYNC_PUBLISH=1 moves that idle off this thread: the frame is
+    // handed, with copies of the records below, to a publisher that waits for
+    // the GPU and then files serial-then-records itself (`defer`). A frame that
+    // drew no stage has no completion to wait for and files its records here as
+    // always — but only once the frame before it is published, or its records
+    // would land under the older frame's and be overwritten by them.
+    static klxr_frame_pub fpub;          // xrEndFrame is externally synchronised
+    int vk_async = s->gfx == KLXR_GFX_VULKAN && kl_vulkan_frame_async_on();
+    int defer = vk_async && drawn_stage >= 0;
+    if (vk_async && drawn_stage < 0) kl_vulkan_frame_drain(0);
+    if (defer) {
+        fpub.rec.ok = 0;
+        fpub.file_pl = 0;
+        fpub.npl = 0;
+    }
+    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN && !defer) {
         kl_vulkan_frame_done(drawn_stage);
         // KL_GPU_TIME (and the performance overlay's live timing): close the
         // guest's frame here, as kl_openvr does when both eyes are in. Without
@@ -6680,7 +6737,11 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         klxr_pose_note(s, KLXR_POSE_SRC_SUBMIT, sub);
     }
     klxr_pose_trace_report(s);
-    if (drawn_stage >= 0)
+    if (drawn_stage >= 0 && defer)
+        kl_ovrp_frame_end_external_seal(drawn_stage,
+                                        have_layer_pose ? layer_pose : NULL,
+                                        have_layer_pose ? layer_tan : NULL, &fpub.rec);
+    else if (drawn_stage >= 0)
         kl_ovrp_frame_end_external(drawn_stage,
                                    have_layer_pose ? layer_pose : NULL,
                                    have_layer_pose ? layer_tan : NULL);
@@ -6710,7 +6771,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         for (int k = 0; k < npl; k++)
             if (pl[k].slot[0] >= 0 || pl[k].slot[1] >= 0) { any_reachable = 1; break; }
         if (npl == 0 || any_reachable) {
-            kl_ovrp_proj_layers_external(pl, npl);
+            if (defer) {
+                fpub.file_pl = 1;
+                fpub.npl = npl;
+                memcpy(fpub.pl, pl, (size_t)npl * sizeof *pl);
+            } else {
+                kl_ovrp_proj_layers_external(pl, npl);
+            }
         } else {
             static int said;
             if (!said++)
@@ -6760,11 +6827,28 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // how a guest taking a menu down is expressed. Unconditional rather than
     // guarded on nquads: leaving the previous frame's list standing would keep
     // drawing a layer the guest has stopped submitting.
-    kl_ovrp_overlays_external(quads, nquads);
-    // The same statement for the eye, which had no way to be told "not this
-    // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
-    // and a quad shows one or the other, not both at once.
-    kl_ovrp_eye_layer_external(proj_layers > 0);
+    if (!defer) {
+        kl_ovrp_overlays_external(quads, nquads);
+        // The same statement for the eye, which had no way to be told "not this
+        // frame" — see kl_ovrp.h. A guest that alternates between a projection
+        // pair and a quad shows one or the other, not both at once.
+        kl_ovrp_eye_layer_external(proj_layers > 0);
+    } else {
+        fpub.nquads = nquads;
+        memcpy(fpub.quads, quads, (size_t)nquads * sizeof *quads);
+        fpub.eye_layer = proj_layers > 0;
+        // Handed over: the publisher files serial, then fpub, once the GPU is
+        // done, and this thread goes straight on to the next frame. Not taken
+        // (no device to fence on) is the synchronous seam, in its order.
+        if (!kl_vulkan_frame_done_async(drawn_stage, klxr_frame_publish,
+                                        &fpub, sizeof fpub)) {
+            kl_vulkan_frame_done(drawn_stage);
+            klxr_frame_publish(&fpub);
+        }
+        // After the fence-only submit, so its empty command buffer is counted
+        // in the frame it closes.
+        kl_gpu_time_frame_end();
+    }
 
     return KLXR_SUCCESS;
 }
